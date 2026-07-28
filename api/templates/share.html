@@ -1,0 +1,208 @@
+
+{% extends "base.html" %}
+{% load my_filters %}
+{% block title %}{{ "分享机器" | translate }}{% endblock %}
+{% block legend_name %}{{ "分享机器给其他用户" | translate }}{% endblock %}
+{% block content %}
+<section class="card">
+  <div class="card-header">
+    <div>
+      <h2 class="card-title">{{ "选择需要分享的设备" | translate }}</h2>
+      <p class="card-subtitle">{{ "请确认后生成分享链接" | translate }}</p>
+    </div>
+    <button id="create" type="button" class="btn btn-primary">{{ "生成分享链接" | translate }}</button>
+  </div>
+  <div class="card-body">
+    <div class="panel-grid">
+      <div class="item-card">
+        <div class="item-header">
+          <div>
+            <h3 class="item-title">{{ "选择设备" | translate }}</h3>
+            <div class="item-meta">{{ "支持搜索 ID 或别名" | translate }}</div>
+          </div>
+        </div>
+        <div class="form-field">
+          <label for="peer-search">{{ "搜索设备" | translate }}</label>
+          <input id="peer-search" type="text" placeholder="{{ "输入 Camellia ID 或别名" | translate }}">
+        </div>
+        <div class="picker">
+          <div class="picker-list" id="peer-list"></div>
+        </div>
+      </div>
+      <div class="item-card">
+        <div class="item-header">
+          <div>
+            <h3 class="item-title">{{ "已选择设备" | translate }}</h3>
+            <div class="item-meta">{{ "确认后生成分享链接" | translate }}</div>
+          </div>
+        </div>
+        <div class="form-field">
+          <div class="tag-list" id="selected-tags"></div>
+        </div>
+        <div class="notice is-warning">
+          <div>{{ "1、链接有效期为15分钟，切勿随意分享给他人。" | translate }}</div>
+          <div>{{ "2、所分享的机器，被分享人享有相同的权限，如果机器设置了保存密码，被分享人也可以直接连接。" | translate }}</div>
+          <div>{{ "3、链接仅有效1次，非分享人访问后即生效并失效。" | translate }}</div>
+        </div>
+        <div id="share-message" class="notice is-success" style="margin-top: 12px; display: none;"></div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="card">
+  <div class="card-header">
+    <div>
+      <h2 class="card-title">{{ "已创建的分享链接" | translate }}</h2>
+      <p class="card-subtitle">{{ "出于安全考虑，完整链接只在创建时显示一次" | translate }}</p>
+    </div>
+  </div>
+  <div class="card-body">
+    <div class="panel-grid">
+      {% for one in sharelinks %}
+      <article class="item-card">
+        <div class="item-header">
+          <div>
+            <h3 class="item-title">{{ one.token_prefix }}…</h3>
+            <div class="item-meta">{{ one.create_time }}</div>
+          </div>
+          {% if is_admin %}
+          <span class="pill">{{ one.owner }}</span>
+          {% endif %}
+        </div>
+        <div class="info-grid">
+          {% if is_admin %}
+          <div class="info-item">
+            <span>{{ "归属用户" | translate }}</span>
+            <strong>{{ one.owner }}</strong>
+          </div>
+          {% endif %}
+          <div class="info-item">
+            <span>{{ "设备数量" | translate }}</span>
+            <strong>{{ one.peer_count }}</strong>
+          </div>
+          <div class="info-item">
+            <span>{{ "过期时间" | translate }}</span>
+            <strong>{{ one.expires_at }}</strong>
+          </div>
+        </div>
+      </article>
+      {% endfor %}
+    </div>
+  </div>
+</section>
+
+<script nonce="{{ csp_nonce }}">
+  const peers = [
+    {% for peer in peers %}
+    { value: "{{ peer.id }}", title: "{{ peer.name|escapejs }}" }{% if not forloop.last %},{% endif %}
+    {% endfor %}
+  ];
+
+  const selected = new Set();
+  const listEl = document.getElementById('peer-list');
+  const tagsEl = document.getElementById('selected-tags');
+  const searchEl = document.getElementById('peer-search');
+  const messageEl = document.getElementById('share-message');
+  const baseUrl = window.location.origin + window.location.pathname.replace(/\/$/, '');
+
+  const renderList = () => {
+    const keyword = (searchEl.value || '').toLowerCase();
+    listEl.innerHTML = '';
+    peers
+      .filter((peer) => peer.title.toLowerCase().includes(keyword) || peer.value.includes(keyword))
+      .forEach((peer) => {
+        const item = document.createElement('label');
+        item.className = 'picker-item' + (selected.has(peer.value) ? ' is-selected' : '');
+        const checkbox = document.createElement('input');
+        checkbox.type = 'checkbox';
+        checkbox.value = peer.value;
+        checkbox.checked = selected.has(peer.value);
+        checkbox.addEventListener('change', () => {
+          if (checkbox.checked) {
+            selected.add(peer.value);
+          } else {
+            selected.delete(peer.value);
+          }
+          renderList();
+          renderTags();
+        });
+        const text = document.createElement('span');
+        text.textContent = peer.title;
+        item.appendChild(checkbox);
+        item.appendChild(text);
+        listEl.appendChild(item);
+      });
+  };
+
+  const renderTags = () => {
+    tagsEl.innerHTML = '';
+    if (selected.size === 0) {
+      tagsEl.innerHTML = '<span class="muted">{{ "暂无选择" | translate | escapejs }}</span>';
+      return;
+    }
+    peers
+      .filter((peer) => selected.has(peer.value))
+      .forEach((peer) => {
+        const tag = document.createElement('span');
+        tag.className = 'tag';
+        tag.textContent = peer.title;
+        tagsEl.appendChild(tag);
+      });
+  };
+
+  const getCookie = (name) => {
+    const match = document.cookie.match(new RegExp('(^| )' + name + '=([^;]+)'));
+    return match ? decodeURIComponent(match[2]) : '';
+  };
+
+  document.getElementById('create').addEventListener('click', async () => {
+    messageEl.style.display = 'none';
+    if (selected.size === 0) {
+      messageEl.textContent = '{{ "请选择至少一台设备。" | translate | escapejs }}';
+      messageEl.style.display = 'block';
+      messageEl.className = 'notice is-warning';
+      return;
+    }
+
+    const payload = peers
+      .filter((peer) => selected.has(peer.value))
+      .map((peer) => ({ value: peer.value, title: peer.title }));
+
+    const formData = new URLSearchParams();
+    formData.append('data', JSON.stringify(payload));
+
+    try {
+      const resp = await fetch('/api/share', {
+        method: 'POST',
+        headers: {
+          'X-CSRFToken': getCookie('csrftoken'),
+        },
+        credentials: 'same-origin',
+        body: formData,
+      });
+      const data = await resp.json();
+      if (resp.ok && data.code === 1 && data.token) {
+        messageEl.textContent = '{{ "链接只显示一次，请立即复制：" | translate | escapejs }}' + ' ' + baseUrl + '/' + data.token;
+        messageEl.className = 'notice is-success';
+        messageEl.style.display = 'block';
+        selected.clear();
+        renderList();
+        renderTags();
+      } else {
+        messageEl.textContent = data.msg || '{{ "请求失败，请稍后重试。" | translate | escapejs }}';
+        messageEl.className = 'notice is-warning';
+        messageEl.style.display = 'block';
+      }
+    } catch (error) {
+      messageEl.textContent = '{{ "网络异常，请稍后重试。" | translate | escapejs }}';
+      messageEl.className = 'notice is-warning';
+      messageEl.style.display = 'block';
+    }
+  });
+
+  searchEl.addEventListener('input', renderList);
+  renderList();
+  renderTags();
+</script>
+{% endblock %}

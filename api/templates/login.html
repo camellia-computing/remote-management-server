@@ -1,0 +1,111 @@
+{% load static %}
+{% load i18n %}
+{% load my_filters %}
+<!DOCTYPE html>
+{% get_current_language as CAMELLIA_REMOTE_LANGUAGE_CODE %}
+<html lang="{{ CAMELLIA_REMOTE_LANGUAGE_CODE }}">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+    <meta name="theme-color" content="#397bff">
+    <title>{{ "登录" | translate }}_【Camellia】</title>
+    <link rel="icon" type="image/svg+xml" href="{% static 'web_client/favicon.svg' %}">
+    <link rel="stylesheet" href="{% static 'ui/app.css' %}">
+</head>
+<body class="auth-body">
+  <div class="auth-shell">
+    <div class="auth-hero">
+      <div>
+        <div class="auth-brand">
+          <div class="brand-mark"><img src="{% static 'web_client/favicon.svg' %}" alt="" aria-hidden="true"></div>
+          <div class="brand-text">
+            <span class="brand-title">Camellia</span>
+            <span class="brand-subtitle">{{ "安全控制台" | translate }}</span>
+          </div>
+        </div>
+        <h1>{{ "欢迎回来" | translate }}</h1>
+        <p>{{ "安全的远程控制与设备管理入口" | translate }}</p>
+      </div>
+      <div class="notice">
+        {{ "建议启用强密码并定期检查设备归属。" | translate }}
+      </div>
+    </div>
+    <div class="auth-card">
+      <h2>{{ "登录" | translate }}</h2>
+      <div id="form-message" class="form-message"></div>
+      <form id="login-form" action="/api/user_action?action=login" method="post">
+        {% csrf_token %}
+        <input type="hidden" name="next" id="next-url">
+        <div class="form-field">
+          <label for="account">{{ "用户名" | translate }}</label>
+          <input id="account" type="text" name="account" autocomplete="username" required placeholder="{{ "请输入用户名" | translate }}">
+        </div>
+        <div class="form-field">
+          <label for="password">{{ "密码" | translate }}</label>
+          <input id="password" type="password" name="password" autocomplete="current-password" maxlength="128" required placeholder="{{ "请输入密码" | translate }}">
+        </div>
+        <button type="submit" class="btn btn-primary" style="width: 100%;">{{ "登录" | translate }}</button>
+      </form>
+      <div class="auth-footer">
+        <div><a href="/api/user_action?action=register">{{ "立即注册" | translate }}</a></div>
+        <div class="muted" id="forget-link" style="margin-top: 8px;">{{ "忘记密码？" | translate }}</div>
+      </div>
+    </div>
+  </div>
+
+  <script nonce="{{ csp_nonce }}">
+    const messageEl = document.getElementById('form-message');
+    const form = document.getElementById('login-form');
+    const getCookie = (name) => {
+      const match = document.cookie.match(new RegExp('(^| )' + name + '=([^;]+)'));
+      return match ? decodeURIComponent(match[2]) : '';
+    };
+
+    const showMessage = (text) => {
+      messageEl.textContent = text;
+      messageEl.classList.add('is-visible');
+    };
+
+    document.getElementById('forget-link').addEventListener('click', () => {
+      showMessage('{{ "暂未开启找回密码功能，请联系管理员。" | translate | escapejs }}');
+    });
+
+    const nextField = document.getElementById('next-url');
+    const urlParams = new URLSearchParams(window.location.search);
+    const nextParam = urlParams.get('next') || '';
+    const registered = urlParams.get('registered') || '';
+    const isSafeNext = (value) => value.startsWith('/') && !value.startsWith('//');
+    if (nextParam && isSafeNext(nextParam)) {
+      nextField.value = nextParam;
+    }
+    if (registered === '1') {
+      showMessage('{{ "注册成功，请使用新账号登录。" | translate | escapejs }}');
+    }
+
+    form.addEventListener('submit', async (event) => {
+      event.preventDefault();
+      messageEl.classList.remove('is-visible');
+      const formData = new FormData(form);
+      try {
+        const resp = await fetch(form.action, {
+          method: 'POST',
+          headers: {
+            'X-CSRFToken': getCookie('csrftoken'),
+          },
+          credentials: 'same-origin',
+          body: formData,
+        });
+        const data = await resp.json();
+        if (data.code === 1) {
+          const target = nextField.value && isSafeNext(nextField.value) ? nextField.value : data.url;
+          window.location.href = target;
+        } else {
+          showMessage(data.msg || '{{ "登录失败，请检查输入信息。" | translate | escapejs }}');
+        }
+      } catch (error) {
+        showMessage('{{ "网络异常，请稍后再试。" | translate | escapejs }}');
+      }
+    });
+  </script>
+</body>
+</html>

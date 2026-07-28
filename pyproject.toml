@@ -1,0 +1,55 @@
+[project]
+name = "camellia-remote-management-server"
+version = "0.1.0"
+description = "Production management API and web console for Camellia Remote"
+readme = "README.md"
+requires-python = ">=3.13"
+license = "AGPL-3.0-only"
+authors = [{ name = "Camellia Computing" }]
+dependencies = [
+  "django>=6.0,<7.0",
+  "openpyxl>=3.1,<4",
+  "gunicorn>=26,<27",
+  "whitenoise>=6.12,<7",
+  "authlib>=1.7,<2",
+  "requests>=2.32,<3",
+  "pynacl>=1.6,<2",
+  "psycopg[binary]>=3.3,<4",
+]
+
+[dependency-groups]
+dev = [
+  "ruff>=0.15,<0.16",
+  "pytest>=9,<10",
+  "pytest-django>=4.12,<5",
+  "coverage>=7.15,<8",
+]
+
+[tool.uv]
+package = false
+
+[tool.ruff]
+target-version = "py313"
+line-length = 120
+extend-exclude = [
+  "static",
+  "static_root",
+  "static/web_client",
+]
+
+[tool.ruff.lint]
+select = ["E", "F", "B"]
+ignore = ["E501", "F403", "F405"]
+
+[tool.pytest.ini_options]
+DJANGO_SETTINGS_MODULE = "camellia_remote_management.settings"
+python_files = ["tests.py", "test_*.py", "*_tests.py"]
+addopts = "--strict-markers --reuse-db"
+
+[tool.coverage.run]
+source = ["api", "webui2", "camellia_remote_management"]
+omit = ["*/migrations/*", "*/tests.py"]
+
+[tool.coverage.report]
+skip_covered = true
+show_missing = true

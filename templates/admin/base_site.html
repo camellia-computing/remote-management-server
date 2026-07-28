@@ -1,0 +1,48 @@
+{% extends "admin/base.html" %}
+{% load static %}
+{% load i18n %}
+
+{% block title %}{% trans "Camellia 管理后台" %}{% endblock %}
+
+{% block extrastyle %}
+{{ block.super }}
+<link rel="stylesheet" href="{% static 'camellia_admin/admin.css' %}">
+{% endblock %}
+
+{% block extrahead %}
+{{ block.super }}
+<link rel="icon" type="image/svg+xml" href="{% static 'web_client/favicon.svg' %}">
+<meta name="theme-color" content="#397bff">
+{% endblock %}
+
+{% block branding %}
+<h1 id="site-name">
+  <a href="{% url 'admin:index' %}">{% trans "Camellia 管理后台" %}</a>
+  <span class="site-subtitle">{% trans "管理后台" %}</span>
+</h1>
+{% endblock %}
+
+{% block nav-global %}{% endblock %}
+
+{% block usertools %}
+{% if has_permission %}
+<div id="user-tools">
+  {% block welcome-msg %}
+  {% translate "Welcome," %}
+  <strong>{% firstof user.get_short_name user.get_username %}</strong>.
+  {% endblock %}
+  {% block userlinks %}
+  {% if site_url %}
+  <a href="{{ site_url }}">{% translate "View site" %}</a> /
+  {% endif %}
+  {% if user.has_usable_password %}
+  <a href="{% url 'admin:password_change' %}">{% translate "Change password" %}</a> /
+  {% endif %}
+  <form id="logout-form" method="post" action="{% url 'admin:logout' %}">
+    {% csrf_token %}
+    <button type="submit">{% translate "Log out" %}</button>
+  </form>
+  {% endblock %}
+</div>
+{% endif %}
+{% endblock %}

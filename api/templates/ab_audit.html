@@ -1,0 +1,79 @@
+{% extends "base.html" %}
+{% load i18n %}
+
+{% block title %}{% trans "规则审计" %}{% endblock %}
+{% block legend_name %}{% trans "规则审计" %}{% endblock %}
+{% block page_actions %}
+  <a class="btn btn-secondary btn-xs" href="/api/ab_rules">{% trans "规则总览" %}</a>
+  <a class="btn btn-ghost btn-xs" href="/api/ab_manage">{% trans "返回权限配置" %}</a>
+{% endblock %}
+
+{% block content %}
+<div class="card ab-hero">
+  <div class="card-header">
+    <div>
+      <h2 class="card-title">{% trans "规则审计日志" %}</h2>
+      <p class="card-subtitle">{% trans "查看权限变更与共享配置的历史记录。" %}</p>
+    </div>
+    <span class="pill">{{ page_obj.paginator.count }} {% trans "条记录" %}</span>
+  </div>
+  <div class="ab-hero-body">
+    <form class="ab-filter" method="get" action="/api/ab_audit">
+      <input class="ab-input ab-input-wide" type="text" name="q" value="{{ filter_q }}" placeholder="{% trans "搜索地址簿、执行人或目标" %}">
+      <button class="btn btn-secondary btn-xs" type="submit">{% trans "筛选" %}</button>
+      {% if filter_q %}
+        <a class="btn btn-ghost btn-xs" href="/api/ab_audit">{% trans "清除" %}</a>
+      {% endif %}
+    </form>
+  </div>
+</div>
+
+<div class="card ab-global">
+  <div class="card-header">
+    <div>
+      <h2 class="card-title">{% trans "审计记录" %}</h2>
+      <p class="card-subtitle">{% trans "按时间倒序展示规则变更。" %}</p>
+    </div>
+  </div>
+  <div class="ab-table ab-table--audit">
+    <div class="ab-table-head">
+      <div>{% trans "时间" %}</div>
+      <div>{% trans "地址簿" %}</div>
+      <div>{% trans "动作" %}</div>
+      <div>{% trans "目标" %}</div>
+      <div>{% trans "权限" %}</div>
+      <div>{% trans "执行人" %}</div>
+      <div>{% trans "详情" %}</div>
+    </div>
+    {% for entry in entries %}
+      <div class="ab-table-row">
+        <div>{{ entry.created_at|date:"Y-m-d H:i" }}</div>
+        <div>
+          <div class="ab-row-title">{{ entry.profile_name }}</div>
+          <div class="ab-row-meta">{{ entry.profile_guid }}</div>
+        </div>
+        <div>{{ entry.action }}</div>
+        <div>{{ entry.target_type }} · {{ entry.target_name }}</div>
+        <div>{{ entry.rule_label }}</div>
+        <div>{{ entry.actor }}</div>
+        <div class="ab-row-meta">{{ entry.details }}</div>
+      </div>
+    {% empty %}
+      <div class="ab-empty">{% trans "暂无审计记录。" %}</div>
+    {% endfor %}
+  </div>
+</div>
+
+<div class="pagination">
+  {% if page_obj.has_previous %}
+    <a class="btn btn-ghost" href="?{% if filter_q %}q={{ filter_q|urlencode }}&{% endif %}page={{ page_obj.previous_page_number }}">{% trans "上一页" %}</a>
+  {% endif %}
+  {% if page_obj.paginator.num_pages > 1 %}
+    <span class="page-info">{% trans "页码" %} {{ page_obj.number }} / {{ page_obj.paginator.num_pages }}</span>
+  {% endif %}
+  {% if page_obj.has_next %}
+    <a class="btn btn-ghost" href="?{% if filter_q %}q={{ filter_q|urlencode }}&{% endif %}page={{ page_obj.next_page_number }}">{% trans "下一页" %}</a>
+    <a class="btn btn-ghost" href="?{% if filter_q %}q={{ filter_q|urlencode }}&{% endif %}page={{ page_obj.paginator.num_pages }}">{% trans "尾页" %} &raquo;</a>
+  {% endif %}
+</div>
+{% endblock %}

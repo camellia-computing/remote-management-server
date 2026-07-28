@@ -1,0 +1,365 @@
+{% extends "base.html" %}
+{% load i18n %}
+
+{% block title %}{% trans "地址簿权限" %}{% endblock %}
+{% block legend_name %}{% trans "地址簿权限" %}{% endblock %}
+{% block page_actions %}
+  {% if u.is_admin %}
+    <a class="btn btn-ghost btn-xs" href="/api/ab_shares_export?format=csv">{% trans "导出共享 CSV" %}</a>
+    <a class="btn btn-secondary btn-xs" href="/api/ab_rules">{% trans "规则总览" %}</a>
+    <a class="btn btn-ghost btn-xs" href="/api/ab_audit">{% trans "规则审计" %}</a>
+  {% endif %}
+{% endblock %}
+
+{% block content %}
+<div class="card ab-hero">
+  <div class="card-header">
+    <div>
+      <h2 class="card-title">{% trans "共享与访问规则" %}</h2>
+      <p class="card-subtitle">{% trans "管理用户、组和 Everyone 的访问权限。" %}</p>
+    </div>
+    <span class="pill">{% trans "仅非个人地址簿可配置共享规则。" %}</span>
+  </div>
+  <div class="ab-hero-body">
+    {% if messages %}
+      {% for message in messages %}
+        <div class="notice {% if message.tags %}is-{{ message.tags }}{% endif %}">{{ message }}</div>
+      {% endfor %}
+    {% else %}
+      <div class="notice">{% trans "选择地址簿并配置共享权限。" %}</div>
+    {% endif %}
+    <form class="ab-filter" method="get" action="/api/ab_manage">
+      <input class="ab-input ab-input-wide" type="text" name="q" value="{{ filter_q }}" placeholder="{% trans "搜索地址簿、Owner 或目标" %}">
+      <button class="btn btn-secondary btn-xs" type="submit">{% trans "筛选" %}</button>
+      {% if filter_q %}
+        <a class="btn btn-ghost btn-xs" href="/api/ab_manage">{% trans "清除" %}</a>
+      {% endif %}
+    </form>
+  </div>
+</div>
+
+{% if rule_stats %}
+  <div class="ab-stats">
+    <div class="stat-card">
+      <div class="stat-label">{% trans "规则总数" %}</div>
+      <div class="stat-value">{{ rule_stats.total }}</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">{% trans "用户共享" %}</div>
+      <div class="stat-value">{{ rule_stats.user }}</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">{% trans "组规则" %}</div>
+      <div class="stat-value">{{ rule_stats.group }}</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">{% trans "Everyone 规则" %}</div>
+      <div class="stat-value">{{ rule_stats.everyone }}</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">{% trans "只读" %}</div>
+      <div class="stat-value">{{ rule_stats.read }}</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">{% trans "读写" %}</div>
+      <div class="stat-value">{{ rule_stats.write }}</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">{% trans "完全控制" %}</div>
+      <div class="stat-value">{{ rule_stats.full }}</div>
+    </div>
+  </div>
+{% endif %}
+
+{% if profiles %}
+  <div class="ab-manage-grid">
+    {% for item in profiles %}
+      <section class="card ab-card">
+        <div class="ab-card-header">
+          <div>
+            <h3 class="ab-card-title">{{ item.profile.name }}</h3>
+            <div class="ab-card-meta">
+              {% trans "所属用户" %}: {{ item.profile.owner.username|default:"-" }} · {% trans "地址簿 GUID" %}: {{ item.profile.guid }}
+            </div>
+          </div>
+          {% if item.can_manage %}
+            <span class="status-pill is-online">{% trans "可管理" %}</span>
+          {% else %}
+            <span class="status-pill is-offline">{% trans "只读" %}</span>
+          {% endif %}
+        </div>
+
+        <div class="panel-grid">
+          <section class="section-block">
+            <div class="section-head">
+              <div class="section-title">{% trans "用户共享" %}</div>
+              <span class="pill">{{ item.user_entries|length }}</span>
+            </div>
+            <div class="rule-list">
+              {% if item.user_entries %}
+                {% for entry in item.user_entries %}
+                  <div class="rule-card">
+                    <div class="rule-header">
+                      <div>
+                        <div class="rule-title">{{ entry.name }}</div>
+                        <div class="rule-meta">{{ entry.rule_label }}</div>
+                      </div>
+                    </div>
+                    {% if item.can_manage %}
+                      <div class="action-stack">
+                        <form class="action-panel" method="post" action="/api/ab_manage">
+                          {% csrf_token %}
+                          <input type="hidden" name="action" value="update_rule">
+                          <input type="hidden" name="rule_guid" value="{{ entry.guid }}">
+                          <div class="action-title">{% trans "权限" %}</div>
+                          <div class="action-row">
+                            <select class="ab-select" name="rule">
+                              {% for value, label in rule_choices %}
+                                <option value="{{ value }}" {% if value == entry.rule %}selected{% endif %}>{{ label }}</option>
+                              {% endfor %}
+                            </select>
+                            <button class="btn btn-ghost btn-xs" type="submit">{% trans "更新" %}</button>
+                          </div>
+                        </form>
+                        <form class="action-panel action-panel--danger" method="post" action="/api/ab_manage">
+                          {% csrf_token %}
+                          <input type="hidden" name="action" value="delete_rule">
+                          <input type="hidden" name="rule_guid" value="{{ entry.guid }}">
+                          <div class="action-title">{% trans "删除" %}</div>
+                          <div class="action-row action-row--single">
+                            <button class="btn btn-secondary btn-xs" type="submit">{% trans "删除" %}</button>
+                          </div>
+                        </form>
+                      </div>
+                    {% endif %}
+                  </div>
+                {% endfor %}
+              {% else %}
+                <div class="ab-empty">{% trans "暂无共享" %}</div>
+              {% endif %}
+            </div>
+            {% if item.can_manage %}
+            <form class="action-panel" method="post" action="/api/ab_manage">
+              {% csrf_token %}
+              <input type="hidden" name="action" value="add_user_share">
+              <input type="hidden" name="profile_guid" value="{{ item.profile.guid }}">
+              <div class="action-title">{% trans "新增" %}</div>
+              <div class="action-row">
+                <input class="ab-input" type="text" name="user" placeholder="{% trans "用户名或ID" %}">
+                <select class="ab-select" name="rule">
+                  {% for value, label in rule_choices %}
+                    <option value="{{ value }}">{{ label }}</option>
+                  {% endfor %}
+                </select>
+                <button class="btn btn-primary btn-xs" type="submit">{% trans "新增" %}</button>
+              </div>
+            </form>
+            {% endif %}
+          </section>
+
+          <section class="section-block">
+            <div class="section-head">
+              <div class="section-title">{% trans "组规则" %}</div>
+              <span class="pill">{{ item.group_entries|length }}</span>
+            </div>
+            <div class="rule-list">
+              {% if item.group_entries %}
+                {% for entry in item.group_entries %}
+                  <div class="rule-card">
+                    <div class="rule-header">
+                      <div>
+                        <div class="rule-title">{{ entry.name }}</div>
+                        <div class="rule-meta">{{ entry.rule_label }}</div>
+                      </div>
+                    </div>
+                    {% if item.can_manage %}
+                      <div class="action-stack">
+                        <form class="action-panel" method="post" action="/api/ab_manage">
+                          {% csrf_token %}
+                          <input type="hidden" name="action" value="update_rule">
+                          <input type="hidden" name="rule_guid" value="{{ entry.guid }}">
+                          <div class="action-title">{% trans "权限" %}</div>
+                          <div class="action-row">
+                            <select class="ab-select" name="rule">
+                              {% for value, label in rule_choices %}
+                                <option value="{{ value }}" {% if value == entry.rule %}selected{% endif %}>{{ label }}</option>
+                              {% endfor %}
+                            </select>
+                            <button class="btn btn-ghost btn-xs" type="submit">{% trans "更新" %}</button>
+                          </div>
+                        </form>
+                        <form class="action-panel action-panel--danger" method="post" action="/api/ab_manage">
+                          {% csrf_token %}
+                          <input type="hidden" name="action" value="delete_rule">
+                          <input type="hidden" name="rule_guid" value="{{ entry.guid }}">
+                          <div class="action-title">{% trans "删除" %}</div>
+                          <div class="action-row action-row--single">
+                            <button class="btn btn-secondary btn-xs" type="submit">{% trans "删除" %}</button>
+                          </div>
+                        </form>
+                      </div>
+                    {% endif %}
+                  </div>
+                {% endfor %}
+              {% else %}
+                <div class="ab-empty">{% trans "暂无规则" %}</div>
+              {% endif %}
+            </div>
+            {% if item.can_manage %}
+            <form class="action-panel" method="post" action="/api/ab_manage">
+              {% csrf_token %}
+              <input type="hidden" name="action" value="add_group_rule">
+              <input type="hidden" name="profile_guid" value="{{ item.profile.guid }}">
+              <div class="action-title">{% trans "新增" %}</div>
+              <div class="action-row">
+                <select class="ab-select" name="group">
+                  <option value="">{% trans "选择组" %}</option>
+                  {% for group in groups %}
+                    <option value="{{ group.id }}">{{ group.name }}</option>
+                  {% endfor %}
+                </select>
+                <select class="ab-select" name="rule">
+                  {% for value, label in rule_choices %}
+                    <option value="{{ value }}">{{ label }}</option>
+                  {% endfor %}
+                </select>
+                <button class="btn btn-primary btn-xs" type="submit">{% trans "新增" %}</button>
+              </div>
+            </form>
+            {% endif %}
+          </section>
+
+          <section class="section-block">
+            <div class="section-head">
+              <div class="section-title">{% trans "Everyone 规则" %}</div>
+            </div>
+            <div class="rule-list">
+              {% if item.everyone_rule %}
+                <div class="rule-card">
+                  <div class="rule-header">
+                    <div>
+                      <div class="rule-title">Everyone</div>
+                      <div class="rule-meta">{{ item.everyone_rule.rule_label }}</div>
+                    </div>
+                  </div>
+                  {% if item.can_manage %}
+                    <div class="action-stack">
+                      <form class="action-panel" method="post" action="/api/ab_manage">
+                        {% csrf_token %}
+                        <input type="hidden" name="action" value="update_rule">
+                        <input type="hidden" name="rule_guid" value="{{ item.everyone_rule.guid }}">
+                        <div class="action-title">{% trans "权限" %}</div>
+                        <div class="action-row">
+                          <select class="ab-select" name="rule">
+                            {% for value, label in rule_choices %}
+                              <option value="{{ value }}" {% if value == item.everyone_rule.rule %}selected{% endif %}>{{ label }}</option>
+                            {% endfor %}
+                          </select>
+                          <button class="btn btn-ghost btn-xs" type="submit">{% trans "更新" %}</button>
+                        </div>
+                      </form>
+                      <form class="action-panel action-panel--danger" method="post" action="/api/ab_manage">
+                        {% csrf_token %}
+                        <input type="hidden" name="action" value="delete_rule">
+                        <input type="hidden" name="rule_guid" value="{{ item.everyone_rule.guid }}">
+                        <div class="action-title">{% trans "删除" %}</div>
+                        <div class="action-row action-row--single">
+                          <button class="btn btn-secondary btn-xs" type="submit">{% trans "删除" %}</button>
+                        </div>
+                      </form>
+                    </div>
+                  {% endif %}
+                </div>
+              {% else %}
+                <div class="ab-empty">{% trans "暂无规则" %}</div>
+              {% endif %}
+            </div>
+            {% if item.can_manage %}
+            <form class="action-panel" method="post" action="/api/ab_manage">
+              {% csrf_token %}
+              <input type="hidden" name="action" value="add_everyone_rule">
+              <input type="hidden" name="profile_guid" value="{{ item.profile.guid }}">
+              <div class="action-title">{% trans "新增" %}</div>
+              <div class="action-row">
+                <select class="ab-select" name="rule">
+                  {% for value, label in rule_choices %}
+                    <option value="{{ value }}">{{ label }}</option>
+                  {% endfor %}
+                </select>
+                <button class="btn btn-primary btn-xs" type="submit">{% trans "新增" %}</button>
+              </div>
+            </form>
+            {% endif %}
+          </section>
+        </div>
+      </section>
+    {% endfor %}
+  </div>
+{% else %}
+  <div class="notice is-warning">{% trans "暂无可管理的地址簿。" %}</div>
+{% endif %}
+
+{% if global_rules %}
+  <div class="card ab-global">
+    <div class="card-header">
+      <div>
+        <h2 class="card-title">{% trans "全局规则" %}</h2>
+        <p class="card-subtitle">{% trans "仅管理员可见的规则总览。" %}</p>
+      </div>
+      <span class="pill">{{ global_rules|length }} {% trans "条记录" %}</span>
+    </div>
+    <div class="panel-grid">
+      {% for entry in global_rules %}
+        <article class="item-card">
+          <div class="item-header">
+            <div>
+              <h3 class="item-title">{{ entry.profile_name }}</h3>
+              <div class="item-meta">{{ entry.profile_guid }}</div>
+            </div>
+            <span class="pill">{{ entry.target_type }}</span>
+          </div>
+          <div class="info-grid">
+            <div class="info-item">
+              <span>{% trans "所属用户" %}</span>
+              <strong>{{ entry.owner }}</strong>
+            </div>
+            <div class="info-item">
+              <span>{% trans "目标" %}</span>
+              <strong>{{ entry.target_name }}</strong>
+            </div>
+            <div class="info-item">
+              <span>{% trans "权限" %}</span>
+              <strong>{{ entry.rule_label }}</strong>
+            </div>
+          </div>
+          <div class="action-stack">
+            <form class="action-panel" method="post" action="/api/ab_manage">
+              {% csrf_token %}
+              <input type="hidden" name="action" value="update_rule">
+              <input type="hidden" name="rule_guid" value="{{ entry.guid }}">
+              <div class="action-title">{% trans "权限" %}</div>
+              <div class="action-row">
+                <select class="ab-select" name="rule">
+                  {% for value, label in rule_choices %}
+                    <option value="{{ value }}" {% if value == entry.rule %}selected{% endif %}>{{ label }}</option>
+                  {% endfor %}
+                </select>
+                <button class="btn btn-ghost btn-xs" type="submit">{% trans "更新" %}</button>
+              </div>
+            </form>
+            <form class="action-panel action-panel--danger" method="post" action="/api/ab_manage">
+              {% csrf_token %}
+              <input type="hidden" name="action" value="delete_rule">
+              <input type="hidden" name="rule_guid" value="{{ entry.guid }}">
+              <div class="action-title">{% trans "删除" %}</div>
+              <div class="action-row action-row--single">
+                <button class="btn btn-secondary btn-xs" type="submit">{% trans "删除" %}</button>
+              </div>
+            </form>
+          </div>
+        </article>
+      {% endfor %}
+    </div>
+  </div>
+{% endif %}
+{% endblock %}

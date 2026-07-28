@@ -1,0 +1,124 @@
+{% extends "base.html" %}
+{% load i18n %}
+
+{% block title %}{% trans "地址簿内容管理" %}{% endblock %}
+{% block legend_name %}{{ profile.name }}{% endblock %}
+{% block page_actions %}
+  <a class="btn btn-secondary btn-xs" href="/api/ab_books">{% trans "返回地址簿列表" %}</a>
+  <a class="btn btn-ghost btn-xs" href="/api/tag_manage">{% trans "标签管理" %}</a>
+  <a class="btn btn-ghost btn-xs" href="/api/ab_manage">{% trans "地址簿权限" %}</a>
+  <a class="btn btn-ghost btn-xs" href="/api/ab_book_export?guid={{ profile.guid }}&kind=peers&format=csv">{% trans "导出设备 CSV" %}</a>
+  <a class="btn btn-ghost btn-xs" href="/api/ab_book_export?guid={{ profile.guid }}&kind=peers&format=xls">{% trans "导出设备 Excel" %}</a>
+{% endblock %}
+
+{% block content %}
+<div class="card ab-hero">
+  <div class="card-header">
+    <div>
+      <h2 class="card-title">{{ profile.name }}</h2>
+      <p class="card-subtitle">
+        {% trans "所属用户" %}: {{ owner.username|default:"-" }} ·
+        {% trans "地址簿 GUID" %}: {{ profile.guid }} ·
+        {% trans "权限" %}: {{ rule_label }}
+      </p>
+    </div>
+    {% if is_personal %}
+      <span class="pill">{% trans "个人地址簿" %}</span>
+    {% else %}
+      <span class="pill">{% trans "共享地址簿" %}</span>
+    {% endif %}
+  </div>
+  <div class="ab-hero-body">
+    {% if messages %}
+      {% for message in messages %}
+        <div class="notice {% if message.tags %}is-{{ message.tags }}{% endif %}">{{ message }}</div>
+      {% endfor %}
+    {% else %}
+      <div class="notice">{% trans "在此管理设备与标签内容。" %}</div>
+    {% endif %}
+  </div>
+</div>
+
+<section class="card ab-section-card">
+  <div class="card-header">
+    <div>
+      <h2 class="card-title">{% trans "设备管理" %}</h2>
+      <p class="card-subtitle">{% trans "新增设备并调整标签与备注。" %}</p>
+    </div>
+    <span class="pill">{{ peers|length }} {% trans "台设备" %}</span>
+  </div>
+  <div class="ab-section-body">
+    {% if can_edit %}
+    <form class="ab-form ab-bulk-tags" id="ab-bulk-tags-form" method="post" action="/api/ab_book">
+      {% csrf_token %}
+      <input type="hidden" name="guid" value="{{ profile.guid }}">
+      <input class="ab-input ab-input-wide" type="text" name="tags" placeholder="{% trans "批量标签（逗号分隔）" %}">
+      <input class="ab-input ab-input-wide" type="text" name="note" placeholder="{% trans "批量备注" %}">
+      <button class="btn btn-secondary btn-xs" type="submit" name="action" value="bulk_tag_add">{% trans "批量添加标签" %}</button>
+      <button class="btn btn-ghost btn-xs" type="submit" name="action" value="bulk_tag_remove">{% trans "批量移除标签" %}</button>
+      <button class="btn btn-ghost btn-xs" type="submit" name="action" value="bulk_tag_replace">{% trans "覆盖标签" %}</button>
+      <button class="btn btn-ghost btn-xs" type="submit" name="action" value="bulk_note_update">{% trans "批量更新备注" %}</button>
+      <button class="btn btn-secondary btn-xs" type="submit" name="action" value="bulk_peer_delete">{% trans "批量删除设备" %}</button>
+      <div class="ab-bulk-tip">{% trans "勾选设备后可批量操作标签。" %}</div>
+    </form>
+    {% endif %}
+    {% if can_edit %}
+    <form class="ab-form ab-peer-form" method="post" action="/api/ab_book">
+      {% csrf_token %}
+      <input type="hidden" name="guid" value="{{ profile.guid }}">
+      <input type="hidden" name="action" value="add_peer">
+      <input class="ab-input" type="text" name="rid" placeholder="{% trans "设备ID" %}">
+      <input class="ab-input" type="text" name="alias" placeholder="{% trans "别名（可选）" %}">
+      <input class="ab-input ab-input-wide" type="text" name="note" placeholder="{% trans "备注（可选）" %}">
+      <input class="ab-input ab-input-wide" type="text" name="tags" placeholder="{% trans "标签（逗号分隔）" %}">
+      {% if not is_personal %}
+        <input class="ab-input" type="text" name="password" placeholder="{% trans "共享密码（可选）" %}">
+      {% endif %}
+      <button class="btn btn-primary btn-xs" type="submit">{% trans "新增" %}</button>
+    </form>
+    {% endif %}
+
+    <div class="ab-peer-list">
+      {% for peer in peers %}
+        <div class="ab-peer-row">
+          <div class="ab-peer-main">
+            {% if can_edit %}
+              <label class="ab-peer-select">
+                <input class="ab-check" form="ab-bulk-tags-form" type="checkbox" name="peer_ids" value="{{ peer.rid }}">
+                <span>{% trans "选择" %}</span>
+              </label>
+            {% endif %}
+            <div class="ab-peer-title">{{ peer.rid }}</div>
+            <div class="ab-peer-meta">{{ peer.alias }} · {{ peer.note|default:"-" }}</div>
+            <div class="ab-peer-tags">{{ peer.tag_names|default:"-" }}</div>
+          </div>
+          {% if can_edit %}
+            <form class="ab-inline-form" method="post" action="/api/ab_book">
+              {% csrf_token %}
+              <input type="hidden" name="guid" value="{{ profile.guid }}">
+              <input type="hidden" name="action" value="update_peer">
+              <input type="hidden" name="rid" value="{{ peer.rid }}">
+              <input class="ab-input" type="text" name="alias" value="{{ peer.alias }}" placeholder="{% trans "别名" %}">
+              <input class="ab-input ab-input-wide" type="text" name="note" value="{{ peer.note }}" placeholder="{% trans "备注" %}">
+              <input class="ab-input ab-input-wide" type="text" name="tags" value="{{ peer.tag_names }}" placeholder="{% trans "标签（逗号分隔）" %}">
+              {% if not is_personal %}
+                <input class="ab-input" type="text" name="password" placeholder="{% trans "共享密码（可选）" %}">
+              {% endif %}
+              <button class="btn btn-ghost btn-xs" type="submit">{% trans "更新" %}</button>
+            </form>
+            <form class="ab-inline-form" method="post" action="/api/ab_book">
+              {% csrf_token %}
+              <input type="hidden" name="guid" value="{{ profile.guid }}">
+              <input type="hidden" name="action" value="delete_peer">
+              <input type="hidden" name="rid" value="{{ peer.rid }}">
+              <button class="btn btn-secondary btn-xs" type="submit">{% trans "删除" %}</button>
+            </form>
+          {% endif %}
+        </div>
+      {% empty %}
+        <div class="ab-empty">{% trans "暂无设备" %}</div>
+      {% endfor %}
+    </div>
+  </div>
+</section>
+{% endblock %}

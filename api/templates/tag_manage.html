@@ -1,0 +1,141 @@
+{% extends "base.html" %}
+{% load i18n %}
+
+{% block title %}{% trans "标签管理" %}{% endblock %}
+{% block legend_name %}{% trans "标签管理" %}{% endblock %}
+{% block page_actions %}
+  <a class="btn btn-secondary btn-xs" href="/api/ab_books">{% trans "地址簿管理" %}</a>
+  <a class="btn btn-ghost btn-xs" href="/api/ab_manage">{% trans "地址簿权限" %}</a>
+  <a class="btn btn-ghost btn-xs" href="/api/tag_export?format=csv{% if filter_q %}&q={{ filter_q|urlencode }}{% endif %}">{% trans "导出标签 CSV" %}</a>
+  <a class="btn btn-ghost btn-xs" href="/api/tag_export?format=xls{% if filter_q %}&q={{ filter_q|urlencode }}{% endif %}">{% trans "导出标签 Excel" %}</a>
+{% endblock %}
+
+{% block content %}
+<div class="card ab-hero">
+  <div class="card-header">
+    <div>
+      <h2 class="card-title">{% trans "标签列表" %}</h2>
+      <p class="card-subtitle">{% trans "标签独立管理，与地址簿通过设备关联。" %}</p>
+    </div>
+    <span class="pill">{{ tags|length }} {% trans "个标签" %}</span>
+  </div>
+  <div class="ab-hero-body">
+    {% if messages %}
+      {% for message in messages %}
+        <div class="notice {% if message.tags %}is-{{ message.tags }}{% endif %}">{{ message }}</div>
+      {% endfor %}
+    {% else %}
+      <div class="notice">{% trans "选择地址簿后创建或维护标签。" %}</div>
+    {% endif %}
+    <form class="ab-filter" method="get" action="/api/tag_manage">
+      <input class="ab-input ab-input-wide" type="text" name="q" value="{{ filter_q }}" placeholder="{% trans "搜索标签或地址簿" %}">
+      <button class="btn btn-secondary btn-xs" type="submit">{% trans "筛选" %}</button>
+      {% if filter_q %}
+        <a class="btn btn-ghost btn-xs" href="/api/tag_manage">{% trans "清除" %}</a>
+      {% endif %}
+    </form>
+  </div>
+</div>
+
+<div class="card ab-tag-create">
+  <div class="card-header">
+    <div>
+      <h2 class="card-title">{% trans "创建标签" %}</h2>
+      <p class="card-subtitle">{% trans "选择地址簿并添加标签。" %}</p>
+    </div>
+  </div>
+  <form class="ab-form ab-tag-form" method="post" action="/api/tag_manage">
+    {% csrf_token %}
+    <input type="hidden" name="action" value="add_tag">
+    <select class="ab-select" name="profile_guid">
+      {% for profile in profiles %}
+        <option value="{{ profile.guid }}">{{ profile.name }} · {{ profile.owner.username|default:"-" }}</option>
+      {% endfor %}
+    </select>
+    <input class="ab-input" type="text" name="name" placeholder="{% trans "标签名称" %}">
+    <input class="ab-input ab-color-input" type="color" name="color" value="#397bff" aria-label="{% trans "标签颜色" %}">
+    <button class="btn btn-primary btn-xs" type="submit">{% trans "新增" %}</button>
+  </form>
+</div>
+
+<div class="card ab-global">
+  <div class="card-header">
+    <div>
+      <h2 class="card-title">{% trans "标签明细" %}</h2>
+      <p class="card-subtitle">{% trans "支持颜色调整、重命名与删除。" %}</p>
+    </div>
+  </div>
+  <div class="panel-grid">
+    {% for tag in tags %}
+      <article class="item-card">
+        <div class="item-header">
+          <div>
+            <h3 class="item-title">{{ tag.name }}</h3>
+            <div class="item-meta">{{ tag.profile_guid }}</div>
+          </div>
+          <span class="pill">{{ tag.profile_name }}</span>
+        </div>
+        <div class="info-grid">
+          <div class="info-item">
+            <span>{% trans "所属用户" %}</span>
+            <strong>{{ tag.owner }}</strong>
+          </div>
+          <div class="info-item">
+            <span>{% trans "颜色" %}</span>
+            <strong>
+              <svg class="ab-tag-dot" viewBox="0 0 16 16" aria-hidden="true">
+                <circle cx="8" cy="8" r="8" fill="{{ tag.css_color }}"></circle>
+              </svg>
+              {{ tag.color|default:"-" }}
+            </strong>
+          </div>
+          <div class="info-item">
+            <span>{% trans "地址簿" %}</span>
+            <strong>{{ tag.profile_name }}</strong>
+          </div>
+        </div>
+        <div class="action-stack">
+          {% if tag.can_edit %}
+            <form class="action-panel" method="post" action="/api/tag_manage">
+              {% csrf_token %}
+              <input type="hidden" name="action" value="update_tag">
+              <input type="hidden" name="profile_guid" value="{{ tag.profile_guid }}">
+              <input type="hidden" name="name" value="{{ tag.name }}">
+              <div class="action-title">{% trans "颜色" %}</div>
+              <div class="action-row">
+                <input class="ab-input ab-color-input" type="color" name="color" value="{{ tag.css_color }}" aria-label="{% trans "标签颜色" %}">
+                <button class="btn btn-ghost btn-xs" type="submit">{% trans "更新" %}</button>
+              </div>
+            </form>
+            <form class="action-panel" method="post" action="/api/tag_manage">
+              {% csrf_token %}
+              <input type="hidden" name="action" value="rename_tag">
+              <input type="hidden" name="profile_guid" value="{{ tag.profile_guid }}">
+              <input type="hidden" name="old" value="{{ tag.name }}">
+              <div class="action-title">{% trans "新名称" %}</div>
+              <div class="action-row">
+                <input class="ab-input" type="text" name="new" placeholder="{% trans "新名称" %}">
+                <button class="btn btn-ghost btn-xs" type="submit">{% trans "重命名" %}</button>
+              </div>
+            </form>
+            <form class="action-panel action-panel--danger" method="post" action="/api/tag_manage">
+              {% csrf_token %}
+              <input type="hidden" name="action" value="delete_tag">
+              <input type="hidden" name="profile_guid" value="{{ tag.profile_guid }}">
+              <input type="hidden" name="name" value="{{ tag.name }}">
+              <div class="action-title">{% trans "删除" %}</div>
+              <div class="action-row action-row--single">
+                <button class="btn btn-secondary btn-xs" type="submit">{% trans "删除" %}</button>
+              </div>
+            </form>
+          {% else %}
+            <div class="ab-empty">{% trans "只读" %}</div>
+          {% endif %}
+        </div>
+      </article>
+    {% empty %}
+      <div class="ab-empty">{% trans "暂无标签" %}</div>
+    {% endfor %}
+  </div>
+</div>
+{% endblock %}

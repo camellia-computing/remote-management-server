@@ -1,0 +1,12 @@
+[Unit]
+Description=Hourly Camellia Remote Management PostgreSQL backup
+
+[Timer]
+OnCalendar=hourly
+RandomizedDelaySec=5min
+Persistent=true
+AccuracySec=1min
+Unit=camellia-remote-management-backup.service
+
+[Install]
+WantedBy=timers.target

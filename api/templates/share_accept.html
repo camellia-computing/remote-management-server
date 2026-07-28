@@ -1,0 +1,34 @@
+{% extends "base.html" %}
+{% load my_filters %}
+{% block title %}{{ "领取分享设备" | translate }}{% endblock %}
+{% block legend_name %}{{ "分享确认" | translate }}{% endblock %}
+{% block content %}
+<section class="card">
+  <div class="card-header">
+    <div>
+      <h2 class="card-title">{{ "确认领取分享设备" | translate }}</h2>
+      <p class="card-subtitle">{{ "只有点击确认后，链接才会被使用" | translate }}</p>
+    </div>
+  </div>
+  <div class="card-body">
+    <div class="info-grid">
+      <div class="info-item">
+        <span>{{ "设备数量" | translate }}</span>
+        <strong>{{ peer_count }}</strong>
+      </div>
+      <div class="info-item">
+        <span>{{ "过期时间" | translate }}</span>
+        <strong>{{ expires_at }}</strong>
+      </div>
+    </div>
+    <div class="notice is-warning" style="margin-top: 16px;">
+      {{ "领取后，设备会加入你的个人地址簿；现有同 ID 设备不会被覆盖。链接只能使用一次。" | translate }}
+    </div>
+    <form method="post" action="/api/share/{{ share_token }}" style="margin-top: 16px;">
+      {% csrf_token %}
+      <button type="submit" class="btn btn-primary">{{ "确认领取" | translate }}</button>
+      <a class="btn btn-ghost" href="/api/share">{{ "取消" | translate }}</a>
+    </form>
+  </div>
+</section>
+{% endblock %}

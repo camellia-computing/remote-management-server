@@ -1,0 +1,25 @@
+# Python and test state
+__pycache__/
+*.py[cod]
+*.so
+.venv/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Local configuration and data
+.env
+.env.*
+!.env.example
+.local/
+*.sqlite3
+*.sqlite3_bak
+records/
+static_root/
+
+# Generated Web runtime and build output
+static/web_client/
+.web-client-source/
+build/
+dist/

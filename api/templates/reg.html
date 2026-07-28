@@ -1,0 +1,121 @@
+{% load static %}
+{% load i18n %}
+{% load my_filters %}
+<!DOCTYPE html>
+{% get_current_language as CAMELLIA_REMOTE_LANGUAGE_CODE %}
+<html lang="{{ CAMELLIA_REMOTE_LANGUAGE_CODE }}">
+<head>
+    <meta charset="UTF-8">
+    <meta name="renderer" content="webkit">
+    <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1">
+    <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+    <meta name="theme-color" content="#397bff">
+    <title>{{ "注册" | translate }}_【Camellia】</title>
+    <link rel="icon" type="image/svg+xml" href="{% static 'web_client/favicon.svg' %}">
+    <link rel="stylesheet" href="{% static 'ui/app.css' %}">
+</head>
+<body class="auth-body">
+  <div class="auth-shell">
+    <div class="auth-hero">
+      <div>
+        <div class="auth-brand">
+          <div class="brand-mark"><img src="{% static 'web_client/favicon.svg' %}" alt="" aria-hidden="true"></div>
+          <div class="brand-text">
+            <span class="brand-title">Camellia</span>
+            <span class="brand-subtitle">{{ "安全控制台" | translate }}</span>
+          </div>
+        </div>
+        <h1>{{ "创建新账号" | translate }}</h1>
+        <p>{{ "注册后即可通过 Web 管理界面统一管理设备与日志。" | translate }}</p>
+      </div>
+      <div class="notice">
+        {{ "请使用至少 8 位且不常见的密码或长密码短语。" | translate }}
+      </div>
+    </div>
+    <div class="auth-card">
+      <h2>{{ "注册" | translate }}</h2>
+      <div id="form-message" class="form-message"></div>
+      <form id="register-form" action="/api/user_action?action=register" method="post">
+        {% csrf_token %}
+        <div class="form-field">
+          <label for="user">{{ "用户名" | translate }}</label>
+          <input type="text" id="user" name="user" autocomplete="username" required placeholder="{{ "请输入用户名" | translate }}">
+        </div>
+        <div class="form-field">
+          <label for="pwd">{{ "密码" | translate }}</label>
+          <input type="password" id="pwd" name="pwd" autocomplete="new-password" minlength="8" maxlength="128" required placeholder="{{ "请输入密码" | translate }}">
+        </div>
+        <div class="form-field">
+          <label for="rpwd">{{ "确认密码" | translate }}</label>
+          <input type="password" id="rpwd" name="repassword" autocomplete="new-password" minlength="8" maxlength="128" required placeholder="{{ "请确认密码" | translate }}">
+        </div>
+        <button type="submit" class="btn btn-primary" style="width: 100%;">{{ "注册" | translate }}</button>
+      </form>
+      <div class="auth-footer">
+        <a href="/api/user_action?action=login">{{ "已有账号？立即登录" | translate }}</a>
+      </div>
+    </div>
+  </div>
+
+  <script nonce="{{ csp_nonce }}">
+    const form = document.getElementById('register-form');
+    const messageEl = document.getElementById('form-message');
+
+    const showMessage = (text) => {
+      messageEl.textContent = text;
+      messageEl.classList.add('is-visible');
+    };
+
+    const getCookie = (name) => {
+      const match = document.cookie.match(new RegExp('(^| )' + name + '=([^;]+)'));
+      return match ? decodeURIComponent(match[2]) : '';
+    };
+
+    form.addEventListener('submit', async (event) => {
+      event.preventDefault();
+      messageEl.classList.remove('is-visible');
+      const user = document.getElementById('user').value.trim();
+      const pwd = document.getElementById('pwd').value;
+      const rpwd = document.getElementById('rpwd').value;
+
+      if (user.length < 3) {
+        showMessage('{{ "用户名不得小于3位" | translate | escapejs }}');
+        return;
+      }
+
+      if (pwd.length < 8 || pwd.length > 128) {
+        showMessage('{{ "密码长度不符合要求，应在 8~128 位。" | translate | escapejs }}');
+        return;
+      }
+
+      if (pwd !== rpwd) {
+        showMessage('{{ "两次输入密码不一致!" | translate | escapejs }}');
+        return;
+      }
+
+      const formData = new FormData(form);
+      try {
+        const resp = await fetch(form.action, {
+          method: 'POST',
+          headers: {
+            'X-CSRFToken': getCookie('csrftoken'),
+          },
+          credentials: 'same-origin',
+          body: formData,
+        });
+        const data = await resp.json();
+        if (data.code === 1) {
+          showMessage('{{ "注册成功，正在跳转到登录页。" | translate | escapejs }}');
+          setTimeout(() => {
+            window.location.href = '/api/user_action?action=login&registered=1';
+          }, 450);
+        } else {
+          showMessage(data.msg || '{{ "注册失败，请检查输入信息。" | translate | escapejs }}');
+        }
+      } catch (error) {
+        showMessage('{{ "网络异常，请稍后再试。" | translate | escapejs }}');
+      }
+    });
+  </script>
+</body>
+</html>

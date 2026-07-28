@@ -1,0 +1,67 @@
+{% extends "admin/base_site.html" %}
+{% load i18n %}
+
+{% block content %}
+<div class="admin-dashboard">
+  <div class="admin-hero">
+    <div>
+      <h1 class="admin-title">{% trans "管理概览" %}</h1>
+      <p class="admin-subtitle">{% trans "选择模块以查看、添加或维护数据。" %}</p>
+    </div>
+    <div class="admin-hero-meta">
+      <span class="admin-pill">{{ app_list|length }} {% trans "个模块" %}</span>
+    </div>
+  </div>
+
+  <div class="admin-overview">
+    <section class="admin-overview-card">
+      <div class="admin-overview-kicker">{% trans "模块总览" %}</div>
+      <h2 class="admin-overview-title">{{ app_list|length }} {% trans "个模块" %}</h2>
+      <p class="admin-overview-desc">{% trans "统一管理用户、设备、策略与审计记录。" %}</p>
+    </section>
+    <section class="admin-overview-card is-accent">
+      <div class="admin-overview-kicker">{% trans "快速入口" %}</div>
+      <div class="admin-overview-actions">
+        <a class="admin-action-btn is-primary" href="/admin/">{% trans "管理面板" %}</a>
+        <a class="admin-action-btn" href="/api/home">{% trans "返回控制台" %}</a>
+      </div>
+      <p class="admin-overview-desc">{% trans "建议定期检查权限与策略配置。" %}</p>
+    </section>
+  </div>
+
+  {% if app_list %}
+  <div class="admin-app-grid">
+    {% for app in app_list %}
+    <section class="admin-app-card">
+      <header class="admin-app-header">
+        <div>
+          <h2 class="admin-card-title">{{ app.name }}</h2>
+          <p class="admin-card-meta">{{ app.models|length }} {% trans "个模块" %}</p>
+        </div>
+        {% if app.app_url %}
+        <a class="admin-card-link" href="{{ app.app_url }}">{% trans "进入模块" %}</a>
+        {% endif %}
+      </header>
+      <div class="admin-model-grid">
+        {% for model in app.models %}
+        <div class="admin-model-card">
+          <div class="admin-model-name">{{ model.name }}</div>
+          <div class="admin-model-actions">
+            {% if model.perms.change %}
+            <a class="admin-action-btn" href="{{ model.admin_url }}">{% trans "管理" %}</a>
+            {% endif %}
+            {% if model.perms.add %}
+            <a class="admin-action-btn is-primary" href="{{ model.add_url }}">{% trans "新增" %}</a>
+            {% endif %}
+          </div>
+        </div>
+        {% endfor %}
+      </div>
+    </section>
+    {% endfor %}
+  </div>
+  {% else %}
+  <p class="admin-empty">{% trans "没有可用的管理模块。" %}</p>
+  {% endif %}
+</div>
+{% endblock %}

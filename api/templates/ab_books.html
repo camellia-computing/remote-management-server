@@ -1,0 +1,141 @@
+{% extends "base.html" %}
+{% load i18n %}
+
+{% block title %}{% trans "地址簿管理" %}{% endblock %}
+{% block legend_name %}{% trans "地址簿管理" %}{% endblock %}
+{% block page_actions %}
+  <a class="btn btn-secondary btn-xs" href="/api/ab_manage">{% trans "地址簿权限" %}</a>
+  <a class="btn btn-ghost btn-xs" href="/api/ab_books_export?format=csv{% if filter_q %}&q={{ filter_q|urlencode }}{% endif %}">{% trans "导出 CSV" %}</a>
+  <a class="btn btn-ghost btn-xs" href="/api/ab_books_export?format=xls{% if filter_q %}&q={{ filter_q|urlencode }}{% endif %}">{% trans "导出 Excel" %}</a>
+  {% if u.is_admin %}
+    <a class="btn btn-ghost btn-xs" href="/api/ab_rules">{% trans "规则总览" %}</a>
+    <a class="btn btn-ghost btn-xs" href="/api/ab_audit">{% trans "规则审计" %}</a>
+  {% endif %}
+{% endblock %}
+
+{% block content %}
+<div class="card ab-hero">
+  <div class="card-header">
+    <div>
+      <h2 class="card-title">{% trans "地址簿列表" %}</h2>
+      <p class="card-subtitle">{% trans "管理地址簿、标签与设备内容。" %}</p>
+    </div>
+    <span class="pill">{{ profiles|length }} {% trans "个地址簿" %}</span>
+  </div>
+  <div class="ab-hero-body">
+    {% if messages %}
+      {% for message in messages %}
+        <div class="notice {% if message.tags %}is-{{ message.tags }}{% endif %}">{{ message }}</div>
+      {% endfor %}
+    {% else %}
+      <div class="notice">{% trans "创建新的地址簿或进入管理页面。" %}</div>
+    {% endif %}
+    <form class="ab-filter" method="get" action="/api/ab_books">
+      <input class="ab-input ab-input-wide" type="text" name="q" value="{{ filter_q }}" placeholder="{% trans "搜索名称、GUID 或用户" %}">
+      <button class="btn btn-secondary btn-xs" type="submit">{% trans "筛选" %}</button>
+      {% if filter_q %}
+        <a class="btn btn-ghost btn-xs" href="/api/ab_books">{% trans "清除" %}</a>
+      {% endif %}
+    </form>
+  </div>
+</div>
+
+<div class="card ab-book-create">
+  <div class="card-header">
+    <div>
+      <h2 class="card-title">{% trans "创建地址簿" %}</h2>
+      <p class="card-subtitle">{% trans "默认创建共享地址簿，可用于协作管理。" %}</p>
+    </div>
+  </div>
+  <form class="ab-form ab-book-form ab-form-grid ab-form-grid--auto" method="post" action="/api/ab_books">
+    {% csrf_token %}
+    <input type="hidden" name="action" value="create_book">
+    <input class="ab-input" type="text" name="name" placeholder="{% trans "地址簿名称" %}">
+    <input class="ab-input ab-input-wide" type="text" name="note" placeholder="{% trans "备注（可选）" %}">
+    {% if u.is_admin %}
+      <input class="ab-input" type="text" name="owner" placeholder="{% trans "所属用户（用户名或ID）" %}">
+    {% endif %}
+    <button class="btn btn-primary btn-xs" type="submit">{% trans "创建" %}</button>
+  </form>
+</div>
+
+{% if profiles %}
+  <div class="panel-grid">
+    {% for item in profiles %}
+      <article class="item-card">
+        <div class="item-header">
+          <div>
+            <h3 class="item-title">{{ item.profile.name }}</h3>
+            <div class="item-meta">
+              {% trans "所属用户" %}: {{ item.profile.owner.username|default:"-" }} · {% trans "地址簿 GUID" %}: {{ item.profile.guid }}
+            </div>
+          </div>
+          {% if item.is_personal %}
+            <span class="pill">{% trans "个人地址簿" %}</span>
+          {% else %}
+            <span class="pill">{% trans "共享地址簿" %}</span>
+          {% endif %}
+        </div>
+        <div class="info-grid">
+          <div class="info-item">
+            <span>{% trans "设备" %}</span>
+            <strong>{{ item.peers_count }}</strong>
+          </div>
+          <div class="info-item">
+            <span>{% trans "标签" %}</span>
+            <strong>{{ item.tags_count }}</strong>
+          </div>
+          <div class="info-item">
+            <span>{% trans "权限" %}</span>
+            <strong>{{ item.access_label }}</strong>
+          </div>
+        </div>
+        <div class="action-stack action-stack--grid">
+          <div class="action-panel">
+            <div class="action-title">{% trans "进入管理" %}</div>
+            <div class="action-row action-row--single">
+              <a class="btn btn-secondary btn-xs" href="/api/ab_book?guid={{ item.profile.guid }}">{% trans "进入管理" %}</a>
+            </div>
+          </div>
+          {% if item.can_manage and not item.is_personal %}
+            <form class="action-panel" method="post" action="/api/ab_books">
+              {% csrf_token %}
+              <input type="hidden" name="action" value="update_book">
+              <input type="hidden" name="guid" value="{{ item.profile.guid }}">
+              <div class="action-title">{% trans "更新" %}</div>
+              <div class="action-row">
+                <input class="ab-input" type="text" name="name" value="{{ item.profile.name }}">
+                <input class="ab-input" type="text" name="note" value="{{ item.profile.note }}">
+                <button class="btn btn-ghost btn-xs" type="submit">{% trans "更新" %}</button>
+              </div>
+            </form>
+            <form class="action-panel action-panel--danger" method="post" action="/api/ab_books">
+              {% csrf_token %}
+              <input type="hidden" name="action" value="delete_book">
+              <input type="hidden" name="guid" value="{{ item.profile.guid }}">
+              <div class="action-title">{% trans "删除" %}</div>
+              <div class="action-row action-row--single">
+                <button class="btn btn-secondary btn-xs" type="submit">{% trans "删除" %}</button>
+              </div>
+            </form>
+          {% endif %}
+          {% if u.is_admin and not item.is_personal %}
+            <form class="action-panel" method="post" action="/api/ab_books">
+              {% csrf_token %}
+              <input type="hidden" name="action" value="transfer_book">
+              <input type="hidden" name="guid" value="{{ item.profile.guid }}">
+              <div class="action-title">{% trans "转移" %}</div>
+              <div class="action-row">
+                <input class="ab-input" type="text" name="owner" placeholder="{% trans "转移给用户" %}">
+                <button class="btn btn-ghost btn-xs" type="submit">{% trans "转移" %}</button>
+              </div>
+            </form>
+          {% endif %}
+        </div>
+      </article>
+    {% endfor %}
+  </div>
+{% else %}
+  <div class="notice is-warning">{% trans "暂无可管理的地址簿。" %}</div>
+{% endif %}
+{% endblock %}

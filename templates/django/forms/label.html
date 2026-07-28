@@ -1,0 +1,6 @@
+{% load my_filters %}
+{% if use_tag %}
+<label{{ attrs|safe_attrs }}>{{ label }}{% if field and field.field.required %}<span class="required">*</span>{% endif %}</label>
+{% else %}
+{{ label }}
+{% endif %}

@@ -1,0 +1,1593 @@
+msgid ""
+msgstr ""
+"Project-Id-Version: PACKAGE VERSION\n"
+"Report-Msgid-Bugs-To: \n"
+"POT-Creation-Date: 2024-05-14 10:44+0800\n"
+"PO-Revision-Date: YEAR-MO-DA HO:MI+ZONE\n"
+"Last-Translator: FULL NAME <EMAIL@ADDRESS>\n"
+"Language-Team: LANGUAGE <LL@li.org>\n"
+"Language: \n"
+"MIME-Version: 1.0\n"
+"Content-Type: text/plain; charset=UTF-8\n"
+"Content-Transfer-Encoding: 8bit\n"
+"Plural-Forms: nplurals=2; plural=(n != 1);\n"
+
+#: .\api\admin_user.py:14 .\api\front_locale.py:28
+msgid "密码"
+msgstr "Password"
+
+#: .\api\admin_user.py:15
+msgid "再次输入密码"
+msgstr "Re-enter password"
+
+#: .\api\admin_user.py:26
+msgid "密码校验失败，两次密码不一致。"
+msgstr "Password verification failed, passwords do not match."
+
+#: .\api\admin_user.py:44
+msgid "密码Hash值"
+msgstr "Password Hash Value"
+
+#: .\api\admin_user.py:75
+msgid "基本信息"
+msgstr "Basic Information"
+
+#: .\api\admin_user.py:100
+msgid "Camellia自建Web"
+msgstr "Camellia Self-Hosted Web"
+
+#: .\api\admin_user.py:101
+msgid "未定义"
+msgstr "Undefined"
+
+#: .\api\front_locale.py:4 .\api\templates\base.html:42
+msgid "管理后台"
+msgstr "Admin Panel"
+
+#: .\api\front_locale.py:5
+msgid "ID列表"
+msgstr "ID List"
+
+#: .\api\front_locale.py:6
+msgid "分享机器"
+msgstr "Share Machine"
+
+#: .\api\front_locale.py:7
+msgid "这么简易的东西，忘记密码这功能就没必要了吧。"
+msgstr "This is simple enough; no need for password recovery."
+
+#: .\api\front_locale.py:8
+msgid "立即注册"
+msgstr "Register Now"
+
+#: .\api\front_locale.py:9
+msgid "创建时间"
+msgstr "Creation Time"
+
+#: .\api\front_locale.py:10
+msgid "注册成功，请前往登录页登录。"
+msgstr "Registration successful, please go to the login page to login."
+
+#: .\api\front_locale.py:11
+msgid "注册日期"
+msgstr "Registration Date"
+
+#: .\api\front_locale.py:13
+msgid "导出xlsx"
+msgstr "Export as xlsx"
+
+#: .\api\front_locale.py:14
+msgid "生成分享链接"
+msgstr "Generate Share Link"
+
+#: .\api\front_locale.py:15
+msgid "请输入8~20位密码。可以包含字母、数字和特殊字符。"
+msgstr "Please enter a password of 8-20 characters. It can include letters, numbers, and symbols."
+
+#: .\api\front_locale.py:16
+msgid "尾页"
+msgstr "Last Page"
+
+#: .\api\front_locale.py:17
+msgid "请确认密码"
+msgstr "Please confirm password"
+
+#: .\api\front_locale.py:18
+msgid "注册"
+msgstr "Register"
+
+#: .\api\front_locale.py:19 .\api\models_work.py:73
+msgid "内存"
+msgstr "Memory"
+
+#: .\api\front_locale.py:20 .\api\templates\base.html:31
+msgid "首页"
+msgstr "Home"
+
+#: .\api\front_locale.py:21 .\api\templates\base.html:37
+msgid "网页控制"
+msgstr "Web Control"
+
+#: .\api\front_locale.py:22
+msgid "注册时间"
+msgstr "Registration Time"
+
+#: .\api\front_locale.py:23
+msgid "链接地址"
+msgstr "Link Address"
+
+#: .\api\front_locale.py:24
+msgid "请输入密码"
+msgstr "Please enter password"
+
+#: .\api\front_locale.py:25 .\api\models_work.py:50 .\api\models_work.py:76
+msgid "系统用户名"
+msgstr "System Username"
+
+#: .\api\front_locale.py:26
+msgid "状态"
+msgstr "Status"
+
+#: .\api\front_locale.py:27
+msgid "已有账号？立即登录"
+msgstr "Already have an account? Login now"
+
+#: .\api\front_locale.py:29 .\api\models_work.py:52
+msgid "别名"
+msgstr "Alias"
+
+#: .\api\front_locale.py:30
+msgid "上一页"
+msgstr "Previous Page"
+
+#: .\api\front_locale.py:31
+msgid "更新时间"
+msgstr "Update Time"
+
+#: .\api\front_locale.py:32
+msgid "综合屏"
+msgstr "Comprehensive Screen"
+
+#: .\api\front_locale.py:33 .\api\models_work.py:53
+msgid "平台"
+msgstr "Platform"
+
+#: .\api\front_locale.py:34
+msgid "全部用户"
+msgstr "All Users"
+
+#: .\api\front_locale.py:35
+msgid "注册页"
+msgstr "Registration Page"
+
+#: .\api\front_locale.py:36
+msgid "分享机器给其他用户"
+msgstr "Share machine with other users"
+
+#: .\api\front_locale.py:37 .\api\templates\base.html:33
+msgid "所有设备"
+msgstr "All Devices"
+
+#: .\api\front_locale.py:38
+msgid "连接密码"
+msgstr "Connection Password"
+
+#: .\api\front_locale.py:39
+msgid "设备统计"
+msgstr "Device Statistics"
+
+#: .\api\front_locale.py:41 .\api\templates\base.html:36
+msgid "分享"
+msgstr "Share"
+
+#: .\api\front_locale.py:42
+msgid "请输入用户名"
+msgstr "Please enter username"
+
+#: .\api\front_locale.py:43
+msgid "1、链接有效期为15分钟，切勿随意分享给他人。"
+msgstr "1. The link is valid for 15 minutes. Do not share it casually."
+
+#: .\api\front_locale.py:44
+msgid "CPU"
+msgstr "CPU"
+
+#: .\api\front_locale.py:45 .\api\models_work.py:49 .\api\models_work.py:70
+msgid "客户端ID"
+msgstr "Client ID"
+
+#: .\api\front_locale.py:46
+msgid "下一页"
+msgstr "Next Page"
+
+#: .\api\front_locale.py:47
+msgid "登录"
+msgstr "Login"
+
+#: .\api\front_locale.py:48 .\api\templates\base.html:45
+msgid "退出"
+msgstr "Logout"
+
+#: .\api\front_locale.py:49
+msgid "请将要分享的机器调整到右侧"
+msgstr "Please adjust the machines to be shared to the right"
+
+#: .\api\front_locale.py:50
+msgid "成功！如需分享，请复制以下链接给其他人：<br>"
+msgstr "Success! To share, copy the link below to others:<br>"
+
+#: .\api\front_locale.py:51
+msgid "忘记密码？"
+msgstr "Forgot Password?"
+
+#: .\api\front_locale.py:52
+msgid "计算机名"
+msgstr "Computer Name"
+
+#: .\api\front_locale.py:53
+msgid "两次输入密码不一致!"
+msgstr "Passwords do not match!"
+
+#: .\api\front_locale.py:54
+msgid "页码"
+msgstr "Page Number"
+
+#: .\api\front_locale.py:55
+msgid "版本"
+msgstr "Version"
+
+#: .\api\front_locale.py:56 .\api\models_user.py:32 .\api\models_work.py:9
+msgid "用户名"
+msgstr "Username"
+
+#: .\api\front_locale.py:57
+msgid ""
+"3、为保障安全，链接有效期为15分钟、链接仅有效1次。链接一旦被（非分享人的登录"
+"用户）访问，分享生效，后续访问链接失效。"
+msgstr ""
+"3. For security reasons, the link is valid for 15 minutes and only valid "
+"once. Once the link is accessed by a user (other than the sharing person), "
+"the sharing becomes effective, and subsequent access to the link will be "
+"invalid."
+
+#: .\api\front_locale.py:58
+msgid "系统"
+msgstr "System"
+
+#: .\api\front_locale.py:59
+msgid "我的机器"
+msgstr "My Machine"
+
+#: .\api\front_locale.py:60
+#, fuzzy
+#| msgid "基本信息"
+msgid "信息"
+msgstr "Basic Information"
+
+#: .\api\front_locale.py:61
+msgid "远程ID"
+msgstr "Remote ID"
+
+#: .\api\front_locale.py:62
+msgid "远程别名"
+msgstr "Remote Alias"
+
+#: .\api\front_locale.py:63 .\api\models_work.py:11 .\api\models_work.py:48
+#: .\api\models_work.py:126
+msgid "用户ID"
+msgstr "User ID"
+
+#: .\api\front_locale.py:64
+msgid "用户别名"
+msgstr "User Alias"
+
+#: .\api\front_locale.py:65
+msgid "用户IP"
+msgstr "User IP"
+
+#: .\api\front_locale.py:66
+msgid "文件大小"
+msgstr "Filesize"
+
+#: .\api\front_locale.py:67
+msgid "发送/接受"
+msgstr "Sent/Received"
+
+#: .\api\front_locale.py:68
+msgid "记录于"
+msgstr "Logged At"
+
+#: .\api\front_locale.py:69
+msgid "连接开始时间"
+msgstr "Connection Start Time\t"
+
+#: .\api\front_locale.py:70
+msgid "连接结束时间"
+msgstr "Connection End Time"
+
+#: .\api\front_locale.py:71
+msgid "时长"
+msgstr "Duration"
+
+#: .\api\front_locale.py:72 .\api\templates\base.html:40
+msgid "连接日志"
+msgstr "Connection Log"
+
+#: .\api\front_locale.py:73 .\api\templates\base.html:41
+msgid "文件传输日志"
+msgstr "File Transfer Log"
+
+#: .\api\front_locale.py:74
+msgid "页码 #"
+msgstr "Page #"
+
+#: .\api\front_locale.py:75
+msgid "下一页 #"
+msgstr "Next #"
+
+#: .\api\front_locale.py:76
+msgid "上一页 #"
+msgstr "Previous #"
+
+#: .\api\front_locale.py:77
+#, fuzzy
+#| msgid "上一页"
+msgid "第一页"
+msgstr "First"
+
+#: .\api\front_locale.py:78
+#, fuzzy
+#| msgid "上一页"
+msgid "上页"
+msgstr "Previous Page"
+
+#: .\api\models_user.py:40
+msgid "登录信息:"
+msgstr "Login Information:"
+
+#: .\api\models_user.py:42
+msgid "是否激活"
+msgstr "Is Active"
+
+#: .\api\models_user.py:43
+msgid "是否管理员"
+msgstr "Is Administrator"
+
+#: .\api\models_user.py:82
+msgid "用户"
+msgstr "User"
+
+#: .\api\models_user.py:83
+msgid "用户列表"
+msgstr "User List"
+
+#: .\api\models_work.py:10
+msgid "Camellia ID"
+msgstr "Camellia ID"
+
+#: .\api\models_work.py:12
+msgid "uuid"
+msgstr "UUID"
+
+#: .\api\models_work.py:13
+msgid "access_token"
+msgstr "Access Token"
+
+#: .\api\models_work.py:14
+msgid "登录时间"
+msgstr "Login Time"
+
+#: .\api\models_work.py:19
+msgid "Token列表"
+msgstr "Token List"
+
+#: .\api\models_work.py:30
+msgid "所属用户ID"
+msgstr "Belongs to User ID"
+
+#: .\api\models_work.py:31
+msgid "标签名称"
+msgstr "Tag Name"
+
+#: .\api\models_work.py:32
+msgid "标签颜色"
+msgstr "Tag Color"
+
+#: .\api\models_work.py:37
+msgid "Tags列表"
+msgstr "Tags List"
+
+#: .\api\models_work.py:51
+msgid "操作系统名"
+msgstr "Operating System Name"
+
+#: .\api\models_work.py:54
+msgid "标签"
+msgstr "Tag"
+
+#: .\api\models_work.py:23
+msgid "令牌"
+msgstr "Token"
+
+#: .\api\models_work.py:24
+msgid "令牌列表"
+msgstr "Token List"
+
+#: .\api\models_work.py:44
+msgid "标签列表"
+msgstr "Tag List"
+
+#: .\api\models_work.py:74
+msgid "客户端"
+msgstr "Client"
+
+#: .\api\models_work.py:75
+msgid "客户端列表"
+msgstr "Client List"
+
+#: .\api\models_work.py:136
+msgid "连接日志列表"
+msgstr "Connection Log List"
+
+#: .\api\models_work.py:151
+msgid "文件传输日志列表"
+msgstr "File Transfer Log List"
+
+#: .\api\models_work.py:55
+msgid "设备链接密码"
+msgstr "Device Connection Password"
+
+#: .\api\models_work.py:60
+msgid "Peers列表"
+msgstr "Peers List"
+
+#: .\api\models_work.py:72
+msgid "主机名"
+msgstr "Hostname"
+
+#: .\api\models_work.py:74
+msgid "操作系统"
+msgstr "Operating System"
+
+#: .\api\models_work.py:77
+msgid "客户端版本"
+msgstr "Client Version"
+
+#: .\api\models_work.py:78
+msgid "设备注册时间"
+msgstr "Device Registration Time"
+
+#: .\api\models_work.py:83
+msgid "设备"
+msgstr "Device"
+
+#: .\api\models_work.py:84
+msgid "设备列表"
+msgstr "Device List"
+
+#: .\api\models_work.py:127
+msgid "链接Key"
+msgstr "Link Key"
+
+#: .\api\models_work.py:128
+msgid "机器ID列表"
+msgstr "Machine ID List"
+
+#: .\api\models_work.py:129
+msgid "是否使用"
+msgstr "Is Used"
+
+#: .\api\models_work.py:130
+msgid "是否过期"
+msgstr "Is Expired"
+
+#: .\api\models_work.py:131
+msgid "生成时间"
+msgstr "Generation Time"
+
+#: .\api\models_work.py:137
+msgid "分享链接"
+msgstr "Share Link"
+
+#: .\api\models_work.py:138
+msgid "链接列表"
+msgstr "Link List"
+
+#: .\api\views_api.py:20
+msgid "请求方式错误！请使用POST方式。"
+msgstr "Request method error! Please use the POST method."
+
+#: .\api\views_api.py:34
+msgid "帐号或密码错误！请重试，多次重试后将被锁定IP！"
+msgstr "Account or password error! Please retry. After multiple retries, the IP will be locked!"
+
+#: .\api\views_api.py:72
+msgid "请求方式错误！"
+msgstr "Request method error!"
+
+#: .\api\views_api.py:80
+msgid "异常请求！"
+msgstr "Abnormal request!"
+
+#: .\api\views_api.py:93 .\api\views_api.py:213
+msgid "错误的提交方式！"
+msgstr "Incorrect submission method!"
+
+#: .\api\views_api.py:121
+msgid "拉取列表错误！"
+msgstr "Error fetching list!"
+
+#: .\api\views_api.py:200
+msgid "更新地址簿有误"
+msgstr "Error updating address book"
+
+#: .\api\views_api.py:247 .\api\views_front.py:207 .\api\views_front.py:226
+msgid "在线"
+msgstr "Online"
+
+#: .\api\views_api.py:308
+msgid "好的"
+msgstr "Okay"
+
+#: .\api\views_front.py:50
+msgid "model_to_dict接收的参数必须是模型对象"
+msgstr "The parameter received by model_to_dict must be a model object"
+
+#: .\api\views_front.py:55
+#, python-brace-format
+msgid "model_to_dict,要替换成{replace_field}字段已经存在了"
+msgstr "model_to_dict: target field {replace_field} already exists"
+
+#: .\api\views_front.py:60
+#, python-brace-format
+msgid "model_to_dict,要新增默认值，但字段{default_key}已经存在了"
+msgstr "model_to_dict: cannot add default; field {default_key} already exists"
+
+#: .\api\views_front.py:134
+msgid "出了点问题，未获取用户名或密码。"
+msgstr "There was a problem, username or password not obtained."
+
+#: .\api\views_front.py:141
+msgid "帐号或密码错误！"
+msgstr "Account or password error!"
+
+#: .\api\views_front.py:153
+msgid "当前未开放注册，请联系管理员！"
+msgstr "Registration is currently not open, please contact the administrator!"
+
+#: .\api\views_front.py:160
+msgid "用户名不得小于3位"
+msgstr "Username must be at least 3 characters"
+
+#: .\api\views_front.py:165
+msgid "密码长度不符合要求, 应在8~20位。"
+msgstr "Password length must be between 8-20 characters."
+
+#: .\api\views_front.py:171
+msgid "用户名已存在。"
+msgstr "Username already exists."
+
+#: .\api\views_front.py:207 .\api\views_front.py:226
+msgid "离线"
+msgstr "Offline"
+
+#: .\api\views_front.py:210
+msgid "是"
+msgstr "Yes"
+
+#: .\api\views_front.py:210
+msgid "否"
+msgstr "No"
+
+#: .\api\views_front.py:252
+msgid "设备信息表"
+msgstr "Device Information Table"
+
+#: .\api\views_front.py:351
+msgid "数据为空。"
+msgstr "Data is empty."
+
+#: .\api\views_front.py:373 .\api\views_front.py:378 .\api\views_front.py:409
+#: .\api\views_front.py:414
+msgid "UNKNOWN"
+msgstr "Unknown"
+
+#: .\api\front_locale.py:84
+msgid "管理控制台"
+msgstr "Management Console"
+
+#: .\api\front_locale.py:85
+msgid "控制面板"
+msgstr "Control Panel"
+
+#: .\api\front_locale.py:87
+msgid "访客"
+msgstr "Guest"
+
+#: .\api\front_locale.py:88
+msgid "管理员"
+msgstr "Admin"
+
+#: .\api\front_locale.py:89
+msgid "语言"
+msgstr "Language"
+
+#: .\api\front_locale.py:90
+msgid "未登录"
+msgstr "Not logged in"
+
+#: .\api\front_locale.py:90
+msgid "安全的远程控制与设备管理入口"
+msgstr "Secure remote control and device management portal"
+
+#: .\api\front_locale.py:91
+msgid "建议启用强密码并定期检查设备归属。"
+msgstr "Use strong passwords and regularly review device ownership."
+
+#: .\api\front_locale.py:92
+msgid "暂未开启找回密码功能，请联系管理员。"
+msgstr "Password recovery is not enabled. Please contact the administrator."
+
+#: .\api\front_locale.py:93
+msgid "登录失败，请检查输入信息。"
+msgstr "Login failed. Please check your input."
+
+#: .\api\front_locale.py:94
+msgid "网络异常，请稍后再试。"
+msgstr "Network error. Please try again later."
+
+#: .\api\front_locale.py:95
+msgid "创建新账号"
+msgstr "Create a new account"
+
+#: .\api\front_locale.py:96
+msgid "注册后即可通过 Web 管理界面统一管理设备与日志。"
+msgstr "After registration, manage devices and logs through the web console."
+
+#: .\api\front_locale.py:97
+msgid "密码长度建议 8~20 位，可包含字母、数字或特殊字符。"
+msgstr "Recommended password length is 8-20 characters, including letters, numbers, or symbols."
+
+#: .\api\front_locale.py:98
+msgid "注册成功，正在跳转到登录页。"
+msgstr "Registration successful. Redirecting to the login page."
+
+#: .\api\front_locale.py:99
+msgid "注册成功，请使用新账号登录。"
+msgstr "Registration successful. Please log in with your new account."
+
+#: .\api\front_locale.py:100
+msgid "帐号未激活，请联系管理员。"
+msgstr "Account is not activated. Please contact the administrator."
+
+#: .\api\front_locale.py:101
+msgid "系统错误"
+msgstr "System Error"
+
+#: .\api\front_locale.py:102
+msgid "工作台加载失败，请检查数据库迁移与日志输出。"
+msgstr "Failed to load the workspace. Check database migrations and logs."
+
+#: .\api\front_locale.py:103
+msgid "首页加载失败，请检查数据库迁移与日志输出。"
+msgstr "Failed to load the home page. Check database migrations and logs."
+
+#: .\api\front_locale.py:104
+msgid "首页概览"
+msgstr "Home Overview"
+
+#: .\api\front_locale.py:105
+msgid "查看设备"
+msgstr "View Devices"
+
+#: .\api\front_locale.py:106
+msgid "管理员视图"
+msgstr "Admin View"
+
+#: .\api\front_locale.py:107
+msgid "设备概览"
+msgstr "Device Overview"
+
+#: .\api\front_locale.py:108
+msgid "实时掌握设备在线状态与更新节奏"
+msgstr "Track device status and updates in real time"
+
+#: .\api\front_locale.py:109
+msgid "在线设备"
+msgstr "Online Devices"
+
+#: .\api\front_locale.py:110
+msgid "离线设备"
+msgstr "Offline Devices"
+
+#: .\api\front_locale.py:111
+msgid "未知状态"
+msgstr "Unknown Status"
+
+#: .\api\front_locale.py:112
+msgid "总设备数"
+msgstr "Total Devices"
+
+#: .\api\front_locale.py:113
+msgid "创建分享链接"
+msgstr "Create Share Link"
+
+#: .\api\front_locale.py:114
+msgid "最近更新设备"
+msgstr "Recently Updated Devices"
+
+#: .\api\front_locale.py:115
+msgid "最近 6 台设备的状态与更新时间"
+msgstr "Status and update time of the latest 6 devices"
+
+#: .\api\front_locale.py:116
+msgid "暂无设备数据，可前往设备页查看详情。"
+msgstr "No device data yet. Go to the devices page for details."
+
+#: .\api\front_locale.py:117
+msgid "打开管理后台"
+msgstr "Open Admin Panel"
+
+#: .\api\front_locale.py:118
+msgid "Camellia 控制台"
+msgstr "Camellia Console"
+
+#: .\api\front_locale.py:119
+msgid "Camellia 管理后台"
+msgstr "Camellia Admin"
+
+#: .\api\templates\home.html:?
+msgid "快速生成临时分享入口"
+msgstr "Quickly generate a temporary sharing entry"
+
+#: .\api\templates\home.html:?
+msgid "查看最近的连接记录"
+msgstr "Review recent connection records"
+
+#: .\api\templates\home.html:?
+msgid "审计文件传输情况"
+msgstr "Audit file transfer activities"
+
+#: .\api\templates\home.html:?
+msgid "管理用户与策略"
+msgstr "Manage users and policies"
+
+#: .\api\templates\login.html:?
+msgid "安全控制台"
+msgstr "Secure Console"
+
+#: .\api\templates\login.html:?
+msgid "欢迎回来"
+msgstr "Welcome back"
+
+#: .\api\templates\reg.html:?
+msgid "注册失败，请检查输入信息。"
+msgstr "Registration failed. Please check your input."
+
+#: .\api\templates\share.html:?
+msgid "选择设备"
+msgstr "Select devices"
+
+#: .\api\templates\share.html:?
+msgid "支持搜索 ID 或别名"
+msgstr "Search by ID or alias"
+
+#: .\api\templates\share.html:?
+msgid "确认后生成分享链接"
+msgstr "Confirm to generate a share link"
+
+#: .\api\templates\share.html:?
+msgid "成功！如需分享，请复制以下链接给其他人："
+msgstr "Success! To share, copy the link below to others:"
+
+#: .\api\templates\share.html:?
+msgid "请求失败，请稍后重试。"
+msgstr "Request failed. Please try again later."
+
+#: .\api\templates\share.html:?
+msgid "网络异常，请稍后重试。"
+msgstr "Network error. Please try again later."
+
+#: .\templates\admin\index.html:6
+msgid "管理概览"
+msgstr "Admin Overview"
+
+#: .\templates\admin\index.html:7
+msgid "选择模块以查看、添加或维护数据。"
+msgstr "Choose a module to view, add, or manage data."
+
+#: .\templates\admin\index.html:15
+msgid "模块总览"
+msgstr "Module Overview"
+
+#: .\templates\admin\index.html:17
+msgid "统一管理用户、设备、策略与审计记录。"
+msgstr "Manage users, devices, policies, and audit records in one place."
+
+#: .\templates\admin\index.html:20
+msgid "快速入口"
+msgstr "Quick Access"
+
+#: .\templates\admin\index.html:22
+msgid "管理面板"
+msgstr "Admin Panel"
+
+#: .\templates\admin\index.html:23
+msgid "返回控制台"
+msgstr "Back to Console"
+
+#: .\templates\admin\index.html:25
+msgid "建议定期检查权限与策略配置。"
+msgstr "Review permissions and policies regularly."
+
+#: .\templates\admin\index.html:10
+msgid "个模块"
+msgstr "modules"
+
+#: .\templates\admin\index.html:21
+msgid "查看全部"
+msgstr "View all"
+
+#: .\templates\admin\index.html:22
+msgid "进入模块"
+msgstr "Open module"
+
+#: .\templates\admin\index.html:30
+msgid "管理"
+msgstr "Manage"
+
+#: .\templates\admin\index.html:33
+msgid "新增"
+msgstr "New"
+
+#: .\templates\admin\index.html:38
+msgid "没有可用的管理模块。"
+msgstr "No admin modules available."
+
+#: .\api\apps.py:7
+msgid "Camellia 管理"
+msgstr "Camellia Admin"
+
+#: .\webui\apps.py:7
+msgid "网页控制台"
+msgstr "Web Console"
+
+#: .\api\templates\share.html:33
+msgid "2、所分享的机器，被分享人享有相同的权限，如果机器设置了保存密码，被分享人也可以直接连接。"
+msgstr "2. The shared device grants the same permissions. If it has a saved password, the recipient can connect directly."
+
+#: .\api\templates\share.html:34
+msgid "3、链接仅有效1次，非分享人访问后即生效并失效。"
+msgstr "3. The link is valid only once. After a non-owner accesses it, it becomes effective and then expires."
+
+#: .\api\templates\show_conn_log.html:18
+msgid "IP"
+msgstr "IP"
+
+#: .\api\templates\share.html:46
+msgid "历史记录"
+msgstr "History"
+
+#: .\api\templates\show_file_log.html:43
+msgid "发送"
+msgstr "Sent"
+
+#: .\api\templates\home.html:18 .\api\templates\show_work.html:18 .\api\templates\show_work.html:95
+msgid "台设备"
+msgstr "devices"
+
+#: .\api\templates\show_work.html:28
+msgid "备注"
+msgstr "Notes"
+
+#: .\api\templates\share.html:45
+msgid "已创建的分享链接"
+msgstr "Created Share Links"
+
+#: .\api\templates\share.html:28
+msgid "已选择设备"
+msgstr "Selected Devices"
+
+#: .\api\templates\home.html:65 .\api\templates\show_work.html:103
+msgid "归属用户"
+msgstr "Owner"
+
+#: .\api\templates\show_conn_log.html:9 .\api\templates\show_file_log.html:9
+msgid "当前用户"
+msgstr "Current User"
+
+#: .\api\templates\show_file_log.html:41
+msgid "接收"
+msgstr "Received"
+
+#: .\api\templates\share.html:19
+msgid "搜索设备"
+msgstr "Search Devices"
+
+#: .\api\templates\show_file_log.html:18
+msgid "文件"
+msgstr "File"
+
+#: .\api\templates\show_conn_log.html:11 .\api\templates\show_file_log.html:11
+msgid "条记录"
+msgstr "records"
+
+#: .\api\templates\reg.html:58
+msgid "确认密码"
+msgstr "Confirm Password"
+
+#: .\api\templates\show_work.html:105
+msgid "策略"
+msgstr "Policy"
+
+#: .\api\templates\show_work.html:93
+msgid "管理员模式"
+msgstr "Admin Mode"
+
+#: .\api\templates\msg.html:10
+msgid "系统消息"
+msgstr "System Message"
+
+#: .\api\templates\home.html:68 .\api\templates\show_work.html:27 .\api\templates\show_work.html:104
+msgid "设备组"
+msgstr "Device Group"
+
+#: .\api\models_work.py:67
+msgid "共享密码"
+msgstr "Share password"
+
+#: .\api\models_work.py:69
+msgid "登录账号"
+msgstr "Login account"
+
+#: .\api\models_work.py:70
+msgid "同服务器"
+msgstr "Same server"
+
+#: .\api\templates\share.html:11
+msgid "请确认后生成分享链接"
+msgstr "Confirm then generate the share link"
+
+#: .\api\templates\share.html:20
+msgid "输入 Camellia ID 或别名"
+msgstr "Enter Camellia ID or alias"
+
+#: .\api\templates\show_conn_log.html:23
+msgid "连接类型"
+msgstr "Connection Type"
+
+#: .\api\templates\share.html:10
+msgid "选择需要分享的设备"
+msgstr "Select devices to share"
+
+#: .\api\templates\share.html:118
+msgid "暂无选择"
+msgstr "None selected"
+
+#: .\api\models_work.py:231
+msgid "审计会话"
+msgstr "Audit Session"
+
+#: .\api\models_work.py:232
+msgid "审计会话列表"
+msgstr "Audit Session List"
+
+#: .\api\models_work.py:242
+msgid "告警日志"
+msgstr "Alarm Log"
+
+#: .\api\models_work.py:243
+msgid "告警日志列表"
+msgstr "Alarm Log List"
+
+#: .\api\models_work.py:188
+msgid "策略列表"
+msgstr "Policy List"
+
+#: .\api\models_work.py:204
+msgid "地址簿"
+msgstr "Address Book"
+
+#: .\api\models_work.py:205
+msgid "地址簿列表"
+msgstr "Address Book List"
+
+#: .\api\models_work.py:216
+msgid "地址簿共享"
+msgstr "Address Book Share"
+
+#: .\api\models_work.py:217
+msgid "地址簿共享列表"
+msgstr "Address Book Share List"
+
+#: .\api\models_work.py:235
+msgid "地址簿规则"
+msgstr "Address Book Rule"
+
+#: .\api\models_work.py:236
+msgid "地址簿规则列表"
+msgstr "Address Book Rule List"
+
+#: .\api\templates\ab_manage.html:4 .\api\templates\ab_manage.html:5
+msgid "地址簿权限"
+msgstr "Address Book Access"
+
+#: .\api\templates\ab_manage.html:9
+msgid "共享与访问规则"
+msgstr "Sharing & Access Rules"
+
+#: .\api\templates\ab_manage.html:10
+msgid "管理用户、组和 Everyone 的访问权限。"
+msgstr "Manage access for users, groups, and everyone."
+
+#: .\api\templates\ab_manage.html:12
+msgid "仅非个人地址簿可配置共享规则。"
+msgstr "Only non-personal address books can be shared."
+
+#: .\api\templates\ab_manage.html:18
+msgid "选择地址簿并配置共享权限。"
+msgstr "Select an address book and configure sharing."
+
+#: .\api\templates\ab_manage.html:22
+msgid "搜索地址簿、Owner 或目标"
+msgstr "Search address books, owner, or target"
+
+#: .\api\templates\ab_manage.html:23
+msgid "筛选"
+msgstr "Filter"
+
+#: .\api\templates\ab_manage.html:25
+msgid "清除"
+msgstr "Clear"
+
+#: .\api\templates\ab_manage.html:234
+msgid "全局规则"
+msgstr "Global Rules"
+
+#: .\api\templates\ab_manage.html:235
+msgid "仅管理员可见的规则总览。"
+msgstr "Admin-only rules overview."
+
+#: .\api\templates\ab_manage.html:243
+msgid "类型"
+msgstr "Type"
+
+#: .\api\templates\ab_manage.html:244
+msgid "目标"
+msgstr "Target"
+
+#: .\api\templates\ab_manage.html:245
+msgid "权限"
+msgstr "Permission"
+
+#: .\api\templates\ab_manage.html:246
+msgid "操作"
+msgstr "Actions"
+
+#: .\api\views_front.py:441
+msgid "用户组"
+msgstr "Group"
+
+#: .\api\views_front.py:438 .\api\views_front.py:439
+msgid "所有人"
+msgstr "Everyone"
+
+#: .\api\templates\ab_manage.html:29
+msgid "所属用户"
+msgstr "Owner"
+
+#: .\api\templates\ab_manage.html:29
+msgid "地址簿 GUID"
+msgstr "Address Book GUID"
+
+#: .\api\templates\ab_manage.html:33
+msgid "可管理"
+msgstr "Manageable"
+
+#: .\api\templates\ab_manage.html:35 .\api\views_front.py:365
+msgid "只读"
+msgstr "Read-only"
+
+#: .\api\templates\ab_manage.html:42
+msgid "用户共享"
+msgstr "User Shares"
+
+#: .\api\templates\ab_manage.html:81
+msgid "暂无共享"
+msgstr "No shares yet"
+
+#: .\api\templates\ab_manage.html:90
+msgid "用户名或ID"
+msgstr "Username or ID"
+
+#: .\api\templates\ab_manage.html:106
+msgid "组规则"
+msgstr "Group Rules"
+
+#: .\api\templates\ab_manage.html:145 .\api\templates\ab_manage.html:206
+msgid "暂无规则"
+msgstr "No rules yet"
+
+#: .\api\templates\ab_manage.html:153
+msgid "选择组"
+msgstr "Select group"
+
+#: .\api\templates\ab_manage.html:172
+msgid "Everyone 规则"
+msgstr "Everyone Rule"
+
+#: .\api\templates\ab_manage.html:71 .\api\templates\ab_manage.html:128 .\api\templates\ab_manage.html:188
+msgid "更新"
+msgstr "Update"
+
+#: .\api\templates\ab_manage.html:77 .\api\templates\ab_manage.html:134 .\api\templates\ab_manage.html:194
+msgid "删除"
+msgstr "Delete"
+
+#: .\api\templates\ab_manage.html:226
+msgid "暂无可管理的地址簿。"
+msgstr "No address books to manage."
+
+#: .\api\views_front.py:372
+msgid "读写"
+msgstr "Read/Write"
+
+#: .\api\views_front.py:373
+msgid "完全控制"
+msgstr "Full Control"
+
+#: .\api\views_front.py:545
+msgid "地址簿不存在或不可配置。"
+msgstr "Address book not found or cannot be configured."
+
+#: .\api\views_front.py:549 .\api\views_front.py:588 .\api\views_front.py:612
+msgid "无权限操作该地址簿。"
+msgstr "No permission to manage this address book."
+
+#: .\api\views_front.py:555
+msgid "用户不存在。"
+msgstr "User not found."
+
+#: .\api\views_front.py:563 .\api\views_front.py:600
+msgid "用户共享已更新。"
+msgstr "User share updated."
+
+#: .\api\views_front.py:572
+msgid "用户组不存在。"
+msgstr "Group not found."
+
+#: .\api\views_front.py:579
+msgid "组规则已更新。"
+msgstr "Group rule updated."
+
+#: .\api\views_front.py:589
+msgid "Everyone 规则已更新。"
+msgstr "Everyone rule updated."
+
+#: .\api\views_front.py:595 .\api\views_front.py:606
+msgid "规则不存在。"
+msgstr "Rule not found."
+
+#: .\api\views_front.py:598
+msgid "用户共享已删除。"
+msgstr "User share deleted."
+
+#: .\api\views_front.py:619
+msgid "规则已删除。"
+msgstr "Rule deleted."
+
+#: .\api\views_front.py:624
+msgid "规则已更新。"
+msgstr "Rule updated."
+
+#: .\api\views_front.py:628
+msgid "操作失败。"
+msgstr "Operation failed."
+
+msgid "规则总览"
+msgstr "Rules Overview"
+
+msgid "规则审计"
+msgstr "Rules Audit"
+
+msgid "规则总数"
+msgstr "Total Rules"
+
+msgid "返回权限配置"
+msgstr "Back to Access Settings"
+
+msgid "导出 CSV"
+msgstr "Export CSV"
+
+msgid "导出 Excel"
+msgstr "Export Excel"
+
+msgid "地址簿规则总览"
+msgstr "Address Book Rules Overview"
+
+msgid "集中管理共享与访问规则，支持批量操作。"
+msgstr "Manage sharing and access rules in one place with bulk actions."
+
+msgid "筛选规则并进行批量操作。"
+msgstr "Filter rules and apply bulk actions."
+
+msgid "批量操作"
+msgstr "Bulk Actions"
+
+msgid "批量更新"
+msgstr "Bulk Update"
+
+msgid "批量删除"
+msgstr "Bulk Delete"
+
+msgid "勾选规则后再执行批量操作。"
+msgstr "Select rules before running bulk actions."
+
+msgid "规则列表"
+msgstr "Rule List"
+
+msgid "支持单条编辑与删除。"
+msgstr "Supports single rule edits and deletions."
+
+msgid "选择"
+msgstr "Select"
+
+msgid "规则审计日志"
+msgstr "Rules Audit Log"
+
+msgid "查看权限变更与共享配置的历史记录。"
+msgstr "Review permission changes and sharing history."
+
+msgid "搜索地址簿、执行人或目标"
+msgstr "Search address books, actors, or targets"
+
+msgid "审计记录"
+msgstr "Audit Records"
+
+msgid "按时间倒序展示规则变更。"
+msgstr "Rules changes sorted by time."
+
+msgid "时间"
+msgstr "Time"
+
+msgid "动作"
+msgstr "Action"
+
+msgid "执行人"
+msgstr "Actor"
+
+msgid "详情"
+msgstr "Details"
+
+msgid "暂无审计记录。"
+msgstr "No audit records."
+
+msgid "请选择至少一条规则。"
+msgstr "Select at least one rule."
+
+msgid "已批量删除 %(count)s 条规则。"
+msgstr "Bulk deleted %(count)s rules."
+
+msgid "已批量更新 %(count)s 条规则。"
+msgstr "Bulk updated %(count)s rules."
+
+msgid "有 %(count)s 条规则未能处理。"
+msgstr "%(count)s rules could not be processed."
+
+msgid "用户共享新增"
+msgstr "User share added"
+
+msgid "用户共享更新"
+msgstr "User share updated"
+
+msgid "用户共享删除"
+msgstr "User share deleted"
+
+msgid "规则新增"
+msgstr "Rule added"
+
+msgid "规则更新"
+msgstr "Rule updated"
+
+msgid "规则删除"
+msgstr "Rule deleted"
+
+msgid "地址簿管理"
+msgstr "Address Book Management"
+
+msgid "管理地址簿、标签与设备内容。"
+msgstr "Manage address books, tags, and device entries."
+
+msgid "个地址簿"
+msgstr "address books"
+
+msgid "创建新的地址簿或进入管理页面。"
+msgstr "Create a new address book or enter the management page."
+
+msgid "搜索名称、GUID 或用户"
+msgstr "Search name, GUID, or user"
+
+msgid "创建地址簿"
+msgstr "Create Address Book"
+
+msgid "默认创建共享地址簿，可用于协作管理。"
+msgstr "Creates a shared address book by default for collaboration."
+
+msgid "地址簿名称"
+msgstr "Address Book Name"
+
+msgid "备注（可选）"
+msgstr "Note (optional)"
+
+msgid "所属用户（用户名或ID）"
+msgstr "Owner (username or ID)"
+
+msgid "个人地址簿"
+msgstr "Personal Address Book"
+
+msgid "共享地址簿"
+msgstr "Shared Address Book"
+
+msgid "进入管理"
+msgstr "Manage"
+
+msgid "地址簿名称不能为空。"
+msgstr "Address book name cannot be empty."
+
+msgid "地址簿名称为保留名称。"
+msgstr "Address book name is reserved."
+
+msgid "目标用户不存在。"
+msgstr "Target user not found."
+
+msgid "地址簿名称已存在。"
+msgstr "Address book name already exists."
+
+msgid "地址簿已创建。"
+msgstr "Address book created."
+
+msgid "个人地址簿不可修改。"
+msgstr "Personal address book cannot be modified."
+
+msgid "地址簿已更新。"
+msgstr "Address book updated."
+
+msgid "个人地址簿不可删除。"
+msgstr "Personal address book cannot be deleted."
+
+msgid "地址簿已删除。"
+msgstr "Address book deleted."
+
+msgid "无权限"
+msgstr "No access"
+
+msgid "当前权限不足以修改地址簿内容。"
+msgstr "Current permission is insufficient to modify this address book."
+
+msgid "标签名称不能为空。"
+msgstr "Tag name cannot be empty."
+
+msgid "标签已更新。"
+msgstr "Tag updated."
+
+msgid "标签已重命名。"
+msgstr "Tag renamed."
+
+msgid "标签颜色已更新。"
+msgstr "Tag color updated."
+
+msgid "标签已删除。"
+msgstr "Tag deleted."
+
+msgid "设备ID不能为空。"
+msgstr "Device ID cannot be empty."
+
+msgid "设备已更新。"
+msgstr "Device updated."
+
+msgid "设备已新增。"
+msgstr "Device added."
+
+msgid "设备不存在。"
+msgstr "Device not found."
+
+msgid "设备已删除。"
+msgstr "Device deleted."
+
+msgid "地址簿内容管理"
+msgstr "Address Book Content"
+
+msgid "返回地址簿列表"
+msgstr "Back to Address Books"
+
+msgid "在此管理设备与标签内容。"
+msgstr "Manage devices and tags here."
+
+msgid "标签管理"
+msgstr "Tag Management"
+
+msgid "新增、重命名或删除标签。"
+msgstr "Add, rename, or delete tags."
+
+msgid "个标签"
+msgstr "tags"
+
+msgid "颜色（可选）"
+msgstr "Color (optional)"
+
+msgid "颜色"
+msgstr "Color"
+
+msgid "新名称"
+msgstr "New name"
+
+msgid "重命名"
+msgstr "Rename"
+
+msgid "暂无标签"
+msgstr "No tags yet"
+
+msgid "设备管理"
+msgstr "Device Management"
+
+msgid "新增设备并调整标签与备注。"
+msgstr "Add devices and adjust tags or notes."
+
+msgid "设备ID"
+msgstr "Device ID"
+
+msgid "别名（可选）"
+msgstr "Alias (optional)"
+
+msgid "标签（逗号分隔）"
+msgstr "Tags (comma-separated)"
+
+msgid "共享密码（可选）"
+msgstr "Share password (optional)"
+
+msgid "暂无设备"
+msgstr "No devices yet"
+
+msgid "导出设备 CSV"
+msgstr "Export Devices CSV"
+
+msgid "导出设备 Excel"
+msgstr "Export Devices Excel"
+
+msgid "导出标签 CSV"
+msgstr "Export Tags CSV"
+
+msgid "批量标签（逗号分隔）"
+msgstr "Bulk tags (comma-separated)"
+
+msgid "批量备注"
+msgstr "Bulk note"
+
+msgid "批量添加标签"
+msgstr "Bulk add tags"
+
+msgid "批量移除标签"
+msgstr "Bulk remove tags"
+
+msgid "覆盖标签"
+msgstr "Replace tags"
+
+msgid "勾选设备后可批量操作标签。"
+msgstr "Select devices to run bulk tag actions."
+
+msgid "请选择至少一台设备。"
+msgstr "Select at least one device."
+
+msgid "已批量更新 %(count)s 台设备标签。"
+msgstr "Bulk updated tags for %(count)s devices."
+
+msgid "批量更新备注"
+msgstr "Bulk update notes"
+
+msgid "批量删除设备"
+msgstr "Bulk delete devices"
+
+msgid "已批量更新 %(count)s 台设备备注。"
+msgstr "Bulk updated notes for %(count)s devices."
+
+msgid "已批量删除 %(count)s 台设备。"
+msgstr "Bulk deleted %(count)s devices."
+
+msgid "转移给用户"
+msgstr "Transfer to user"
+
+msgid "转移"
+msgstr "Transfer"
+
+msgid "导出共享 CSV"
+msgstr "Export Shares CSV"
+
+msgid "地址簿规则审计"
+msgstr "Address Book Rule Audit"
+
+msgid "地址簿规则审计列表"
+msgstr "Address Book Rule Audit List"
+
+msgid "地址簿概览"
+msgstr "Address Book Overview"
+
+msgid "总体统计"
+msgstr "Overall Metrics"
+
+msgid "地址簿数据概览与权限汇总。"
+msgstr "Overview of address book data and permissions."
+
+msgid "共享"
+msgstr "Shares"
+
+msgid "规则"
+msgstr "Rules"
+
+msgid "访问权限分布"
+msgstr "Access Distribution"
+
+msgid "共享规则与权限类型统计。"
+msgstr "Sharing rules and permission breakdown."
+
+msgid "热门地址簿"
+msgstr "Top Address Books"
+
+msgid "按设备数量排序的前几项。"
+msgstr "Top items by device count."
+
+msgid "暂无数据"
+msgstr "No data"
+
+msgid "标签独立管理，与地址簿通过设备关联。"
+msgstr "Tags are managed independently and linked to address books via devices."
+
+msgid "选择地址簿后创建或维护标签。"
+msgstr "Choose an address book to create or maintain tags."
+
+msgid "搜索标签或地址簿"
+msgstr "Search tags or address books"
+
+msgid "创建标签"
+msgstr "Create Tag"
+
+msgid "选择地址簿并添加标签。"
+msgstr "Select an address book and add a tag."
+
+msgid "标签明细"
+msgstr "Tag Details"
+
+msgid "支持颜色调整、重命名与删除。"
+msgstr "Supports color updates, renaming, and deletion."
+
+msgid "导出标签 Excel"
+msgstr "Export Tags Excel"
+
+msgid "创建"
+msgstr "Create"
+
+msgid "共享权限"
+msgstr "Share Permission"
+
+msgid "地址簿GUID"
+msgstr "Address Book GUID"
+
+msgid "过期时间"
+msgstr "Expires At"
+
+msgid "邮箱"
+msgstr "Email"
+
+msgid "规则总览加载失败，请检查数据库迁移与日志输出。"
+msgstr "Rules overview failed to load. Please check database migrations and logs."
+
+msgid "未找到所选设备的归属用户。"
+msgstr "Selected devices do not have an owner."
+
+msgid "请选择同一用户的设备进行分享。"
+msgstr "Please select devices belonging to the same user."
+
+msgid "仅支持分享自己名下的设备。"
+msgstr "You can only share your own devices."
+
+#~ msgid "未知"
+#~ msgstr "UNKNOWN"

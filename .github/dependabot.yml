@@ -1,0 +1,46 @@
+version: 2
+updates:
+  - package-ecosystem: uv
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "02:00"
+      timezone: Asia/Singapore
+    groups:
+      python-dependencies:
+        patterns:
+          - "*"
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: deps(python)
+
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "02:30"
+      timezone: Asia/Singapore
+    groups:
+      container-dependencies:
+        patterns:
+          - "*"
+    open-pull-requests-limit: 3
+    commit-message:
+      prefix: deps(container)
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "03:00"
+      timezone: Asia/Singapore
+    groups:
+      workflow-actions:
+        patterns:
+          - "*"
+    open-pull-requests-limit: 3
+    commit-message:
+      prefix: deps(actions)

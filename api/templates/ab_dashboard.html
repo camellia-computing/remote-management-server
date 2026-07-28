@@ -1,0 +1,106 @@
+{% extends "base.html" %}
+{% load i18n %}
+
+{% block title %}{% trans "地址簿概览" %}{% endblock %}
+{% block legend_name %}{% trans "地址簿概览" %}{% endblock %}
+{% block page_actions %}
+  <a class="btn btn-secondary btn-xs" href="/api/ab_books">{% trans "地址簿管理" %}</a>
+  <a class="btn btn-ghost btn-xs" href="/api/ab_manage">{% trans "地址簿权限" %}</a>
+{% endblock %}
+
+{% block content %}
+<div class="ab-dashboard-grid">
+  <section class="card ab-dash-card">
+    <div class="card-header">
+      <div>
+        <h2 class="card-title">{% trans "总体统计" %}</h2>
+        <p class="card-subtitle">{% trans "地址簿数据概览与权限汇总。" %}</p>
+      </div>
+    </div>
+    <div class="ab-dash-metrics">
+      <div class="stat-card">
+        <div class="stat-label">{% trans "地址簿" %}</div>
+        <div class="stat-value">{{ total_books }}</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-label">{% trans "设备" %}</div>
+        <div class="stat-value">{{ total_peers }}</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-label">{% trans "标签" %}</div>
+        <div class="stat-value">{{ total_tags }}</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-label">{% trans "共享" %}</div>
+        <div class="stat-value">{{ total_shares }}</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-label">{% trans "规则" %}</div>
+        <div class="stat-value">{{ total_rules }}</div>
+      </div>
+    </div>
+  </section>
+
+  <section class="card ab-dash-card">
+    <div class="card-header">
+      <div>
+        <h2 class="card-title">{% trans "访问权限分布" %}</h2>
+        <p class="card-subtitle">{% trans "共享规则与权限类型统计。" %}</p>
+      </div>
+    </div>
+    <div class="ab-dash-metrics">
+      <div class="stat-card">
+        <div class="stat-label">{% trans "用户共享" %}</div>
+        <div class="stat-value">{{ rule_stats.user }}</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-label">{% trans "组规则" %}</div>
+        <div class="stat-value">{{ rule_stats.group }}</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-label">{% trans "Everyone 规则" %}</div>
+        <div class="stat-value">{{ rule_stats.everyone }}</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-label">{% trans "只读" %}</div>
+        <div class="stat-value">{{ rule_stats.read }}</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-label">{% trans "读写" %}</div>
+        <div class="stat-value">{{ rule_stats.write }}</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-label">{% trans "完全控制" %}</div>
+        <div class="stat-value">{{ rule_stats.full }}</div>
+      </div>
+    </div>
+  </section>
+
+  <section class="card ab-dash-card ab-dash-wide">
+    <div class="card-header">
+      <div>
+        <h2 class="card-title">{% trans "热门地址簿" %}</h2>
+        <p class="card-subtitle">{% trans "按设备数量排序的前几项。" %}</p>
+      </div>
+    </div>
+    <div class="ab-chart">
+      {% for item in top_profiles %}
+        <div class="ab-chart-row">
+          <div class="ab-chart-label">
+            <div class="ab-chart-title">{{ item.name }}</div>
+            <div class="ab-chart-meta">{{ item.owner }} · {{ item.peers }} {% trans "台设备" %}</div>
+          </div>
+          <progress
+            class="ab-chart-bar"
+            max="100"
+            value="{{ item.peers_pct }}"
+            aria-label="{{ item.name }} {{ item.peers_pct }}%"
+          >{{ item.peers_pct }}%</progress>
+        </div>
+      {% empty %}
+        <div class="ab-empty">{% trans "暂无数据" %}</div>
+      {% endfor %}
+    </div>
+  </section>
+</div>
+{% endblock %}

@@ -1,0 +1,181 @@
+{% extends "base.html" %}
+{% load i18n %}
+
+{% block title %}{% trans "规则总览" %}{% endblock %}
+{% block legend_name %}{% trans "规则总览" %}{% endblock %}
+{% block page_actions %}
+  <a class="btn btn-secondary btn-xs" href="/api/ab_manage">{% trans "返回权限配置" %}</a>
+  <a class="btn btn-ghost btn-xs" href="/api/ab_audit">{% trans "规则审计" %}</a>
+  <a class="btn btn-ghost btn-xs" href="/api/ab_rules_export?format=csv{% if filter_q %}&q={{ filter_q|urlencode }}{% endif %}">{% trans "导出 CSV" %}</a>
+  <a class="btn btn-ghost btn-xs" href="/api/ab_rules_export?format=xls{% if filter_q %}&q={{ filter_q|urlencode }}{% endif %}">{% trans "导出 Excel" %}</a>
+{% endblock %}
+
+{% block content %}
+<div class="card ab-hero">
+  <div class="card-header">
+    <div>
+      <h2 class="card-title">{% trans "地址簿规则总览" %}</h2>
+      <p class="card-subtitle">{% trans "集中管理共享与访问规则，支持批量操作。" %}</p>
+    </div>
+    <span class="pill">{{ page_obj.paginator.count }} {% trans "条记录" %}</span>
+  </div>
+  <div class="ab-hero-body">
+    {% if messages %}
+      {% for message in messages %}
+        <div class="notice {% if message.tags %}is-{{ message.tags }}{% endif %}">{{ message }}</div>
+      {% endfor %}
+    {% else %}
+      <div class="notice">{% trans "筛选规则并进行批量操作。" %}</div>
+    {% endif %}
+    <form class="ab-filter" method="get" action="/api/ab_rules">
+      <input class="ab-input ab-input-wide" type="text" name="q" value="{{ filter_q }}" placeholder="{% trans "搜索地址簿、Owner 或目标" %}">
+      <button class="btn btn-secondary btn-xs" type="submit">{% trans "筛选" %}</button>
+      {% if filter_q %}
+        <a class="btn btn-ghost btn-xs" href="/api/ab_rules">{% trans "清除" %}</a>
+      {% endif %}
+    </form>
+  </div>
+</div>
+
+{% if rule_stats %}
+  <div class="ab-stats">
+    <div class="stat-card">
+      <div class="stat-label">{% trans "规则总数" %}</div>
+      <div class="stat-value">{{ rule_stats.total }}</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">{% trans "用户共享" %}</div>
+      <div class="stat-value">{{ rule_stats.user }}</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">{% trans "组规则" %}</div>
+      <div class="stat-value">{{ rule_stats.group }}</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">{% trans "Everyone 规则" %}</div>
+      <div class="stat-value">{{ rule_stats.everyone }}</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">{% trans "只读" %}</div>
+      <div class="stat-value">{{ rule_stats.read }}</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">{% trans "读写" %}</div>
+      <div class="stat-value">{{ rule_stats.write }}</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">{% trans "完全控制" %}</div>
+      <div class="stat-value">{{ rule_stats.full }}</div>
+    </div>
+  </div>
+{% endif %}
+
+<form id="ab-bulk-form" class="ab-bulk" method="post" action="/api/ab_rules">
+  {% csrf_token %}
+  {% if filter_q %}
+    <input type="hidden" name="q" value="{{ filter_q }}">
+  {% endif %}
+  <div class="ab-bulk-main">
+    <div class="ab-bulk-title">{% trans "批量操作" %}</div>
+    <div class="ab-bulk-controls">
+      <select class="ab-select" name="rule">
+        {% for value, label in rule_choices %}
+          <option value="{{ value }}">{{ label }}</option>
+        {% endfor %}
+      </select>
+      <button class="btn btn-secondary btn-xs" type="submit" name="action" value="bulk_update">{% trans "批量更新" %}</button>
+      <button class="btn btn-ghost btn-xs" type="submit" name="action" value="bulk_delete">{% trans "批量删除" %}</button>
+    </div>
+  </div>
+  <div class="ab-bulk-tip">{% trans "勾选规则后再执行批量操作。" %}</div>
+</form>
+
+<div class="card ab-global">
+  <div class="card-header">
+    <div>
+      <h2 class="card-title">{% trans "规则列表" %}</h2>
+      <p class="card-subtitle">{% trans "支持单条编辑与删除。" %}</p>
+    </div>
+  </div>
+  <div class="panel-grid">
+    {% for entry in page_obj %}
+      <article class="item-card">
+        <div class="item-header">
+          <div>
+            <h3 class="item-title">{{ entry.profile_name }}</h3>
+            <div class="item-meta">{{ entry.profile_guid }}</div>
+          </div>
+          <label class="ab-peer-select">
+            <input form="ab-bulk-form" class="ab-check" type="checkbox" name="selected" value="{{ entry.guid }}">
+            <span>{% trans "选择" %}</span>
+          </label>
+        </div>
+        <div class="info-grid">
+          <div class="info-item">
+            <span>{% trans "所属用户" %}</span>
+            <strong>{{ entry.owner }}</strong>
+          </div>
+          <div class="info-item">
+            <span>{% trans "类型" %}</span>
+            <strong>{{ entry.target_type }}</strong>
+          </div>
+          <div class="info-item">
+            <span>{% trans "目标" %}</span>
+            <strong>{{ entry.target_name }}</strong>
+          </div>
+          <div class="info-item">
+            <span>{% trans "权限" %}</span>
+            <strong>{{ entry.rule_label }}</strong>
+          </div>
+        </div>
+        <div class="action-stack">
+          <form class="action-panel" method="post" action="/api/ab_rules">
+            {% csrf_token %}
+            {% if filter_q %}
+              <input type="hidden" name="q" value="{{ filter_q }}">
+            {% endif %}
+            <input type="hidden" name="action" value="update_rule">
+            <input type="hidden" name="rule_guid" value="{{ entry.guid }}">
+            <div class="action-title">{% trans "权限" %}</div>
+            <div class="action-row">
+              <select class="ab-select" name="rule">
+                {% for value, label in rule_choices %}
+                  <option value="{{ value }}" {% if value == entry.rule %}selected{% endif %}>{{ label }}</option>
+                {% endfor %}
+              </select>
+              <button class="btn btn-ghost btn-xs" type="submit">{% trans "更新" %}</button>
+            </div>
+          </form>
+          <form class="action-panel action-panel--danger" method="post" action="/api/ab_rules">
+            {% csrf_token %}
+            {% if filter_q %}
+              <input type="hidden" name="q" value="{{ filter_q }}">
+            {% endif %}
+            <input type="hidden" name="action" value="delete_rule">
+            <input type="hidden" name="rule_guid" value="{{ entry.guid }}">
+            <div class="action-title">{% trans "删除" %}</div>
+            <div class="action-row action-row--single">
+              <button class="btn btn-secondary btn-xs" type="submit">{% trans "删除" %}</button>
+            </div>
+          </form>
+        </div>
+      </article>
+    {% empty %}
+      <div class="ab-empty">{% trans "暂无规则" %}</div>
+    {% endfor %}
+  </div>
+</div>
+
+<div class="pagination">
+  {% if page_obj.has_previous %}
+    <a class="btn btn-ghost" href="?{% if filter_q %}q={{ filter_q|urlencode }}&{% endif %}page={{ page_obj.previous_page_number }}">{% trans "上一页" %}</a>
+  {% endif %}
+  {% if page_obj.paginator.num_pages > 1 %}
+    <span class="page-info">{% trans "页码" %} {{ page_obj.number }} / {{ page_obj.paginator.num_pages }}</span>
+  {% endif %}
+  {% if page_obj.has_next %}
+    <a class="btn btn-ghost" href="?{% if filter_q %}q={{ filter_q|urlencode }}&{% endif %}page={{ page_obj.next_page_number }}">{% trans "下一页" %}</a>
+    <a class="btn btn-ghost" href="?{% if filter_q %}q={{ filter_q|urlencode }}&{% endif %}page={{ page_obj.paginator.num_pages }}">{% trans "尾页" %} &raquo;</a>
+  {% endif %}
+</div>
+{% endblock %}

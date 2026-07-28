@@ -1,0 +1,174 @@
+name: Build pinned Camellia Remote Web client
+description: Build the locked Camellia Remote Web revision from a repository owned by the current account
+
+inputs:
+  repository-name:
+    description: Repository name under github.repository_owner; owner-qualified names are rejected
+    required: false
+    default: remote-client
+  flutter-version:
+    description: Flutter SDK version used by the Camellia Remote Web build
+    required: false
+    default: 3.44.5
+  node-version:
+    description: Node.js version used by the Camellia Remote Web bridge build
+    required: false
+    default: 24.18.0
+
+outputs:
+  revision:
+    description: Immutable Camellia Remote commit used for this build
+    value: ${{ steps.config.outputs.revision }}
+
+runs:
+  using: composite
+  steps:
+    - name: Resolve locked source
+      id: config
+      shell: bash
+      env:
+        REPOSITORY_NAME: ${{ inputs.repository-name }}
+      run: |
+        if [[ ! "$REPOSITORY_NAME" =~ ^[A-Za-z0-9_.-]+$ ]] \
+          || [[ "$REPOSITORY_NAME" == "." ]] \
+          || [[ "$REPOSITORY_NAME" == ".." ]]; then
+          echo "repository-name must be one unqualified repository name under the current owner" >&2
+          exit 1
+        fi
+        revision="$("$GITHUB_WORKSPACE/scripts/web_client_revision.sh")"
+        echo "repository=${GITHUB_REPOSITORY_OWNER}/${REPOSITORY_NAME}" >> "$GITHUB_OUTPUT"
+        echo "revision=$revision" >> "$GITHUB_OUTPUT"
+
+    - name: Verify locked Camellia Remote source policy
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+        REPOSITORY: ${{ steps.config.outputs.repository }}
+        REVISION: ${{ steps.config.outputs.revision }}
+      run: |
+        default_branch="$(gh api "repos/$REPOSITORY" --jq .default_branch)"
+        default_revision="$(gh api "repos/$REPOSITORY/commits/$default_branch" --jq .sha)"
+        comparison_status="$(
+          gh api "repos/$REPOSITORY/compare/${REVISION}...${default_revision}" \
+            --jq .status
+        )"
+        if [[ "$comparison_status" != "ahead" && "$comparison_status" != "identical" ]]; then
+          echo "Camellia Remote revision $REVISION is not reachable from $default_branch" >&2
+          exit 1
+        fi
+
+        runs_json="$(
+          gh api -X GET "repos/$REPOSITORY/actions/runs" \
+            -f head_sha="$REVISION" \
+            -f event=push \
+            -f status=success \
+            -f per_page=100
+        )"
+        verified_run=""
+        while IFS= read -r run_id; do
+          jobs_json="$(
+            gh api -X GET "repos/$REPOSITORY/actions/runs/$run_id/jobs" \
+              -f per_page=100
+          )"
+          if [[ "$(
+            jq -r '[.jobs[] | select(.name == "CI / Required" and .conclusion == "success")] | length' \
+              <<< "$jobs_json"
+          )" == "1" ]]; then
+            verified_run="$run_id"
+            break
+          fi
+        done < <(jq -r '.workflow_runs | sort_by(.run_number) | reverse[] | .id' <<< "$runs_json")
+
+        if [[ -z "$verified_run" ]]; then
+          echo "Camellia Remote revision $REVISION has no successful push CI / Required check" >&2
+          exit 1
+        fi
+        echo "Verified Camellia Remote push CI run $verified_run for $REVISION"
+
+    - name: Restore compiled Web runtime
+      id: runtime-cache
+      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: static/web_client
+        key: >-
+          camellia-remote-web-v1-${{ runner.os }}-${{ steps.config.outputs.revision }}-${{
+          inputs.flutter-version }}-${{ inputs.node-version }}-${{
+          hashFiles('sync_web_client.sh', '.github/actions/build-web-client/action.yml') }}
+
+    - name: Checkout locked Camellia Remote source
+      if: steps.runtime-cache.outputs.cache-hit != 'true'
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        repository: ${{ steps.config.outputs.repository }}
+        ref: ${{ steps.config.outputs.revision }}
+        path: .web-client-source
+        persist-credentials: false
+        submodules: recursive
+
+    - name: Verify checked-out source
+      if: steps.runtime-cache.outputs.cache-hit != 'true'
+      shell: bash
+      env:
+        EXPECTED_REVISION: ${{ steps.config.outputs.revision }}
+      run: |
+        actual_revision="$(git -C "$GITHUB_WORKSPACE/.web-client-source" rev-parse HEAD)"
+        if [[ "$actual_revision" != "$EXPECTED_REVISION" ]]; then
+          echo "Camellia Remote checkout mismatch: expected $EXPECTED_REVISION, got $actual_revision" >&2
+          exit 1
+        fi
+
+    - name: Set up Flutter
+      if: steps.runtime-cache.outputs.cache-hit != 'true'
+      uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2.23.0
+      with:
+        channel: stable
+        flutter-version: ${{ inputs.flutter-version }}
+        cache: true
+
+    - name: Set up Node.js
+      if: steps.runtime-cache.outputs.cache-hit != 'true'
+      uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+      with:
+        node-version: ${{ inputs.node-version }}
+        cache: npm
+        cache-dependency-path: .web-client-source/flutter/web/js/package-lock.json
+
+    - name: Build and synchronize Web runtime
+      if: steps.runtime-cache.outputs.cache-hit != 'true'
+      shell: bash
+      run: |
+        "$GITHUB_WORKSPACE/sync_web_client.sh" \
+          --build-from "$GITHUB_WORKSPACE/.web-client-source"
+
+    - name: Verify compiled Web runtime
+      shell: bash
+      env:
+        EXPECTED_REVISION: ${{ steps.config.outputs.revision }}
+      run: |
+        revision_file="$GITHUB_WORKSPACE/static/web_client/.source_revision"
+        if [[ ! -f "$revision_file" ]]; then
+          echo "Compiled Web runtime is missing $revision_file" >&2
+          exit 1
+        fi
+        revision_record="$(tr -d '\r\n' < "$revision_file")"
+        if [[ "$revision_record" != "$EXPECTED_REVISION clean" ]]; then
+          echo "Web runtime provenance mismatch: expected '$EXPECTED_REVISION clean', got '$revision_record'" >&2
+          exit 1
+        fi
+        required_files=(
+          flutter_bootstrap.js
+          main.dart.js
+          manifest.json
+          canvaskit/canvaskit.wasm
+          js/dist/web_bridge.js
+        )
+        for required_file in "${required_files[@]}"; do
+          if [[ ! -f "$GITHUB_WORKSPACE/static/web_client/$required_file" ]]; then
+            echo "Compiled Web runtime is missing $required_file" >&2
+            exit 1
+          fi
+        done
+        if [[ -n "$(find "$GITHUB_WORKSPACE/static/web_client" -type l -print -quit)" ]]; then
+          echo "Compiled Web runtime must not contain symbolic links" >&2
+          exit 1
+        fi

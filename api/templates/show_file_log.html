@@ -1,0 +1,69 @@
+{% extends "base.html" %}
+{% load my_filters %}
+{% block title %}{{ "Camellia 控制台" | translate }}{% endblock %}
+{% block legend_name %}{{ "文件传输日志" | translate }}{% endblock %}
+{% block content %}
+<section class="card">
+  <div class="card-header">
+    <div>
+      <h2 class="card-title">{{ "文件传输日志" | translate }}</h2>
+      <p class="card-subtitle">{{ "当前用户" | translate }}: {{ u.username|default:"-" }}</p>
+    </div>
+    <span class="pill">{{ page_obj.paginator.count }} {{ "条记录" | translate }}</span>
+  </div>
+  <div class="card-body">
+    <div class="table-wrap">
+      <table class="data-table">
+        <thead>
+          <tr>
+            <th>{{ "文件" | translate }}</th>
+            <th>{{ "远程ID" | translate }}</th>
+            <th>{{ "远程别名" | translate }}</th>
+            <th>{{ "用户ID" | translate }}</th>
+            <th>{{ "用户别名" | translate }}</th>
+            <th>{{ "用户IP" | translate }}</th>
+            <th>{{ "文件大小" | translate }}</th>
+            <th>{{ "发送/接受" | translate }}</th>
+            <th>{{ "记录于" | translate }}</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for one in page_obj %}
+          <tr>
+            <td>{{ one.file }}</td>
+            <td>{{ one.remote_id }}</td>
+            <td>{{ one.remote_alias }}</td>
+            <td>{{ one.user_id }}</td>
+            <td>{{ one.user_alias }}</td>
+            <td>{{ one.user_ip }}</td>
+            <td>{{ one.filesize_display }}</td>
+            <td>
+              {% if one.direction == 0 %}
+                <span class="status-pill is-online">{{ "接收" | translate }}</span>
+              {% else %}
+                <span class="status-pill is-offline">{{ "发送" | translate }}</span>
+              {% endif %}
+            </td>
+            <td>{{ one.logged_at }}</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </div>
+</section>
+<div class="pagination">
+  {% if page_obj.has_previous %}
+    <a class="btn btn-ghost" href="?page=1">&laquo; {{ "首页" | translate }}</a>
+    <a class="btn btn-ghost" href="?page={{ page_obj.previous_page_number }}">{{ "上一页" | translate }}</a>
+  {% endif %}
+  {% if page_obj.paginator.num_pages > 1 %}
+    <span class="page-info">{{ "页码" | translate }} {{ page_obj.number }} / {{ page_obj.paginator.num_pages }}</span>
+  {% endif %}
+  {% if page_obj.has_next %}
+    <a class="btn btn-ghost" href="?page={{ page_obj.next_page_number }}">{{ "下一页" | translate }}</a>
+    <a class="btn btn-ghost" href="?page={{ page_obj.paginator.num_pages }}">{{ "尾页" | translate }} &raquo;</a>
+  {% endif %}
+</div>
+
+{% endblock %}

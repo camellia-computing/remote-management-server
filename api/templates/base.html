@@ -1,0 +1,84 @@
+{% load static %}
+{% load i18n %}
+<!DOCTYPE html>
+{% get_current_language as CAMELLIA_REMOTE_LANGUAGE_CODE %}
+<html lang="{{ CAMELLIA_REMOTE_LANGUAGE_CODE }}">
+
+<head>
+    <meta charset="utf-8">
+    <title>{% block title %}{% endblock %}</title>
+    <meta name="renderer" content="webkit">
+    <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1">
+    <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+    <meta name="theme-color" content="#397bff">
+    <link rel="icon" type="image/svg+xml" href="{% static 'web_client/favicon.svg' %}">
+    <link rel="stylesheet" href="{% static 'ui/app.css' %}">
+    {% block link %}{% endblock %}
+</head>
+
+<body class="app-body">
+    {% with current_user=u|default:request.user %}
+    <header class="topbar">
+        <div class="topbar-inner">
+            <div class="brand">
+                <div class="brand-mark"><img src="{% static 'web_client/favicon.svg' %}" alt="" aria-hidden="true"></div>
+                <div class="brand-text">
+                    <span class="brand-title">Camellia</span>
+                    <span class="brand-subtitle">{% trans "管理控制台" %}</span>
+                </div>
+            </div>
+            <nav class="nav-links">
+                <a class="nav-link{% if nav_active == 'home' %} is-active{% endif %}" href="/api/home">{% trans "首页" %}</a>
+                <a class="nav-link{% if nav_active == 'work' %} is-active{% endif %}" href="/api/work">{% trans "设备" %}</a>
+                {% if current_user.is_admin %}
+                <a class="nav-link{% if nav_active == 'work_admin' %} is-active{% endif %}" href="/api/work?show_type=admin">{% trans "所有设备" %}</a>
+                {% endif %}
+                <a class="nav-link{% if nav_active == 'share' %} is-active{% endif %}" href="/api/share">{% trans "分享" %}</a>
+                <a class="nav-link{% if nav_active == 'ab_dashboard' %} is-active{% endif %}" href="/api/ab_dashboard">{% trans "地址簿概览" %}</a>
+                <a class="nav-link{% if nav_active == 'ab_books' %} is-active{% endif %}" href="/api/ab_books">{% trans "地址簿管理" %}</a>
+                <a class="nav-link{% if nav_active == 'tag_manage' %} is-active{% endif %}" href="/api/tag_manage">{% trans "标签管理" %}</a>
+                <a class="nav-link{% if nav_active == 'ab_manage' %} is-active{% endif %}" href="/api/ab_manage">{% trans "地址簿权限" %}</a>
+                {% if current_user.is_admin %}
+                <a class="nav-link{% if nav_active == 'ab_rules' %} is-active{% endif %}" href="/api/ab_rules">{% trans "规则总览" %}</a>
+                <a class="nav-link{% if nav_active == 'ab_audit' %} is-active{% endif %}" href="/api/ab_audit">{% trans "规则审计" %}</a>
+                <a class="nav-link{% if nav_active == 'conn_log' %} is-active{% endif %}" href="/api/conn_log">{% trans "连接日志" %}</a>
+                <a class="nav-link{% if nav_active == 'file_log' %} is-active{% endif %}" href="/api/file_log">{% trans "文件传输日志" %}</a>
+                <a class="nav-link" href="/admin" target="_blank">{% trans "管理后台" %}</a>
+                {% endif %}
+                <a class="nav-link nav-cta" href="/webui2" target="_blank">{% trans "网页控制" %}</a>
+                <form method="post" action="/api/user_action?action=logout" class="nav-logout-form">
+                  {% csrf_token %}
+                  <button type="submit" class="nav-link nav-link-button">{% trans "退出" %}</button>
+                </form>
+            </nav>
+            <div class="topbar-actions">
+                <div class="user-chip">
+                    {% if current_user.username %}
+                    <span>{{ current_user.username }}</span>
+                    {% else %}
+                    <span>{% trans "访客" %}</span>
+                    {% endif %}
+                    {% if current_user.is_admin %}
+                    <span class="user-badge">{% trans "管理员" %}</span>
+                    {% endif %}
+                </div>
+            </div>
+        </div>
+    </header>
+
+    <main class="page">
+        <div class="page-header">
+            <div>
+                <div class="page-kicker">{% trans "控制面板" %}</div>
+                <h1 class="page-title">{% block legend_name %}{% endblock %}</h1>
+            </div>
+            <div class="page-actions">
+                {% block page_actions %}{% endblock %}
+            </div>
+        </div>
+        {% block content %}{% endblock %}
+    </main>
+    {% endwith %}
+</body>
+
+</html>

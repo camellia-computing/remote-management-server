@@ -1,0 +1,421 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: remote-management-ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  classify:
+    name: Classify changes
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      runtime: ${{ steps.changes.outputs.runtime }}
+      automation: ${{ steps.changes.outputs.automation }}
+      dependencies: ${{ steps.changes.outputs.dependencies }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Classify changed paths
+        id: changes
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PUSH_BASE_SHA: ${{ github.event.before }}
+          PUSH_HEAD_SHA: ${{ github.sha }}
+        run: |
+          runtime=false
+          automation=false
+          dependencies=false
+
+          if [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
+            runtime=true
+            automation=true
+          else
+            if [[ "$EVENT_NAME" == "pull_request" ]]; then
+              base="$PR_BASE_SHA"
+              head="$PR_HEAD_SHA"
+            else
+              base="$PUSH_BASE_SHA"
+              head="$PUSH_HEAD_SHA"
+            fi
+            if [[ "$base" =~ ^0+$ ]]; then
+              base="$(git hash-object -t tree /dev/null)"
+            fi
+
+            changed_paths="$RUNNER_TEMP/api-changed-paths"
+            git diff --name-only -z "$base" "$head" > "$changed_paths"
+            while IFS= read -r -d '' path; do
+              case "$path" in
+                README.md|README_EN.md|docs/*|LICENSE|LICENSE.*|.github/ISSUE_TEMPLATE/*|.github/workflows/*|.github/dependabot.yml|scripts/release_metadata.py|scripts/test_release_metadata.py)
+                  ;;
+                *)
+                  runtime=true
+                  ;;
+              esac
+              case "$path" in
+                .github/*|scripts/*|sync_web_client.sh)
+                  automation=true
+                  ;;
+              esac
+              case "$path" in
+                pyproject.toml|uv.lock|Dockerfile|docker-compose*.yml|docker-compose*.yaml|.github/dependabot.yml|.github/actions/*|.github/workflows/*)
+                  dependencies=true
+                  ;;
+              esac
+            done < "$changed_paths"
+          fi
+
+          {
+            echo "runtime=$runtime"
+            echo "automation=$automation"
+            echo "dependencies=$dependencies"
+          } >> "$GITHUB_OUTPUT"
+          {
+            echo "### Change classification"
+            echo
+            echo "- Runtime validation: \`$runtime\`"
+            echo "- Automation validation: \`$automation\`"
+            echo "- Dependency review: \`$dependencies\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  metadata:
+    name: Validate component version
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      version: ${{ steps.release.outputs.version }}
+      tag: ${{ steps.release.outputs.tag }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Validate release metadata
+        id: release
+        run: |
+          python scripts/test_release_metadata.py
+          python scripts/release_metadata.py --github-output
+
+  dependency_review:
+    name: Review dependency changes
+    if: >-
+      github.event_name == 'pull_request' &&
+      needs.classify.outputs.dependencies == 'true'
+    needs: classify
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Review dependency graph delta
+        uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0
+        with:
+          fail-on-severity: moderate
+          comment-summary-in-pr: never
+
+  automation:
+    name: Workflow and synchronization automation
+    if: needs.classify.outputs.automation == 'true'
+    needs: classify
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Lint workflows and shell scripts
+        run: |
+          go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
+          shellcheck sync_web_client.sh scripts/web_client_revision.sh
+
+  web_client:
+    name: Build pinned Web client
+    if: needs.classify.outputs.runtime == 'true'
+    needs: [classify, metadata]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    outputs:
+      revision: ${{ steps.web_client.outputs.revision }}
+    steps:
+      - name: Checkout API source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Build Web client
+        id: web_client
+        uses: ./.github/actions/build-web-client
+        with:
+          repository-name: ${{ vars.REMOTE_CLIENT_REPOSITORY_NAME || 'remote-client' }}
+
+      - name: Upload Web runtime
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: camellia-remote-web-${{ steps.web_client.outputs.revision }}
+          path: static/web_client
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 14
+
+  quality:
+    name: Python and Django quality
+    if: needs.classify.outputs.runtime == 'true'
+    needs: [classify, web_client]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    services:
+      postgres:
+        image: postgres:18-alpine@sha256:9a8afca54e7861fd90fab5fdf4c42477a6b1cb7d293595148e674e0a3181de15
+        env:
+          POSTGRES_DB: camellia_remote_ci
+          POSTGRES_USER: camellia_remote_ci
+          POSTGRES_PASSWORD: ci-postgres-password
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U camellia_remote_ci -d camellia_remote_ci"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    env:
+      CAMELLIA_REMOTE_DEBUG: "true"
+      CAMELLIA_REMOTE_SECRET_KEY: ci-only-secret-key
+      CAMELLIA_REMOTE_ALLOWED_HOSTS: "127.0.0.1,localhost"
+      CAMELLIA_REMOTE_CSRF_TRUSTED_ORIGINS: "http://127.0.0.1:21114"
+      CAMELLIA_REMOTE_DATABASE_URL: postgres://camellia_remote_ci:ci-postgres-password@127.0.0.1:5432/camellia_remote_ci
+      CAMELLIA_REMOTE_DATABASE_SSLMODE: disable
+      CAMELLIA_REMOTE_DEVICE_VERIFICATION_TOKEN: ci-device-verification-token-with-sufficient-length
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Download Web runtime
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: camellia-remote-web-${{ needs.web_client.outputs.revision }}
+          path: static/web_client
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          version: "0.11.30"
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Install dependencies
+        run: uv sync --locked --all-groups
+
+      - name: Audit dependencies
+        run: uv audit --locked --preview-features audit-command
+
+      - name: Static analysis
+        run: |
+          uv run python -m compileall api webui2 camellia_remote_management scripts
+          uv run ruff check api webui2 camellia_remote_management scripts
+
+      - name: Django checks
+        run: |
+          uv run python manage.py check
+          uv run python manage.py makemigrations --check --dry-run
+
+      - name: Production settings check
+        env:
+          CAMELLIA_REMOTE_DEBUG: "false"
+          CAMELLIA_REMOTE_SECRET_KEY: ci-only-production-secret-key-with-sufficient-length-000
+          CAMELLIA_REMOTE_DATA_ENCRYPTION_KEY: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
+          CAMELLIA_REMOTE_DEVICE_VERIFICATION_TOKEN: ci-device-verification-token-with-sufficient-length
+          CAMELLIA_REMOTE_SECURE_TLS: "true"
+          CAMELLIA_REMOTE_SECURE_HSTS_INCLUDE_SUBDOMAINS: "true"
+          CAMELLIA_REMOTE_SECURE_HSTS_PRELOAD: "true"
+        run: uv run python manage.py check --deploy --fail-level WARNING
+
+      - name: Fresh database migration
+        run: uv run python manage.py migrate --noinput
+
+      - name: Tests
+        run: uv run python -m pytest --create-db
+
+  container:
+    name: Container smoke test
+    if: needs.classify.outputs.runtime == 'true'
+    needs: [classify, web_client, quality]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    services:
+      postgres:
+        image: postgres:18-alpine@sha256:9a8afca54e7861fd90fab5fdf4c42477a6b1cb7d293595148e674e0a3181de15
+        env:
+          POSTGRES_DB: camellia_remote_container_ci
+          POSTGRES_USER: camellia_remote_container_ci
+          POSTGRES_PASSWORD: ci-postgres-password
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U camellia_remote_container_ci -d camellia_remote_container_ci"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Download Web runtime
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: camellia-remote-web-${{ needs.web_client.outputs.revision }}
+          path: static/web_client
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+
+      - name: Build runtime image
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          file: ./Dockerfile
+          load: true
+          push: false
+          tags: camellia-remote-management-server:ci
+          cache-from: type=gha,scope=remote-management-ci-image
+          cache-to: type=gha,scope=remote-management-ci-image,mode=max
+
+      - name: Create smoke-test volumes
+        run: |
+          docker volume create camellia-remote-management-ci-records
+
+      - name: Migrate container database
+        run: |
+          docker run --rm \
+            --network host \
+            -e CAMELLIA_REMOTE_DEBUG=false \
+            -e CAMELLIA_REMOTE_SECRET_KEY=ci-only-production-secret-key-with-sufficient-length-000 \
+            -e CAMELLIA_REMOTE_DATA_ENCRYPTION_KEY=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA= \
+            -e CAMELLIA_REMOTE_DEVICE_VERIFICATION_TOKEN=ci-device-verification-token-with-sufficient-length \
+            -e CAMELLIA_REMOTE_DATABASE_URL=postgres://camellia_remote_container_ci:ci-postgres-password@127.0.0.1:5432/camellia_remote_container_ci \
+            -e CAMELLIA_REMOTE_DATABASE_SSLMODE=disable \
+            -e CAMELLIA_REMOTE_ALLOWED_HOSTS=127.0.0.1,localhost \
+            -e CAMELLIA_REMOTE_CSRF_TRUSTED_ORIGINS=https://api.example.test \
+            -e CAMELLIA_REMOTE_SECURE_TLS=true \
+            -v camellia-remote-management-ci-records:/app/records \
+            camellia-remote-management-server:ci \
+            python manage.py migrate --noinput
+
+      - name: Start hardened container
+        run: |
+          docker run -d \
+            --name camellia-remote-management-ci \
+            --network host \
+            --read-only \
+            --tmpfs /tmp:size=128m,mode=1777 \
+            --cap-drop ALL \
+            --security-opt no-new-privileges:true \
+            -e CAMELLIA_REMOTE_DEBUG=false \
+            -e CAMELLIA_REMOTE_SECRET_KEY=ci-only-production-secret-key-with-sufficient-length-000 \
+            -e CAMELLIA_REMOTE_DATA_ENCRYPTION_KEY=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA= \
+            -e CAMELLIA_REMOTE_DEVICE_VERIFICATION_TOKEN=ci-device-verification-token-with-sufficient-length \
+            -e CAMELLIA_REMOTE_DATABASE_URL=postgres://camellia_remote_container_ci:ci-postgres-password@127.0.0.1:5432/camellia_remote_container_ci \
+            -e CAMELLIA_REMOTE_DATABASE_SSLMODE=disable \
+            -e CAMELLIA_REMOTE_ALLOWED_HOSTS=127.0.0.1,localhost \
+            -e CAMELLIA_REMOTE_CSRF_TRUSTED_ORIGINS=https://api.example.test \
+            -e CAMELLIA_REMOTE_SECURE_TLS=true \
+            -e CAMELLIA_REMOTE_GUNICORN_WORKERS=1 \
+            -v camellia-remote-management-ci-records:/app/records \
+            camellia-remote-management-server:ci
+
+      - name: Verify container readiness
+        run: |
+          for _attempt in $(seq 1 30); do
+            if docker exec camellia-remote-management-ci python -c \
+              'import json, urllib.request; request = urllib.request.Request("http://127.0.0.1:21114/health/ready", headers={"X-Forwarded-Proto": "https"}); response = urllib.request.urlopen(request, timeout=2); assert response.status == 200 and json.load(response)["status"] == "ready"'; then
+              exit 0
+            fi
+            sleep 1
+          done
+          docker logs camellia-remote-management-ci
+          exit 1
+
+      - name: Clean up container resources
+        if: always()
+        run: |
+          docker rm --force camellia-remote-management-ci 2>/dev/null || true
+          docker volume rm camellia-remote-management-ci-records 2>/dev/null || true
+
+  required:
+    name: CI / Required
+    if: always()
+    needs:
+      - classify
+      - metadata
+      - dependency_review
+      - automation
+      - web_client
+      - quality
+      - container
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Enforce required results
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          RUNTIME_REQUIRED: ${{ needs.classify.outputs.runtime }}
+          AUTOMATION_REQUIRED: ${{ needs.classify.outputs.automation }}
+          DEPENDENCIES_CHANGED: ${{ needs.classify.outputs.dependencies }}
+          CLASSIFY_RESULT: ${{ needs.classify.result }}
+          METADATA_RESULT: ${{ needs.metadata.result }}
+          DEPENDENCY_REVIEW_RESULT: ${{ needs.dependency_review.result }}
+          AUTOMATION_RESULT: ${{ needs.automation.result }}
+          WEB_CLIENT_RESULT: ${{ needs.web_client.result }}
+          QUALITY_RESULT: ${{ needs.quality.result }}
+          CONTAINER_RESULT: ${{ needs.container.result }}
+        run: |
+          failure=false
+          require_success() {
+            local name="$1"
+            local result="$2"
+            if [[ "$result" != "success" ]]; then
+              echo "$name must succeed, got: $result" >&2
+              failure=true
+            fi
+          }
+
+          require_success "change classification" "$CLASSIFY_RESULT"
+          require_success "component version validation" "$METADATA_RESULT"
+          if [[ "$AUTOMATION_REQUIRED" == "true" ]]; then
+            require_success "workflow and synchronization automation" "$AUTOMATION_RESULT"
+          fi
+          if [[ "$RUNTIME_REQUIRED" == "true" ]]; then
+            require_success "Web client build" "$WEB_CLIENT_RESULT"
+            require_success "Python and Django quality" "$QUALITY_RESULT"
+            require_success "container smoke test" "$CONTAINER_RESULT"
+          fi
+          if [[ "$EVENT_NAME" == "pull_request" && "$DEPENDENCIES_CHANGED" == "true" ]]; then
+            require_success "dependency review" "$DEPENDENCY_REVIEW_RESULT"
+          fi
+          if [[ "$failure" == "true" ]]; then
+            exit 1
+          fi

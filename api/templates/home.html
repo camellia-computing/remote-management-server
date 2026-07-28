@@ -1,0 +1,107 @@
+{% extends "base.html" %}
+{% load my_filters %}
+{% block title %}{{ "Camellia 控制台" | translate }}{% endblock %}
+{% block legend_name %}{{ "首页概览" | translate }}{% endblock %}
+{% block page_actions %}
+<a class="btn btn-secondary" href="/api/work">{{ "查看设备" | translate }}</a>
+{% if u.is_admin %}
+<a class="btn btn-secondary" href="/api/work?show_type=admin">{{ "管理员视图" | translate }}</a>
+{% endif %}
+{% endblock %}
+{% block content %}
+<section class="card">
+  <div class="card-header">
+    <div>
+      <h2 class="card-title">{{ "设备概览" | translate }}</h2>
+      <p class="card-subtitle">{{ "实时掌握设备在线状态与更新节奏" | translate }}</p>
+    </div>
+    <span class="pill">{{ summary.total }} {{ "台设备" | translate }}</span>
+  </div>
+  <div class="card-body">
+    <div class="stat-grid">
+      <div class="stat-card">
+        <div class="stat-label">{{ "在线设备" | translate }}</div>
+        <div class="stat-value">{{ summary.online }}</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-label">{{ "离线设备" | translate }}</div>
+        <div class="stat-value">{{ summary.offline }}</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-label">{{ "未知状态" | translate }}</div>
+        <div class="stat-value">{{ summary.unknown }}</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-label">{{ "总设备数" | translate }}</div>
+        <div class="stat-value">{{ summary.total }}</div>
+      </div>
+    </div>
+    <div class="action-tiles">
+      <a class="action-tile" href="/api/share">
+        <span class="action-tile-title">{{ "创建分享链接" | translate }}</span>
+        <span class="action-tile-meta">{{ "快速生成临时分享入口" | translate }}</span>
+      </a>
+      {% if u.is_admin %}
+      <a class="action-tile" href="/api/conn_log">
+        <span class="action-tile-title">{{ "连接日志" | translate }}</span>
+        <span class="action-tile-meta">{{ "查看最近的连接记录" | translate }}</span>
+      </a>
+      <a class="action-tile" href="/api/file_log">
+        <span class="action-tile-title">{{ "文件传输日志" | translate }}</span>
+        <span class="action-tile-meta">{{ "审计文件传输情况" | translate }}</span>
+      </a>
+      <a class="action-tile" href="/admin" target="_blank">
+        <span class="action-tile-title">{{ "打开管理后台" | translate }}</span>
+        <span class="action-tile-meta">{{ "管理用户与策略" | translate }}</span>
+      </a>
+      {% endif %}
+    </div>
+  </div>
+</section>
+
+<section class="card">
+  <div class="card-header">
+    <div>
+      <h2 class="card-title">{{ "最近更新设备" | translate }}</h2>
+      <p class="card-subtitle">{{ "最近 6 台设备的状态与更新时间" | translate }}</p>
+    </div>
+  </div>
+  <div class="card-body">
+    {% if recent %}
+    <div class="panel-grid">
+      {% for one in recent %}
+      <article class="item-card">
+        <div class="item-header">
+          <div>
+            <h3 class="item-title">{{ one.rid|default:"-" }}</h3>
+            <div class="item-meta">{{ one.alias|default:"-" }} · {{ one.device_group_name|default:"-" }}</div>
+          </div>
+          <span class="status-pill {% if one.status == "在线"|translate %}is-online{% elif one.status == "离线"|translate %}is-offline{% else %}is-unknown{% endif %}">
+            {{ one.status|default:"-" }}
+          </span>
+        </div>
+        <div class="info-grid">
+          {% if u.is_admin %}
+          <div class="info-item">
+            <span>{{ "归属用户" | translate }}</span>
+            <strong>{{ one.owner_name|default:one.rust_user|default:"-" }}</strong>
+          </div>
+          {% endif %}
+          <div class="info-item">
+            <span>{{ "设备组" | translate }}</span>
+            <strong>{{ one.device_group_name|default:"-" }}</strong>
+          </div>
+          <div class="info-item">
+            <span>{{ "更新时间" | translate }}</span>
+            <strong>{{ one.update_time|default:"-" }}</strong>
+          </div>
+        </div>
+      </article>
+      {% endfor %}
+    </div>
+    {% else %}
+    <div class="notice is-warning">{{ "暂无设备数据，可前往设备页查看详情。" | translate }}</div>
+    {% endif %}
+  </div>
+</section>
+{% endblock %}

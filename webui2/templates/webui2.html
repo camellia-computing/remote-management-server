@@ -1,0 +1,254 @@
+{% load static %}
+{% load i18n %}
+{% get_current_language as CAMELLIA_REMOTE_LANGUAGE_CODE %}
+<!DOCTYPE html>
+<html lang="{{ CAMELLIA_REMOTE_LANGUAGE_CODE }}">
+
+<head>
+  <base href="{% static 'web_client/' %}">
+  <meta charset="UTF-8">
+  <meta content="IE=Edge" http-equiv="X-UA-Compatible">
+  <meta name="description" content="Camellia Web Client">
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+  <meta name="theme-color" content="#397bff">
+
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black">
+  <meta name="apple-mobile-web-app-title" content="Camellia Web">
+  <link rel="apple-touch-icon" href="{% static 'web_client/favicon.svg' %}">
+
+  <link rel="icon" type="image/svg+xml" href="{% static 'web_client/favicon.svg' %}">
+
+  <title>Camellia WebUI 2</title>
+
+  <link rel="stylesheet" href="{% static 'webui2/app.css' %}">
+  <link rel="manifest" href="{% static 'web_client/manifest.json' %}">
+</head>
+
+<body>
+  <div class="shell" id="webui2-shell">
+    <div class="shell-content">
+      <header class="shell-header">
+        <div class="brand">
+          <div class="brand-mark">
+            <img src="{% static 'web_client/favicon.svg' %}" alt="" aria-hidden="true">
+          </div>
+          <div class="brand-copy">
+            <span class="brand-name">Camellia</span>
+            <span class="brand-tag">{% trans "Web Client 2" %}</span>
+          </div>
+        </div>
+        <div class="status-row">
+          <span class="status-pill">{% trans "端到端加密" %}</span>
+          <span class="status-pill">{% trans "低延迟" %}</span>
+          <span class="status-pill">{% trans "免安装" %}</span>
+        </div>
+      </header>
+
+      <main class="shell-main">
+        <section class="hero">
+          <p class="hero-kicker">Camellia WebUI 2</p>
+          <h1>{% blocktrans trimmed %}浏览器里的精致远程控制{% endblocktrans %}</h1>
+          <p class="hero-subtitle">
+            {% blocktrans trimmed %}正在建立安全会话，请保持页面开启以完成 Camellia 工作区加载。{% endblocktrans %}
+          </p>
+          <div class="hero-actions">
+            <button class="btn btn-primary" type="button" disabled data-cta="primary">{% trans "正在启动工作区" %}</button>
+            <button class="btn btn-ghost" type="button" disabled data-cta="secondary">{% trans "网络自检中" %}</button>
+          </div>
+          <div class="hero-tags">
+            <span>{% trans "自适应码率" %}</span>
+            <span>{% trans "设备已验证" %}</span>
+            <span>{% trans "中继已就绪" %}</span>
+          </div>
+        </section>
+
+        <aside class="status-panel">
+          <div class="panel-card">
+            <div class="panel-header">
+              <h2>{% trans "连接状态" %}</h2>
+              <span class="pulse-dot" aria-hidden="true"></span>
+            </div>
+            <div class="status-list">
+              <div class="status-item">
+                <span class="status-label">{% trans "ID 服务器" %}</span>
+                <span class="status-value" data-status="id-server">{% trans "解析中" %}</span>
+              </div>
+              <div class="status-item">
+                <span class="status-label">{% trans "Relay 服务器" %}</span>
+                <span class="status-value" data-status="relay-server">{% trans "解析中" %}</span>
+              </div>
+              <div class="status-item">
+                <span class="status-label">{% trans "当前用户" %}</span>
+                <span class="status-value" data-status="user">{% trans "校验中" %}</span>
+              </div>
+              <div class="status-item">
+                <span class="status-label">{% trans "API 心跳" %}</span>
+                <span class="status-value" data-status="api">{% trans "检测中" %}</span>
+              </div>
+            </div>
+            <div class="progress-track" aria-hidden="true">
+              <div class="progress-bar"></div>
+            </div>
+          </div>
+          <div class="panel-card panel-card-accent">
+            <h2>{% trans "快速提示" %}</h2>
+            <ul class="tip-list">
+              <li>{% trans "保持远端设备在线并避免休眠。" %}</li>
+              <li>{% trans "有线网络可获得更稳定的操控体验。" %}</li>
+              <li>{% trans "会话中支持剪贴板同步。" %}</li>
+            </ul>
+          </div>
+        </aside>
+      </main>
+
+      <section class="feature-grid">
+        <article class="feature-card">
+          <h3>{% trans "精准流媒体" %}</h3>
+          <p>{% trans "动态码率与清晰度调节，适配高并发与长时会话。" %}</p>
+          <span class="feature-foot">{% trans "音频与文件传输已就绪" %}</span>
+        </article>
+        <article class="feature-card">
+          <h3>{% trans "Camellia 中继" %}</h3>
+          <p>{% trans "专属中继链路，逐跳验证设备与身份。" %}</p>
+          <span class="feature-foot">{% trans "设备指纹已确认" %}</span>
+        </article>
+        <article class="feature-card">
+          <h3>{% trans "零安装体验" %}</h3>
+          <p>{% trans "无需额外下载，浏览器内快速启动安全控制。" %}</p>
+          <span class="feature-foot">{% trans "为现代 Chromium 优化" %}</span>
+        </article>
+      </section>
+
+      <footer class="shell-footer">
+        <span>{% trans "Camellia 远程平台" %}</span>
+        <span class="footer-meta">{% trans "WebUI 2 - Secure by design" %}</span>
+      </footer>
+    </div>
+  </div>
+
+  <script nonce="{{ csp_nonce }}">
+    (function () {
+      var idServerNode = document.querySelector('[data-status="id-server"]');
+      var relayServerNode = document.querySelector('[data-status="relay-server"]');
+      var userNode = document.querySelector('[data-status="user"]');
+      var apiNode = document.querySelector('[data-status="api"]');
+      var primaryCta = document.querySelector('[data-cta="primary"]');
+      var secondaryCta = document.querySelector('[data-cta="secondary"]');
+
+      function setStatus(node, text, stateClass) {
+        if (!node) {
+          return;
+        }
+        node.textContent = text;
+        node.classList.remove('is-ok', 'is-warn', 'is-bad');
+        if (stateClass) {
+          node.classList.add(stateClass);
+        }
+      }
+
+      function setButton(node, text) {
+        if (!node) {
+          return;
+        }
+        node.textContent = text;
+      }
+
+      function formatServerList(list, fallback) {
+        if (Array.isArray(list) && list.length > 0) {
+          return list.join(', ');
+        }
+        return fallback;
+      }
+
+      fetch('/webui2/status', { credentials: 'same-origin' })
+        .then(function (res) {
+          if (!res.ok) {
+            throw new Error('status');
+          }
+          return res.json();
+        })
+        .then(function (payload) {
+          var userLabel = payload.user ? payload.user : '{% trans "访客" %}';
+          if (payload.is_admin) {
+            userLabel = userLabel + ' ({% trans "管理员" %})';
+          }
+          setStatus(
+            idServerNode,
+            formatServerList(payload.id_servers, payload.id_server || payload.host || '{% trans "未知" %}'),
+            'is-ok'
+          );
+          var relayDisplay = formatServerList(payload.relay_servers, payload.relay_server || '{% trans "未配置" %}');
+          var relayState = (Array.isArray(payload.relay_servers) && payload.relay_servers.length > 0) ? 'is-ok' : 'is-warn';
+          setStatus(relayServerNode, relayDisplay, relayState);
+          setStatus(userNode, userLabel, 'is-ok');
+        })
+        .catch(function () {
+          setStatus(idServerNode, '{% trans "不可用" %}', 'is-bad');
+          setStatus(relayServerNode, '{% trans "不可用" %}', 'is-bad');
+          setStatus(userNode, '{% trans "无法读取" %}', 'is-bad');
+        });
+
+      fetch('/health/ready', { credentials: 'same-origin' })
+        .then(function (res) {
+          if (!res.ok) {
+            throw new Error('api');
+          }
+          return res.json();
+        })
+        .then(function (payload) {
+          if (payload && payload.status === 'ready') {
+            setStatus(apiNode, '{% trans "在线" %}', 'is-ok');
+            setButton(secondaryCta, '{% trans "网络状态良好" %}');
+          } else {
+            setStatus(apiNode, '{% trans "波动" %}', 'is-warn');
+            setButton(secondaryCta, '{% trans "网络略有波动" %}');
+          }
+        })
+        .catch(function () {
+          setStatus(apiNode, '{% trans "离线" %}', 'is-bad');
+          setButton(secondaryCta, '{% trans "网络异常" %}');
+        });
+
+      setTimeout(function () {
+        setButton(primaryCta, '{% trans "工作区准备中" %}');
+      }, 1200);
+    })();
+  </script>
+
+  <script nonce="{{ csp_nonce }}">
+    window.api = ["{{ domain|escapejs }}"];
+    window.__CAMELLIA_WEB__ = Object.assign({}, window.__CAMELLIA_WEB__ || {}, {
+      appName: "Camellia",
+      apiServer: "{{ api_server|escapejs }}",
+      rsPubKey: "{{ rs_pub_key|escapejs }}",
+      rendezvousServers: JSON.parse("{{ id_servers_json|escapejs }}"),
+      relayServers: JSON.parse("{{ relay_servers_json|escapejs }}"),
+      env: {
+        CAMELLIA_REMOTE_API_SERVER: "{{ api_server|escapejs }}",
+        CAMELLIA_REMOTE_RS_PUB_KEY: "{{ rs_pub_key|escapejs }}",
+        RENDEZVOUS_SERVERS: "{{ id_servers_csv|escapejs }}",
+        CAMELLIA_REMOTE_RELAY_SERVER: "{{ relay_servers_csv|escapejs }}",
+        CAMELLIA_REMOTE_DEFAULT_ID_PORT: "{{ default_id_port|escapejs }}"
+      },
+      isPublicServer: false
+    });
+
+    function markLoaded() {
+      var primaryCta = document.querySelector('[data-cta="primary"]');
+      if (primaryCta) {
+        primaryCta.textContent = '{% trans "工作区已就绪" %}';
+      }
+      document.body.classList.add('app-loaded');
+    }
+
+    window.addEventListener("flutter-first-frame", markLoaded);
+    window.addEventListener("load", function () {
+      window.setTimeout(markLoaded, 8000);
+    });
+  </script>
+  <script type="module" src="{% static 'web_client/js/dist/web_bridge.js' %}"></script>
+  <script src="{% static 'web_client/flutter_bootstrap.js' %}" async></script>
+</body>
+
+</html>

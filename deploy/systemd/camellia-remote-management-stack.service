@@ -1,0 +1,32 @@
+[Unit]
+Description=Camellia Remote Management OCI stack
+Documentation=https://github.com/camellia-computing/remote-management-server
+Requires=docker.service
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=/opt/camellia-remote-management
+EnvironmentFile=/etc/camellia-remote-management/management.env
+ExecStartPre=/usr/bin/docker compose --env-file /etc/camellia-remote-management/management.env -f /opt/camellia-remote-management/docker-compose.yaml config --quiet
+ExecStart=/usr/bin/docker compose --env-file /etc/camellia-remote-management/management.env -f /opt/camellia-remote-management/docker-compose.yaml up --detach --wait --remove-orphans
+ExecReload=/usr/bin/docker compose --env-file /etc/camellia-remote-management/management.env -f /opt/camellia-remote-management/docker-compose.yaml up --detach --wait --remove-orphans
+ExecStop=/usr/bin/docker compose --env-file /etc/camellia-remote-management/management.env -f /opt/camellia-remote-management/docker-compose.yaml down
+TimeoutStartSec=10min
+TimeoutStopSec=2min
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target
