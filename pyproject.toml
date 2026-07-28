@@ -14,12 +14,12 @@ dependencies = [
   "authlib>=1.7,<2",
   "requests>=2.32,<3",
   "pynacl>=1.6,<2",
-  "psycopg[binary]>=3.3,<4",
+  "psycopg[binary]>=3.3.4,<4",
 ]
 
 [dependency-groups]
 dev = [
-  "ruff>=0.15,<0.16",
+  "ruff>=0.16.0,<0.17",
   "pytest>=9,<10",
   "pytest-django>=4.12,<5",
   "coverage>=7.15,<8",
