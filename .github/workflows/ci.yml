@@ -146,7 +146,12 @@ jobs:
       - name: Lint workflows and shell scripts
         run: |
           go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
-          shellcheck sync_web_client.sh scripts/web_client_revision.sh
+          shellcheck \
+            .github/scripts/*.sh \
+            .github/scripts/tests/*.sh \
+            sync_web_client.sh \
+            scripts/web_client_revision.sh
+          bash .github/scripts/tests/test_release_publication.sh
 
   web_client:
     name: Build pinned Web client
