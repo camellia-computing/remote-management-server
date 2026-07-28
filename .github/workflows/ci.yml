@@ -154,6 +154,9 @@ jobs:
     needs: [classify, metadata]
     runs-on: ubuntu-24.04
     timeout-minutes: 45
+    permissions:
+      actions: read
+      contents: read
     outputs:
       revision: ${{ steps.web_client.outputs.revision }}
     steps:
