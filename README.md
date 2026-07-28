@@ -76,7 +76,7 @@ sudo systemctl enable --now camellia-remote-management-backup.timer
 ./sync_web_client.sh --build-from ../remote-client
 ```
 
-生成的 `static/web_client` 不提交。CI 只从同一 GitHub owner 下的 `remote-client` 获取锁定提交，并验证其默认分支可达性与成功的 push CI。发布只能选择默认分支可达的提交，必须复用精确 CI 产物、通过 `release` 环境审批，并发布多架构、带 SBOM/provenance 且经 Sigstore 签名的 OCI 摘要。GitHub Release 只记录不可变版本和摘要，不发布 `latest`。
+生成的 `static/web_client` 不提交。CI 只从同一 GitHub owner 下的 `remote-client` 获取锁定提交，并验证其默认分支可达性与成功的 push CI。发布只能选择默认分支可达的提交，必须复用精确 CI 产物、通过 Release App 仓库策略校验与 `release` 环境审批，并发布多架构、带 SBOM/provenance 且经 Sigstore 签名的 OCI 摘要。GitHub Release 先以 App 身份建立 draft，回读全部资产与校验和后才公开并再次验证不可变状态；不发布 `latest`。完整状态机见 [发布规范](docs/releasing.md)。
 
 ## 许可证与来源
 
