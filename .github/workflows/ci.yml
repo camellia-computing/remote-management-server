@@ -303,6 +303,18 @@ jobs:
           cache-from: type=gha,scope=remote-management-ci-image
           cache-to: type=gha,scope=remote-management-ci-image,mode=max
 
+      - name: Vulnerability scan
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: camellia-remote-management-server:ci
+          version: v0.70.0
+          scanners: vuln
+          vuln-type: os,library
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: "1"
+          timeout: 10m0s
+
       - name: Create smoke-test volumes
         run: |
           docker volume create camellia-remote-management-ci-records
