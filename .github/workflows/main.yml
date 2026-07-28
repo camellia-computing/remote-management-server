@@ -15,14 +15,33 @@ concurrency:
 jobs:
   policy:
     name: Policy
-    if: ${{ vars.RELEASE_APP_CLIENT_ID != '' || vars.RELEASE_APP_LOGIN != '' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Validate optional Release App group
+        id: configuration
+        shell: bash
+        env:
+          CLIENT_ID: ${{ vars.RELEASE_APP_CLIENT_ID }}
+          LOGIN: ${{ vars.RELEASE_APP_LOGIN }}
+          PRIVATE_KEY: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+        run: |
+          if [[ -z "$CLIENT_ID" && -z "$LOGIN" && -z "$PRIVATE_KEY" ]]; then
+            echo 'configured=false' >> "$GITHUB_OUTPUT"
+            echo 'Release App group is not configured; formal publication remains disabled.'
+            exit 0
+          fi
+          [[ -n "$CLIENT_ID" && -n "$LOGIN" && -n "$PRIVATE_KEY" ]] || {
+            echo 'Release App variables and private key must be configured as one atomic group.' >&2
+            exit 1
+          }
+          echo 'configured=true' >> "$GITHUB_OUTPUT"
+      - if: steps.configuration.outputs.configured == 'true'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - name: Release policy token
+        if: steps.configuration.outputs.configured == 'true'
         id: app-token
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v2.2.1
         with:
@@ -34,6 +53,7 @@ jobs:
           permission-contents: write
           permission-metadata: read
       - name: Validate hosted repository policy
+        if: steps.configuration.outputs.configured == 'true'
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
           RELEASE_APP_LOGIN: ${{ vars.RELEASE_APP_LOGIN }}
