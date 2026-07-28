@@ -107,6 +107,13 @@ case "$1" in
           printf '[]\n'
         fi
         ;;
+      repos/test/repository/git/matching-refs/tags/v1.2.3)
+        if [[ "$FAKE_TAG_EXISTS" == true ]]; then
+          jq -nc '[{ref: "refs/tags/v1.2.3"}]'
+        else
+          printf '[]\n'
+        fi
+        ;;
       repos/test/repository/releases/tags/v1.2.3)
         release_json
         ;;
@@ -210,6 +217,7 @@ export FAKE_REMOTE="$remote"
 export FAKE_SHA=0123456789abcdef0123456789abcdef01234567
 export FAKE_STATE="$state"
 export FAKE_TAG=v1.2.3
+export FAKE_TAG_EXISTS=false
 export FAKE_TITLE='Camellia Remote 1.2.3'
 export FAKE_UPLOADER="$FAKE_APP"
 
@@ -242,6 +250,16 @@ run_publisher >/dev/null
 [[ "$(cat "$state")" == published ]]
 cmp "$assets/camellia-remote-1.2.3.tar.gz" "$remote/camellia-remote-1.2.3.tar.gz"
 
+run_publisher >/dev/null
+[[ "$(cat "$state")" == published ]]
+
+printf 'tampered public payload\n' > "$remote/camellia-remote-1.2.3.tar.gz"
+if run_publisher >/dev/null 2>&1; then
+  echo 'Publication accepted modified bytes from an existing immutable Release' >&2
+  exit 1
+fi
+cp "$assets/camellia-remote-1.2.3.tar.gz" "$remote/camellia-remote-1.2.3.tar.gz"
+
 printf 'interrupted upload\n' > "$remote/camellia-remote-1.2.3.tar.gz"
 printf 'draft\n' > "$state"
 run_publisher >/dev/null
@@ -266,6 +284,16 @@ if run_publisher >/dev/null 2>&1; then
 fi
 [[ ! -f "$state" ]]
 rm "$assets/unsafe asset"
+
+FAKE_TAG_EXISTS=true
+export FAKE_TAG_EXISTS
+if run_publisher >/dev/null 2>&1; then
+  echo 'Publication accepted a pre-existing tag without a compatible App Release' >&2
+  exit 1
+fi
+[[ ! -f "$state" ]]
+FAKE_TAG_EXISTS=false
+export FAKE_TAG_EXISTS
 
 FAKE_IMMUTABLE=false
 export FAKE_IMMUTABLE

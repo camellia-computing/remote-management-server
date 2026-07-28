@@ -74,33 +74,61 @@ compatible_count="$(
   echo "Multiple Releases unexpectedly use $RELEASE_TAG" >&2
   exit 1
 }
+release_state=absent
 if [[ "$compatible_count" == 1 ]]; then
-  jq -e \
+  release_state="$(
+    jq -er \
     --arg app "$RELEASE_APP_LOGIN" \
     --arg sha "$RELEASE_COMMIT" \
     --arg tag "$RELEASE_TAG" \
     --arg title "$RELEASE_TITLE" '
       .[] |
       select(.tag_name == $tag) |
-      .draft == true and
-      .immutable == false and
-      .target_commitish == $sha and
-      .author.login == $app and
-      .name == $title
-    ' <<< "$releases_json" >/dev/null || {
-    echo "Existing Release $RELEASE_TAG is not a compatible App-authored draft" >&2
+      if (
+        .target_commitish == $sha and
+        .author.login == $app and
+        .name == $title and
+        .prerelease == false and
+        .draft == true and
+        .immutable == false
+      ) then "draft"
+      elif (
+        .target_commitish == $sha and
+        .author.login == $app and
+        .name == $title and
+        .prerelease == false and
+        .draft == false and
+        .immutable == true
+      ) then "published"
+      else error("incompatible release state")
+      end
+    ' <<< "$releases_json"
+  )" || {
+    echo "Existing Release $RELEASE_TAG is not a compatible App-authored draft or immutable publication" >&2
     exit 1
   }
 fi
 
-if [[ "$compatible_count" == 0 ]]; then
+if [[ "$release_state" == absent ]]; then
+  tag_refs="$(
+    gh api -X GET \
+      "repos/$GITHUB_REPOSITORY/git/matching-refs/tags/$RELEASE_TAG"
+  )" || {
+    echo "Unable to inspect existing refs for $RELEASE_TAG" >&2
+    exit 1
+  }
+  jq -e --arg ref "refs/tags/$RELEASE_TAG" \
+    '[.[] | select(.ref == $ref)] | length == 0' <<< "$tag_refs" >/dev/null || {
+    echo "Tag $RELEASE_TAG already exists without a compatible App-authored Release" >&2
+    exit 1
+  }
   gh release create "$RELEASE_TAG" "${upload_assets[@]}" \
     --draft \
     --notes-file "$RELEASE_NOTES_FILE" \
     --repo "$GITHUB_REPOSITORY" \
     --target "$RELEASE_COMMIT" \
     --title "$RELEASE_TITLE"
-else
+elif [[ "$release_state" == draft ]]; then
   gh release upload "$RELEASE_TAG" "${upload_assets[@]}" \
     --clobber \
     --repo "$GITHUB_REPOSITORY"
@@ -154,6 +182,15 @@ verify_release() {
     sha256sum --check "$checksum_name"
   )
 }
+
+if [[ "$release_state" == published ]]; then
+  verify_release false true || {
+    echo "Existing immutable Release $RELEASE_TAG failed public byte-for-byte verification" >&2
+    exit 1
+  }
+  echo "Verified existing immutable Release $RELEASE_TAG"
+  exit 0
+fi
 
 verify_release true false
 gh release edit "$RELEASE_TAG" --draft=false --repo "$GITHUB_REPOSITORY"
