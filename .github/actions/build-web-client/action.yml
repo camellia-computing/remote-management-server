@@ -119,7 +119,7 @@ runs:
 
     - name: Set up Flutter
       if: steps.runtime-cache.outputs.cache-hit != 'true'
-      uses: camellia-computing/remote-client/.github/actions/setup-flutter@bb596e18481f6a06c7861a9e4c67d5159e071c69
+      uses: ./.web-client-source/.github/actions/setup-flutter
       with:
         channel: stable
         flutter-version: ${{ inputs.flutter-version }}

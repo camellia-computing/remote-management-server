@@ -70,7 +70,7 @@ jobs:
                   ;;
               esac
               case "$path" in
-                .github/*|scripts/*|sync_web_client.sh)
+                .github/*|scripts/*|deploy/*|docker-compose*.yml|docker-compose*.yaml|run.sh|sync_web_client.sh)
                   automation=true
                   ;;
               esac
@@ -143,15 +143,41 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Audit workflow security
+        uses: zizmorcore/zizmor-action@6fc4b006235f201fdab3722e17240ab420d580e5 # v0.6.1
+        with:
+          inputs: .github
+          online-audits: false
+          persona: pedantic
+          version: 1.28.0
+          advanced-security: false
+          annotations: true
+
       - name: Lint workflows and shell scripts
         run: |
           go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
           shellcheck \
             .github/scripts/*.sh \
             .github/scripts/tests/*.sh \
+            deploy/backup-postgres.sh \
+            run.sh \
             sync_web_client.sh \
             scripts/web_client_revision.sh
           bash .github/scripts/tests/test_release_publication.sh
+
+      - name: Validate deployment configuration
+        env:
+          CAMELLIA_REMOTE_MANAGEMENT_IMAGE: ghcr.io/example/management@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+          CAMELLIA_REMOTE_SECRET_KEY: ci-only-production-secret-key-with-sufficient-length-000
+          CAMELLIA_REMOTE_DATA_ENCRYPTION_KEY: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
+          CAMELLIA_REMOTE_DEVICE_VERIFICATION_TOKEN: ci-device-verification-token-with-sufficient-length
+          CAMELLIA_REMOTE_DATABASE_PASSWORD: "test:@/%# strong password"
+          CAMELLIA_REMOTE_ALLOWED_HOSTS: api.example.test
+          CAMELLIA_REMOTE_CSRF_TRUSTED_ORIGINS: https://api.example.test
+          CAMELLIA_REMOTE_API_SERVER: https://api.example.test
+          CAMELLIA_REMOTE_ID_SERVER: wss://remote.example.test:443
+          CAMELLIA_REMOTE_RS_PUB_KEY: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
+        run: docker compose --env-file /dev/null -f docker-compose.yaml config --quiet
 
   web_client:
     name: Build pinned Web client
@@ -160,8 +186,8 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     permissions:
-      actions: read
-      contents: read
+      actions: read # Query the exact source revision's successful CI run.
+      contents: read # Check out the management and locked Web sources.
     outputs:
       revision: ${{ steps.web_client.outputs.revision }}
     steps:
@@ -254,6 +280,10 @@ jobs:
           CAMELLIA_REMOTE_SECRET_KEY: ci-only-production-secret-key-with-sufficient-length-000
           CAMELLIA_REMOTE_DATA_ENCRYPTION_KEY: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
           CAMELLIA_REMOTE_DEVICE_VERIFICATION_TOKEN: ci-device-verification-token-with-sufficient-length
+          CAMELLIA_REMOTE_CSRF_TRUSTED_ORIGINS: https://127.0.0.1:21114
+          CAMELLIA_REMOTE_API_SERVER: https://127.0.0.1:21114
+          CAMELLIA_REMOTE_ID_SERVER: wss://remote.example.test:443
+          CAMELLIA_REMOTE_RS_PUB_KEY: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
           CAMELLIA_REMOTE_SECURE_TLS: "true"
           CAMELLIA_REMOTE_SECURE_HSTS_INCLUDE_SUBDOMAINS: "true"
           CAMELLIA_REMOTE_SECURE_HSTS_PRELOAD: "true"
@@ -263,7 +293,9 @@ jobs:
         run: uv run python manage.py migrate --noinput
 
       - name: Tests
-        run: uv run python -m pytest --create-db
+        run: |
+          uv run coverage run -m pytest --create-db
+          uv run coverage report
 
   container:
     name: Container smoke test
@@ -308,6 +340,8 @@ jobs:
           load: true
           push: false
           tags: camellia-remote-management-server:ci
+          build-args: |
+            SOURCE_REPOSITORY_URL=${{ github.server_url }}/${{ github.repository }}
           cache-from: type=gha,scope=remote-management-ci-image
           cache-to: type=gha,scope=remote-management-ci-image,mode=max
 
@@ -339,6 +373,9 @@ jobs:
             -e CAMELLIA_REMOTE_DATABASE_SSLMODE=disable \
             -e CAMELLIA_REMOTE_ALLOWED_HOSTS=127.0.0.1,localhost \
             -e CAMELLIA_REMOTE_CSRF_TRUSTED_ORIGINS=https://api.example.test \
+            -e CAMELLIA_REMOTE_API_SERVER=https://api.example.test \
+            -e CAMELLIA_REMOTE_ID_SERVER=wss://remote.example.test:443 \
+            -e CAMELLIA_REMOTE_RS_PUB_KEY=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA= \
             -e CAMELLIA_REMOTE_SECURE_TLS=true \
             -v camellia-remote-management-ci-records:/app/records \
             camellia-remote-management-server:ci \
@@ -361,6 +398,9 @@ jobs:
             -e CAMELLIA_REMOTE_DATABASE_SSLMODE=disable \
             -e CAMELLIA_REMOTE_ALLOWED_HOSTS=127.0.0.1,localhost \
             -e CAMELLIA_REMOTE_CSRF_TRUSTED_ORIGINS=https://api.example.test \
+            -e CAMELLIA_REMOTE_API_SERVER=https://api.example.test \
+            -e CAMELLIA_REMOTE_ID_SERVER=wss://remote.example.test:443 \
+            -e CAMELLIA_REMOTE_RS_PUB_KEY=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA= \
             -e CAMELLIA_REMOTE_SECURE_TLS=true \
             -e CAMELLIA_REMOTE_GUNICORN_WORKERS=1 \
             -v camellia-remote-management-ci-records:/app/records \

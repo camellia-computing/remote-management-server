@@ -7,6 +7,8 @@ updates:
       day: monday
       time: "02:00"
       timezone: Asia/Singapore
+    cooldown:
+      default-days: 7
     groups:
       python-dependencies:
         patterns:
@@ -22,6 +24,8 @@ updates:
       day: monday
       time: "02:30"
       timezone: Asia/Singapore
+    cooldown:
+      default-days: 7
     groups:
       container-dependencies:
         patterns:
@@ -37,6 +41,8 @@ updates:
       day: monday
       time: "03:00"
       timezone: Asia/Singapore
+    cooldown:
+      default-days: 7
     groups:
       workflow-actions:
         patterns:

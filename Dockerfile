@@ -18,9 +18,11 @@ RUN uv sync --locked --no-dev --no-install-project
 
 FROM python:3.14.6-slim@sha256:cea0e6040540fb2b965b6e7fb5ffa00871e632eef63719f0ea54bca189ce14a6 AS runtime
 
+ARG SOURCE_REPOSITORY_URL
+
 LABEL org.opencontainers.image.title="Camellia Remote Management Server" \
       org.opencontainers.image.description="Account, device, policy, audit, and management API for Camellia Remote" \
-      org.opencontainers.image.source="https://github.com/camellia-computing/remote-management-server" \
+      org.opencontainers.image.source="${SOURCE_REPOSITORY_URL}" \
       org.opencontainers.image.licenses="AGPL-3.0-only" \
       org.opencontainers.image.vendor="Camellia Computing"
 
@@ -29,7 +31,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PATH="/opt/venv/bin:${PATH}" \
     HOST="0.0.0.0" \
     PORT="21114" \
-    TZ="Asia/Singapore"
+    TZ="UTC"
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends tzdata \
@@ -40,7 +42,7 @@ RUN apt-get update \
 WORKDIR /app
 
 COPY --from=builder /opt/venv /opt/venv
-COPY --chown=appuser:appuser manage.py version.py run.sh ./
+COPY --chown=appuser:appuser manage.py run.sh ./
 COPY --chown=appuser:appuser web-client.lock ./
 COPY --chown=appuser:appuser api ./api
 COPY --chown=appuser:appuser locale ./locale

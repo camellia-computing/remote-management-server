@@ -19,7 +19,7 @@ dependencies = [
 
 [dependency-groups]
 dev = [
-  "ruff>=0.15,<0.16",
+  "ruff>=0.16,<0.17",
   "pytest>=9,<10",
   "pytest-django>=4.12,<5",
   "coverage>=7.15,<8",
@@ -38,8 +38,13 @@ extend-exclude = [
 ]
 
 [tool.ruff.lint]
-select = ["E", "F", "B"]
-ignore = ["E501", "F403", "F405"]
+select = ["E", "F", "B", "BLE", "C4", "I", "PIE", "RUF059", "S", "UP"]
+ignore = ["E501"]
+
+[tool.ruff.lint.per-file-ignores]
+"api/migrations/*" = ["I", "S"]
+"api/tests.py" = ["S105", "S106"]
+"webui2/tests.py" = ["S106"]
 
 [tool.pytest.ini_options]
 DJANGO_SETTINGS_MODULE = "camellia_remote_management.settings"
@@ -48,8 +53,16 @@ addopts = "--strict-markers --reuse-db"
 
 [tool.coverage.run]
 source = ["api", "webui2", "camellia_remote_management"]
-omit = ["*/migrations/*", "*/tests.py"]
+omit = [
+  "*/migrations/*",
+  "*/tests.py",
+  "api/front_locale.py",
+  "camellia_remote_management/asgi.py",
+  "camellia_remote_management/wsgi.py",
+]
 
 [tool.coverage.report]
+fail_under = 45
+precision = 1
 skip_covered = true
 show_missing = true
