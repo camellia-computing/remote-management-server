@@ -1,0 +1,25 @@
+[Unit]
+Description=Remove expired Camellia Remote Management authentication state
+Requires=camellia-remote-management-stack.service
+After=camellia-remote-management-stack.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/docker compose --env-file /etc/camellia-remote-management/management.env -f /opt/camellia-remote-management/docker-compose.yaml exec -T management python manage.py purge_expired_state
+User=root
+Group=root
+UMask=0077
+Nice=10
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_UNIX
+SystemCallArchitectures=native

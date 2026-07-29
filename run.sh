@@ -20,15 +20,36 @@ MAX_REQUESTS_JITTER="${CAMELLIA_REMOTE_GUNICORN_MAX_REQUESTS_JITTER:-100}"
 FORWARDED_ALLOW_IPS="${CAMELLIA_REMOTE_GUNICORN_FORWARDED_ALLOW_IPS:-127.0.0.1}"
 RECORD_DIR="${CAMELLIA_REMOTE_RECORD_UPLOAD_ROOT:-$APP_DIR/records}"
 
-if [ -z "${CAMELLIA_REMOTE_DATABASE_URL:-}" ]; then
-    echo "CAMELLIA_REMOTE_DATABASE_URL is required" >&2
-    exit 1
-fi
+require_integer_range() {
+    variable_name="$1"
+    variable_value="$2"
+    minimum="$3"
+    maximum="$4"
+    case "$variable_value" in
+        ''|*[!0-9]*)
+            echo "$variable_name must be an integer" >&2
+            exit 1
+            ;;
+    esac
+    if [ "$variable_value" -lt "$minimum" ] || [ "$variable_value" -gt "$maximum" ]; then
+        echo "$variable_name must be between $minimum and $maximum" >&2
+        exit 1
+    fi
+}
 
 if [ ! -d "$RECORD_DIR" ] || [ ! -w "$RECORD_DIR" ]; then
     echo "Recording directory is not writable: $RECORD_DIR" >&2
     exit 1
 fi
+
+require_integer_range CAMELLIA_REMOTE_BIND_PORT "$PORT" 1 65535
+require_integer_range CAMELLIA_REMOTE_GUNICORN_WORKERS "$WORKERS" 1 64
+require_integer_range CAMELLIA_REMOTE_GUNICORN_THREADS "$THREADS" 1 64
+require_integer_range CAMELLIA_REMOTE_GUNICORN_TIMEOUT_SECONDS "$TIMEOUT" 1 600
+require_integer_range CAMELLIA_REMOTE_GUNICORN_GRACEFUL_TIMEOUT_SECONDS "$GRACEFUL_TIMEOUT" 1 600
+require_integer_range CAMELLIA_REMOTE_GUNICORN_KEEP_ALIVE_SECONDS "$KEEP_ALIVE" 1 120
+require_integer_range CAMELLIA_REMOTE_GUNICORN_MAX_REQUESTS "$MAX_REQUESTS" 1 1000000
+require_integer_range CAMELLIA_REMOTE_GUNICORN_MAX_REQUESTS_JITTER "$MAX_REQUESTS_JITTER" 0 1000000
 
 case "${CAMELLIA_REMOTE_RUN_MIGRATIONS:-false}" in
     1|true|TRUE|yes|YES)
@@ -42,7 +63,7 @@ case "${CAMELLIA_REMOTE_RUN_MIGRATIONS:-false}" in
         ;;
 esac
 
-python manage.py check
+python manage.py check --deploy
 
 exec gunicorn camellia_remote_management.wsgi:application \
     --bind "$HOST:$PORT" \

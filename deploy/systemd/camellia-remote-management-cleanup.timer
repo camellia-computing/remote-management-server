@@ -1,0 +1,13 @@
+[Unit]
+Description=Periodically remove expired Camellia Remote Management state
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=5min
+RandomizedDelaySec=1min
+Persistent=true
+AccuracySec=30s
+Unit=camellia-remote-management-cleanup.service
+
+[Install]
+WantedBy=timers.target
