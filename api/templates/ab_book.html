@@ -52,13 +52,13 @@
     <form class="ab-form ab-bulk-tags" id="ab-bulk-tags-form" method="post" action="/api/ab_book">
       {% csrf_token %}
       <input type="hidden" name="guid" value="{{ profile.guid }}">
-      <input class="ab-input ab-input-wide" type="text" name="tags" placeholder="{% trans "批量标签（逗号分隔）" %}">
-      <input class="ab-input ab-input-wide" type="text" name="note" placeholder="{% trans "批量备注" %}">
+      <input class="ab-input ab-input-wide" type="text" name="tags" aria-label="{% trans "批量标签（逗号分隔）" %}" placeholder="{% trans "批量标签（逗号分隔）" %}">
+      <input class="ab-input ab-input-wide" type="text" name="note" aria-label="{% trans "批量备注" %}" placeholder="{% trans "批量备注" %}">
       <button class="btn btn-secondary btn-xs" type="submit" name="action" value="bulk_tag_add">{% trans "批量添加标签" %}</button>
       <button class="btn btn-ghost btn-xs" type="submit" name="action" value="bulk_tag_remove">{% trans "批量移除标签" %}</button>
       <button class="btn btn-ghost btn-xs" type="submit" name="action" value="bulk_tag_replace">{% trans "覆盖标签" %}</button>
       <button class="btn btn-ghost btn-xs" type="submit" name="action" value="bulk_note_update">{% trans "批量更新备注" %}</button>
-      <button class="btn btn-secondary btn-xs" type="submit" name="action" value="bulk_peer_delete">{% trans "批量删除设备" %}</button>
+      <button class="btn btn-secondary btn-xs" type="submit" name="action" value="bulk_peer_delete" data-confirm="{% trans "此操作不可撤销。确认继续？" %}">{% trans "批量删除设备" %}</button>
       <div class="ab-bulk-tip">{% trans "勾选设备后可批量操作标签。" %}</div>
     </form>
     {% endif %}
@@ -67,12 +67,12 @@
       {% csrf_token %}
       <input type="hidden" name="guid" value="{{ profile.guid }}">
       <input type="hidden" name="action" value="add_peer">
-      <input class="ab-input" type="text" name="rid" placeholder="{% trans "设备ID" %}">
-      <input class="ab-input" type="text" name="alias" placeholder="{% trans "别名（可选）" %}">
-      <input class="ab-input ab-input-wide" type="text" name="note" placeholder="{% trans "备注（可选）" %}">
-      <input class="ab-input ab-input-wide" type="text" name="tags" placeholder="{% trans "标签（逗号分隔）" %}">
+      <input class="ab-input" type="text" name="rid" aria-label="{% trans "设备ID" %}" placeholder="{% trans "设备ID" %}">
+      <input class="ab-input" type="text" name="alias" aria-label="{% trans "别名（可选）" %}" placeholder="{% trans "别名（可选）" %}">
+      <input class="ab-input ab-input-wide" type="text" name="note" aria-label="{% trans "备注（可选）" %}" placeholder="{% trans "备注（可选）" %}">
+      <input class="ab-input ab-input-wide" type="text" name="tags" aria-label="{% trans "标签（逗号分隔）" %}" placeholder="{% trans "标签（逗号分隔）" %}">
       {% if not is_personal %}
-        <input class="ab-input" type="text" name="password" placeholder="{% trans "共享密码（可选）" %}">
+        <input class="ab-input" type="password" name="password" autocomplete="new-password" aria-label="{% trans "共享密码（可选）" %}" placeholder="{% trans "共享密码（可选）" %}">
       {% endif %}
       <button class="btn btn-primary btn-xs" type="submit">{% trans "新增" %}</button>
     </form>
@@ -84,7 +84,7 @@
           <div class="ab-peer-main">
             {% if can_edit %}
               <label class="ab-peer-select">
-                <input class="ab-check" form="ab-bulk-tags-form" type="checkbox" name="peer_ids" value="{{ peer.rid }}">
+                <input class="ab-check" form="ab-bulk-tags-form" type="checkbox" name="peer_ids" value="{{ peer.rid }}" aria-label="{% trans "选择" %}">
                 <span>{% trans "选择" %}</span>
               </label>
             {% endif %}
@@ -98,15 +98,15 @@
               <input type="hidden" name="guid" value="{{ profile.guid }}">
               <input type="hidden" name="action" value="update_peer">
               <input type="hidden" name="rid" value="{{ peer.rid }}">
-              <input class="ab-input" type="text" name="alias" value="{{ peer.alias }}" placeholder="{% trans "别名" %}">
-              <input class="ab-input ab-input-wide" type="text" name="note" value="{{ peer.note }}" placeholder="{% trans "备注" %}">
-              <input class="ab-input ab-input-wide" type="text" name="tags" value="{{ peer.tag_names }}" placeholder="{% trans "标签（逗号分隔）" %}">
+              <input class="ab-input" type="text" name="alias" value="{{ peer.alias }}" aria-label="{% trans "别名" %}" placeholder="{% trans "别名" %}">
+              <input class="ab-input ab-input-wide" type="text" name="note" value="{{ peer.note }}" aria-label="{% trans "备注" %}" placeholder="{% trans "备注" %}">
+              <input class="ab-input ab-input-wide" type="text" name="tags" value="{{ peer.tag_names }}" aria-label="{% trans "标签（逗号分隔）" %}" placeholder="{% trans "标签（逗号分隔）" %}">
               {% if not is_personal %}
-                <input class="ab-input" type="text" name="password" placeholder="{% trans "共享密码（可选）" %}">
+                <input class="ab-input" type="password" name="password" autocomplete="new-password" aria-label="{% trans "共享密码（可选）" %}" placeholder="{% trans "共享密码（可选）" %}">
               {% endif %}
               <button class="btn btn-ghost btn-xs" type="submit">{% trans "更新" %}</button>
             </form>
-            <form class="ab-inline-form" method="post" action="/api/ab_book">
+            <form class="ab-inline-form" method="post" action="/api/ab_book" data-confirm="{% trans "此操作不可撤销。确认继续？" %}">
               {% csrf_token %}
               <input type="hidden" name="guid" value="{{ profile.guid }}">
               <input type="hidden" name="action" value="delete_peer">

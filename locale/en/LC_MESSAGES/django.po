@@ -1589,5 +1589,8 @@ msgstr "Please select devices belonging to the same user."
 msgid "仅支持分享自己名下的设备。"
 msgstr "You can only share your own devices."
 
+msgid "此操作不可撤销。确认继续？"
+msgstr "This action cannot be undone. Continue?"
+
 #~ msgid "未知"
 #~ msgstr "UNKNOWN"

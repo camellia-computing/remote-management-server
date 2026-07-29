@@ -1,52 +1,46 @@
-from django.shortcuts import render
-from django.http import HttpResponseRedirect
-from django.http import JsonResponse
-from django.db import IntegrityError, transaction
-from django.db.models import Count, Prefetch, Q
-from django.contrib.auth.decorators import login_required
+import hashlib
+import json
+import logging
+import secrets
+import uuid
+from io import StringIO
+from itertools import chain
+from urllib.parse import urlencode
+
+from django.conf import settings
 from django.contrib import auth, messages
 from django.contrib.auth import password_validation
-from django.core.exceptions import ValidationError
-from api.models import (
-    RemotePeer,
-    RemoteDevice,
-    UserProfile,
-    RemoteTag,
-    ShareLink,
-    ConnLog,
-    FileLog,
-    AddressBookProfile,
-    AddressBookShare,
-    AddressBookRule,
-    AddressBookRuleAudit,
-    LoginAttempt,
-)
-from django.forms.models import model_to_dict
-from django.core.paginator import Paginator
-from django.http import HttpResponse
-from django.conf import settings
+from django.contrib.auth.decorators import login_required
 from django.contrib.auth.models import Group
+from django.core.exceptions import ValidationError
+from django.core.paginator import Paginator
+from django.db import IntegrityError, transaction
+from django.db.models import Count, Model, Prefetch, Q
+from django.db.models.fields import CharField, DateField, DateTimeField, TextField
+from django.forms.models import model_to_dict
+from django.http import HttpResponse, HttpResponseRedirect, JsonResponse
+from django.shortcuts import render
 from django.utils import timezone
-
-from itertools import chain
-from django.db.models.fields import DateTimeField, DateField, CharField, TextField
-from django.db.models import Model
-import datetime
-import json
-import hashlib
-import secrets
-import sys
-import logging
-import uuid
-
-from io import StringIO
-from urllib.parse import urlencode
 from django.utils.translation import gettext as _
 
-from api.xlsx import safe_csv_writer, xlsx_response
 from api.formatting import format_bytes
+from api.models import (
+    AddressBookProfile,
+    AddressBookRule,
+    AddressBookRuleAudit,
+    AddressBookShare,
+    ConnLog,
+    FileLog,
+    LoginAttempt,
+    RemoteDevice,
+    RemotePeer,
+    RemoteTag,
+    ShareLink,
+    UserProfile,
+)
 from api.request_utils import client_ip
 from api.tag_colors import normalize_tag_color, tag_color_css
+from api.xlsx import safe_csv_writer, xlsx_response
 
 logger = logging.getLogger(__name__)
 MAX_AB_PEERS = 10_000
@@ -174,7 +168,6 @@ def _normalize_device_item(item):
 
 
 def index(request):
-    logger.debug("index args: %s", sys.argv)
     if request.user and getattr(request.user, "is_authenticated", False):
         _log_event(request, "front_redirect_home", level="debug")
         return HttpResponseRedirect("/api/home")
@@ -327,7 +320,7 @@ def user_logout(request):
 def get_single_info(uid):
     user = UserProfile.objects.filter(Q(id=uid)).first()
     personal_guid = _personal_guid(user) if user else ""
-    legacy_peers = {
+    address_book_peers = {
         peer.rid: model_to_dict(peer, exclude=("tags",))
         for peer in RemotePeer.objects.filter(
             profile__owner_id=uid,
@@ -335,7 +328,7 @@ def get_single_info(uid):
         )
     }
     devices = (
-        RemoteDevice.objects.filter(Q(owner_id=uid) | Q(rid__in=legacy_peers.keys()))
+        RemoteDevice.objects.filter(Q(owner_id=uid) | Q(rid__in=address_book_peers.keys()))
         .select_related(
             "owner__strategy",
             "device_group__strategy",
@@ -351,24 +344,24 @@ def get_single_info(uid):
         item["device_group_name"] = device.device_group.name if device.device_group_id else ""
         effective_strategy = device.effective_strategy()
         item["strategy_name"] = effective_strategy.name if effective_strategy else ""
-        legacy = legacy_peers.pop(device.rid, None)
-        if legacy:
+        address_book_peer = address_book_peers.pop(device.rid, None)
+        if address_book_peer:
             for key in ("alias", "platform", "rhash", "password"):
-                if legacy.get(key):
-                    item[key] = legacy[key]
+                if address_book_peer.get(key):
+                    item[key] = address_book_peer[key]
             if not item.get("device_group_name"):
-                item["device_group_name"] = legacy.get("device_group_name", "")
+                item["device_group_name"] = address_book_peer.get("device_group_name", "")
             if not item.get("note"):
-                item["note"] = legacy.get("note", "")
+                item["note"] = address_book_peer.get("note", "")
         item["rust_user"] = item["owner_name"] or (user.username if user else "")
         item["status"] = _("在线") if (now - device.update_time).total_seconds() <= 120 else _("离线")
         rhash_value = item.get("rhash") or ""
         item["has_rhash"] = _("是") if len(rhash_value) > 1 else _("否")
         items[device.rid] = _normalize_device_item(item)
 
-    # Keep legacy address-book peers visible even before a device heartbeat has
-    # populated the modern owner relation.
-    for rid, item in legacy_peers.items():
+    # Address-book-only peers remain actionable even before a device heartbeat
+    # creates the corresponding inventory record.
+    for rid, item in address_book_peers.items():
         rhash_value = item.get("rhash") or ""
         item["has_rhash"] = _("是") if len(rhash_value) > 1 else _("否")
         item["rust_user"] = user.username if user else ""
@@ -465,7 +458,7 @@ def work(request):
             "show_work.html",
             {"u": u, "show_all": show_all, "page_obj": page_obj, "nav_active": nav_active},
         )
-    except Exception:  # noqa
+    except Exception:  # noqa: BLE001 - page-level boundary renders a stable 500 response
         logger.exception("work view failed")
         return render(
             request,
@@ -476,6 +469,7 @@ def work(request):
                 "u": u,
                 "nav_active": "work",
             },
+            status=500,
         )
 
 
@@ -600,7 +594,7 @@ def _ab_accessible_profiles(user, filter_q=None):
 def _parse_rule(value):
     try:
         rule = int(value)
-    except Exception:
+    except (TypeError, ValueError):
         return 1
     return rule if rule in (1, 2, 3) else 1
 
@@ -1021,7 +1015,7 @@ def home(request):
                 "nav_active": "home",
             },
         )
-    except Exception:  # noqa
+    except Exception:  # noqa: BLE001 - page-level boundary renders a stable 500 response
         logger.exception("home view failed")
         return render(
             request,
@@ -1032,6 +1026,7 @@ def home(request):
                 "u": u,
                 "nav_active": "home",
             },
+            status=500,
         )
 
 
@@ -1080,15 +1075,6 @@ def _share_message(request, title, message, status=200):
 def share(request, share_token=None):
     is_admin = getattr(request.user, "is_admin", False)
     now = timezone.now()
-    ShareLink.objects.filter(
-        is_used=False,
-        is_expired=False,
-        expires_at__lte=now,
-    ).update(is_expired=True)
-    ShareLink.objects.filter(
-        Q(is_used=True) | Q(is_expired=True),
-        create_time__lt=now - datetime.timedelta(days=30),
-    ).delete()
 
     if share_token is not None:
         if (
@@ -1127,8 +1113,6 @@ def share(request, share_token=None):
                     "nav_active": "share",
                 },
             )
-        if request.method != "POST":
-            return JsonResponse({"error": "Method not allowed"}, status=405)
         with transaction.atomic():
             link = (
                 ShareLink.objects.select_for_update(of=("self",))
@@ -1236,8 +1220,6 @@ def share(request, share_token=None):
             f"已获取 {len(imports)} 台设备；已存在的设备不会被覆盖。",
         )
 
-    if request.method not in ("GET", "POST"):
-        return JsonResponse({"error": "Method not allowed"}, status=405)
     if is_admin:
         peers_qs = RemotePeer.objects.select_related(
             "profile__owner",
@@ -1304,7 +1286,7 @@ def share(request, share_token=None):
         data = request.POST.get("data", "[]")
         try:
             data = json.loads(data)
-        except Exception:
+        except (TypeError, json.JSONDecodeError):
             _log_event(
                 request,
                 "front_share_create_failed",
@@ -2153,7 +2135,7 @@ def ab_book_export(request):
     guid = request.GET.get("guid", "")
     kind = str(request.GET.get("kind", "peers")).lower()
     export_format = str(request.GET.get("format", "csv")).lower()
-    profile, owner, rule = _get_profile_access_web(u, guid)
+    profile, owner, _rule = _get_profile_access_web(u, guid)
     if not profile:
         return HttpResponseRedirect("/api/ab_books")
     if not owner and not u.is_admin:
@@ -2191,7 +2173,9 @@ def ab_book_export(request):
             )
         )
     )
-    headers = [_("设备ID"), _("别名"), _("备注"), _("标签"), _("共享密码（可选）")]
+    # Portable exports intentionally omit connection credentials. They remain
+    # available only through authenticated, access-scoped runtime APIs.
+    headers = [_("设备ID"), _("别名"), _("备注"), _("标签")]
     if export_format in ("xls", "xlsx"):
         response = xlsx_response(
             f"ab_peers_{filename_stamp}.xlsx",
@@ -2203,7 +2187,6 @@ def ab_book_export(request):
                     peer.alias,
                     peer.note or "",
                     _peer_tag_text(peer),
-                    peer.password if not _is_personal_guid(profile.guid) else "",
                 ]
                 for peer in rows
             ],
@@ -2221,7 +2204,6 @@ def ab_book_export(request):
                 peer.alias,
                 peer.note or "",
                 _peer_tag_text(peer),
-                peer.password if not _is_personal_guid(profile.guid) else "",
             ]
         )
     response = HttpResponse(output.getvalue(), content_type="text/csv; charset=utf-8")
@@ -2530,7 +2512,7 @@ def ab_rules(request):
         paginator = Paginator(rules, 20)
         page_number = request.GET.get("page")
         page_obj = paginator.get_page(page_number)
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 - page-level boundary redirects with a stable error
         logger.exception("ab_rules view failed: %s", exc)
         messages.error(request, _("规则总览加载失败，请检查数据库迁移与日志输出。"))
         return HttpResponseRedirect("/api/ab_manage")

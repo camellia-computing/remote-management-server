@@ -15,4 +15,6 @@ def translate(text):
 def safe_attrs(attrs):
     if not attrs:
         return ""
-    return mark_safe(flatatt(attrs))
+    # flatatt escapes every key and value; marking only its generated markup is
+    # required so Django does not escape the complete attribute fragment.
+    return mark_safe(flatatt(attrs))  # noqa: S308

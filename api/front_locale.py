@@ -1,5 +1,6 @@
-from django.utils.translation import gettext as _
+"""Static gettext markers scanned by ``makemessages`` for browser-rendered UI."""
 
+from django.utils.translation import gettext as _
 
 _("管理后台")
 _("ID列表")

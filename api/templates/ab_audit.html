@@ -19,7 +19,7 @@
   </div>
   <div class="ab-hero-body">
     <form class="ab-filter" method="get" action="/api/ab_audit">
-      <input class="ab-input ab-input-wide" type="text" name="q" value="{{ filter_q }}" placeholder="{% trans "搜索地址簿、执行人或目标" %}">
+      <input class="ab-input ab-input-wide" type="text" name="q" value="{{ filter_q }}" aria-label="{% trans "搜索地址簿、执行人或目标" %}" placeholder="{% trans "搜索地址簿、执行人或目标" %}">
       <button class="btn btn-secondary btn-xs" type="submit">{% trans "筛选" %}</button>
       {% if filter_q %}
         <a class="btn btn-ghost btn-xs" href="/api/ab_audit">{% trans "清除" %}</a>

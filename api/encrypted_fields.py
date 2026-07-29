@@ -7,7 +7,6 @@ from django.db import models
 from nacl.exceptions import CryptoError
 from nacl.secret import SecretBox
 
-
 FIELD_PREFIX = "secretbox:v1:"
 
 

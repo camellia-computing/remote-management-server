@@ -2,16 +2,21 @@ import base64
 import datetime
 import hashlib
 import json
-from pathlib import Path
+import os
 import tempfile
+from io import StringIO
+from pathlib import Path
+from unittest.mock import patch
 
-from django.core.exceptions import ValidationError
-from django.db import connection, transaction
 from django.contrib.auth.models import Group
-from django.test import TestCase, override_settings
+from django.core.exceptions import ImproperlyConfigured, ValidationError
+from django.core.management import call_command
+from django.db import connection, transaction
+from django.test import SimpleTestCase, TestCase, override_settings
 from django.utils import timezone
 from nacl.signing import SigningKey
 
+from api.formatting import format_bytes
 from api.models import (
     AddressBookProfile,
     AddressBookRule,
@@ -29,6 +34,17 @@ from api.models import (
     StrategyProfile,
     UserProfile,
 )
+from api.tag_colors import normalize_tag_color, tag_color_css
+from api.xlsx import spreadsheet_safe_value
+from camellia_remote_management import settings as project_settings
+from camellia_remote_management.settings import (
+    _database_host,
+    _database_text,
+    _database_tls_options,
+    env_bool,
+    env_choice,
+    env_int,
+)
 
 
 def device_uuid(label):
@@ -36,6 +52,128 @@ def device_uuid(label):
 
 
 DEFAULT_DEVICE_UUID = device_uuid("device-uuid")
+
+
+class UtilityContractTests(SimpleTestCase):
+    def test_byte_formatting_uses_binary_units_and_rejects_invalid_values(self):
+        self.assertEqual(format_bytes(0), "0 B")
+        self.assertEqual(format_bytes(1024), "1 KiB")
+        self.assertEqual(format_bytes(1536), "1.5 KiB")
+        with self.assertRaises(TypeError):
+            format_bytes(True)
+        with self.assertRaises(ValueError):
+            format_bytes(-1)
+
+    def test_tag_colors_have_one_bounded_argb_representation(self):
+        self.assertEqual(normalize_tag_color("#336699"), str(0xFF336699))
+        self.assertEqual(normalize_tag_color("#80336699"), str(0x80336699))
+        self.assertEqual(tag_color_css(str(0xFF336699)), "#336699")
+        for value in (True, -1, 0x1_0000_0000, "rgb(1,2,3)", "#12345"):
+            with self.subTest(value=value):
+                self.assertIsNone(normalize_tag_color(value))
+
+    def test_spreadsheet_exports_neutralize_formula_prefixes(self):
+        for value in ("=1+1", " +SUM(A1:A2)", "\t@command", "-2+3"):
+            with self.subTest(value=value):
+                self.assertTrue(spreadsheet_safe_value(value).startswith("'"))
+        self.assertEqual(spreadsheet_safe_value("ordinary text"), "ordinary text")
+        self.assertEqual(spreadsheet_safe_value(42), 42)
+
+
+class SettingsParserTests(SimpleTestCase):
+    def test_boolean_values_are_explicit_and_case_insensitive(self):
+        with patch.dict(os.environ, {"TEST_BOOLEAN": "YeS"}):
+            self.assertTrue(env_bool("TEST_BOOLEAN"))
+        with patch.dict(os.environ, {"TEST_BOOLEAN": "OFF"}):
+            self.assertFalse(env_bool("TEST_BOOLEAN", True))
+
+    def test_invalid_boolean_does_not_silently_disable_security(self):
+        with (
+            patch.dict(os.environ, {"TEST_BOOLEAN": "treu"}),
+            self.assertRaises(ImproperlyConfigured),
+        ):
+            env_bool("TEST_BOOLEAN")
+
+    def test_invalid_or_out_of_range_integer_does_not_use_a_default(self):
+        for value in ("many", "0", "101"):
+            with (
+                self.subTest(value=value),
+                patch.dict(os.environ, {"TEST_INTEGER": value}),
+                self.assertRaises(ImproperlyConfigured),
+            ):
+                env_int("TEST_INTEGER", 10, 1, 100)
+
+    def test_choice_normalization_is_strict(self):
+        with patch.dict(os.environ, {"TEST_CHOICE": "debug"}):
+            self.assertEqual(env_choice("TEST_CHOICE", "INFO", {"DEBUG", "INFO"}), "DEBUG")
+        with (
+            patch.dict(os.environ, {"TEST_CHOICE": "verbose"}),
+            self.assertRaises(ImproperlyConfigured),
+        ):
+            env_choice("TEST_CHOICE", "INFO", {"DEBUG", "INFO"})
+
+    def test_database_parameters_preserve_strong_password_characters(self):
+        password = "correct horse:@/%# battery staple"
+        self.assertEqual(
+            _database_text(password, "TEST_DATABASE_PASSWORD", 1024),
+            password,
+        )
+        for host in ("postgres", "db.internal.example", "127.0.0.1", "2001:db8::1"):
+            with self.subTest(host=host):
+                self.assertEqual(_database_host(host), host)
+        for host in ("https://db.example", "db host", "-db.example"):
+            with self.subTest(host=host), self.assertRaises(ImproperlyConfigured):
+                _database_host(host)
+
+    def test_external_database_tls_fails_closed(self):
+        with (
+            patch.object(project_settings, "DEBUG", False),
+            patch.dict(
+                os.environ,
+                {
+                    "CAMELLIA_REMOTE_DATABASE_SSLMODE": "require",
+                    "CAMELLIA_REMOTE_DATABASE_SSLROOTCERT": "",
+                    "CAMELLIA_REMOTE_DATABASE_SSLCERT": "",
+                    "CAMELLIA_REMOTE_DATABASE_SSLKEY": "",
+                },
+                clear=False,
+            ),
+            self.assertRaises(ImproperlyConfigured),
+        ):
+            _database_tls_options("db.example.test")
+
+        with (
+            patch.object(project_settings, "DEBUG", False),
+            patch.dict(
+                os.environ,
+                {
+                    "CAMELLIA_REMOTE_DATABASE_SSLMODE": "verify-full",
+                    "CAMELLIA_REMOTE_DATABASE_SSLROOTCERT": "/run/secrets/database-ca.pem",
+                    "CAMELLIA_REMOTE_DATABASE_SSLCERT": "",
+                    "CAMELLIA_REMOTE_DATABASE_SSLKEY": "",
+                },
+                clear=False,
+            ),
+        ):
+            options = _database_tls_options("db.example.test")
+        self.assertEqual(options["sslmode"], "verify-full")
+        self.assertEqual(options["sslrootcert"], "/run/secrets/database-ca.pem")
+
+    def test_database_client_certificate_and_key_are_atomic_configuration(self):
+        with (
+            patch.dict(
+                os.environ,
+                {
+                    "CAMELLIA_REMOTE_DATABASE_SSLMODE": "disable",
+                    "CAMELLIA_REMOTE_DATABASE_SSLROOTCERT": "",
+                    "CAMELLIA_REMOTE_DATABASE_SSLCERT": "/run/secrets/database-client.pem",
+                    "CAMELLIA_REMOTE_DATABASE_SSLKEY": "",
+                },
+                clear=False,
+            ),
+            self.assertRaises(ImproperlyConfigured),
+        ):
+            _database_tls_options("127.0.0.1")
 
 
 class ApiTestMixin:
@@ -134,6 +272,31 @@ class ApiTestMixin:
 
 
 class ApiContractTests(ApiTestMixin, TestCase):
+    def test_malformed_json_is_a_client_error(self):
+        for payload in (b'{"username":', b"[]", b"null", b'"text"'):
+            with self.subTest(payload=payload):
+                response = self.client.post(
+                    "/api/login",
+                    data=payload,
+                    content_type="application/json",
+                )
+
+                self.assertEqual(response.status_code, 400, response.content)
+                self.assertEqual(response.json(), {"error": "Invalid JSON payload"})
+
+    def test_routes_reject_unsupported_methods_with_allow_contracts(self):
+        for path, method, allowed in (
+            ("/api/users", self.client.put, "GET, POST"),
+            ("/api/peers", self.client.post, "GET"),
+            ("/api/device-group/accessible", self.client.post, "GET"),
+            ("/api/home", self.client.post, "GET"),
+            ("/webui2/status", self.client.post, "GET"),
+        ):
+            with self.subTest(path=path):
+                response = method(path, data="{}", content_type="application/json")
+                self.assertEqual(response.status_code, 405, response.content)
+                self.assertEqual(response.headers["Allow"], allowed)
+
     def test_login_requires_bearer_token_for_current_user(self):
         token = self._login("alice", "alice-pass")
         device = RemoteDevice.objects.get(rid="123456789")
@@ -236,6 +399,16 @@ class ApiContractTests(ApiTestMixin, TestCase):
         )
         self.assertNotEqual(poll_code, "test-state")
         self.assertNotIn(poll_code, OidcPendingAuth.objects.get().poll_code_hash)
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT nonce, code_verifier FROM api_oidcpendingauth WHERE state = %s",
+                ["test-state"],
+            )
+            stored_nonce, stored_verifier = cursor.fetchone()
+        self.assertTrue(stored_nonce.startswith("secretbox:v1:"))
+        self.assertTrue(stored_verifier.startswith("secretbox:v1:"))
+        self.assertNotIn("test-nonce", stored_nonce)
+        self.assertNotIn("test-code-verifier", stored_verifier)
 
         state_is_not_a_poll_secret = self.client.get("/api/oidc/auth-query?code=test-state")
         self.assertNotIn("access_token", state_is_not_a_poll_secret.json())
@@ -426,6 +599,121 @@ class ApiContractTests(ApiTestMixin, TestCase):
             )
         with self.assertRaises(ValidationError):
             first.refresh_from_db()
+
+    @override_settings(
+        STORAGES={
+            "default": {"BACKEND": "django.core.files.storage.FileSystemStorage"},
+            "staticfiles": {"BACKEND": "django.contrib.staticfiles.storage.StaticFilesStorage"},
+        }
+    )
+    def test_admin_forms_and_exports_do_not_render_connection_credentials(self):
+        profile = AddressBookProfile.objects.create(
+            owner=self.user,
+            guid="team-operations",
+            name="Operations",
+            rule=3,
+        )
+        peer_secret = "peer-secret-that-must-not-render"
+        peer = RemotePeer.objects.create(
+            profile=profile,
+            rid="765432100",
+            password=peer_secret,
+        )
+        device_secret = "device-secret-that-must-not-render"
+        device = self._device(
+            owner=self.user,
+            rid="765432101",
+            uuid=device_uuid("admin-secret-device"),
+            address_book_password=device_secret,
+        )
+        self.client.force_login(self.admin)
+
+        for path, secret in (
+            (f"/admin/api/remotepeer/{peer.pk}/change/", peer_secret),
+            (f"/admin/api/remotedevice/{device.pk}/change/", device_secret),
+        ):
+            with self.subTest(path=path):
+                response = self.client.get(path)
+                self.assertEqual(response.status_code, 200, response.content)
+                self.assertNotContains(response, secret)
+                self.assertContains(response, 'type="password"')
+
+        self.client.force_login(self.user)
+        exported = self.client.get(
+            f"/api/ab_book_export?guid={profile.guid}&kind=peers&format=csv",
+        )
+        self.assertEqual(exported.status_code, 200, exported.content)
+        self.assertNotIn(peer_secret.encode(), exported.content)
+
+    def test_expired_authentication_state_cleanup_is_dry_run_safe_and_idempotent(self):
+        now = timezone.now()
+        old = now - datetime.timedelta(days=60)
+        device = self._device(owner=self.user)
+        token = RemoteToken.objects.create(
+            device=device,
+            access_token="a" * 64,
+            expires_at=now - datetime.timedelta(minutes=1),
+        )
+        attempt = LoginAttempt.objects.create(ip="192.0.2.1", username="alice")
+        LoginAttempt.objects.filter(pk=attempt.pk).update(
+            created_at=now - datetime.timedelta(hours=1),
+        )
+        oidc = OidcPendingAuth.objects.create(
+            state="expired-state",
+            poll_code_hash="b" * 64,
+            provider="example",
+            request_ip="192.0.2.1",
+            nonce="expired-nonce",
+            code_verifier="expired-verifier",
+        )
+        OidcPendingAuth.objects.filter(pk=oidc.pk).update(created_at=old)
+        recent_expired_share = ShareLink.objects.create(
+            creator=self.user,
+            shash="c" * 64,
+            token_prefix="recent",
+            expires_at=now - datetime.timedelta(minutes=1),
+        )
+        retained_share = ShareLink.objects.create(
+            creator=self.user,
+            shash="d" * 64,
+            token_prefix="retained",
+            expires_at=now + datetime.timedelta(days=1),
+            is_used=True,
+            used_at=old,
+            used_by=self.user,
+        )
+        ShareLink.objects.filter(pk=retained_share.pk).update(create_time=old)
+
+        output = StringIO()
+        call_command("purge_expired_state", "--dry-run", stdout=output)
+        self.assertTrue(RemoteToken.objects.filter(pk=token.pk).exists())
+        self.assertTrue(LoginAttempt.objects.filter(pk=attempt.pk).exists())
+        self.assertTrue(OidcPendingAuth.objects.filter(pk=oidc.pk).exists())
+        self.assertFalse(ShareLink.objects.get(pk=recent_expired_share.pk).is_expired)
+        self.assertTrue(ShareLink.objects.filter(pk=retained_share.pk).exists())
+        self.assertTrue(json.loads(output.getvalue())["dry_run"])
+
+        call_command("purge_expired_state", stdout=StringIO())
+        self.assertFalse(RemoteToken.objects.filter(pk=token.pk).exists())
+        self.assertFalse(LoginAttempt.objects.filter(pk=attempt.pk).exists())
+        self.assertFalse(OidcPendingAuth.objects.filter(pk=oidc.pk).exists())
+        recent_expired_share.refresh_from_db()
+        self.assertTrue(recent_expired_share.is_expired)
+        self.assertFalse(ShareLink.objects.filter(pk=retained_share.pk).exists())
+
+        second = StringIO()
+        call_command("purge_expired_state", stdout=second)
+        result = json.loads(second.getvalue())
+        self.assertEqual(
+            {key: value for key, value in result.items() if key != "dry_run"},
+            {
+                "expired_access_tokens": 0,
+                "expired_oidc_sessions": 0,
+                "expired_share_links_marked": 0,
+                "login_attempts": 0,
+                "retained_share_links": 0,
+            },
+        )
 
     def test_admin_can_manage_users_and_disabled_users_cannot_login(self):
         admin_token = self._login(
@@ -769,6 +1057,28 @@ class ApiContractTests(ApiTestMixin, TestCase):
         self.assertIsNone(device.strategy_id)
         self.assertEqual(device.device_group_id, group.id)
 
+    def test_heartbeat_fails_closed_for_corrupt_strategy_data(self):
+        device = self._device(owner=self.user)
+        device_token = self._login("alice", "alice-pass")
+        strategy = StrategyProfile.objects.create(
+            name="strict-policy",
+            config_options={"source": "valid"},
+        )
+        device.strategy = strategy
+        device.save(update_fields=["strategy"])
+        StrategyProfile.objects.filter(pk=strategy.pk).update(
+            config_options={"unexpected": ["non-string-value"]},
+        )
+
+        heartbeat = self._post_json(
+            "/api/heartbeat",
+            {"id": device.rid, "uuid": device.uuid, "modified_at": 0},
+            token=device_token,
+        )
+
+        self.assertEqual(heartbeat.status_code, 503, heartbeat.content)
+        self.assertEqual(heartbeat.json(), {"error": "Invalid strategy configuration"})
+
     def test_disabled_devices_are_blocked_by_login_and_heartbeat(self):
         device = self._device(owner=self.user)
         token = self._login("alice", "alice-pass")
@@ -1023,7 +1333,7 @@ class ApiContractTests(ApiTestMixin, TestCase):
             "staticfiles": {"BACKEND": "django.contrib.staticfiles.storage.StaticFilesStorage"},
         }
     )
-    def test_front_device_pages_merge_legacy_metadata_and_expose_unknown_state(self):
+    def test_front_device_pages_merge_address_book_metadata_and_expose_unknown_state(self):
         self._device(
             owner=self.user,
             rid="765432100",

@@ -29,7 +29,7 @@
       <div class="notice">{% trans "选择地址簿并配置共享权限。" %}</div>
     {% endif %}
     <form class="ab-filter" method="get" action="/api/ab_manage">
-      <input class="ab-input ab-input-wide" type="text" name="q" value="{{ filter_q }}" placeholder="{% trans "搜索地址簿、Owner 或目标" %}">
+      <input class="ab-input ab-input-wide" type="text" name="q" value="{{ filter_q }}" aria-label="{% trans "搜索地址簿、Owner 或目标" %}" placeholder="{% trans "搜索地址簿、Owner 或目标" %}">
       <button class="btn btn-secondary btn-xs" type="submit">{% trans "筛选" %}</button>
       {% if filter_q %}
         <a class="btn btn-ghost btn-xs" href="/api/ab_manage">{% trans "清除" %}</a>
@@ -113,7 +113,7 @@
                           <input type="hidden" name="rule_guid" value="{{ entry.guid }}">
                           <div class="action-title">{% trans "权限" %}</div>
                           <div class="action-row">
-                            <select class="ab-select" name="rule">
+                            <select class="ab-select" name="rule" aria-label="{% trans "权限" %}">
                               {% for value, label in rule_choices %}
                                 <option value="{{ value }}" {% if value == entry.rule %}selected{% endif %}>{{ label }}</option>
                               {% endfor %}
@@ -121,7 +121,7 @@
                             <button class="btn btn-ghost btn-xs" type="submit">{% trans "更新" %}</button>
                           </div>
                         </form>
-                        <form class="action-panel action-panel--danger" method="post" action="/api/ab_manage">
+                        <form class="action-panel action-panel--danger" method="post" action="/api/ab_manage" data-confirm="{% trans "此操作不可撤销。确认继续？" %}">
                           {% csrf_token %}
                           <input type="hidden" name="action" value="delete_rule">
                           <input type="hidden" name="rule_guid" value="{{ entry.guid }}">
@@ -145,8 +145,8 @@
               <input type="hidden" name="profile_guid" value="{{ item.profile.guid }}">
               <div class="action-title">{% trans "新增" %}</div>
               <div class="action-row">
-                <input class="ab-input" type="text" name="user" placeholder="{% trans "用户名或ID" %}">
-                <select class="ab-select" name="rule">
+                <input class="ab-input" type="text" name="user" aria-label="{% trans "用户名或ID" %}" placeholder="{% trans "用户名或ID" %}">
+                <select class="ab-select" name="rule" aria-label="{% trans "权限" %}">
                   {% for value, label in rule_choices %}
                     <option value="{{ value }}">{{ label }}</option>
                   {% endfor %}
@@ -180,7 +180,7 @@
                           <input type="hidden" name="rule_guid" value="{{ entry.guid }}">
                           <div class="action-title">{% trans "权限" %}</div>
                           <div class="action-row">
-                            <select class="ab-select" name="rule">
+                            <select class="ab-select" name="rule" aria-label="{% trans "权限" %}">
                               {% for value, label in rule_choices %}
                                 <option value="{{ value }}" {% if value == entry.rule %}selected{% endif %}>{{ label }}</option>
                               {% endfor %}
@@ -188,7 +188,7 @@
                             <button class="btn btn-ghost btn-xs" type="submit">{% trans "更新" %}</button>
                           </div>
                         </form>
-                        <form class="action-panel action-panel--danger" method="post" action="/api/ab_manage">
+                        <form class="action-panel action-panel--danger" method="post" action="/api/ab_manage" data-confirm="{% trans "此操作不可撤销。确认继续？" %}">
                           {% csrf_token %}
                           <input type="hidden" name="action" value="delete_rule">
                           <input type="hidden" name="rule_guid" value="{{ entry.guid }}">
@@ -212,13 +212,13 @@
               <input type="hidden" name="profile_guid" value="{{ item.profile.guid }}">
               <div class="action-title">{% trans "新增" %}</div>
               <div class="action-row">
-                <select class="ab-select" name="group">
+                <select class="ab-select" name="group" aria-label="{% trans "用户组" %}">
                   <option value="">{% trans "选择组" %}</option>
                   {% for group in groups %}
                     <option value="{{ group.id }}">{{ group.name }}</option>
                   {% endfor %}
                 </select>
-                <select class="ab-select" name="rule">
+                <select class="ab-select" name="rule" aria-label="{% trans "权限" %}">
                   {% for value, label in rule_choices %}
                     <option value="{{ value }}">{{ label }}</option>
                   {% endfor %}
@@ -250,7 +250,7 @@
                         <input type="hidden" name="rule_guid" value="{{ item.everyone_rule.guid }}">
                         <div class="action-title">{% trans "权限" %}</div>
                         <div class="action-row">
-                          <select class="ab-select" name="rule">
+                          <select class="ab-select" name="rule" aria-label="{% trans "权限" %}">
                             {% for value, label in rule_choices %}
                               <option value="{{ value }}" {% if value == item.everyone_rule.rule %}selected{% endif %}>{{ label }}</option>
                             {% endfor %}
@@ -258,7 +258,7 @@
                           <button class="btn btn-ghost btn-xs" type="submit">{% trans "更新" %}</button>
                         </div>
                       </form>
-                      <form class="action-panel action-panel--danger" method="post" action="/api/ab_manage">
+                      <form class="action-panel action-panel--danger" method="post" action="/api/ab_manage" data-confirm="{% trans "此操作不可撤销。确认继续？" %}">
                         {% csrf_token %}
                         <input type="hidden" name="action" value="delete_rule">
                         <input type="hidden" name="rule_guid" value="{{ item.everyone_rule.guid }}">
@@ -281,7 +281,7 @@
               <input type="hidden" name="profile_guid" value="{{ item.profile.guid }}">
               <div class="action-title">{% trans "新增" %}</div>
               <div class="action-row">
-                <select class="ab-select" name="rule">
+                <select class="ab-select" name="rule" aria-label="{% trans "权限" %}">
                   {% for value, label in rule_choices %}
                     <option value="{{ value }}">{{ label }}</option>
                   {% endfor %}
@@ -339,7 +339,7 @@
               <input type="hidden" name="rule_guid" value="{{ entry.guid }}">
               <div class="action-title">{% trans "权限" %}</div>
               <div class="action-row">
-                <select class="ab-select" name="rule">
+                <select class="ab-select" name="rule" aria-label="{% trans "权限" %}">
                   {% for value, label in rule_choices %}
                     <option value="{{ value }}" {% if value == entry.rule %}selected{% endif %}>{{ label }}</option>
                   {% endfor %}
@@ -347,7 +347,7 @@
                 <button class="btn btn-ghost btn-xs" type="submit">{% trans "更新" %}</button>
               </div>
             </form>
-            <form class="action-panel action-panel--danger" method="post" action="/api/ab_manage">
+            <form class="action-panel action-panel--danger" method="post" action="/api/ab_manage" data-confirm="{% trans "此操作不可撤销。确认继续？" %}">
               {% csrf_token %}
               <input type="hidden" name="action" value="delete_rule">
               <input type="hidden" name="rule_guid" value="{{ entry.guid }}">

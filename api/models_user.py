@@ -83,11 +83,6 @@ class UserProfile(AbstractBaseUser, PermissionsMixin):
     class Meta:
         verbose_name = _("用户")
         verbose_name_plural = _("用户列表")
-        permissions = (
-            ("view_task", "Can see available tasks"),
-            ("change_task_status", "Can change the status of tasks"),
-            ("close_task", "Can remove a task by setting its status as closed"),
-        )
         constraints = (
             models.UniqueConstraint(
                 Lower("username"),

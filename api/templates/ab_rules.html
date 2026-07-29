@@ -28,7 +28,7 @@
       <div class="notice">{% trans "筛选规则并进行批量操作。" %}</div>
     {% endif %}
     <form class="ab-filter" method="get" action="/api/ab_rules">
-      <input class="ab-input ab-input-wide" type="text" name="q" value="{{ filter_q }}" placeholder="{% trans "搜索地址簿、Owner 或目标" %}">
+      <input class="ab-input ab-input-wide" type="text" name="q" value="{{ filter_q }}" aria-label="{% trans "搜索地址簿、Owner 或目标" %}" placeholder="{% trans "搜索地址簿、Owner 或目标" %}">
       <button class="btn btn-secondary btn-xs" type="submit">{% trans "筛选" %}</button>
       {% if filter_q %}
         <a class="btn btn-ghost btn-xs" href="/api/ab_rules">{% trans "清除" %}</a>
@@ -78,13 +78,13 @@
   <div class="ab-bulk-main">
     <div class="ab-bulk-title">{% trans "批量操作" %}</div>
     <div class="ab-bulk-controls">
-      <select class="ab-select" name="rule">
+      <select class="ab-select" name="rule" aria-label="{% trans "权限" %}">
         {% for value, label in rule_choices %}
           <option value="{{ value }}">{{ label }}</option>
         {% endfor %}
       </select>
       <button class="btn btn-secondary btn-xs" type="submit" name="action" value="bulk_update">{% trans "批量更新" %}</button>
-      <button class="btn btn-ghost btn-xs" type="submit" name="action" value="bulk_delete">{% trans "批量删除" %}</button>
+      <button class="btn btn-ghost btn-xs" type="submit" name="action" value="bulk_delete" data-confirm="{% trans "此操作不可撤销。确认继续？" %}">{% trans "批量删除" %}</button>
     </div>
   </div>
   <div class="ab-bulk-tip">{% trans "勾选规则后再执行批量操作。" %}</div>
@@ -106,7 +106,7 @@
             <div class="item-meta">{{ entry.profile_guid }}</div>
           </div>
           <label class="ab-peer-select">
-            <input form="ab-bulk-form" class="ab-check" type="checkbox" name="selected" value="{{ entry.guid }}">
+            <input form="ab-bulk-form" class="ab-check" type="checkbox" name="selected" value="{{ entry.guid }}" aria-label="{% trans "选择" %}">
             <span>{% trans "选择" %}</span>
           </label>
         </div>
@@ -138,7 +138,7 @@
             <input type="hidden" name="rule_guid" value="{{ entry.guid }}">
             <div class="action-title">{% trans "权限" %}</div>
             <div class="action-row">
-              <select class="ab-select" name="rule">
+              <select class="ab-select" name="rule" aria-label="{% trans "权限" %}">
                 {% for value, label in rule_choices %}
                   <option value="{{ value }}" {% if value == entry.rule %}selected{% endif %}>{{ label }}</option>
                 {% endfor %}
@@ -146,7 +146,7 @@
               <button class="btn btn-ghost btn-xs" type="submit">{% trans "更新" %}</button>
             </div>
           </form>
-          <form class="action-panel action-panel--danger" method="post" action="/api/ab_rules">
+          <form class="action-panel action-panel--danger" method="post" action="/api/ab_rules" data-confirm="{% trans "此操作不可撤销。确认继续？" %}">
             {% csrf_token %}
             {% if filter_q %}
               <input type="hidden" name="q" value="{{ filter_q }}">

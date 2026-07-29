@@ -31,7 +31,7 @@
       <div class="notice">{% trans "创建新的地址簿或进入管理页面。" %}</div>
     {% endif %}
     <form class="ab-filter" method="get" action="/api/ab_books">
-      <input class="ab-input ab-input-wide" type="text" name="q" value="{{ filter_q }}" placeholder="{% trans "搜索名称、GUID 或用户" %}">
+      <input class="ab-input ab-input-wide" type="text" name="q" value="{{ filter_q }}" aria-label="{% trans "搜索名称、GUID 或用户" %}" placeholder="{% trans "搜索名称、GUID 或用户" %}">
       <button class="btn btn-secondary btn-xs" type="submit">{% trans "筛选" %}</button>
       {% if filter_q %}
         <a class="btn btn-ghost btn-xs" href="/api/ab_books">{% trans "清除" %}</a>
@@ -50,10 +50,10 @@
   <form class="ab-form ab-book-form ab-form-grid ab-form-grid--auto" method="post" action="/api/ab_books">
     {% csrf_token %}
     <input type="hidden" name="action" value="create_book">
-    <input class="ab-input" type="text" name="name" placeholder="{% trans "地址簿名称" %}">
-    <input class="ab-input ab-input-wide" type="text" name="note" placeholder="{% trans "备注（可选）" %}">
+    <input class="ab-input" type="text" name="name" aria-label="{% trans "地址簿名称" %}" placeholder="{% trans "地址簿名称" %}">
+    <input class="ab-input ab-input-wide" type="text" name="note" aria-label="{% trans "备注（可选）" %}" placeholder="{% trans "备注（可选）" %}">
     {% if u.is_admin %}
-      <input class="ab-input" type="text" name="owner" placeholder="{% trans "所属用户（用户名或ID）" %}">
+      <input class="ab-input" type="text" name="owner" aria-label="{% trans "所属用户（用户名或ID）" %}" placeholder="{% trans "所属用户（用户名或ID）" %}">
     {% endif %}
     <button class="btn btn-primary btn-xs" type="submit">{% trans "创建" %}</button>
   </form>
@@ -104,12 +104,12 @@
               <input type="hidden" name="guid" value="{{ item.profile.guid }}">
               <div class="action-title">{% trans "更新" %}</div>
               <div class="action-row">
-                <input class="ab-input" type="text" name="name" value="{{ item.profile.name }}">
-                <input class="ab-input" type="text" name="note" value="{{ item.profile.note }}">
+                <input class="ab-input" type="text" name="name" value="{{ item.profile.name }}" aria-label="{% trans "地址簿名称" %}">
+                <input class="ab-input" type="text" name="note" value="{{ item.profile.note }}" aria-label="{% trans "备注" %}">
                 <button class="btn btn-ghost btn-xs" type="submit">{% trans "更新" %}</button>
               </div>
             </form>
-            <form class="action-panel action-panel--danger" method="post" action="/api/ab_books">
+            <form class="action-panel action-panel--danger" method="post" action="/api/ab_books" data-confirm="{% trans "此操作不可撤销。确认继续？" %}">
               {% csrf_token %}
               <input type="hidden" name="action" value="delete_book">
               <input type="hidden" name="guid" value="{{ item.profile.guid }}">
@@ -120,13 +120,13 @@
             </form>
           {% endif %}
           {% if u.is_admin and not item.is_personal %}
-            <form class="action-panel" method="post" action="/api/ab_books">
+            <form class="action-panel" method="post" action="/api/ab_books" data-confirm="{% trans "此操作不可撤销。确认继续？" %}">
               {% csrf_token %}
               <input type="hidden" name="action" value="transfer_book">
               <input type="hidden" name="guid" value="{{ item.profile.guid }}">
               <div class="action-title">{% trans "转移" %}</div>
               <div class="action-row">
-                <input class="ab-input" type="text" name="owner" placeholder="{% trans "转移给用户" %}">
+                <input class="ab-input" type="text" name="owner" aria-label="{% trans "转移给用户" %}" placeholder="{% trans "转移给用户" %}">
                 <button class="btn btn-ghost btn-xs" type="submit">{% trans "转移" %}</button>
               </div>
             </form>
