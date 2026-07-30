@@ -35,8 +35,8 @@ on:
         default: linux/amd64,linux/arm64
 
 permissions:
-  contents: read
-  actions: read
+  contents: read # Resolve immutable source commits and release metadata.
+  actions: read # Locate the exact successful CI run and Web artifact.
 
 concurrency:
   group: remote-management-release
@@ -103,7 +103,7 @@ jobs:
       - name: Release policy token
         if: inputs.publish
         id: policy-token
-        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v2.2.1
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         with:
           client-id: ${{ vars.RELEASE_APP_CLIENT_ID }}
           private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
@@ -238,7 +238,9 @@ jobs:
     environment: release
     steps:
       - name: Record approval gate
-        run: echo "Production release approved for ${{ needs.validate.outputs.tag }}"
+        env:
+          RELEASE_TAG: ${{ needs.validate.outputs.tag }}
+        run: echo "Production release approved for $RELEASE_TAG"
 
   image:
     name: Build release image once
@@ -250,10 +252,10 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     permissions:
-      contents: read
-      actions: read
-      id-token: write
-      packages: write
+      contents: read # Check out the immutable release source.
+      actions: read # Download the exact Web artifact from validated CI.
+      id-token: write # Obtain keyless Sigstore and provenance identities.
+      packages: write # Publish the selected same-owner GHCR image.
     outputs:
       digest: ${{ steps.build.outputs.digest }}
       tags: ${{ steps.meta.outputs.tags }}
@@ -353,6 +355,8 @@ jobs:
           push: ${{ inputs.publish }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            SOURCE_REPOSITORY_URL=${{ github.server_url }}/${{ github.repository }}
           cache-from: type=gha,scope=remote-management-release
           cache-to: type=gha,scope=remote-management-release,mode=max
           provenance: mode=max
@@ -381,9 +385,9 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
-      attestations: write
-      contents: read
-      id-token: write
+      attestations: write # Publish the image-digest GitHub attestation.
+      contents: read # Check out release automation without workflow credentials.
+      id-token: write # Obtain the OIDC identity used by the attestation.
     steps:
       - name: Checkout immutable release automation
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -393,7 +397,7 @@ jobs:
 
       - name: Release publication token
         id: release-token
-        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v2.2.1
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         with:
           client-id: ${{ vars.RELEASE_APP_CLIENT_ID }}
           private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}

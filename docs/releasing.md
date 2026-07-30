@@ -1,7 +1,7 @@
 # Release policy
 
-Camellia Remote Management follows the organization
-[CI/CD baseline](https://github.com/camellia-computing/.github/blob/main/docs/CI_CD_BASELINE.md).
+Camellia Remote Management follows `docs/CI_CD_BASELINE.md` in the
+organization policy repository.
 The management version, source commit, pinned Remote Web commit and successful
 exact-SHA push CI run form one immutable release input.
 
@@ -31,7 +31,7 @@ No `latest` deployment input is trusted. Deploy the digest recorded by
 
 Formal publication requires variable `RELEASE_APP_CLIENT_ID`, variable
 `RELEASE_APP_LOGIN`, secret `RELEASE_APP_PRIVATE_KEY`, and selected App
-installation access to `remote-management-server`. The App needs
+installation access to this repository. The App needs
 Administration read, Contents read/write and Metadata read; it must not have
 Actions or Workflows permission.
 

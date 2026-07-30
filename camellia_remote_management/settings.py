@@ -1,11 +1,12 @@
-import ipaddress
 import base64
 import binascii
 import hashlib
+import ipaddress
 import os
 import re
 from pathlib import Path
 from urllib.parse import unquote, urlsplit
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import django
 from django.core.exceptions import ImproperlyConfigured
@@ -19,7 +20,12 @@ def env_bool(name, default=False):
     value = os.environ.get(name)
     if value is None:
         return default
-    return value.strip().lower() in ("1", "true", "yes", "on", "y")
+    normalized = value.strip().lower()
+    if normalized in ("1", "true", "yes", "on"):
+        return True
+    if normalized in ("0", "false", "no", "off"):
+        return False
+    raise ImproperlyConfigured(f"{name} must be true or false")
 
 
 def env_csv(name, default=None):
@@ -30,15 +36,37 @@ def env_csv(name, default=None):
 
 
 def env_int(name, default, min_value=None, max_value=None):
-    try:
-        value = int(os.environ.get(name, str(default)).strip())
-    except ValueError:
+    raw_value = os.environ.get(name)
+    if raw_value is None:
         value = default
+    else:
+        try:
+            value = int(raw_value.strip())
+        except ValueError as exc:
+            raise ImproperlyConfigured(f"{name} must be an integer") from exc
     if min_value is not None and value < min_value:
-        return default
+        raise ImproperlyConfigured(f"{name} must be at least {min_value}")
     if max_value is not None and value > max_value:
-        return default
+        raise ImproperlyConfigured(f"{name} must be at most {max_value}")
     return value
+
+
+def env_choice(name, default, choices):
+    value = os.environ.get(name, default).strip().upper()
+    if value not in choices:
+        allowed = ", ".join(sorted(choices))
+        raise ImproperlyConfigured(f"{name} must be one of: {allowed}")
+    return value
+
+
+def canonical_base64_bytes(value, expected_size):
+    try:
+        decoded = base64.b64decode(value, validate=True)
+    except (binascii.Error, ValueError):
+        return None
+    if len(decoded) != expected_size or base64.b64encode(decoded).decode("ascii") != value:
+        return None
+    return decoded
 
 
 def valid_https_url(value, *, allow_query=True):
@@ -46,6 +74,7 @@ def valid_https_url(value, *, allow_query=True):
         return False
     try:
         parsed = urlsplit(value)
+        _port = parsed.port
     except ValueError:
         return False
     return (
@@ -58,11 +87,18 @@ def valid_https_url(value, *, allow_query=True):
     )
 
 
+def valid_https_origin(value):
+    if not valid_https_url(value, allow_query=False):
+        return False
+    parsed = urlsplit(value)
+    return parsed.path in ("", "/") and value == f"{parsed.scheme}://{parsed.netloc}"
+
+
 DEBUG = env_bool("CAMELLIA_REMOTE_DEBUG", False)
 SECRET_KEY = os.environ.get("CAMELLIA_REMOTE_SECRET_KEY", "").strip()
 if not SECRET_KEY:
     if DEBUG:
-        SECRET_KEY = "dev-only-insecure-secret-key"
+        SECRET_KEY = "dev-only-insecure-secret-key"  # noqa: S105 - isolated debug default
     else:
         raise ImproperlyConfigured("CAMELLIA_REMOTE_SECRET_KEY must be set when CAMELLIA_REMOTE_DEBUG is false")
 if not DEBUG and (len(SECRET_KEY) < 50 or SECRET_KEY.startswith("dev-only-") or "replace-with" in SECRET_KEY.lower()):
@@ -70,17 +106,8 @@ if not DEBUG and (len(SECRET_KEY) < 50 or SECRET_KEY.startswith("dev-only-") or 
 
 _data_encryption_key = os.environ.get("CAMELLIA_REMOTE_DATA_ENCRYPTION_KEY", "").strip()
 if _data_encryption_key:
-    try:
-        DATA_ENCRYPTION_KEY_BYTES = base64.b64decode(
-            _data_encryption_key,
-            validate=True,
-        )
-    except (binascii.Error, ValueError) as exc:
-        raise ImproperlyConfigured("CAMELLIA_REMOTE_DATA_ENCRYPTION_KEY must be canonical Base64") from exc
-    if (
-        len(DATA_ENCRYPTION_KEY_BYTES) != 32
-        or base64.b64encode(DATA_ENCRYPTION_KEY_BYTES).decode("ascii") != _data_encryption_key
-    ):
+    DATA_ENCRYPTION_KEY_BYTES = canonical_base64_bytes(_data_encryption_key, 32)
+    if DATA_ENCRYPTION_KEY_BYTES is None:
         raise ImproperlyConfigured("CAMELLIA_REMOTE_DATA_ENCRYPTION_KEY must encode exactly 32 bytes")
 elif DEBUG:
     DATA_ENCRYPTION_KEY_BYTES = hashlib.sha256(f"development-data-key:{SECRET_KEY}".encode()).digest()
@@ -90,6 +117,15 @@ else:
 DEFAULT_AUTO_FIELD = "django.db.models.AutoField"
 ALLOWED_HOSTS = env_csv("CAMELLIA_REMOTE_ALLOWED_HOSTS", ["127.0.0.1", "localhost"])
 CSRF_TRUSTED_ORIGINS = env_csv("CAMELLIA_REMOTE_CSRF_TRUSTED_ORIGINS", ["http://127.0.0.1:21114"])
+if not DEBUG:
+    if "CAMELLIA_REMOTE_ALLOWED_HOSTS" not in os.environ or not ALLOWED_HOSTS:
+        raise ImproperlyConfigured("CAMELLIA_REMOTE_ALLOWED_HOSTS is required in production")
+    if "*" in ALLOWED_HOSTS:
+        raise ImproperlyConfigured("CAMELLIA_REMOTE_ALLOWED_HOSTS must not contain a wildcard in production")
+    if "CAMELLIA_REMOTE_CSRF_TRUSTED_ORIGINS" not in os.environ or not CSRF_TRUSTED_ORIGINS:
+        raise ImproperlyConfigured("CAMELLIA_REMOTE_CSRF_TRUSTED_ORIGINS is required in production")
+    if any(not valid_https_origin(origin) for origin in CSRF_TRUSTED_ORIGINS):
+        raise ImproperlyConfigured("CAMELLIA_REMOTE_CSRF_TRUSTED_ORIGINS must contain only HTTPS origins")
 # The OIDC client polls server-side state and deliberately clears popup.opener,
 # so every response can retain full cross-origin opener isolation.
 SECURE_CROSS_ORIGIN_OPENER_POLICY = "same-origin"
@@ -109,6 +145,8 @@ if TRUST_PROXY_HEADERS and not TRUSTED_PROXY_NETWORKS:
 
 # TLS-terminating deployments should set CAMELLIA_REMOTE_SECURE_TLS=true.
 _secure_tls = env_bool("CAMELLIA_REMOTE_SECURE_TLS", False)
+if not DEBUG and not _secure_tls:
+    raise ImproperlyConfigured("CAMELLIA_REMOTE_SECURE_TLS must be true in production")
 SESSION_COOKIE_SECURE = _secure_tls
 CSRF_COOKIE_SECURE = _secure_tls
 SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https") if _secure_tls else None
@@ -138,6 +176,38 @@ API_SERVER = os.environ.get("CAMELLIA_REMOTE_API_SERVER", "").strip()
 RS_PUB_KEY = os.environ.get("CAMELLIA_REMOTE_RS_PUB_KEY", "").strip()
 RELAY_SERVER = os.environ.get("CAMELLIA_REMOTE_RELAY_SERVER", "").strip()
 DEFAULT_ID_PORT = env_int("CAMELLIA_REMOTE_DEFAULT_ID_PORT", 21116, 1, 65535)
+if not DEBUG:
+    if not valid_https_url(API_SERVER):
+        raise ImproperlyConfigured("CAMELLIA_REMOTE_API_SERVER must be an HTTPS URL in production")
+    _api_origin = urlsplit(API_SERVER)
+    _api_origin = f"{_api_origin.scheme}://{_api_origin.netloc}"
+    if _api_origin not in CSRF_TRUSTED_ORIGINS:
+        raise ImproperlyConfigured(
+            "CAMELLIA_REMOTE_CSRF_TRUSTED_ORIGINS must include the CAMELLIA_REMOTE_API_SERVER origin"
+        )
+    _id_server_endpoints = [endpoint for endpoint in re.split(r"[,;\s]+", ID_SERVER) if endpoint]
+    _relay_server_endpoints = [endpoint for endpoint in re.split(r"[,;\s]+", RELAY_SERVER) if endpoint]
+    if not _id_server_endpoints:
+        raise ImproperlyConfigured("CAMELLIA_REMOTE_ID_SERVER is required in production")
+    for endpoint in (*_id_server_endpoints, *_relay_server_endpoints):
+        try:
+            parsed_endpoint = urlsplit(endpoint)
+            endpoint_port = parsed_endpoint.port
+        except ValueError as exc:
+            raise ImproperlyConfigured("Remote server endpoints must be valid WSS URLs") from exc
+        if (
+            parsed_endpoint.scheme != "wss"
+            or not parsed_endpoint.hostname
+            or parsed_endpoint.username is not None
+            or parsed_endpoint.password is not None
+            or parsed_endpoint.fragment
+            or endpoint_port is None
+        ):
+            raise ImproperlyConfigured(
+                "CAMELLIA_REMOTE_ID_SERVER and CAMELLIA_REMOTE_RELAY_SERVER must contain WSS URLs with explicit ports"
+            )
+    if canonical_base64_bytes(RS_PUB_KEY, 32) is None:
+        raise ImproperlyConfigured("CAMELLIA_REMOTE_RS_PUB_KEY must encode exactly 32 bytes")
 PLUGIN_SIGNING_KEY = os.environ.get("CAMELLIA_REMOTE_PLUGIN_SIGNING_KEY", "").strip()
 DEVICE_VERIFICATION_TOKEN = os.environ.get("CAMELLIA_REMOTE_DEVICE_VERIFICATION_TOKEN", "").strip()
 if DEVICE_VERIFICATION_TOKEN and (
@@ -205,6 +275,24 @@ if all(_oidc_values):
 
 ALLOW_REGISTRATION = env_bool("CAMELLIA_REMOTE_ALLOW_REGISTRATION", False)
 MAX_PASSWORD_LENGTH = 128
+LOGIN_ATTEMPT_RETENTION_MINUTES = env_int(
+    "CAMELLIA_REMOTE_LOGIN_ATTEMPT_RETENTION_MINUTES",
+    15,
+    5,
+    24 * 60,
+)
+OIDC_PENDING_RETENTION_MINUTES = env_int(
+    "CAMELLIA_REMOTE_OIDC_PENDING_RETENTION_MINUTES",
+    5,
+    2,
+    60,
+)
+SHARE_LINK_RETENTION_DAYS = env_int(
+    "CAMELLIA_REMOTE_SHARE_LINK_RETENTION_DAYS",
+    30,
+    1,
+    365,
+)
 
 # Recording uploads contain highly sensitive session data. Keep each request
 # bounded before Django materializes request.body, and cap the resulting file so
@@ -222,6 +310,8 @@ RECORD_UPLOAD_MAX_FILE_BYTES = env_int(
     1024 * 1024 * 1024 * 1024,
 )
 RECORD_UPLOAD_ROOT = Path(os.environ.get("CAMELLIA_REMOTE_RECORD_UPLOAD_ROOT", BASE_DIR / "records"))
+if not RECORD_UPLOAD_ROOT.is_absolute():
+    raise ImproperlyConfigured("CAMELLIA_REMOTE_RECORD_UPLOAD_ROOT must be an absolute path")
 DATA_UPLOAD_MAX_MEMORY_SIZE = RECORD_UPLOAD_MAX_CHUNK_BYTES
 DATA_UPLOAD_MAX_NUMBER_FIELDS = env_int("CAMELLIA_REMOTE_DATA_UPLOAD_MAX_NUMBER_FIELDS", 1000, 100, 10000)
 DATA_UPLOAD_MAX_NUMBER_FILES = 0
@@ -229,7 +319,13 @@ FILE_UPLOAD_PERMISSIONS = 0o600
 
 
 DATABASE_URL = os.environ.get("CAMELLIA_REMOTE_DATABASE_URL", "").strip()
+DATABASE_HOST = os.environ.get("CAMELLIA_REMOTE_DATABASE_HOST", "").strip()
+DATABASE_NAME = os.environ.get("CAMELLIA_REMOTE_DATABASE_NAME", "").strip()
+DATABASE_USER = os.environ.get("CAMELLIA_REMOTE_DATABASE_USER", "").strip()
+DATABASE_PASSWORD = os.environ.get("CAMELLIA_REMOTE_DATABASE_PASSWORD", "")
 SQLITE_DB_PATH = os.environ.get("CAMELLIA_REMOTE_SQLITE_DB_PATH", "").strip()
+if SQLITE_DB_PATH and not Path(SQLITE_DB_PATH).is_absolute():
+    raise ImproperlyConfigured("CAMELLIA_REMOTE_SQLITE_DB_PATH must be an absolute path")
 
 LANGUAGE_CODE = os.environ.get("CAMELLIA_REMOTE_LANGUAGE_CODE", "zh-hans")
 
@@ -255,6 +351,7 @@ MIDDLEWARE = [
     "django.middleware.csrf.CsrfViewMiddleware",
     "django.contrib.auth.middleware.AuthenticationMiddleware",
     "django.contrib.messages.middleware.MessageMiddleware",
+    "api.middleware.ApiExceptionMiddleware",
     "django.middleware.clickjacking.XFrameOptionsMiddleware",
 ]
 
@@ -282,13 +379,96 @@ FORM_RENDERER = "django.forms.renderers.TemplatesSetting"
 WSGI_APPLICATION = "camellia_remote_management.wsgi.application"
 
 
-if not DATABASE_URL:
+_discrete_database_names = (
+    "CAMELLIA_REMOTE_DATABASE_HOST",
+    "CAMELLIA_REMOTE_DATABASE_NAME",
+    "CAMELLIA_REMOTE_DATABASE_USER",
+    "CAMELLIA_REMOTE_DATABASE_PASSWORD",
+)
+_has_discrete_database_settings = any(name in os.environ for name in _discrete_database_names)
+if DATABASE_URL and _has_discrete_database_settings:
+    raise ImproperlyConfigured(
+        "CAMELLIA_REMOTE_DATABASE_URL cannot be combined with discrete database connection settings"
+    )
+
+
+def _database_text(value, name, max_bytes):
+    if not value or "\x00" in value or len(value.encode("utf-8")) > max_bytes:
+        raise ImproperlyConfigured(f"{name} must be a non-empty value of at most {max_bytes} UTF-8 bytes")
+    return value
+
+
+def _database_host(value):
+    if not value or len(value) > 253 or any(character.isspace() for character in value):
+        raise ImproperlyConfigured("CAMELLIA_REMOTE_DATABASE_HOST is invalid")
+    try:
+        ipaddress.ip_address(value)
+        return value
+    except ValueError:
+        pass
+    if not re.fullmatch(
+        r"(?=.{1,253}\Z)(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)*"
+        r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?",
+        value,
+    ):
+        raise ImproperlyConfigured("CAMELLIA_REMOTE_DATABASE_HOST is invalid")
+    return value
+
+
+def _database_tls_options(database_host):
+    sslmode = os.environ.get(
+        "CAMELLIA_REMOTE_DATABASE_SSLMODE",
+        "prefer" if DEBUG else "verify-full",
+    ).strip()
+    if sslmode not in (
+        "disable",
+        "allow",
+        "prefer",
+        "require",
+        "verify-ca",
+        "verify-full",
+    ):
+        raise ImproperlyConfigured("CAMELLIA_REMOTE_DATABASE_SSLMODE is invalid")
+    local_hosts = {"127.0.0.1", "::1", "localhost", "postgres"}
+    if not DEBUG and database_host not in local_hosts and sslmode != "verify-full":
+        raise ImproperlyConfigured(
+            "external production databases must use CAMELLIA_REMOTE_DATABASE_SSLMODE=verify-full"
+        )
+
+    options = {
+        "connect_timeout": env_int("CAMELLIA_REMOTE_DATABASE_CONNECT_TIMEOUT", 10, 1, 60),
+        "sslmode": sslmode,
+    }
+    certificate_options = {
+        "CAMELLIA_REMOTE_DATABASE_SSLROOTCERT": "sslrootcert",
+        "CAMELLIA_REMOTE_DATABASE_SSLCERT": "sslcert",
+        "CAMELLIA_REMOTE_DATABASE_SSLKEY": "sslkey",
+    }
+    configured_certificates = {}
+    for environment_name, option_name in certificate_options.items():
+        value = os.environ.get(environment_name, "").strip()
+        if value:
+            if not Path(value).is_absolute():
+                raise ImproperlyConfigured(f"{environment_name} must be an absolute path")
+            options[option_name] = value
+            configured_certificates[option_name] = value
+    if ("sslcert" in configured_certificates) != ("sslkey" in configured_certificates):
+        raise ImproperlyConfigured(
+            "CAMELLIA_REMOTE_DATABASE_SSLCERT and CAMELLIA_REMOTE_DATABASE_SSLKEY must be configured together"
+        )
+    return options
+
+
+if not DATABASE_URL and not _has_discrete_database_settings:
     if not DEBUG:
-        raise ImproperlyConfigured("CAMELLIA_REMOTE_DATABASE_URL is required when CAMELLIA_REMOTE_DEBUG is false")
+        raise ImproperlyConfigured(
+            "a PostgreSQL connection is required through CAMELLIA_REMOTE_DATABASE_URL "
+            "or the discrete database settings when CAMELLIA_REMOTE_DEBUG is false"
+        )
     DATABASES = {
         "default": {
             "ENGINE": "django.db.backends.sqlite3",
-            "NAME": SQLITE_DB_PATH or (BASE_DIR / ".local/db.sqlite3"),
+            "NAME": SQLITE_DB_PATH or (BASE_DIR / "db.sqlite3"),
             "OPTIONS": {
                 "timeout": env_int("CAMELLIA_REMOTE_SQLITE_BUSY_TIMEOUT_SECONDS", 20, 1, 300),
                 "transaction_mode": "IMMEDIATE",
@@ -296,8 +476,41 @@ if not DATABASE_URL:
             },
         }
     }
+elif _has_discrete_database_settings:
+    missing_database_settings = [
+        name
+        for name, value in (
+            ("CAMELLIA_REMOTE_DATABASE_HOST", DATABASE_HOST),
+            ("CAMELLIA_REMOTE_DATABASE_NAME", DATABASE_NAME),
+            ("CAMELLIA_REMOTE_DATABASE_USER", DATABASE_USER),
+            ("CAMELLIA_REMOTE_DATABASE_PASSWORD", DATABASE_PASSWORD),
+        )
+        if not value
+    ]
+    if missing_database_settings:
+        raise ImproperlyConfigured(
+            "discrete database settings must be configured together; missing " + ", ".join(missing_database_settings)
+        )
+    database_host = _database_host(DATABASE_HOST)
+    DATABASES = {
+        "default": {
+            "ENGINE": "django.db.backends.postgresql",
+            "NAME": _database_text(DATABASE_NAME, "CAMELLIA_REMOTE_DATABASE_NAME", 63),
+            "HOST": database_host,
+            "USER": _database_text(DATABASE_USER, "CAMELLIA_REMOTE_DATABASE_USER", 63),
+            "PASSWORD": _database_text(DATABASE_PASSWORD, "CAMELLIA_REMOTE_DATABASE_PASSWORD", 1024),
+            "PORT": env_int("CAMELLIA_REMOTE_DATABASE_PORT", 5432, 1, 65535),
+            "CONN_MAX_AGE": env_int("CAMELLIA_REMOTE_DATABASE_CONN_MAX_AGE", 60, 0, 3600),
+            "CONN_HEALTH_CHECKS": True,
+            "OPTIONS": _database_tls_options(database_host),
+        }
+    }
 else:
-    _database = urlsplit(DATABASE_URL)
+    try:
+        _database = urlsplit(DATABASE_URL)
+        _database_port = _database.port
+    except ValueError as exc:
+        raise ImproperlyConfigured("CAMELLIA_REMOTE_DATABASE_URL is invalid") from exc
     if (
         _database.scheme not in ("postgres", "postgresql")
         or not _database.hostname
@@ -311,35 +524,32 @@ else:
             "CAMELLIA_REMOTE_DATABASE_URL must be a PostgreSQL URL with credentials and database name; "
             "configure TLS through CAMELLIA_REMOTE_DATABASE_SSLMODE"
         )
-    _database_sslmode = os.environ.get("CAMELLIA_REMOTE_DATABASE_SSLMODE", "prefer" if DEBUG else "require").strip()
-    if _database_sslmode not in (
-        "disable",
-        "allow",
-        "prefer",
-        "require",
-        "verify-ca",
-        "verify-full",
-    ):
-        raise ImproperlyConfigured("CAMELLIA_REMOTE_DATABASE_SSLMODE is invalid")
+    database_host = _database.hostname
     DATABASES = {
         "default": {
             "ENGINE": "django.db.backends.postgresql",
-            "NAME": unquote(_database.path.lstrip("/")),
+            "NAME": _database_text(
+                unquote(_database.path.lstrip("/")),
+                "CAMELLIA_REMOTE_DATABASE_URL database name",
+                63,
+            ),
             "HOST": _database.hostname,
-            "USER": unquote(_database.username),
-            "PASSWORD": unquote(_database.password),
-            "PORT": _database.port or 5432,
+            "USER": _database_text(
+                unquote(_database.username),
+                "CAMELLIA_REMOTE_DATABASE_URL username",
+                63,
+            ),
+            "PASSWORD": _database_text(
+                unquote(_database.password),
+                "CAMELLIA_REMOTE_DATABASE_URL password",
+                1024,
+            ),
+            "PORT": _database_port or 5432,
             "CONN_MAX_AGE": env_int("CAMELLIA_REMOTE_DATABASE_CONN_MAX_AGE", 60, 0, 3600),
             "CONN_HEALTH_CHECKS": True,
-            "OPTIONS": {
-                "connect_timeout": env_int("CAMELLIA_REMOTE_DATABASE_CONNECT_TIMEOUT", 10, 1, 60),
-                "sslmode": _database_sslmode,
-            },
+            "OPTIONS": _database_tls_options(database_host),
         }
     }
-
-# Password validation
-# https://docs.djangoproject.com/en/3.1/ref/settings/#auth-password-validators
 
 AUTH_PASSWORD_VALIDATORS = [
     {
@@ -357,20 +567,21 @@ AUTH_PASSWORD_VALIDATORS = [
 ]
 
 
-# Internationalization
-# https://docs.djangoproject.com/en/3.1/topics/i18n/
-
-# LANGUAGE_CODE = 'zh-hans'
-
-TIME_ZONE = os.environ.get("CAMELLIA_REMOTE_TIME_ZONE", "Asia/Shanghai")
+TIME_ZONE = os.environ.get("CAMELLIA_REMOTE_TIME_ZONE", "UTC").strip()
+try:
+    ZoneInfo(TIME_ZONE)
+except (ValueError, ZoneInfoNotFoundError) as exc:
+    raise ImproperlyConfigured("CAMELLIA_REMOTE_TIME_ZONE must be a valid IANA time zone") from exc
 
 USE_I18N = True
 
 USE_TZ = True
 
-# ==========日志配置 开始=====================
-LOG_LEVEL = os.environ.get("CAMELLIA_REMOTE_LOG_LEVEL", "INFO").upper()
-LOG_LEVEL = LOG_LEVEL if LOG_LEVEL in ("CAMELLIA_REMOTE_DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL") else "INFO"
+LOG_LEVEL = env_choice(
+    "CAMELLIA_REMOTE_LOG_LEVEL",
+    "INFO",
+    {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"},
+).upper()
 
 LOGGING = {
     "version": 1,
@@ -398,15 +609,13 @@ LOGGING = {
         "api": {"handlers": ["console"], "level": LOG_LEVEL, "propagate": False},
     },
 }
-# ==========日志配置 结束=====================
-
-
-# Static files (CSS, JavaScript, Images)
-# https://docs.djangoproject.com/en/3.1/howto/static-files/
-
 STATIC_URL = "/static/"
 STATIC_ROOT = BASE_DIR / "static_root"
 STATICFILES_DIRS = [BASE_DIR / "static"]
+# pytest-django temporarily overrides DEBUG after settings are loaded. Keep the
+# intended development mode explicit so tests do not scan an uncollected root.
+WHITENOISE_AUTOREFRESH = DEBUG
+WHITENOISE_USE_FINDERS = DEBUG
 STORAGES = {
     "default": {
         "BACKEND": "django.core.files.storage.FileSystemStorage",
@@ -435,7 +644,7 @@ SECURE_CSP = {
 SECURE_CSP_REPORT_ONLY = {}
 X_FRAME_OPTIONS = "DENY"
 
-MEDIA_ROOT = BASE_DIR / "records"
+MEDIA_ROOT = RECORD_UPLOAD_ROOT
 MEDIA_URL = "/records/"
 
 LANGUAGES = (

@@ -1,5 +1,6 @@
 import json
 import re
+from html.parser import HTMLParser
 from pathlib import Path
 from unittest import skipUnless
 
@@ -13,6 +14,75 @@ from webui2.views import (
     _normalize_rendezvous_server,
     _resolve_webui2_servers,
 )
+
+
+class _AccessibilityParser(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.label_targets = set()
+        self.controls = []
+        self.blank_links = []
+        self.destructive_actions = []
+        self._current_form = None
+
+    def handle_starttag(self, tag, attrs):
+        attributes = dict(attrs)
+        if tag == "form":
+            self._current_form = {"confirm": attributes.get("data-confirm"), "actions": []}
+        if tag == "label" and attributes.get("for"):
+            self.label_targets.add(attributes["for"])
+        if tag in {"input", "select", "textarea"} and attributes.get("type", "").lower() != "hidden":
+            self.controls.append(attributes)
+        if (
+            tag == "input"
+            and self._current_form is not None
+            and attributes.get("type", "").lower() == "hidden"
+            and attributes.get("name") == "action"
+        ):
+            self._current_form["actions"].append((attributes.get("value"), self._current_form["confirm"]))
+        if tag == "button" and attributes.get("name") == "action":
+            self.destructive_actions.append((attributes.get("value"), attributes.get("data-confirm")))
+        if tag == "a" and attributes.get("target", "").lower() == "_blank":
+            self.blank_links.append(attributes)
+
+    def handle_endtag(self, tag):
+        if tag == "form" and self._current_form is not None:
+            self.destructive_actions.extend(self._current_form["actions"])
+            self._current_form = None
+
+
+class TemplateAccessibilityTests(SimpleTestCase):
+    def test_form_controls_and_new_windows_have_accessible_names(self):
+        template_roots = (
+            Path(settings.BASE_DIR) / "api" / "templates",
+            Path(settings.BASE_DIR) / "webui2" / "templates",
+            Path(settings.BASE_DIR) / "templates",
+        )
+        for template_path in sorted(path for root in template_roots for path in root.rglob("*.html")):
+            parser = _AccessibilityParser()
+            parser.feed(template_path.read_text(encoding="utf-8"))
+            for attributes in parser.controls:
+                with self.subTest(template=template_path.name, control=attributes.get("name")):
+                    self.assertTrue(
+                        attributes.get("aria-label")
+                        or attributes.get("aria-labelledby")
+                        or attributes.get("id") in parser.label_targets,
+                        f"{template_path}: visible form control has no accessible name",
+                    )
+            for attributes in parser.blank_links:
+                with self.subTest(template=template_path.name, href=attributes.get("href")):
+                    rel = set((attributes.get("rel") or "").split())
+                    self.assertIn("noopener", rel, f"{template_path}: target=_blank must isolate opener")
+                    self.assertIn("noreferrer", rel, f"{template_path}: target=_blank must suppress referrer")
+            for action, confirmation in parser.destructive_actions:
+                if action and (
+                    action.startswith("delete_") or action in {"bulk_delete", "bulk_peer_delete", "transfer_book"}
+                ):
+                    with self.subTest(template=template_path.name, action=action):
+                        self.assertTrue(
+                            confirmation,
+                            f"{template_path}: {action} must require explicit confirmation",
+                        )
 
 
 class WebClientServerConfigurationTests(SimpleTestCase):

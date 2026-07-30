@@ -1,6 +1,27 @@
 import ipaddress
+import json
 
 from django.conf import settings
+
+
+class InvalidJsonPayload(ValueError):
+    """Raised when an endpoint receives a non-decodable JSON body."""
+
+
+def load_json_body(request):
+    if not request.body:
+        return {}
+    try:
+        return json.loads(request.body.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise InvalidJsonPayload("Request body is not valid UTF-8 JSON") from exc
+
+
+def load_json_object(request):
+    payload = load_json_body(request)
+    if not isinstance(payload, dict):
+        raise InvalidJsonPayload("Request body must be a JSON object")
+    return payload
 
 
 def _canonical_ip(value):
@@ -35,4 +56,4 @@ def client_ip(request):
                 return real_ip
     # Keep audit/rate-limit keys valid and fail closed when the server did not
     # receive a usable transport address.
-    return remote or "0.0.0.0"
+    return remote or "0.0.0.0"  # noqa: S104 - non-routable audit sentinel, not a bind address

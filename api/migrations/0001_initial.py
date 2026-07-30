@@ -117,11 +117,6 @@ class Migration(migrations.Migration):
             options={
                 "verbose_name": "用户",
                 "verbose_name_plural": "用户列表",
-                "permissions": (
-                    ("view_task", "Can see available tasks"),
-                    ("change_task_status", "Can change the status of tasks"),
-                    ("close_task", "Can remove a task by setting its status as closed"),
-                ),
             },
             managers=[
                 ("objects", api.models_user.MyUserManager()),
@@ -432,8 +427,11 @@ class Migration(migrations.Migration):
                 ("rid", models.CharField(blank=True, default="", max_length=16, verbose_name="Camellia ID")),
                 ("device_uuid", models.CharField(blank=True, default="", max_length=344, verbose_name="Device UUID")),
                 ("device_info", models.JSONField(blank=True, default=dict, verbose_name="Device Info")),
-                ("nonce", models.CharField(max_length=64, verbose_name="OIDC Nonce")),
-                ("code_verifier", models.CharField(max_length=128, verbose_name="PKCE Code Verifier")),
+                ("nonce", api.encrypted_fields.EncryptedTextField(max_length=64, verbose_name="OIDC Nonce")),
+                (
+                    "code_verifier",
+                    api.encrypted_fields.EncryptedTextField(max_length=128, verbose_name="PKCE Code Verifier"),
+                ),
                 ("status", models.CharField(db_index=True, default="pending", max_length=16, verbose_name="Status")),
                 ("error_code", models.CharField(blank=True, default="", max_length=64, verbose_name="Error Code")),
                 ("created_at", models.DateTimeField(auto_now_add=True, db_index=True, verbose_name="Created At")),

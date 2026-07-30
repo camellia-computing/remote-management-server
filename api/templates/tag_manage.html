@@ -28,7 +28,7 @@
       <div class="notice">{% trans "选择地址簿后创建或维护标签。" %}</div>
     {% endif %}
     <form class="ab-filter" method="get" action="/api/tag_manage">
-      <input class="ab-input ab-input-wide" type="text" name="q" value="{{ filter_q }}" placeholder="{% trans "搜索标签或地址簿" %}">
+      <input class="ab-input ab-input-wide" type="text" name="q" value="{{ filter_q }}" aria-label="{% trans "搜索标签或地址簿" %}" placeholder="{% trans "搜索标签或地址簿" %}">
       <button class="btn btn-secondary btn-xs" type="submit">{% trans "筛选" %}</button>
       {% if filter_q %}
         <a class="btn btn-ghost btn-xs" href="/api/tag_manage">{% trans "清除" %}</a>
@@ -47,12 +47,12 @@
   <form class="ab-form ab-tag-form" method="post" action="/api/tag_manage">
     {% csrf_token %}
     <input type="hidden" name="action" value="add_tag">
-    <select class="ab-select" name="profile_guid">
+    <select class="ab-select" name="profile_guid" aria-label="{% trans "地址簿" %}">
       {% for profile in profiles %}
         <option value="{{ profile.guid }}">{{ profile.name }} · {{ profile.owner.username|default:"-" }}</option>
       {% endfor %}
     </select>
-    <input class="ab-input" type="text" name="name" placeholder="{% trans "标签名称" %}">
+    <input class="ab-input" type="text" name="name" aria-label="{% trans "标签名称" %}" placeholder="{% trans "标签名称" %}">
     <input class="ab-input ab-color-input" type="color" name="color" value="#397bff" aria-label="{% trans "标签颜色" %}">
     <button class="btn btn-primary btn-xs" type="submit">{% trans "新增" %}</button>
   </form>
@@ -114,11 +114,11 @@
               <input type="hidden" name="old" value="{{ tag.name }}">
               <div class="action-title">{% trans "新名称" %}</div>
               <div class="action-row">
-                <input class="ab-input" type="text" name="new" placeholder="{% trans "新名称" %}">
+                <input class="ab-input" type="text" name="new" aria-label="{% trans "新名称" %}" placeholder="{% trans "新名称" %}">
                 <button class="btn btn-ghost btn-xs" type="submit">{% trans "重命名" %}</button>
               </div>
             </form>
-            <form class="action-panel action-panel--danger" method="post" action="/api/tag_manage">
+            <form class="action-panel action-panel--danger" method="post" action="/api/tag_manage" data-confirm="{% trans "此操作不可撤销。确认继续？" %}">
               {% csrf_token %}
               <input type="hidden" name="action" value="delete_tag">
               <input type="hidden" name="profile_guid" value="{{ tag.profile_guid }}">

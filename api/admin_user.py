@@ -1,12 +1,13 @@
-from django.contrib import admin
-from api import models
 from django import forms
-from django.contrib.auth.models import Group
+from django.contrib import admin
+from django.contrib.auth import password_validation
 from django.contrib.auth.admin import UserAdmin as BaseUserAdmin
 from django.contrib.auth.forms import ReadOnlyPasswordHashField
-from django.contrib.auth import password_validation
+from django.contrib.auth.models import Group
 from django.core.exceptions import ValidationError
 from django.utils.translation import gettext as _
+
+from api import models
 
 
 class UserCreationForm(forms.ModelForm):
@@ -51,7 +52,7 @@ class UserCreationForm(forms.ModelForm):
 
     def save(self, commit=True):
         # Save the provided password in hashed format
-        user = super(UserCreationForm, self).save(commit=False)
+        user = super().save(commit=False)
         user.set_password(self.cleaned_data["password1"])
         if commit:
             user.save()
@@ -95,7 +96,7 @@ class UserChangeForm(forms.ModelForm):
 
     def save(self, commit=True):
         # Save the provided password in hashed format
-        user = super(UserChangeForm, self).save(commit=False)
+        user = super().save(commit=False)
 
         if commit:
             user.save()
@@ -145,7 +146,36 @@ admin.site.register(models.UserProfile, UserAdmin)
 admin.site.register(models.RemoteToken, models.RemoteTokenAdmin)
 
 
-class RemotePeerAdminForm(forms.ModelForm):
+class SecretPreservingAdminForm(forms.ModelForm):
+    """Keep encrypted values write-only in Django admin forms."""
+
+    secret_field_names = ()
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        for name in self.secret_field_names:
+            field = self.fields.get(name)
+            if field is None:
+                continue
+            field.widget = forms.PasswordInput(
+                render_value=False,
+                attrs={"autocomplete": "new-password"},
+            )
+            field.help_text = _("留空以保留现有值。")
+            self.initial[name] = ""
+
+    def clean(self):
+        cleaned_data = super().clean()
+        if self.instance.pk:
+            for name in self.secret_field_names:
+                if not cleaned_data.get(name):
+                    cleaned_data[name] = getattr(self.instance, name)
+        return cleaned_data
+
+
+class RemotePeerAdminForm(SecretPreservingAdminForm):
+    secret_field_names = ("rhash", "password")
+
     class Meta:
         model = models.RemotePeer
         fields = "__all__"
@@ -162,9 +192,21 @@ class RemotePeerAdminCustom(models.RemotePeerAdmin):
     form = RemotePeerAdminForm
 
 
+class RemoteDeviceAdminForm(SecretPreservingAdminForm):
+    secret_field_names = ("address_book_password",)
+
+    class Meta:
+        model = models.RemoteDevice
+        fields = "__all__"
+
+
+class RemoteDeviceAdminCustom(models.RemoteDeviceAdmin):
+    form = RemoteDeviceAdminForm
+
+
 admin.site.register(models.RemoteTag, models.RemoteTagAdmin)
 admin.site.register(models.RemotePeer, RemotePeerAdminCustom)
-admin.site.register(models.RemoteDevice, models.RemoteDeviceAdmin)
+admin.site.register(models.RemoteDevice, RemoteDeviceAdminCustom)
 admin.site.register(models.ShareLink, models.ShareLinkAdmin)
 admin.site.register(models.ConnLog, models.ConnLogAdmin)
 admin.site.register(models.FileLog, models.FileLogAdmin)

@@ -1,18 +1,15 @@
 [Unit]
-Description=Back up Camellia Remote Management PostgreSQL
+Description=Remove expired Camellia Remote Management authentication state
 Requires=camellia-remote-management-stack.service
 After=camellia-remote-management-stack.service
 
 [Service]
 Type=oneshot
-EnvironmentFile=/etc/camellia-remote-management/management.env
-ExecStart=/opt/camellia-remote-management/backup-postgres.sh
+ExecStart=/usr/bin/docker compose --env-file /etc/camellia-remote-management/management.env -f /opt/camellia-remote-management/docker-compose.yaml exec -T management python manage.py purge_expired_state
 User=root
 Group=root
 UMask=0077
 Nice=10
-IOSchedulingClass=best-effort
-IOSchedulingPriority=7
 CapabilityBoundingSet=
 MemoryDenyWriteExecute=yes
 NoNewPrivileges=yes
@@ -23,7 +20,6 @@ ProtectHostname=yes
 ProtectProc=invisible
 ProtectSystem=strict
 ProtectHome=yes
-ReadWritePaths=/var/backups/camellia-remote-management
 ProtectKernelLogs=yes
 ProtectKernelModules=yes
 ProtectKernelTunables=yes

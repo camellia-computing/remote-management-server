@@ -1,14 +1,15 @@
 import datetime
 import uuid
-from django.db import models
+
+from django.conf import settings
 from django.contrib import admin
 from django.contrib.auth.models import Group
 from django.core.exceptions import ValidationError
+from django.db import models
 from django.db.models.signals import m2m_changed
 from django.dispatch import receiver
-from django.utils.translation import gettext_lazy as _
-from django.conf import settings
 from django.utils import timezone
+from django.utils.translation import gettext_lazy as _
 
 from .encrypted_fields import EncryptedTextField
 
@@ -795,7 +796,7 @@ class OidcPendingAuth(models.Model):
     provider = models.CharField(verbose_name="Provider", max_length=64)
     request_ip = models.GenericIPAddressField(
         verbose_name="Request IP",
-        default="0.0.0.0",
+        default="0.0.0.0",  # noqa: S104 - non-routable audit sentinel, not a bind address
         db_index=True,
     )
     rid = models.CharField(verbose_name="Camellia ID", max_length=16, blank=True, default="")
@@ -805,8 +806,8 @@ class OidcPendingAuth(models.Model):
         blank=True,
         default=dict,
     )
-    nonce = models.CharField(verbose_name="OIDC Nonce", max_length=64)
-    code_verifier = models.CharField(verbose_name="PKCE Code Verifier", max_length=128)
+    nonce = EncryptedTextField(verbose_name="OIDC Nonce", max_length=64)
+    code_verifier = EncryptedTextField(verbose_name="PKCE Code Verifier", max_length=128)
     status = models.CharField(verbose_name="Status", max_length=16, default=STATUS_PENDING, db_index=True)
     error_code = models.CharField(verbose_name="Error Code", max_length=64, blank=True, default="")
     authenticated_user = models.ForeignKey(

@@ -1,3 +1,3 @@
-from .views_front import *
-from .views_api import *
-from .front_locale import *
+from .views_front import index
+
+__all__ = ("index",)

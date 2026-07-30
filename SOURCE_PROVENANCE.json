@@ -3,7 +3,6 @@
   "component": "camellia-remote-management-server",
   "source_repository": "https://github.com/XavierAlpha/camellia-api-server",
   "source_commit": "13d16a161afa38cb08e1bcd41a45ba2fb6d2439e",
-  "normalized_repository": "https://github.com/camellia-computing/remote-management-server",
   "history_policy": "fresh-root-snapshot",
   "production_database": "PostgreSQL 18",
   "license": "AGPL-3.0-only"

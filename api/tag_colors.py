@@ -1,6 +1,5 @@
 import re
 
-
 MAX_ARGB_COLOR = 0xFFFFFFFF
 
 

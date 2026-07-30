@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import argparse
-import ast
 import json
 import os
 import re
@@ -12,7 +11,6 @@ import sys
 import tomllib
 from dataclasses import asdict, dataclass
 from pathlib import Path
-
 
 SEMVER_RE = re.compile(r"^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$")
 
@@ -38,17 +36,20 @@ def _read_toml(path: Path) -> dict:
         raise MetadataError(f"cannot read {path}: {error}") from error
 
 
-def _project_version(root: Path) -> str:
+def _project_metadata(root: Path) -> tuple[str, str]:
     project = _read_toml(root / "pyproject.toml").get("project")
-    if not isinstance(project, dict) or project.get("name") != "camellia-remote-management-server":
-        raise MetadataError("pyproject.toml must describe project camellia-remote-management-server")
+    if not isinstance(project, dict):
+        raise MetadataError("pyproject.toml must contain a project table")
+    name = project.get("name")
     version = project.get("version")
-    if not isinstance(version, str):
-        raise MetadataError("pyproject.toml project.version must be a string")
-    return version
+    if not isinstance(name, str) or not name.strip():
+        raise MetadataError("pyproject.toml project.name must be a non-empty string")
+    if not isinstance(version, str) or not version.strip():
+        raise MetadataError("pyproject.toml project.version must be a non-empty string")
+    return name, version
 
 
-def _lock_version(root: Path) -> str:
+def _lock_version(root: Path, project_name: str) -> str:
     packages = _read_toml(root / "uv.lock").get("package")
     if not isinstance(packages, list):
         raise MetadataError("uv.lock does not contain a package list")
@@ -56,54 +57,29 @@ def _lock_version(root: Path) -> str:
         package
         for package in packages
         if isinstance(package, dict)
-        and package.get("name") == "camellia-remote-management-server"
+        and package.get("name") == project_name
         and package.get("source") == {"virtual": "."}
     ]
     if len(matches) != 1 or not isinstance(matches[0].get("version"), str):
-        raise MetadataError("uv.lock must contain exactly one virtual camellia-remote-management-server package")
+        raise MetadataError(f"uv.lock must contain exactly one virtual {project_name} package")
     return matches[0]["version"]
-
-
-def _legacy_version(root: Path) -> str:
-    path = root / "version.py"
-    try:
-        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-    except (OSError, SyntaxError) as error:
-        raise MetadataError(f"cannot read {path}: {error}") from error
-
-    values: list[str] = []
-    for node in tree.body:
-        if not isinstance(node, ast.Assign) or len(node.targets) != 1:
-            continue
-        target = node.targets[0]
-        if isinstance(target, ast.Name) and target.id == "APP_VERSION":
-            if not isinstance(node.value, ast.Constant) or not isinstance(node.value.value, str):
-                raise MetadataError("version.py APP_VERSION must be a string literal")
-            values.append(node.value.value)
-    if len(values) != 1:
-        raise MetadataError("version.py must assign APP_VERSION exactly once")
-    return values[0]
 
 
 def load_metadata(root: Path) -> ReleaseMetadata:
     root = root.resolve()
-    project_version = _project_version(root)
+    project_name, project_version = _project_metadata(root)
     match = SEMVER_RE.fullmatch(project_version)
     if match is None:
         raise MetadataError("project version must be stable SemVer MAJOR.MINOR.PATCH")
 
-    lock_version = _lock_version(root)
-    legacy_version = _legacy_version(root)
-    expected_legacy = f"v{project_version}"
-    if lock_version != project_version or legacy_version != expected_legacy:
-        raise MetadataError(
-            f"version mismatch: pyproject.toml={project_version}, uv.lock={lock_version}, version.py={legacy_version}"
-        )
+    lock_version = _lock_version(root, project_name)
+    if lock_version != project_version:
+        raise MetadataError(f"version mismatch: pyproject.toml={project_version}, uv.lock={lock_version}")
 
     major, minor, patch = match.groups()
     return ReleaseMetadata(
         version=project_version,
-        tag=expected_legacy,
+        tag=f"v{project_version}",
         major=major,
         minor=minor,
         patch=patch,

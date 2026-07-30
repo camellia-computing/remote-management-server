@@ -7,12 +7,11 @@
 <head>
     <meta charset="utf-8">
     <title>{% block title %}{% endblock %}</title>
-    <meta name="renderer" content="webkit">
-    <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1">
     <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
     <meta name="theme-color" content="#397bff">
     <link rel="icon" type="image/svg+xml" href="{% static 'web_client/favicon.svg' %}">
     <link rel="stylesheet" href="{% static 'ui/app.css' %}">
+    <script defer src="{% static 'ui/app.js' %}"></script>
     {% block link %}{% endblock %}
 </head>
 
@@ -43,9 +42,9 @@
                 <a class="nav-link{% if nav_active == 'ab_audit' %} is-active{% endif %}" href="/api/ab_audit">{% trans "规则审计" %}</a>
                 <a class="nav-link{% if nav_active == 'conn_log' %} is-active{% endif %}" href="/api/conn_log">{% trans "连接日志" %}</a>
                 <a class="nav-link{% if nav_active == 'file_log' %} is-active{% endif %}" href="/api/file_log">{% trans "文件传输日志" %}</a>
-                <a class="nav-link" href="/admin" target="_blank">{% trans "管理后台" %}</a>
+                <a class="nav-link" href="/admin" target="_blank" rel="noopener noreferrer">{% trans "管理后台" %}</a>
                 {% endif %}
-                <a class="nav-link nav-cta" href="/webui2" target="_blank">{% trans "网页控制" %}</a>
+                <a class="nav-link nav-cta" href="/webui2" target="_blank" rel="noopener noreferrer">{% trans "网页控制" %}</a>
                 <form method="post" action="/api/user_action?action=logout" class="nav-logout-form">
                   {% csrf_token %}
                   <button type="submit" class="nav-link nav-link-button">{% trans "退出" %}</button>

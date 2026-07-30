@@ -1,12 +1,11 @@
-from django.http import JsonResponse, HttpResponse, HttpResponseRedirect
 import base64
 import binascii
 import contextlib
-import hashlib
-import json
 import datetime
 import functools
+import hashlib
 import ipaddress
+import json
 import logging
 import os
 import re
@@ -17,58 +16,56 @@ import uuid
 from urllib.parse import urlsplit
 
 import requests
+from authlib.integrations.requests_client import OAuth2Session
+from django.conf import settings
 from django.contrib import auth
 from django.contrib.auth import password_validation
+from django.contrib.auth.models import Group
 from django.core.exceptions import ValidationError
 from django.core.validators import validate_email
-
-# from django.forms.models import model_to_dict
-from api.models import (
-    RemoteToken,
-    UserProfile,
-    RemoteTag,
-    RemotePeer,
-    RemoteDevice,
-    ConnLog,
-    FileLog,
-    StrategyProfile,
-    DeviceGroup,
-    AddressBookProfile,
-    AddressBookShare,
-    AddressBookRule,
-    AddressBookRuleAudit,
-    AlarmLog,
-    OidcPendingAuth,
-    OidcIdentity,
-    LoginAttempt,
-)
-from django.contrib.auth.models import Group
-from django.db import transaction
-from django.db import IntegrityError
-from django.db import connection
+from django.db import IntegrityError, connection, transaction
 from django.db.models import Prefetch, Q, QuerySet
+from django.http import HttpResponse, HttpResponseRedirect, JsonResponse
 from django.utils import timezone
 from django.utils.translation import gettext as _
-from django.conf import settings
-from authlib.integrations.requests_client import OAuth2Session
 from joserfc import jwt
 from joserfc.jwk import KeySet
 from joserfc.jwt import JWTClaimsRegistry
 from nacl.signing import SigningKey
 
-from api.request_utils import client_ip
+# from django.forms.models import model_to_dict
+from api.models import (
+    AddressBookProfile,
+    AddressBookRule,
+    AddressBookRuleAudit,
+    AddressBookShare,
+    AlarmLog,
+    ConnLog,
+    DeviceGroup,
+    FileLog,
+    LoginAttempt,
+    OidcIdentity,
+    OidcPendingAuth,
+    RemoteDevice,
+    RemotePeer,
+    RemoteTag,
+    RemoteToken,
+    StrategyProfile,
+    UserProfile,
+)
+from api.request_utils import client_ip, load_json_body, load_json_object
 from api.tag_colors import normalize_tag_color
 
 logger = logging.getLogger(__name__)
 EFFECTIVE_SECONDS = 7200
 MAX_DEPLOY_KEY_LEN = 512
 MAX_PLUGIN_SIGN_MSG_BYTES = 64 * 1024
-OIDC_PENDING_MINUTES = 5
+OIDC_PENDING_MINUTES = settings.OIDC_PENDING_RETENTION_MINUTES
 OIDC_MAX_PENDING_PER_IP = 20
 OIDC_DOCUMENT_MAX_BYTES = 1024 * 1024
 LOGIN_LOCK_MAX_FAILURES = 10
 LOGIN_LOCK_MAX_IP_FAILURES = 100
-LOGIN_LOCK_WINDOW_MINUTES = 15
+LOGIN_LOCK_WINDOW_MINUTES = settings.LOGIN_ATTEMPT_RETENTION_MINUTES
 MAX_DEVICE_UUID_TEXT_LEN = 344
 MAX_AUDIT_INFO_BYTES = 16 * 1024
 MAX_AUDIT_NOTE_BYTES = 16 * 1024
@@ -97,12 +94,11 @@ OIDC_SAFE_ID_TOKEN_ALGORITHMS = frozenset(
 
 
 def _load_json(request):
-    try:
-        if request.body:
-            return json.loads(request.body.decode())
-    except Exception:
-        return {}
-    return {}
+    return load_json_body(request)
+
+
+def _load_json_object(request):
+    return load_json_object(request)
 
 
 def _get_bearer_token(request):
@@ -380,15 +376,21 @@ def _auth_body(user, raw_token):
 
 def _oidc_provider_name(op):
     name = str(op or "").strip()
+    if len(name) > 4096:
+        return ""
     if name.startswith("common-oidc/"):
         try:
             payload = json.loads(name[len("common-oidc/") :])
-            name = payload.get("name") or payload.get("op") or ""
-        except Exception:
+        except json.JSONDecodeError:
             name = ""
+        else:
+            if isinstance(payload, dict):
+                name = payload.get("name") or payload.get("op") or ""
+            else:
+                name = ""
     if name.startswith("oidc/"):
         name = name[len("oidc/") :]
-    return name
+    return name if re.fullmatch(r"[A-Za-z0-9._-]{1,64}", name) else ""
 
 
 def _valid_https_url(value):
@@ -396,6 +398,7 @@ def _valid_https_url(value):
         return False
     try:
         parsed = urlsplit(value)
+        _port = parsed.port
     except ValueError:
         return False
     return (
@@ -531,7 +534,7 @@ def _oidc_local_username(claims, issuer, subject, attempt=0):
             break
     if not base:
         base = "oidc-user"
-    if attempt == 0 and not UserProfile.objects.filter(username=base).exists():
+    if attempt == 0 and not UserProfile.objects.filter(username__iexact=base).exists():
         return base
     suffix = "-" + hashlib.sha256(f"{issuer}\0{subject}\0{attempt}".encode()).hexdigest()[:10]
     return f"{base[: max_length - len(suffix)]}{suffix}"
@@ -588,8 +591,6 @@ def _resolve_oidc_user(provider_name, issuer, claims):
                         email=email,
                         is_active=True,
                     )
-                    user.set_unusable_password()
-                    user.save(update_fields=["password"])
                     OidcIdentity.objects.create(
                         issuer=issuer,
                         subject=subject,
@@ -1297,21 +1298,14 @@ def _login_locked(ip, username):
 
 def _record_login_failure(ip, username):
     LoginAttempt.objects.create(
-        ip=ip or "0.0.0.0",
+        ip=ip or "0.0.0.0",  # noqa: S104 - non-routable audit sentinel, not a bind address
         username=username.casefold()[:150],
     )
-    # Opportunistic cleanup keeps the table tiny without a scheduled job.
-    window_start = timezone.now() - datetime.timedelta(minutes=LOGIN_LOCK_WINDOW_MINUTES)
-    LoginAttempt.objects.filter(created_at__lt=window_start).delete()
 
 
 def login(request):
     result = {}
-    if request.method != "POST":
-        _log_event(request, "api_login_invalid_method", level="warning")
-        return JsonResponse({"error": _("请求方式错误！请使用POST方式。")}, status=405)
-
-    data = _load_json(request)
+    data = _load_json_object(request)
 
     username_value = data.get("username", "")
     username = username_value.strip() if isinstance(username_value, str) else ""
@@ -1378,10 +1372,6 @@ def login(request):
 
 
 def logout(request):
-    if request.method != "POST":
-        _log_event(request, "api_logout_invalid_method", level="warning")
-        return JsonResponse({"error": _("请求方式错误！")}, status=405)
-
     token, user = _get_token_user(request)
     if not token or not user:
         _log_event(request, "api_logout_failed", level="warning")
@@ -1395,10 +1385,6 @@ def logout(request):
 
 def currentUser(request):
     result = {}
-    if request.method != "POST":
-        _log_event(request, "api_current_user_invalid_method", level="warning")
-        return JsonResponse({"error": _("错误的提交方式！")}, status=405)
-
     token, user = _get_token_user(request)
 
     if not user:
@@ -1418,11 +1404,8 @@ def currentUser(request):
 
 
 def sysinfo(request):
-    if request.method != "POST":
-        _log_event(request, "api_sysinfo_invalid_method", level="warning")
-        return JsonResponse({"error": _("错误的提交方式！")}, status=405)
     client_ip = get_client_ip(request)
-    postdata = _load_json(request)
+    postdata = _load_json_object(request)
     rid = postdata.get("id")
     device_uuid = postdata.get("uuid")
     if not _valid_device_identity(rid, device_uuid):
@@ -1462,9 +1445,7 @@ def sysinfo(request):
 
 
 def heartbeat(request):
-    if request.method != "POST":
-        return JsonResponse({"error": _("请求方式错误！请使用POST方式。")}, status=405)
-    postdata = _load_json(request)
+    postdata = _load_json_object(request)
     rid = postdata.get("id")
     device_uuid = postdata.get("uuid")
     if not _valid_device_identity(rid, device_uuid):
@@ -1502,7 +1483,7 @@ def heartbeat(request):
     response = {}
     try:
         client_modified = int(postdata.get("modified_at", 0))
-    except Exception:
+    except (TypeError, ValueError):
         client_modified = 0
     if device:
         profile = device.effective_strategy()
@@ -1516,15 +1497,13 @@ def heartbeat(request):
                         "event=invalid_strategy_options strategy_id=%s",
                         profile.pk,
                     )
-                    options = {}
+                    return JsonResponse({"error": "Invalid strategy configuration"}, status=503)
                 response["strategy"] = {"config_options": options, "extra": {}}
     _log_event(request, "api_heartbeat", level="debug", username=user.username, rid=rid, uuid=device_uuid)
     return JsonResponse(response)
 
 
 def sysinfo_ver(request):
-    if request.method != "POST":
-        return JsonResponse({"error": _("请求方式错误！请使用POST方式。")}, status=405)
     _token, user = _get_token_user(request)
     if not user:
         return JsonResponse({"error": "Invalid token"}, status=401)
@@ -1533,14 +1512,10 @@ def sysinfo_ver(request):
 
 
 def health_live(request):
-    if request.method != "GET":
-        return JsonResponse({"status": "method_not_allowed"}, status=405)
     return JsonResponse({"status": "live"})
 
 
 def health_ready(request):
-    if request.method != "GET":
-        return JsonResponse({"status": "method_not_allowed"}, status=405)
     if len(getattr(settings, "DEVICE_VERIFICATION_TOKEN", "")) < 32:
         return JsonResponse({"status": "not_ready"}, status=503)
     try:
@@ -1555,17 +1530,13 @@ def health_ready(request):
 
 
 def login_options(request):
-    if request.method != "GET":
-        return JsonResponse({"error": "GET required"}, status=405)
     _log_event(request, "api_login_options", level="debug")
     providers = getattr(settings, "OIDC_PROVIDERS", {})
     return JsonResponse([f"oidc/{name}" for name in providers.keys()], safe=False)
 
 
 def oidc_auth(request):
-    if request.method != "POST":
-        return JsonResponse({"error": _("请求方式错误！请使用POST方式。")}, status=405)
-    data = _load_json(request)
+    data = _load_json_object(request)
     provider_name = _oidc_provider_name(data.get("op"))
     provider = getattr(settings, "OIDC_PROVIDERS", {}).get(provider_name)
     if not provider:
@@ -1581,7 +1552,6 @@ def oidc_auth(request):
 
     now = timezone.now()
     cutoff = now - datetime.timedelta(minutes=OIDC_PENDING_MINUTES)
-    OidcPendingAuth.objects.filter(created_at__lt=cutoff).delete()
     client_ip = get_client_ip(request)
     if (
         OidcPendingAuth.objects.filter(
@@ -1637,8 +1607,6 @@ def oidc_auth(request):
 
 
 def oidc_auth_query(request):
-    if request.method != "GET":
-        return JsonResponse({"error": "GET required"}, status=405)
     poll_code = str(request.GET.get("code", "")).strip()
     if not poll_code or len(poll_code) > 128:
         return JsonResponse({"error": "No authed oidc is found"})
@@ -1684,8 +1652,6 @@ def oidc_auth_query(request):
 
 
 def oidc_callback(request):
-    if request.method != "GET":
-        return HttpResponse("GET required", status=405)
     state = str(request.GET.get("state", "")).strip()
     code = str(request.GET.get("code", "")).strip()
     session = OidcPendingAuth.objects.filter(Q(state=state)).first() if state else None
@@ -1757,10 +1723,7 @@ def oidc_callback(request):
 
 
 def devices_cli(request):
-    if request.method != "POST":
-        _log_event(request, "api_devices_cli_invalid_method", level="warning")
-        return JsonResponse({"error": _("请求方式错误！请使用POST方式。")}, status=405)
-    postdata = _load_json(request)
+    postdata = _load_json_object(request)
     rid = postdata.get("id", "")
     device_uuid = postdata.get("uuid", "")
     if not _valid_device_identity(rid, device_uuid):
@@ -1859,9 +1822,6 @@ def devices_cli(request):
 
 
 def devices_deploy(request):
-    if request.method != "POST":
-        _log_event(request, "api_devices_deploy_invalid_method", level="warning")
-        return JsonResponse({"result": "INVALID_INPUT"}, status=405)
     token, user = _get_token_user(request)
     if not user:
         _log_event(request, "api_devices_deploy_unauthorized", level="warning")
@@ -1869,7 +1829,7 @@ def devices_deploy(request):
     if len(settings.DEVICE_VERIFICATION_TOKEN) < 32:
         _log_event(request, "api_devices_deploy_not_enabled", level="error", username=user.username)
         return JsonResponse({"result": "NOT_ENABLED"}, status=503)
-    postdata = _load_json(request)
+    postdata = _load_json_object(request)
     rid = str(postdata.get("id", "")).strip()
     uuid_value = str(postdata.get("uuid", "")).strip()
     pk = str(postdata.get("pk", "")).strip()
@@ -1949,8 +1909,6 @@ def devices_deploy(request):
 
 
 def devices_verify_deployment(request):
-    if request.method != "POST":
-        return HttpResponse(status=405)
     expected_token = settings.DEVICE_VERIFICATION_TOKEN
     supplied_token = _get_bearer_token(request)
     if (
@@ -1963,7 +1921,7 @@ def devices_verify_deployment(request):
         return HttpResponse(status=401)
     if len(request.body) > 4096:
         return HttpResponse(status=413)
-    postdata = _load_json(request)
+    postdata = _load_json_object(request)
     rid = str(postdata.get("id", "")).strip()
     uuid_value = str(postdata.get("uuid", "")).strip()
     public_key_hash = str(postdata.get("public_key_hash", "")).strip().lower()
@@ -1984,9 +1942,6 @@ def devices_verify_deployment(request):
 
 
 def plugin_sign(request):
-    if request.method != "POST":
-        _log_event(request, "api_plugin_sign_invalid_method", level="warning")
-        return JsonResponse({"error": _("请求方式错误！请使用POST方式。")}, status=405)
     _token, user = _get_token_user(request)
     if not user:
         _log_event(request, "api_plugin_sign_unauthorized", level="warning")
@@ -1998,7 +1953,7 @@ def plugin_sign(request):
     if signing_key is None:
         _log_event(request, "api_plugin_sign_not_configured", level="warning")
         return JsonResponse({"error": "Plugin signing key is not configured"}, status=503)
-    postdata = _load_json(request)
+    postdata = _load_json_object(request)
     msg = postdata.get("msg", [])
     if not isinstance(msg, list) or len(msg) > MAX_PLUGIN_SIGN_MSG_BYTES:
         _log_event(request, "api_plugin_sign_invalid_msg", level="warning")
@@ -2020,9 +1975,6 @@ def plugin_sign(request):
 
 
 def record(request):
-    if request.method != "POST":
-        _log_event(request, "api_record_invalid_method", level="warning")
-        return JsonResponse({"error": _("请求方式错误！请使用POST方式。")}, status=405)
     token, user = _get_token_user(request)
     if not token or not user or not _get_active_token_device(token, user):
         _log_event(request, "api_record_unauthorized", level="warning")
@@ -2144,8 +2096,6 @@ def audit_with_type(request, typ):
         if typ == "conn/active":
             return _audit_conn_active(request)
         return JsonResponse({"error": "Not found"}, status=404)
-    if request.method != "POST":
-        return JsonResponse({"error": "Method not allowed"}, status=405)
     if typ == "conn":
         return _audit_conn(request)
     if typ == "file":
@@ -2157,14 +2107,11 @@ def audit_with_type(request, typ):
 
 
 def audit_note(request):
-    if request.method != "PUT":
-        _log_event(request, "api_audit_note_invalid_method", level="warning")
-        return JsonResponse({"error": _("请求方式错误！")}, status=405)
     token, user = _get_token_user(request)
     if not token or not user or not _get_active_token_device(token, user):
         _log_event(request, "api_audit_note_unauthorized", level="warning")
         return JsonResponse({"error": "Invalid token"}, status=401)
-    postdata = _load_json(request)
+    postdata = _load_json_object(request)
     guid = postdata.get("guid", "")
     note = postdata.get("note", "")
     if not isinstance(guid, str) or not isinstance(note, str):
@@ -2189,15 +2136,11 @@ def audit_note(request):
 
 
 def audit_root(request):
-    if request.method == "PUT":
-        return audit_note(request)
-    return JsonResponse({"error": "Method not allowed"}, status=405)
+    return audit_note(request)
 
 
 def ab_settings(request):
-    if request.method != "POST":
-        return JsonResponse({"error": "POST required"}, status=405)
-    token, user = _get_token_user(request)
+    _token, user = _get_token_user(request)
     if not user:
         _log_event(request, "api_ab_settings_unauthorized", level="warning")
         return JsonResponse({"error": "Invalid token"}, status=401)
@@ -2212,9 +2155,7 @@ def ab_settings(request):
 
 
 def ab_personal(request):
-    if request.method != "POST":
-        return JsonResponse({"error": "POST required"}, status=405)
-    token, user = _get_token_user(request)
+    _token, user = _get_token_user(request)
     if not user:
         _log_event(request, "api_ab_personal_unauthorized", level="warning")
         return JsonResponse({"error": "Invalid token"}, status=401)
@@ -2224,9 +2165,7 @@ def ab_personal(request):
 
 
 def ab_shared_profiles(request):
-    if request.method != "POST":
-        return JsonResponse({"error": "POST required"}, status=405)
-    token, user = _get_token_user(request)
+    _token, user = _get_token_user(request)
     if not user:
         _log_event(request, "api_ab_shared_profiles_unauthorized", level="warning")
         return JsonResponse({"error": "Invalid token"}, status=401)
@@ -2286,14 +2225,11 @@ def ab_shared_profiles(request):
 
 
 def ab_shared_add(request):
-    if request.method != "POST":
-        _log_event(request, "api_ab_shared_add_invalid_method", level="warning")
-        return JsonResponse({"error": "POST required"}, status=405)
-    token, user = _get_token_user(request)
+    _token, user = _get_token_user(request)
     if not user:
         _log_event(request, "api_ab_shared_add_unauthorized", level="warning")
         return JsonResponse({"error": "Invalid token"}, status=401)
-    postdata = _load_json(request)
+    postdata = _load_json_object(request)
     name = str(postdata.get("name", "")).strip()
     note = postdata.get("note", "")
     info = postdata.get("info", None)
@@ -2319,14 +2255,11 @@ def ab_shared_add(request):
 
 
 def ab_shared_update_profile(request):
-    if request.method != "PUT":
-        _log_event(request, "api_ab_shared_update_invalid_method", level="warning")
-        return JsonResponse({"error": "PUT required"}, status=405)
-    token, user = _get_token_user(request)
+    _token, user = _get_token_user(request)
     if not user:
         _log_event(request, "api_ab_shared_update_unauthorized", level="warning")
         return JsonResponse({"error": "Invalid token"}, status=401)
-    postdata = _load_json(request)
+    postdata = _load_json_object(request)
     guid = postdata.get("guid", "")
     if not guid:
         return JsonResponse({"error": "Invalid guid"}, status=400)
@@ -2393,10 +2326,7 @@ def ab_shared_update_profile(request):
 
 
 def ab_shared_delete(request):
-    if request.method != "DELETE":
-        _log_event(request, "api_ab_shared_delete_invalid_method", level="warning")
-        return JsonResponse({"error": "DELETE required"}, status=405)
-    token, user = _get_token_user(request)
+    _token, user = _get_token_user(request)
     if not user:
         _log_event(request, "api_ab_shared_delete_unauthorized", level="warning")
         return JsonResponse({"error": "Invalid token"}, status=401)
@@ -2420,9 +2350,7 @@ def ab_shared_delete(request):
 def ab_rules(request):
     if request.method == "DELETE":
         return ab_rules_delete(request)
-    if request.method != "GET":
-        return JsonResponse({"error": "GET or DELETE required"}, status=405)
-    token, user = _get_token_user(request)
+    _token, user = _get_token_user(request)
     if not user:
         session_user = getattr(request, "user", None)
         if session_user and getattr(session_user, "is_authenticated", False):
@@ -2434,7 +2362,7 @@ def ab_rules(request):
         return JsonResponse({"error": "Invalid guid"}, status=400)
     if _is_personal_guid(guid):
         return JsonResponse({"error": "Personal address book cannot be shared"}, status=403)
-    profile, owner, rule = _get_profile_access(user, guid)
+    profile, _owner, _rule = _get_profile_access(user, guid)
     if not profile:
         return JsonResponse({"error": "Not found"}, status=404)
     if not user.is_admin and str(profile.owner_id) != str(user.id):
@@ -2469,13 +2397,11 @@ def ab_rules(request):
 
 
 def ab_rule(request):
-    token, user = _get_token_user(request)
+    _token, user = _get_token_user(request)
     if not user:
         _log_event(request, "api_ab_rule_unauthorized", level="warning")
         return JsonResponse({"error": "Invalid token"}, status=401)
-    if request.method not in ("POST", "PATCH"):
-        return JsonResponse({"error": "POST or PATCH required"}, status=405)
-    postdata = _load_json(request)
+    postdata = _load_json_object(request)
     if request.method == "POST":
         guid = postdata.get("guid", "")
         rule_value = _valid_ab_rule(postdata.get("rule", 1))
@@ -2572,7 +2498,7 @@ def ab_rule(request):
         )
         _log_event(request, "api_ab_rule_add", username=user.username, guid=guid, rule=rule_value, target="everyone")
         return JsonResponse({"guid": rule_obj.guid, "rule": rule_obj.rule})
-    if request.method == "PATCH":
+    else:
         rule_guid = postdata.get("guid", "")
         rule_value = _valid_ab_rule(postdata.get("rule", 1))
         if rule_value is None:
@@ -2610,14 +2536,10 @@ def ab_rule(request):
         _audit_ab_rule(profile, user, "rule_update", target_type, target_name, rule_value, {"guid": str(rule_obj.guid)})
         _log_event(request, "api_ab_rule_update", username=user.username, guid=rule_guid, rule=rule_value)
         return JsonResponse({"code": 1})
-    return JsonResponse({"error": _("请求方式错误！")}, status=405)
 
 
 def ab_rules_delete(request):
-    if request.method != "DELETE":
-        _log_event(request, "api_ab_rules_delete_invalid_method", level="warning")
-        return JsonResponse({"error": "DELETE required"}, status=405)
-    token, user = _get_token_user(request)
+    _token, user = _get_token_user(request)
     if not user:
         _log_event(request, "api_ab_rules_delete_unauthorized", level="warning")
         return JsonResponse({"error": "Invalid token"}, status=401)
@@ -2662,14 +2584,12 @@ def ab_rules_delete(request):
 
 
 def ab_peers(request):
-    if request.method != "POST":
-        return JsonResponse({"error": "POST required"}, status=405)
-    token, user = _get_token_user(request)
+    _token, user = _get_token_user(request)
     if not user:
         _log_event(request, "api_ab_peers_unauthorized", level="warning")
         return JsonResponse({"error": "Invalid token"}, status=401)
     guid = request.GET.get("ab", "") or _personal_guid(user)
-    profile, owner, rule = _get_profile_access(user, guid)
+    profile, owner, _rule = _get_profile_access(user, guid)
     if guid == _personal_guid(user):
         _ensure_personal_profile(user)
         owner = user
@@ -2728,13 +2648,11 @@ def ab_peers(request):
 
 
 def ab_tags(request, guid):
-    if request.method != "POST":
-        return JsonResponse({"error": "POST required"}, status=405)
-    token, user = _get_token_user(request)
+    _token, user = _get_token_user(request)
     if not user:
         _log_event(request, "api_ab_tags_unauthorized", level="warning")
         return JsonResponse({"error": "Invalid token"}, status=401)
-    profile, owner, rule = _get_profile_access(user, guid)
+    profile, owner, _rule = _get_profile_access(user, guid)
     if guid == _personal_guid(user):
         _ensure_personal_profile(user)
         owner = user
@@ -2754,10 +2672,7 @@ def ab_tags(request, guid):
 
 
 def ab_peer_add(request, guid):
-    if request.method != "POST":
-        _log_event(request, "api_ab_peer_add_invalid_method", level="warning", guid=guid)
-        return JsonResponse({"error": "POST required"}, status=405)
-    token, user = _get_token_user(request)
+    _token, user = _get_token_user(request)
     if not user:
         _log_event(request, "api_ab_peer_add_unauthorized", level="warning", guid=guid)
         return JsonResponse({"error": "Invalid token"}, status=401)
@@ -2774,7 +2689,7 @@ def ab_peer_add(request, guid):
             request, "api_ab_peer_add_denied", level="warning", username=user.username, guid=guid, reason="read_only"
         )
         return JsonResponse({"error": "Read-only"}, status=403)
-    postdata = _load_json(request)
+    postdata = _load_json_object(request)
     payload = _validated_peer_payload(
         postdata,
         guid == _personal_guid(owner),
@@ -2817,10 +2732,7 @@ def ab_peer_add(request, guid):
 
 
 def ab_peer_update(request, guid):
-    if request.method != "PUT":
-        _log_event(request, "api_ab_peer_update_invalid_method", level="warning", guid=guid)
-        return JsonResponse({"error": "PUT required"}, status=405)
-    token, user = _get_token_user(request)
+    _token, user = _get_token_user(request)
     if not user:
         _log_event(request, "api_ab_peer_update_unauthorized", level="warning", guid=guid)
         return JsonResponse({"error": "Invalid token"}, status=401)
@@ -2837,7 +2749,7 @@ def ab_peer_update(request, guid):
             request, "api_ab_peer_update_denied", level="warning", username=user.username, guid=guid, reason="read_only"
         )
         return JsonResponse({"error": "Read-only"}, status=403)
-    postdata = _load_json(request)
+    postdata = _load_json_object(request)
     is_personal = guid == _personal_guid(owner)
     payload = _validated_peer_payload(postdata, is_personal)
     if payload is None:
@@ -2877,10 +2789,7 @@ def ab_peer_update(request, guid):
 
 
 def ab_peer_delete(request, guid):
-    if request.method != "DELETE":
-        _log_event(request, "api_ab_peer_delete_invalid_method", level="warning", guid=guid)
-        return JsonResponse({"error": "DELETE required"}, status=405)
-    token, user = _get_token_user(request)
+    _token, user = _get_token_user(request)
     if not user:
         _log_event(request, "api_ab_peer_delete_unauthorized", level="warning", guid=guid)
         return JsonResponse({"error": "Invalid token"}, status=401)
@@ -2918,10 +2827,7 @@ def ab_peer_delete(request, guid):
 
 
 def ab_tag_add(request, guid):
-    if request.method != "POST":
-        _log_event(request, "api_ab_tag_add_invalid_method", level="warning", guid=guid)
-        return JsonResponse({"error": "POST required"}, status=405)
-    token, user = _get_token_user(request)
+    _token, user = _get_token_user(request)
     if not user:
         _log_event(request, "api_ab_tag_add_unauthorized", level="warning", guid=guid)
         return JsonResponse({"error": "Invalid token"}, status=401)
@@ -2938,7 +2844,7 @@ def ab_tag_add(request, guid):
             request, "api_ab_tag_add_denied", level="warning", username=user.username, guid=guid, reason="read_only"
         )
         return JsonResponse({"error": "Read-only"}, status=403)
-    postdata = _load_json(request)
+    postdata = _load_json_object(request)
     name = str(postdata.get("name", "")).strip()
     color = normalize_tag_color(postdata.get("color", ""))
     if _bounded_text_value(name, 256, False) is None or len(name) > 64 or color is None:
@@ -2972,10 +2878,7 @@ def ab_tag_add(request, guid):
 
 
 def ab_tag_rename(request, guid):
-    if request.method != "PUT":
-        _log_event(request, "api_ab_tag_rename_invalid_method", level="warning", guid=guid)
-        return JsonResponse({"error": "PUT required"}, status=405)
-    token, user = _get_token_user(request)
+    _token, user = _get_token_user(request)
     if not user:
         _log_event(request, "api_ab_tag_rename_unauthorized", level="warning", guid=guid)
         return JsonResponse({"error": "Invalid token"}, status=401)
@@ -2992,7 +2895,7 @@ def ab_tag_rename(request, guid):
             request, "api_ab_tag_rename_denied", level="warning", username=user.username, guid=guid, reason="read_only"
         )
         return JsonResponse({"error": "Read-only"}, status=403)
-    postdata = _load_json(request)
+    postdata = _load_json_object(request)
     old = str(postdata.get("old", "")).strip()
     new = str(postdata.get("new", "")).strip()
     if (
@@ -3036,10 +2939,7 @@ def ab_tag_rename(request, guid):
 
 
 def ab_tag_update(request, guid):
-    if request.method != "PUT":
-        _log_event(request, "api_ab_tag_update_invalid_method", level="warning", guid=guid)
-        return JsonResponse({"error": "PUT required"}, status=405)
-    token, user = _get_token_user(request)
+    _token, user = _get_token_user(request)
     if not user:
         _log_event(request, "api_ab_tag_update_unauthorized", level="warning", guid=guid)
         return JsonResponse({"error": "Invalid token"}, status=401)
@@ -3056,7 +2956,7 @@ def ab_tag_update(request, guid):
             request, "api_ab_tag_update_denied", level="warning", username=user.username, guid=guid, reason="read_only"
         )
         return JsonResponse({"error": "Read-only"}, status=403)
-    postdata = _load_json(request)
+    postdata = _load_json_object(request)
     name = str(postdata.get("name", "")).strip()
     color = normalize_tag_color(postdata.get("color", ""))
     if _bounded_text_value(name, 256, False) is None or len(name) > 64 or color is None:
@@ -3077,10 +2977,7 @@ def ab_tag_update(request, guid):
 
 
 def ab_tag_delete(request, guid):
-    if request.method != "DELETE":
-        _log_event(request, "api_ab_tag_delete_invalid_method", level="warning", guid=guid)
-        return JsonResponse({"error": "DELETE required"}, status=405)
-    token, user = _get_token_user(request)
+    _token, user = _get_token_user(request)
     if not user:
         _log_event(request, "api_ab_tag_delete_unauthorized", level="warning", guid=guid)
         return JsonResponse({"error": "Invalid token"}, status=401)
@@ -3266,10 +3163,7 @@ def _audit_controller_note(request, postdata):
 
 
 def _audit_conn(request):
-    postdata = _load_json(request)
-    if not isinstance(postdata, dict):
-        _log_event(request, "api_audit_conn_invalid_payload", level="warning")
-        return JsonResponse({"error": "Invalid payload"}, status=400)
+    postdata = _load_json_object(request)
     if "note" in postdata and "uuid" not in postdata:
         return _audit_controller_note(request, postdata)
     token, user, error = _audit_device_context(request, postdata)
@@ -3404,10 +3298,7 @@ def _audit_conn(request):
 
 
 def _audit_file(request):
-    postdata = _load_json(request)
-    if not isinstance(postdata, dict):
-        _log_event(request, "api_audit_file_invalid_payload", level="warning")
-        return JsonResponse({"error": "Invalid payload"}, status=400)
+    postdata = _load_json_object(request)
     token, user, error = _audit_device_context(request, postdata)
     if error:
         return error
@@ -3469,10 +3360,7 @@ def _audit_file(request):
 
 
 def _audit_alarm(request):
-    postdata = _load_json(request)
-    if not isinstance(postdata, dict):
-        _log_event(request, "api_audit_alarm_invalid_payload", level="warning")
-        return JsonResponse({"error": "Invalid payload"}, status=400)
+    postdata = _load_json_object(request)
     token, user, error = _audit_device_context(request, postdata)
     if error:
         return error
@@ -3518,7 +3406,7 @@ def _pagination(request, default=100):
     try:
         current = max(1, int(request.GET.get("current", 1)))
         page_size = max(1, min(500, int(request.GET.get("pageSize", default))))
-    except Exception:
+    except (TypeError, ValueError):
         current = 1
         page_size = default
     start = (current - 1) * page_size
@@ -3549,7 +3437,7 @@ def _filter_text(qs, field, value):
 
 
 def _require_admin(request, event):
-    token, user = _get_token_user(request)
+    _token, user = _get_token_user(request)
     if not user:
         _log_event(request, f"{event}_unauthorized", level="warning")
         return None, JsonResponse({"error": "Invalid token"}, status=401)
@@ -3653,9 +3541,7 @@ def users(request):
         admin_user, error = _require_admin(request, "api_users_create")
         if error:
             return error
-        data = _load_json(request)
-        if not isinstance(data, dict):
-            return JsonResponse({"error": "Invalid user payload"}, status=400)
+        data = _load_json_object(request)
         username = _model_text_value(
             data.get("name") or data.get("username"),
             UserProfile,
@@ -3719,10 +3605,7 @@ def users(request):
             return JsonResponse({"error": "User already exists"}, status=409)
         _log_event(request, "api_users_created", username=admin_user.username, target=username)
         return JsonResponse(_serialize_user(user))
-    if request.method != "GET":
-        _log_event(request, "api_users_invalid_method", level="warning")
-        return JsonResponse({"error": _("错误的提交方式！")})
-    token, user = _get_token_user(request)
+    _token, user = _get_token_user(request)
     if not user:
         _log_event(request, "api_users_unauthorized", level="warning")
         return JsonResponse({"error": "Invalid token"}, status=401)
@@ -3746,8 +3629,6 @@ def _user_by_guid(guid):
 
 
 def user_status(request, guid, action):
-    if request.method != "POST":
-        return JsonResponse({"error": _("请求方式错误！请使用POST方式。")}, status=405)
     admin_user, error = _require_admin(request, f"api_user_{action}")
     if error:
         return error
@@ -3765,8 +3646,6 @@ def user_status(request, guid, action):
 
 
 def user_delete(request, guid):
-    if request.method != "DELETE":
-        return JsonResponse({"error": "DELETE required"}, status=405)
     admin_user, error = _require_admin(request, "api_user_delete")
     if error:
         return error
@@ -3791,14 +3670,10 @@ def user_delete(request, guid):
 
 
 def users_force_logout(request):
-    if request.method != "POST":
-        return JsonResponse({"error": _("请求方式错误！请使用POST方式。")}, status=405)
     admin_user, error = _require_admin(request, "api_users_force_logout")
     if error:
         return error
-    data = _load_json(request)
-    if not isinstance(data, dict):
-        return JsonResponse({"error": "Invalid user list"}, status=400)
+    data = _load_json_object(request)
     guids = _identifier_list(data.get("user_guids"), numeric=True)
     if guids is None:
         return JsonResponse({"error": "Invalid user list"}, status=400)
@@ -3810,9 +3685,7 @@ def users_force_logout(request):
 
 
 def devices(request):
-    if request.method != "GET":
-        return JsonResponse({"error": _("错误的提交方式！")}, status=405)
-    token, user = _get_token_user(request)
+    _token, user = _get_token_user(request)
     if not user:
         _log_event(request, "api_devices_unauthorized", level="warning")
         return JsonResponse({"error": "Invalid token"}, status=401)
@@ -3861,8 +3734,6 @@ def _device_by_guid(guid):
 
 
 def device_status(request, guid, action):
-    if request.method != "POST":
-        return JsonResponse({"error": _("请求方式错误！请使用POST方式。")}, status=405)
     admin_user, error = _require_admin(request, f"api_device_{action}")
     if error:
         return error
@@ -3878,8 +3749,6 @@ def device_status(request, guid, action):
 
 
 def device_delete(request, guid):
-    if request.method != "DELETE":
-        return JsonResponse({"error": "DELETE required"}, status=405)
     admin_user, error = _require_admin(request, "api_device_delete")
     if error:
         return error
@@ -3894,14 +3763,10 @@ def device_delete(request, guid):
 
 
 def device_assign(request, guid):
-    if request.method != "POST":
-        return JsonResponse({"error": _("请求方式错误！请使用POST方式。")}, status=405)
     admin_user, error = _require_admin(request, "api_device_assign")
     if error:
         return error
-    data = _load_json(request)
-    if not isinstance(data, dict):
-        return JsonResponse({"error": "Invalid assignment"}, status=400)
+    data = _load_json_object(request)
     typ = str(data.get("type") or "")
     value = data.get("value")
     owner_changed = False
@@ -3990,10 +3855,7 @@ def device_assign(request, guid):
 
 
 def peers(request):
-    if request.method != "GET":
-        _log_event(request, "api_peers_invalid_method", level="warning")
-        return JsonResponse({"error": _("错误的提交方式！")})
-    token, user = _get_token_user(request)
+    _token, user = _get_token_user(request)
     if not user:
         _log_event(request, "api_peers_unauthorized", level="warning")
         return JsonResponse({"error": "Invalid token"}, status=401)
@@ -4074,10 +3936,7 @@ def peers(request):
 
 
 def device_group_accessible(request):
-    if request.method != "GET":
-        _log_event(request, "api_device_group_accessible_invalid_method", level="warning")
-        return JsonResponse({"error": _("错误的提交方式！")})
-    token, user = _get_token_user(request)
+    _token, user = _get_token_user(request)
     if not user:
         _log_event(request, "api_device_group_accessible_unauthorized", level="warning")
         return JsonResponse({"error": "Invalid token"}, status=401)
@@ -4104,9 +3963,7 @@ def device_groups(request):
         admin_user, error = _require_admin(request, "api_device_groups_create")
         if error:
             return error
-        data = _load_json(request)
-        if not isinstance(data, dict):
-            return JsonResponse({"error": "Invalid device group"}, status=400)
+        data = _load_json_object(request)
         name = _model_text_value(
             data.get("name"),
             DeviceGroup,
@@ -4146,8 +4003,6 @@ def device_groups(request):
             )
         _log_event(request, "api_device_groups_created", username=admin_user.username, target=name)
         return JsonResponse(_serialize_device_group(group))
-    if request.method != "GET":
-        return JsonResponse({"error": _("错误的提交方式！")}, status=405)
     admin_user, error = _require_admin(request, "api_device_groups")
     if error:
         return error
@@ -4165,8 +4020,8 @@ def device_group_detail(request, guid):
     if error:
         return error
     if request.method == "PATCH":
-        data = _load_json(request)
-        if not isinstance(data, dict) or not data:
+        data = _load_json_object(request)
+        if not data:
             return JsonResponse({"error": "Invalid device group"}, status=400)
         with transaction.atomic():
             group = DeviceGroup.objects.select_for_update().filter(guid=guid).first()
@@ -4219,7 +4074,7 @@ def device_group_detail(request, guid):
             except IntegrityError:
                 return JsonResponse({"error": "Device group already exists"}, status=409)
         return JsonResponse(_serialize_device_group(group))
-    if request.method == "POST":
+    elif request.method == "POST":
         ids = _load_json(request)
         ids = _identifier_list(ids)
         if ids is None or any(not re.fullmatch(r"[A-Za-z0-9_-]{6,16}", item) for item in ids):
@@ -4232,7 +4087,7 @@ def device_group_detail(request, guid):
             request, "api_device_group_add_devices", username=admin_user.username, target=group.name, updated=updated
         )
         return JsonResponse({"result": "OK", "updated": updated})
-    if request.method == "DELETE":
+    else:
         with transaction.atomic():
             group = DeviceGroup.objects.select_for_update().filter(guid=guid).first()
             if not group:
@@ -4241,12 +4096,9 @@ def device_group_detail(request, guid):
             group.delete()
         _log_event(request, "api_device_group_deleted", username=admin_user.username, target=name)
         return JsonResponse({"result": "OK"})
-    return JsonResponse({"error": "POST, PATCH or DELETE required"}, status=405)
 
 
 def device_group_remove_devices(request, guid):
-    if request.method != "DELETE":
-        return JsonResponse({"error": "DELETE required"}, status=405)
     admin_user, error = _require_admin(request, "api_device_group_remove_devices")
     if error:
         return error
@@ -4272,9 +4124,7 @@ def strategies(request):
     if error:
         return error
     if request.method == "POST":
-        data = _load_json(request)
-        if not isinstance(data, dict):
-            return JsonResponse({"error": "Invalid strategy"}, status=400)
+        data = _load_json_object(request)
         name = _model_text_value(
             data.get("name"),
             StrategyProfile,
@@ -4302,8 +4152,6 @@ def strategies(request):
             target=name,
         )
         return JsonResponse(_serialize_strategy(strategy))
-    if request.method != "GET":
-        return JsonResponse({"error": _("错误的提交方式！")}, status=405)
     qs = StrategyProfile.objects.all().order_by("name")
     return JsonResponse([_serialize_strategy(strategy) for strategy in qs], safe=False)
 
@@ -4317,9 +4165,9 @@ def strategy_detail(request, guid):
         if not strategy:
             return JsonResponse({"error": "Strategy not found"}, status=404)
         return JsonResponse(_serialize_strategy(strategy))
-    if request.method == "PATCH":
-        data = _load_json(request)
-        if not isinstance(data, dict) or not data:
+    elif request.method == "PATCH":
+        data = _load_json_object(request)
+        if not data:
             return JsonResponse({"error": "Invalid strategy"}, status=400)
         with transaction.atomic():
             strategy = StrategyProfile.objects.select_for_update().filter(guid=guid).first()
@@ -4364,7 +4212,7 @@ def strategy_detail(request, guid):
             target=strategy.name,
         )
         return JsonResponse(_serialize_strategy(strategy))
-    if request.method == "DELETE":
+    else:
         with transaction.atomic():
             strategy = StrategyProfile.objects.select_for_update().filter(guid=guid).first()
             if not strategy:
@@ -4378,12 +4226,9 @@ def strategy_detail(request, guid):
             target=name,
         )
         return JsonResponse({"result": "OK"})
-    return JsonResponse({"error": "GET, PATCH or DELETE required"}, status=405)
 
 
 def strategy_status(request, guid):
-    if request.method != "PUT":
-        return JsonResponse({"error": "PUT required"}, status=405)
     admin_user, error = _require_admin(request, "api_strategy_status")
     if error:
         return error
@@ -4403,14 +4248,10 @@ def strategy_status(request, guid):
 
 
 def strategy_assign(request):
-    if request.method != "POST":
-        return JsonResponse({"error": _("请求方式错误！请使用POST方式。")}, status=405)
     admin_user, error = _require_admin(request, "api_strategy_assign")
     if error:
         return error
-    data = _load_json(request)
-    if not isinstance(data, dict):
-        return JsonResponse({"error": "Invalid strategy assignment"}, status=400)
+    data = _load_json_object(request)
     strategy = None
     strategy_guid = data.get("strategy")
     if strategy_guid:
