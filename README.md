@@ -11,7 +11,7 @@ Camellia Remote 的生产管理平面：提供账号与设备管理、地址簿�
 
 ## 本地开发
 
-需要 Python 3.13+、uv 0.12.0 和 PostgreSQL 18。仅快速开发时可使用 SQLite：
+日常开发和 CI 使用 Python 3.13+、uv 0.12.0 和 PostgreSQL 18。仅快速开发时可使用 SQLite：
 
 ```bash
 uv sync --locked --all-groups
@@ -32,6 +32,11 @@ uv run python manage.py makemigrations --check --dry-run
 uv run pytest
 python scripts/test_release_metadata.py
 ```
+
+`[tool.uv].required-version` 暂时允许 `>=0.11.8,<0.13`：截至
+2026-07-30，GitHub 托管的 Dependabot uv 更新器仍使用 0.11.8，精确要求
+0.12.0 会使自动依赖更新失败。CI 仍精确安装 0.12.0；托管更新器支持该版本后
+应恢复精确约束。
 
 ## 生产配置
 
