@@ -177,7 +177,9 @@ jobs:
           CAMELLIA_REMOTE_API_SERVER: https://api.example.test
           CAMELLIA_REMOTE_ID_SERVER: wss://remote.example.test:443
           CAMELLIA_REMOTE_RS_PUB_KEY: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
-        run: docker compose --env-file /dev/null -f docker-compose.yaml config --quiet
+        run: |
+          systemd-analyze security --offline=yes deploy/systemd/*.service >/dev/null
+          docker compose --env-file /dev/null -f docker-compose.yaml config --quiet
 
   web_client:
     name: Build pinned Web client
@@ -254,7 +256,7 @@ jobs:
       - name: Set up uv
         uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
         with:
-          version: "0.11.30"
+          version: "0.12.0"
           enable-cache: true
           cache-dependency-glob: uv.lock
 

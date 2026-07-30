@@ -6,7 +6,7 @@ The service listens on port 21114 behind a TLS reverse proxy. Keep PostgreSQL an
 
 ## Development
 
-Use Python 3.13+, uv 0.11.30+, and PostgreSQL 18. For an isolated SQLite development run:
+Use Python 3.13+, uv 0.12.0, and PostgreSQL 18. For an isolated SQLite development run:
 
 ```bash
 uv sync --locked --all-groups
@@ -24,7 +24,7 @@ Copy `.env.example` to a mode-`0600` secret file and set every required value, e
 
 Address-book connection credentials are authenticated-encrypted at rest and returned only by authenticated, access-scoped runtime APIs. Django admin treats them as write-only values, and CSV/Excel exports omit them.
 
-Install `docker-compose.yaml`, `deploy/backup-postgres.sh`, and `deploy/systemd/*` as documented in the Chinese README. Pin `CAMELLIA_REMOTE_MANAGEMENT_IMAGE` to a published `sha256` digest. The systemd stack performs the one-shot migration before starting the application; the hourly timer produces atomic PostgreSQL custom-format backups. A five-minute timer removes expired login attempts, OIDC sessions and access tokens, marks expired share links, and deletes consumed or expired links after the configured retention period.
+Install `docker-compose.yaml`, `deploy/backup-postgres.sh`, and `deploy/systemd/*` as documented in the Chinese README. Pin `CAMELLIA_REMOTE_MANAGEMENT_IMAGE` to a published `sha256` digest. The systemd stack performs the one-shot migration before starting the application; the hourly timer produces atomic PostgreSQL custom-format backups. A five-minute timer removes expired login attempts, OIDC sessions and access tokens, marks expired share links, and deletes consumed or expired links after the configured retention period. The operations units may reach Docker only through the local Unix socket. That socket is equivalent to host root access, so keep it root-only and prevent unprivileged changes to the deployment directory and environment file.
 
 The Compose default uses `sslmode=disable` only for PostgreSQL on its non-routable, same-host `backend` bridge. External or cross-host databases are required to use `verify-full`, a trusted CA, and a hostname covered by the certificate. Private CA, client certificate, and client key paths can be supplied with `CAMELLIA_REMOTE_DATABASE_SSLROOTCERT`, `CAMELLIA_REMOTE_DATABASE_SSLCERT`, and `CAMELLIA_REMOTE_DATABASE_SSLKEY`; the client certificate and key must be configured together.
 

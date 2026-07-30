@@ -11,7 +11,7 @@ Camellia Remote 的生产管理平面：提供账号与设备管理、地址簿�
 
 ## 本地开发
 
-需要 Python 3.13+、uv 0.11.30+ 和 PostgreSQL 18。仅快速开发时可使用 SQLite：
+需要 Python 3.13+、uv 0.12.0 和 PostgreSQL 18。仅快速开发时可使用 SQLite：
 
 ```bash
 uv sync --locked --all-groups
@@ -63,6 +63,8 @@ sudo systemctl enable --now camellia-remote-management-cleanup.timer
 ```
 
 生产环境应把 `CAMELLIA_REMOTE_MANAGEMENT_IMAGE` 固定为发布清单记录的 `ghcr.io/...@sha256:...`，不得使用浮动标签。迁移由一次性 `migrate` 容器完成；迁移成功后应用容器才会启动。
+systemd 运维单元仅允许通过本机 Unix socket 调用 Docker；该 socket
+等同宿主机 root 权限，必须只允许 root 访问，并保护部署目录和环境文件不被非特权用户修改。
 
 Compose 默认仅在同主机、不可从外部路由的 `backend` 网络内使用 PostgreSQL，因此该链路显式采用 `sslmode=disable`。外部或跨主机数据库强制使用 `verify-full`、可信 CA 和与证书匹配的主机名；私有 CA、客户端证书和私钥可分别通过绝对路径 `CAMELLIA_REMOTE_DATABASE_SSLROOTCERT`、`CAMELLIA_REMOTE_DATABASE_SSLCERT`、`CAMELLIA_REMOTE_DATABASE_SSLKEY` 配置，其中客户端证书与私钥必须成对提供。这是唯一保留的无数据库 TLS 特例。
 
