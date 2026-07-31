@@ -47,8 +47,12 @@ tag; the parent index reference is never reused as two mutable local images.
 
 Manual dispatch is recovery-only for an existing managed tag. It never chooses
 new source, version, architecture, or registry values. Any conflicting lock,
-client evidence, Web bytes, digest, signer, uploader, tag, Release metadata, or
-alias fails closed.
+client evidence, Web bytes, signer, uploader, tag, or Release metadata fails
+closed. Before the managed draft records its container-digest marker, an
+approved recovery may reconcile a stranded registry alias to the newly frozen
+digest for that exact draft and source. The marker is the commit point; after it
+is present, any digest or alias conflict fails closed, and published aliases are
+never moved.
 
 An incomplete publication must retain `release:pending`. After the exact
 immutable `release-complete:<SHA>` marker is validated, recovery accepts the
