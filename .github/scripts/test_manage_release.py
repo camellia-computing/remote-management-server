@@ -8,6 +8,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from typing import Self
 from unittest.mock import patch
 
 SCRIPT = Path(__file__).with_name("manage-release.py")
@@ -35,12 +36,16 @@ class ManagedReleaseTests(unittest.TestCase):
             with self.subTest(value=value), self.assertRaises(release.ReleaseError):
                 release.canonical_sha(value)
 
-    def test_app_git_identity_uses_graphql_and_process_environment(self) -> None:
+    def test_app_git_identity_uses_rest_bot_and_process_environment(self) -> None:
         login = "release-manager[bot]"
-        response = {"data": {"user": {"databaseId": 1234, "login": login}}}
+        response = {"id": 1234, "login": login, "type": "Bot"}
         with (
-            patch.dict(release.os.environ, {"RELEASE_APP_LOGIN": login}, clear=True),
-            patch.object(release, "gh_api", return_value=response) as github,
+            patch.dict(
+                release.os.environ,
+                {"GH_TOKEN": "token", "RELEASE_APP_LOGIN": login},
+                clear=True,
+            ),
+            patch.object(release, "release_app_user", return_value=response) as github,
         ):
             release.configure_app_git()
             self.assertEqual(release.os.environ["GIT_AUTHOR_NAME"], login)
@@ -48,10 +53,50 @@ class ManagedReleaseTests(unittest.TestCase):
                 release.os.environ["GIT_AUTHOR_EMAIL"],
                 f"1234+{login}@users.noreply.github.com",
             )
-        _, keyword_arguments = github.call_args
-        self.assertEqual(github.call_args.args, ("graphql",))
-        self.assertEqual(keyword_arguments["method"], "POST")
-        self.assertEqual(keyword_arguments["payload"]["variables"], {"login": login})
+        github.assert_called_once_with(login)
+
+    def test_app_bot_lookup_uses_fixed_encoded_rest_endpoint(self) -> None:
+        class Response:
+            requested_bound = 0
+
+            def __enter__(self) -> Self:
+                return self
+
+            def __exit__(self, *_args: object) -> None:
+                return None
+
+            def read(self, bound: int) -> bytes:
+                self.requested_bound = bound
+                return b'{"id":1234,"login":"release-manager[bot]","type":"Bot"}'
+
+        response = Response()
+        with (
+            patch.dict(release.os.environ, {"GH_TOKEN": "token"}, clear=True),
+            patch.object(release, "urlopen", return_value=response) as opener,
+        ):
+            user = release.release_app_user("release-manager[bot]")
+        self.assertEqual(user["id"], 1234)
+        self.assertEqual(response.requested_bound, 1_000_001)
+        request = opener.call_args.args[0]
+        self.assertEqual(
+            request.full_url,
+            "https://api.github.com/users/release-manager%5Bbot%5D",
+        )
+        self.assertEqual(request.get_header("Authorization"), "Bearer token")
+        self.assertEqual(opener.call_args.kwargs, {"timeout": 30})
+
+    def test_app_git_identity_rejects_non_bot_actor(self) -> None:
+        login = "release-manager[bot]"
+        with (
+            patch.dict(release.os.environ, {"RELEASE_APP_LOGIN": login}, clear=True),
+            patch.object(
+                release,
+                "release_app_user",
+                return_value={"id": 1234, "login": login, "type": "User"},
+            ),
+            self.assertRaisesRegex(release.ReleaseError, "differs from policy"),
+        ):
+            release.configure_app_git()
 
     def test_runner_output_rejects_paths_outside_runner_commands(self) -> None:
         with (

@@ -14,6 +14,9 @@ import sys
 import tempfile
 from pathlib import Path
 from typing import Any, NoReturn
+from urllib.error import HTTPError, URLError
+from urllib.parse import quote
+from urllib.request import Request, urlopen
 
 ROOT = Path.cwd().resolve()
 CONFIG_PATH = ROOT / ".github" / "release-config.json"
@@ -22,6 +25,7 @@ TAG = re.compile(r"^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$")
 SHA = re.compile(r"^[0-9a-f]{40}$")
 REPOSITORY_COMPONENT = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9._-]{0,99})$")
 RELEASE_APP_LOGIN = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,99})\[bot\]$")
+GITHUB_API_ROOT = "https://api.github.com/"
 REPOSITORY_ENDPOINT = "repos/{owner}/{repo}"
 RUNNER_OUTPUT_ROOT = "/home/runner/work/_temp/_runner_file_commands"
 TRUSTED_EXECUTABLES = {
@@ -151,6 +155,34 @@ def github_server_url() -> str:
     if value != "https://github.com":
         fail("GITHUB_SERVER_URL must identify the reviewed GitHub.com host")
     return "https://github.com"
+
+
+def release_app_user(login: str) -> dict[str, Any]:
+    request = Request(  # noqa: S310 -- URL uses the fixed HTTPS API origin below.
+        GITHUB_API_ROOT + "users/" + quote(login, safe=""),
+        headers={
+            "Accept": "application/vnd.github+json",
+            "Authorization": f"Bearer {require_env('GH_TOKEN')}",
+            "User-Agent": "managed-release-controller",
+            "X-GitHub-Api-Version": "2022-11-28",
+        },
+    )
+    try:
+        with urlopen(request, timeout=30) as response:  # noqa: S310 -- fixed HTTPS.
+            encoded = response.read(1_000_001)
+    except HTTPError as error:
+        fail(f"GitHub bot identity lookup returned HTTP {error.code}")
+    except (OSError, URLError) as error:
+        fail(f"GitHub bot identity lookup failed: {error}")
+    if len(encoded) > 1_000_000:
+        fail("GitHub bot identity response exceeds the supported bound")
+    try:
+        value = json.loads(encoded)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        fail(f"GitHub bot identity response is invalid JSON: {error}")
+    if not isinstance(value, dict):
+        fail("GitHub bot identity response must be an object")
+    return value
 
 
 def append_output(name: str, value: str | int | bool) -> None:
@@ -621,19 +653,11 @@ def ensure_labels() -> None:
 
 def configure_app_git() -> None:
     login = release_app_login()
-    response = gh_api(
-        "graphql",
-        method="POST",
-        payload={
-            "query": ("query($login:String!){user(login:$login){databaseId login}}"),
-            "variables": {"login": login},
-        },
-    )
-    user = response.get("data", {}).get("user") if isinstance(response, dict) else None
-    identifier = user.get("databaseId") if isinstance(user, dict) else None
+    user = release_app_user(login)
+    identifier = user.get("id")
     if not isinstance(identifier, int) or isinstance(identifier, bool) or identifier < 1:
         fail("unable to resolve the Release App bot identity")
-    if user.get("login") != login:
+    if user.get("login") != login or user.get("type") != "Bot":
         fail("resolved Release App bot identity differs from policy")
     email = f"{identifier}+{login}@users.noreply.github.com"
     os.environ.update(
