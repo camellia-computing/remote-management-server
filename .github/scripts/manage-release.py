@@ -261,7 +261,11 @@ def version_text(value: tuple[int, int, int]) -> str:
 
 def current_metadata(config: dict[str, Any], root: Path = ROOT) -> dict[str, Any]:
     script = root / config["metadata_script"]
-    process = run([sys.executable, str(script), "--root", str(root)], cwd=root)
+    process = run(
+        [sys.executable, str(script), "--root", str(root)],
+        cwd=root,
+        env={"ACTIONS_TOKEN": "", "GH_TOKEN": ""},
+    )
     try:
         value = json.loads(process.stdout)
     except json.JSONDecodeError as error:
@@ -353,6 +357,7 @@ def rewrite_version(root: Path, config: dict[str, Any], version: str, base_sha: 
                 timestamp,
             ],
             cwd=root,
+            env={"ACTIONS_TOKEN": "", "GH_TOKEN": ""},
         )
     metadata = current_metadata(config, root)
     if metadata["version"] != version:

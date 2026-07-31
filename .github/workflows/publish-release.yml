@@ -112,7 +112,7 @@ jobs:
       release-pr-number: ${{ steps.release.outputs.release-pr-number }}
       validation-run-id: ${{ steps.release.outputs.validation-run-id }}
     steps:
-      - name: Policy visibility token
+      - name: Release authorization token
         id: policy-token
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         with:
@@ -121,10 +121,11 @@ jobs:
           owner: ${{ github.repository_owner }}
           repositories: ${{ github.event.repository.name }}
           permission-administration: read
-          # GitHub exposes the full merge-policy fields only to tokens with push access.
-          # This repository-scoped token is used solely by the policy validation step.
+          # GitHub exposes full merge policy and draft Releases only to push-capable callers.
+          # Trusted authorization controls use this token for read operations only.
           permission-contents: write
           permission-metadata: read
+          permission-pull-requests: read
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
@@ -153,7 +154,7 @@ jobs:
         id: release
         env:
           ACTIONS_TOKEN: ${{ github.token }}
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ steps.policy-token.outputs.token }}
           RELEASE_APP_LOGIN: ${{ vars.RELEASE_APP_LOGIN }}
           RELEASE_SHA: ${{ needs.metadata.outputs.sha }}
           RELEASE_TAG: ${{ needs.metadata.outputs.tag }}
