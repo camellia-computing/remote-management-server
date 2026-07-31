@@ -19,14 +19,16 @@ as its caller.
 
 | Name | Default | Meaning |
 | --- | --- | --- |
-| `repository-name` | `remote-client` | One unqualified repository name under `github.repository_owner` |
+| `repository-map` | required | Complete reviewed mapping for all Remote logical repository IDs |
 | `flutter-version` | `3.44.5` | Exact Flutter SDK version used for the Web build |
 | `node-version` | `24.18.0` | Exact Node.js version used for the bridge build |
 
 Output `revision` is the full Remote Client commit read from
 `web-client.lock`.
 
-Owner-qualified repository names, path components, and `.`/`..` are rejected.
+The action verifies the current Management binding and resolves the Client
+repository under `github.repository_owner`. Incomplete maps, owner-qualified
+names, path components, and `.`/`..` are rejected.
 
 ## Required workflow permissions
 

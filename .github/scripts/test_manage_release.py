@@ -1,0 +1,96 @@
+#!/usr/bin/env python3
+"""Pure regression tests for the managed stable release controller."""
+
+from __future__ import annotations
+
+import importlib.util
+import json
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+
+SCRIPT = Path(__file__).with_name("manage-release.py")
+SPEC = importlib.util.spec_from_file_location("managed_release", SCRIPT)
+if SPEC is None or SPEC.loader is None:
+    raise RuntimeError("unable to load managed release controller")
+release = importlib.util.module_from_spec(SPEC)
+SPEC.loader.exec_module(release)
+
+
+class ManagedReleaseTests(unittest.TestCase):
+    def test_first_formal_version_is_one(self) -> None:
+        with patch.object(release, "completed_releases", return_value=[]):
+            self.assertEqual(release.automatic_version("a" * 40), "1.0.0")
+
+    def test_semver_and_client_build_number_are_canonical(self) -> None:
+        self.assertEqual(release.parse_version("1.2.3"), (1, 2, 3))
+        self.assertEqual(release.client_build_number("1.2.3"), 1_002_003)
+        with self.assertRaises(release.ReleaseError):
+            release.parse_version("01.2.3")
+
+    def test_cargo_version_rewrite_is_exact(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "Cargo.toml").write_text(
+                '[package]\nname = "fixture"\nversion = "0.1.0"\n',
+                encoding="utf-8",
+            )
+            (root / "Cargo.lock").write_text(
+                'version = 4\n\n[[package]]\nname = "fixture"\nversion = "0.1.0"\n',
+                encoding="utf-8",
+            )
+            release.rewrite_cargo_version(
+                root, {"package_name": "fixture"}, "1.0.0"
+            )
+            self.assertIn(
+                'version = "1.0.0"',
+                (root / "Cargo.toml").read_text(encoding="utf-8"),
+            )
+            self.assertIn(
+                'version = "1.0.0"',
+                (root / "Cargo.lock").read_text(encoding="utf-8"),
+            )
+
+    def test_release_record_requires_digest_for_container(self) -> None:
+        sha = "a" * 40
+        record = {
+            "id": 1,
+            "tag_name": "v1.0.0",
+            "target_commitish": sha,
+            "name": "Fixture 1.0.0",
+            "author": {"login": "release-app[bot]"},
+            "draft": False,
+            "immutable": True,
+            "body": (
+                "<!-- release-pr:7 -->\n"
+                f"<!-- release-commit:{sha} -->\n"
+                f"<!-- release-complete:{sha} -->\n"
+            ),
+        }
+        with (
+            patch.dict(
+                release.os.environ,
+                {"RELEASE_APP_LOGIN": "release-app[bot]"},
+            ),
+            self.assertRaises(release.ReleaseError),
+        ):
+            release.validate_release_record(
+                {"title": "Fixture", "container": True},
+                record,
+                version="1.0.0",
+                sha=sha,
+                number=7,
+            )
+
+    def test_release_configuration_is_portable(self) -> None:
+        config = json.loads(
+            (Path(__file__).parents[1] / "release-config.json").read_text()
+        )
+        self.assertTrue(config["logical_id"].startswith("remote-"))
+        self.assertNotIn("/", config["logical_id"])
+
+
+if __name__ == "__main__":
+    unittest.main()
