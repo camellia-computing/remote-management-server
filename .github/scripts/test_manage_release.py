@@ -10,7 +10,6 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-
 SCRIPT = Path(__file__).with_name("manage-release.py")
 SPEC = importlib.util.spec_from_file_location("managed_release", SCRIPT)
 if SPEC is None or SPEC.loader is None:
@@ -30,6 +29,42 @@ class ManagedReleaseTests(unittest.TestCase):
         with self.assertRaises(release.ReleaseError):
             release.parse_version("01.2.3")
 
+    def test_commit_sha_canonicalization_is_fail_closed(self) -> None:
+        self.assertEqual(release.canonical_sha("a" * 40), "a" * 40)
+        for value in ("A" * 40, "../" + "a" * 37, "-" + "a" * 39):
+            with self.subTest(value=value), self.assertRaises(release.ReleaseError):
+                release.canonical_sha(value)
+
+    def test_app_git_identity_uses_graphql_and_process_environment(self) -> None:
+        login = "release-manager[bot]"
+        response = {"data": {"user": {"databaseId": 1234, "login": login}}}
+        with (
+            patch.dict(release.os.environ, {"RELEASE_APP_LOGIN": login}, clear=True),
+            patch.object(release, "gh_api", return_value=response) as github,
+        ):
+            release.configure_app_git()
+            self.assertEqual(release.os.environ["GIT_AUTHOR_NAME"], login)
+            self.assertEqual(
+                release.os.environ["GIT_AUTHOR_EMAIL"],
+                f"1234+{login}@users.noreply.github.com",
+            )
+        _, keyword_arguments = github.call_args
+        self.assertEqual(github.call_args.args, ("graphql",))
+        self.assertEqual(keyword_arguments["method"], "POST")
+        self.assertEqual(keyword_arguments["payload"]["variables"], {"login": login})
+
+    def test_runner_output_rejects_paths_outside_runner_commands(self) -> None:
+        with (
+            tempfile.TemporaryDirectory() as temporary,
+            patch.dict(
+                release.os.environ,
+                {"GITHUB_OUTPUT": str(Path(temporary) / "output")},
+                clear=True,
+            ),
+            self.assertRaisesRegex(release.ReleaseError, "outside"),
+        ):
+            release.append_output("release-id", 1)
+
     def test_cargo_version_rewrite_is_exact(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -41,9 +76,7 @@ class ManagedReleaseTests(unittest.TestCase):
                 'version = 4\n\n[[package]]\nname = "fixture"\nversion = "0.1.0"\n',
                 encoding="utf-8",
             )
-            release.rewrite_cargo_version(
-                root, {"package_name": "fixture"}, "1.0.0"
-            )
+            release.rewrite_cargo_version(root, {"package_name": "fixture"}, "1.0.0")
             self.assertIn(
                 'version = "1.0.0"',
                 (root / "Cargo.toml").read_text(encoding="utf-8"),
@@ -63,11 +96,7 @@ class ManagedReleaseTests(unittest.TestCase):
             "author": {"login": "release-app[bot]"},
             "draft": False,
             "immutable": True,
-            "body": (
-                "<!-- release-pr:7 -->\n"
-                f"<!-- release-commit:{sha} -->\n"
-                f"<!-- release-complete:{sha} -->\n"
-            ),
+            "body": (f"<!-- release-pr:7 -->\n<!-- release-commit:{sha} -->\n<!-- release-complete:{sha} -->\n"),
         }
         with (
             patch.dict(
@@ -85,9 +114,7 @@ class ManagedReleaseTests(unittest.TestCase):
             )
 
     def test_release_configuration_is_portable(self) -> None:
-        config = json.loads(
-            (Path(__file__).parents[1] / "release-config.json").read_text()
-        )
+        config = json.loads((Path(__file__).parents[1] / "release-config.json").read_text())
         self.assertTrue(config["logical_id"].startswith("remote-"))
         self.assertNotIn("/", config["logical_id"])
 
