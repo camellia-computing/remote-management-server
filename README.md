@@ -83,13 +83,24 @@ Compose 默认仅在同主机、不可从外部路由的 `backend` 网络内使�
 
 ## Web 来源与发布
 
-跨仓体系审查与正式发布前的剩余门禁见客户端仓库中的 `docs/production-readiness-audit.md`；仓库名由组织变量 `REMOTE_CLIENT_REPOSITORY_NAME` 指定，默认值仅用于同组织约定。
+跨仓体系审查与正式发布门禁见逻辑客户端仓库中的
+`docs/production-readiness-audit.md`；物理仓库名由完整且受审的
+`REMOTE_REPOSITORY_MAP` 解析，不在代码中固化。
 
 ```bash
 ./sync_web_client.sh --build-from ../remote-client
 ```
 
-生成的 `static/web_client` 不提交。CI 只从同一 GitHub owner 下的 `remote-client` 获取锁定提交，并验证其默认分支可达性与成功的 push CI。发布只能选择默认分支可达的提交，必须复用精确 CI 产物、通过 Release App 仓库策略校验与 `release` 环境审批，并发布多架构、带 SBOM/provenance 且经 Sigstore 签名的 OCI 摘要。GitHub Release 先以 App 身份建立 draft，回读全部资产与校验和后才公开并再次验证不可变状态；不发布 `latest`。完整状态机见 [发布规范](docs/releasing.md)。
+生成的 `static/web_client` 不提交。CI 从逻辑仓库映射解析客户端，
+构建 `web-client.lock` 指向的精确提交并记录来源。正式发布还要求该
+提交对应唯一的、已完成且不可变的客户端正式 Release，并复用当前
+Management 提交的精确成功 CI Web 产物。Release App 通过受审
+`release/next` PR 生成版本和标签；冻结多架构 OCI、扫描、SBOM、
+provenance 与依赖证据全部成功后才进入 `release` 环境。GHCR 与
+Docker Hub 按映射逐项发布或跳过，所有已配置目标使用同一摘要。
+GitHub Release 的全部资产会签名并公开回读。`latest` 只指向最高的
+已完成稳定版，部署仍必须使用摘要。完整状态机见
+[发布规范](docs/releasing.md)。
 
 ## 许可证与来源
 

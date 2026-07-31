@@ -18,13 +18,24 @@ RUN uv sync --locked --no-dev --no-install-project
 
 FROM python:3.14.6-slim@sha256:cea0e6040540fb2b965b6e7fb5ffa00871e632eef63719f0ea54bca189ce14a6 AS runtime
 
+ARG VERSION
+ARG REVISION
 ARG SOURCE_REPOSITORY_URL
+ARG WEB_REVISION
 
 LABEL org.opencontainers.image.title="Camellia Remote Management Server" \
       org.opencontainers.image.description="Account, device, policy, audit, and management API for Camellia Remote" \
+      org.opencontainers.image.version="${VERSION}" \
+      org.opencontainers.image.revision="${REVISION}" \
       org.opencontainers.image.source="${SOURCE_REPOSITORY_URL}" \
       org.opencontainers.image.licenses="AGPL-3.0-only" \
-      org.opencontainers.image.vendor="Camellia Computing"
+      org.opencontainers.image.vendor="Camellia Computing" \
+      io.camellia.remote.web.revision="${WEB_REVISION}"
+
+RUN test -n "${VERSION}" \
+    && test -n "${REVISION}" \
+    && test -n "${SOURCE_REPOSITORY_URL}" \
+    && test -n "${WEB_REVISION}"
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \

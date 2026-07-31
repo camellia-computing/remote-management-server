@@ -1,0 +1,14 @@
+{
+  "allowed_files": [
+    "CHANGELOG.md",
+    "pyproject.toml",
+    "uv.lock"
+  ],
+  "container": true,
+  "logical_id": "remote-management",
+  "metadata_script": "scripts/release_metadata.py",
+  "package_name": "camellia-remote-management-server",
+  "schema_version": 1,
+  "title": "Camellia Remote Management Server",
+  "version_kind": "python"
+}

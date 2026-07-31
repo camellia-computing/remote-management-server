@@ -163,7 +163,11 @@ jobs:
             run.sh \
             sync_web_client.sh \
             scripts/web_client_revision.sh
-          bash .github/scripts/tests/test_release_publication.sh
+          python3 .github/scripts/test_manage_release.py
+          python3 .github/scripts/test_container_release_evidence.py
+          python3 .github/scripts/test_resolve_remote_client_release.py
+          bash .github/scripts/tests/test_resolve_container_registries.sh
+          bash -n .github/scripts/publish-container-release.sh
 
       - name: Validate deployment configuration
         env:
@@ -202,7 +206,7 @@ jobs:
         id: web_client
         uses: ./.github/actions/build-web-client
         with:
-          repository-name: ${{ vars.REMOTE_CLIENT_REPOSITORY_NAME || 'remote-client' }}
+          repository-map: ${{ vars.REMOTE_REPOSITORY_MAP }}
 
       - name: Upload Web runtime
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -302,7 +306,7 @@ jobs:
   container:
     name: Container smoke test
     if: needs.classify.outputs.runtime == 'true'
-    needs: [classify, web_client, quality]
+    needs: [classify, metadata, web_client, quality]
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     services:
@@ -343,7 +347,10 @@ jobs:
           push: false
           tags: camellia-remote-management-server:ci
           build-args: |
+            VERSION=${{ needs.metadata.outputs.version }}
+            REVISION=${{ github.sha }}
             SOURCE_REPOSITORY_URL=${{ github.server_url }}/${{ github.repository }}
+            WEB_REVISION=${{ needs.web_client.outputs.revision }}
           cache-from: type=gha,scope=remote-management-ci-image
           cache-to: type=gha,scope=remote-management-ci-image,mode=max
 

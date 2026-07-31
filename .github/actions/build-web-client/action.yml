@@ -2,10 +2,9 @@ name: Build pinned Camellia Remote Web client
 description: Build the locked Camellia Remote Web revision from a repository owned by the current account
 
 inputs:
-  repository-name:
-    description: Repository name under github.repository_owner; owner-qualified names are rejected
-    required: false
-    default: remote-client
+  repository-map:
+    description: Complete reviewed Remote logical repository map
+    required: true
   flutter-version:
     description: Flutter SDK version used by the Camellia Remote Web build
     required: false
@@ -27,16 +26,30 @@ runs:
       id: config
       shell: bash
       env:
-        REPOSITORY_NAME: ${{ inputs.repository-name }}
+        REMOTE_REPOSITORY_MAP: ${{ inputs.repository-map }}
       run: |
-        if [[ ! "$REPOSITORY_NAME" =~ ^[A-Za-z0-9_.-]+$ ]] \
-          || [[ "$REPOSITORY_NAME" == "." ]] \
-          || [[ "$REPOSITORY_NAME" == ".." ]]; then
-          echo "repository-name must be one unqualified repository name under the current owner" >&2
-          exit 1
-        fi
+        set -euo pipefail
+        jq -e '
+          type == "object" and
+          keys == [
+            "remote-client",
+            "remote-management",
+            "remote-protocol",
+            "remote-server"
+          ] and
+          all(.[];
+            type == "string" and
+            length >= 1 and length <= 100 and
+            test("^[A-Za-z0-9._-]+$")
+          )
+        ' <<< "$REMOTE_REPOSITORY_MAP" >/dev/null
+        repository_name="$(jq -r '."remote-client"' <<< "$REMOTE_REPOSITORY_MAP")"
+        management_name="$(jq -r '."remote-management"' <<< "$REMOTE_REPOSITORY_MAP")"
+        current_name="${GITHUB_REPOSITORY#*/}"
+        [[ "${management_name,,}" == "${current_name,,}" ]]
+        [[ "${repository_name,,}" != "${management_name,,}" ]]
         revision="$("$GITHUB_WORKSPACE/scripts/web_client_revision.sh")"
-        echo "repository=${GITHUB_REPOSITORY_OWNER}/${REPOSITORY_NAME}" >> "$GITHUB_OUTPUT"
+        echo "repository=${GITHUB_REPOSITORY_OWNER}/${repository_name}" >> "$GITHUB_OUTPUT"
         echo "revision=$revision" >> "$GITHUB_OUTPUT"
 
     - name: Verify locked Camellia Remote source policy
