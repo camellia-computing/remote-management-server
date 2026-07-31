@@ -44,6 +44,13 @@ new source, version, architecture, or registry values. Any conflicting lock,
 client evidence, Web bytes, digest, signer, uploader, tag, Release metadata, or
 alias fails closed.
 
+For `release/next`, `CI / Required` resolves `web-client.lock` before human
+approval and requires exactly one completed, immutable, App-authored Remote
+Client stable Release with valid release evidence at that commit. Ordinary
+feature PRs do not repeat this publication check. A client release therefore
+lands first, its lock-only Management PR lands second, and only then can a
+Management release candidate become mergeable.
+
 ## Required hosted configuration
 
 - Release App client ID, login, and private key;
