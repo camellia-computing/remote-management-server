@@ -30,6 +30,14 @@ The Compose default uses `sslmode=disable` only for PostgreSQL on its non-routab
 
 Store backups on encrypted independent storage, copy them off-site daily, and run quarterly restore drills. Restore into an empty database with the same PostgreSQL major version, run migrations and deployment checks, verify `/health/ready`, then restore traffic.
 
-`web-client.lock` identifies the only Web source accepted by CI. Releases require a successful push CI for the exact reachable commit and the `release` environment approval. Published OCI images are multi-architecture, SBOM/provenance enabled, and keylessly signed by digest; no floating `latest` tag is produced.
+`web-client.lock` identifies the only Web source accepted by CI. A formal
+Management release also requires that exact commit to be a completed immutable
+Remote Client release with valid evidence, then reuses the Web artifact from
+the exact successful Management push CI. Release Manager creates a reviewed
+version PR and exact tag. The workflow freezes and scans one multi-architecture
+OCI layout before protected approval, publishes the identical digest only to
+configured GHCR/Docker Hub targets, signs and publicly reads back all evidence,
+and completes an immutable GitHub Release. Deployments use digests; `latest` is
+only reconciled discovery metadata.
 
 This repository is licensed under GNU AGPL-3.0-only. See `SOURCE_PROVENANCE.json`, `NOTICE`, and `SECURITY.md`.
