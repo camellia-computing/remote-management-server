@@ -235,6 +235,18 @@ class ManagedReleaseTests(unittest.TestCase):
         )
         self.assertLess(workflow.index(extraction), workflow.index(scan_input))
 
+    def test_draft_alias_recovery_stops_at_digest_commit(self) -> None:
+        script = (
+            Path(__file__).with_name("publish-container-release.sh")
+        ).read_text(encoding="utf-8")
+        self.assertIn("reconcile_draft_alias() {", script)
+        self.assertIn(
+            "Draft Release is already committed to a different container digest",
+            script,
+        )
+        self.assertIn("Reconciling uncommitted draft alias", script)
+        self.assertNotIn("Immutable alias conflict:", script)
+
 
 if __name__ == "__main__":
     unittest.main()

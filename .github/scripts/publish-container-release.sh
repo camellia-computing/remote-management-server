@@ -377,8 +377,47 @@ mapfile -t layout_digests < <(jq -r '.manifests[].digest' "$oci_layout/index.jso
 }
 
 registry_fragments=()
+reconcile_draft_alias() {
+  local image="$1" alias="$2" digest="$3" current
+  local -a committed_digests=()
+  [[ "$(jq -r '.draft' "$release_json")" == true ]] || {
+    echo "Registry alias reconciliation requires the managed draft Release" >&2
+    return 1
+  }
+  mapfile -t committed_digests < <(
+    jq -r '.body // ""' "$release_json" |
+      sed -nE 's/^<!-- container-digest:(sha256:[0-9a-f]{64}) -->$/\1/p'
+  )
+  [[ "${#committed_digests[@]}" -le 1 ]] || {
+    echo "Draft Release contains duplicate container digest markers" >&2
+    return 1
+  }
+  if [[ "${#committed_digests[@]}" == 1 &&
+    "${committed_digests[0]}" != "$digest" ]]; then
+    echo "Draft Release is already committed to a different container digest" >&2
+    return 1
+  fi
+
+  current="$(descriptor_digest "$image:$alias")"
+  if [[ -n "$current" && "$current" != "$digest" ]]; then
+    [[ "${#committed_digests[@]}" == 0 ]] || {
+      echo "Committed registry alias conflict: $image:$alias resolves to $current" >&2
+      return 1
+    }
+    echo "Reconciling uncommitted draft alias $image:$alias from $current to $digest"
+  fi
+  if [[ "$current" != "$digest" ]]; then
+    oras copy --recursive --from-oci-layout "$oci_layout@$digest" "$image:$alias"
+    current="$(descriptor_digest "$image:$alias")"
+  fi
+  [[ "$current" == "$digest" ]] || {
+    echo "Registry alias reconciliation failed: $image:$alias resolves to $current" >&2
+    return 1
+  }
+}
+
 publish_registry() {
-  local name="$1" image="$2" alias current signature_file identity fragment
+  local name="$1" image="$2" alias signature_file identity fragment
   fragment="$work_directory/$name-result.json"
   registry_fragments+=("$fragment")
   if [[ -z "$image" ]]; then
@@ -387,15 +426,7 @@ publish_registry() {
     return
   fi
   for alias in "$VERSION" "sha-$RELEASE_SHA"; do
-    current="$(descriptor_digest "$image:$alias")"
-    if [[ -z "$current" ]]; then
-      oras copy --recursive --from-oci-layout "$oci_layout@$digest" "$image:$alias"
-      current="$(descriptor_digest "$image:$alias")"
-    fi
-    [[ "$current" == "$digest" ]] || {
-      echo "Immutable alias conflict: $image:$alias resolves to $current" >&2
-      return 1
-    }
+    reconcile_draft_alias "$image" "$alias" "$digest"
   done
   cosign sign --yes "$image@$digest"
   signature_file="$assets_directory/$name-cosign-verification.json"
