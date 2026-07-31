@@ -227,6 +227,7 @@ jobs:
           python3 .github/scripts/test_container_release_evidence.py
           python3 .github/scripts/test_resolve_remote_client_release.py
           bash .github/scripts/tests/test_resolve_container_registries.sh
+          bash .github/scripts/tests/test_verify_release_image.sh
           bash -n .github/scripts/publish-container-release.sh
 
       - name: Validate deployment configuration
