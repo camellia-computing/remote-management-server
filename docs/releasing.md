@@ -29,7 +29,8 @@ Release and lightweight tag. `publish-release.yml` freezes one Linux
 amd64/arm64 OCI layout containing the verified Web runtime, scans the exact
 layout, generates SBOM/provenance, and records the client release evidence.
 Formal image construction does not import or export a mutable GitHub Actions
-build cache.
+build cache. Trivy scans the extracted, digest-checked OCI layout while the
+original archive remains unchanged as the frozen registry input.
 
 The protected `release` environment is reached only after the frozen candidate
 succeeds. GHCR and Docker Hub publication is conditional on the reviewed

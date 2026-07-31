@@ -222,6 +222,19 @@ class ManagedReleaseTests(unittest.TestCase):
             "GH_TOKEN: ${{ steps.policy-token.outputs.token }}", authorize
         )
 
+    def test_release_scan_consumes_the_extracted_oci_layout(self) -> None:
+        workflow = (
+            Path(__file__).parents[1] / "workflows" / "publish-release.yml"
+        ).read_text(encoding="utf-8")
+        extraction = 'tar -xf "$RUNNER_TEMP/release-image.oci.tar"'
+        scan_input = "input: ${{ runner.temp }}/release-image-layout"
+        self.assertIn(extraction, workflow)
+        self.assertIn(scan_input, workflow)
+        self.assertNotIn(
+            "input: ${{ runner.temp }}/release-image.oci.tar", workflow
+        )
+        self.assertLess(workflow.index(extraction), workflow.index(scan_input))
+
 
 if __name__ == "__main__":
     unittest.main()
