@@ -40,6 +40,11 @@ checksummed, signed, uploaded and publicly read back before completion.
 `latest` is reconciled only to the highest completed stable version and is
 never a deployment input.
 
+Runtime readback binds `web-client.lock` to the exact authorized tag checkout,
+then resolves one unique amd64 and arm64 manifest digest from the signed index.
+Each platform is pulled by its own digest and exercised under an isolated local
+tag; the parent index reference is never reused as two mutable local images.
+
 Manual dispatch is recovery-only for an existing managed tag. It never chooses
 new source, version, architecture, or registry values. Any conflicting lock,
 client evidence, Web bytes, digest, signer, uploader, tag, Release metadata, or

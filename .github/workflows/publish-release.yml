@@ -515,6 +515,7 @@ jobs:
           RELEASE_PR_NUMBER: ${{ steps.release.outputs.release-pr-number }}
           RELEASE_SHA: ${{ needs.metadata.outputs.sha }}
           RELEASE_SIGNING_IDENTITY: ${{ needs.metadata.outputs.signing-identity }}
+          RELEASE_SOURCE_ROOT: ${{ github.workspace }}
           RELEASE_TAG: ${{ needs.metadata.outputs.tag }}
           RELEASE_TITLE: Camellia Remote Management Server
           RUNTIME_VERIFY_SCRIPT: ${{ runner.temp }}/verify-release-image.sh
