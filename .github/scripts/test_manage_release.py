@@ -36,6 +36,14 @@ class ManagedReleaseTests(unittest.TestCase):
         )
         self.assertEqual(command.call_count, 1)
 
+    def test_working_tree_status_preserves_the_first_status_column(self) -> None:
+        status = " M pyproject.toml\n M uv.lock\n?? CHANGELOG.md\n"
+        process = release.subprocess.CompletedProcess([], 0, status, "")
+        with patch.object(release, "run", return_value=process) as command:
+            paths = release.working_tree_paths()
+        self.assertEqual(paths, ["CHANGELOG.md", "pyproject.toml", "uv.lock"])
+        command.assert_called_once_with(["git", "status", "--short"])
+
     def test_semver_and_client_build_number_are_canonical(self) -> None:
         self.assertEqual(release.parse_version("1.2.3"), (1, 2, 3))
         self.assertEqual(release.client_build_number("1.2.3"), 1_002_003)

@@ -398,6 +398,14 @@ def release_commits(base_sha: str, baseline: str | None) -> list[dict[str, str]]
     return commits
 
 
+def working_tree_paths() -> list[str]:
+    status = run(["git", "status", "--short"]).stdout
+    records = [record for record in status.splitlines() if record]
+    if any(len(record) < 4 or record[2] != " " for record in records):
+        fail("git returned malformed working tree status")
+    return sorted(record[3:] for record in records)
+
+
 def render_changelog(root: Path, version: str, base_sha: str) -> None:
     path = root / "CHANGELOG.md"
     existing = path.read_text(encoding="utf-8") if path.exists() else "# Changelog\n"
@@ -676,8 +684,7 @@ def configure_app_git() -> None:
 def prepare_candidate_tree(config: dict[str, Any], base_sha: str, version: str) -> None:
     git("checkout", "-B", RELEASE_BRANCH, base_sha)
     generate_release_tree(ROOT, config, version, base_sha)
-    changed = sorted(item for item in git("status", "--short").splitlines() if item.strip())
-    changed_paths = sorted(item[3:] for item in changed)
+    changed_paths = working_tree_paths()
     if changed_paths != config["allowed_files"]:
         fail("generated release changed an unexpected file set: " + ", ".join(changed_paths))
     git("add", "--", *config["allowed_files"])
