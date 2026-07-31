@@ -149,22 +149,11 @@ jobs:
           RELEASE_APP_LOGIN: ${{ vars.RELEASE_APP_LOGIN }}
           RELEASE_APP_SLUG: ${{ steps.policy-token.outputs.app-slug }}
         run: bash "$RUNNER_TEMP/validate-github-release-policy.sh"
-      - name: Read-only Release App token
-        id: app-token
-        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
-        with:
-          client-id: ${{ vars.RELEASE_APP_CLIENT_ID }}
-          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
-          owner: ${{ github.repository_owner }}
-          repositories: ${{ github.event.repository.name }}
-          permission-contents: read
-          permission-metadata: read
-          permission-pull-requests: read
       - name: Managed release
         id: release
         env:
           ACTIONS_TOKEN: ${{ github.token }}
-          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          GH_TOKEN: ${{ github.token }}
           RELEASE_APP_LOGIN: ${{ vars.RELEASE_APP_LOGIN }}
           RELEASE_SHA: ${{ needs.metadata.outputs.sha }}
           RELEASE_TAG: ${{ needs.metadata.outputs.tag }}
