@@ -60,4 +60,4 @@ GitHub exposes the complete repository merge-policy fields only to a caller
 with push access. The hosted-policy check therefore uses a separate,
 repository-scoped App token with short-lived Contents write permission. That
 token is not reused for release authorization; the authorization controller
-receives a distinct read-only token.
+uses the job token constrained to Contents, Actions, and pull-request read.
