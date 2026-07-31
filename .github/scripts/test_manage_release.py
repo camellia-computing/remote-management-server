@@ -187,6 +187,10 @@ class ManagedReleaseTests(unittest.TestCase):
                 number=7,
             )
 
+    def test_merged_release_pending_policy_is_typed(self) -> None:
+        with self.assertRaisesRegex(release.ReleaseError, "must be boolean"):
+            release.validate_merged_pr({}, {}, "a" * 40, require_pending=None)  # type: ignore[arg-type]
+
     def test_release_configuration_is_portable(self) -> None:
         config = json.loads((Path(__file__).parents[1] / "release-config.json").read_text())
         self.assertTrue(config["logical_id"].startswith("remote-"))

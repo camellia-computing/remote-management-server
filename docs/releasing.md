@@ -44,6 +44,11 @@ new source, version, architecture, or registry values. Any conflicting lock,
 client evidence, Web bytes, digest, signer, uploader, tag, Release metadata, or
 alias fails closed.
 
+An incomplete publication must retain `release:pending`. After the exact
+immutable `release-complete:<SHA>` marker is validated, recovery accepts the
+authorizing PR both immediately before and after label cleanup while still
+revalidating its identity, reviewed head, approval, merge topology and tag.
+
 For `release/next`, `CI / Required` resolves `web-client.lock` before human
 approval and requires exactly one completed, immutable, App-authored Remote
 Client stable Release with valid release evidence at that commit. Ordinary

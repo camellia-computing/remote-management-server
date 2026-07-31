@@ -1096,7 +1096,15 @@ def merged_release_pr(sha: str) -> dict[str, Any]:
     return gh_api(f"{REPOSITORY_ENDPOINT}/pulls/{matches[0]['number']}")
 
 
-def validate_merged_pr(config: dict[str, Any], pr: dict[str, Any], sha: str) -> tuple[int, str, int]:
+def validate_merged_pr(
+    config: dict[str, Any],
+    pr: dict[str, Any],
+    sha: str,
+    *,
+    require_pending: bool = True,
+) -> tuple[int, str, int]:
+    if type(require_pending) is not bool:
+        fail("merged Release PR pending-label policy must be boolean")
     number = pr.get("number")
     title = pr.get("title")
     base_sha = pr.get("base", {}).get("sha")
@@ -1122,8 +1130,10 @@ def validate_merged_pr(config: dict[str, Any], pr: dict[str, Any], sha: str) -> 
     if match.group(1) != version:
         fail("merged Release PR version is not canonical")
     provenance_base, validation_id = parse_provenance(str(pr.get("body", "")))
-    if provenance_base != base_sha or PENDING_LABEL not in label_names(pr):
-        fail("merged Release PR provenance or lifecycle state is invalid")
+    if provenance_base != base_sha:
+        fail("merged Release PR provenance is invalid")
+    if require_pending and PENDING_LABEL not in label_names(pr):
+        fail("incomplete publication lost its managed pending label")
     validation_run(validation_id, base_sha, event="push")
     focused_run = exact_pr_ci_run(head_sha)
     approved, blocked = authorized_review_state(number, head_sha)
@@ -1312,13 +1322,27 @@ def authorize(args: argparse.Namespace, config: dict[str, Any]) -> None:
     if current_metadata(config)["version"] != version:
         fail("publication source version differs from its tag")
     pr = merged_release_pr(sha)
-    number, merged_version, _ = validate_merged_pr(config, pr, sha)
-    if merged_version != version:
-        fail("merged Release PR version differs from the publication tag")
+    release_pr_number = pr.get("number")
+    if type(release_pr_number) is not int or release_pr_number <= 0:
+        fail("merged Release PR has no canonical number")
     release = release_by_tag(tag)
     if release is None:
         fail("Release Manager did not prepare the managed draft")
-    draft, digest, complete = validate_release_record(config, release, version=version, sha=sha, number=number)
+    draft, digest, complete = validate_release_record(
+        config,
+        release,
+        version=version,
+        sha=sha,
+        number=release_pr_number,
+    )
+    number, merged_version, _ = validate_merged_pr(
+        config,
+        pr,
+        sha,
+        require_pending=not complete,
+    )
+    if number != release_pr_number or merged_version != version:
+        fail("merged Release PR identity differs from the publication tag")
     validation_id = exact_push_ci_run(sha)
     append_output("release-id", release["id"])
     append_output("release-draft", draft)
