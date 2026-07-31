@@ -373,14 +373,17 @@ def changelog_baseline(contents: str) -> str | None:
 
 def release_commits(base_sha: str, baseline: str | None) -> list[dict[str, str]]:
     revision = f"v{baseline}..{base_sha}" if baseline else base_sha
-    output = git(
-        "log",
-        "--reverse",
-        "--format=%H%x1f%s%x1f%b%x1e",
-        revision,
-        "--",
-        ".",
-    )
+    output = run(
+        [
+            "git",
+            "log",
+            "--reverse",
+            "--format=%H%x1f%s%x1f%b%x1e",
+            revision,
+            "--",
+            ".",
+        ]
+    ).stdout
     commits: list[dict[str, str]] = []
     for record in output.split("\x1e"):
         record = record.strip("\n")
