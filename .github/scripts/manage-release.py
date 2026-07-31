@@ -158,6 +158,8 @@ def append_output(name: str, value: str | int | bool) -> None:
     if not output.startswith(RUNNER_OUTPUT_ROOT + os.sep):
         fail("GITHUB_OUTPUT is outside the hosted runner command directory")
     rendered = str(value).lower() if isinstance(value, bool) else str(value)
+    # The runner supplies this canonical path inside its fixed command directory.
+    # codeql[py/path-injection]
     with open(output, "a", encoding="utf-8") as stream:
         stream.write(f"{name}={rendered}\n")
 
