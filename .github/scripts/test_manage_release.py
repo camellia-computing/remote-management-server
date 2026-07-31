@@ -24,6 +24,18 @@ class ManagedReleaseTests(unittest.TestCase):
         with patch.object(release, "completed_releases", return_value=[]):
             self.assertEqual(release.automatic_version("a" * 40), "1.0.0")
 
+    def test_release_history_preserves_an_empty_commit_body(self) -> None:
+        sha = "a" * 40
+        history = f"{sha}\x1ffix: close release gap\x1f\x1e\n"
+        process = release.subprocess.CompletedProcess([], 0, history, "")
+        with patch.object(release, "run", return_value=process) as command:
+            commits = release.release_commits(sha, None)
+        self.assertEqual(
+            commits,
+            [{"sha": sha, "subject": "fix: close release gap", "body": ""}],
+        )
+        self.assertEqual(command.call_count, 1)
+
     def test_semver_and_client_build_number_are_canonical(self) -> None:
         self.assertEqual(release.parse_version("1.2.3"), (1, 2, 3))
         self.assertEqual(release.client_build_number("1.2.3"), 1_002_003)
