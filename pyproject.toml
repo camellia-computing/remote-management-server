@@ -1,6 +1,6 @@
 [project]
 name = "camellia-remote-management-server"
-version = "1.0.0"
+version = "0.1.0"
 description = "Production management API and web console for Camellia Remote"
 readme = "README.md"
 requires-python = ">=3.13"
