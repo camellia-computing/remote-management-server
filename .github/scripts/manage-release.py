@@ -1140,6 +1140,15 @@ def release_by_tag(tag: str) -> dict[str, Any] | None:
     return matches[0] if matches else None
 
 
+def release_by_id(release_id: Any) -> dict[str, Any]:
+    if type(release_id) is not int or release_id <= 0:
+        fail("managed Release has an invalid identifier")
+    record = gh_api(f"{REPOSITORY_ENDPOINT}/releases/{release_id}")
+    if not isinstance(record, dict) or record.get("id") != release_id:
+        fail("managed Release identifier did not resolve exactly")
+    return record
+
+
 def tag_sha(tag: str) -> str | None:
     if TAG.fullmatch(tag) is None:
         fail("managed tag must use canonical stable SemVer")
@@ -1270,9 +1279,7 @@ def prepare_merged_release(config: dict[str, Any], sha: str) -> None:
         )
     if tag_sha(tag) != sha:
         fail(f"managed tag {tag} did not converge to the release commit")
-    reread = release_by_tag(tag)
-    if reread is None:
-        fail(f"managed draft Release {tag} disappeared")
+    reread = release_by_id(release.get("id"))
     validate_release_record(config, reread, version=version, sha=sha, number=number)
     print(f"Prepared managed draft Release {tag} at {sha}")
 
