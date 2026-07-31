@@ -55,3 +55,9 @@ alias fails closed.
 The App needs only the repository permissions requested by each workflow. It
 does not receive Actions or Workflows write access. Service repositories do
 not receive desktop/mobile signing keys.
+
+GitHub exposes the complete repository merge-policy fields only to a caller
+with push access. The hosted-policy check therefore uses a separate,
+repository-scoped App token with short-lived Contents write permission. That
+token is not reused for release authorization; the authorization controller
+receives a distinct read-only token.

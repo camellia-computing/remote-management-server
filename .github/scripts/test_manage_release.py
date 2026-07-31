@@ -56,6 +56,15 @@ class ManagedReleaseTests(unittest.TestCase):
             with self.subTest(value=value), self.assertRaises(release.ReleaseError):
                 release.canonical_sha(value)
 
+    def test_release_reread_uses_the_exact_created_identifier(self) -> None:
+        record = {"id": 42}
+        with patch.object(release, "gh_api", return_value=record) as github:
+            self.assertEqual(release.release_by_id(42), record)
+        github.assert_called_once_with(f"{release.REPOSITORY_ENDPOINT}/releases/42")
+        for value in (None, True, 0, -1, "42"):
+            with self.subTest(value=value), self.assertRaises(release.ReleaseError):
+                release.release_by_id(value)
+
     def test_app_git_identity_uses_rest_bot_and_process_environment(self) -> None:
         login = "release-manager[bot]"
         response = {"id": 1234, "login": login, "type": "Bot"}
