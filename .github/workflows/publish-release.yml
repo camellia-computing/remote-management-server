@@ -424,9 +424,9 @@ jobs:
           repositories: ${{ github.event.repository.name }}
           permission-administration: read
           permission-contents: write
-          permission-issues: write
           permission-metadata: read
-          permission-pull-requests: read
+          # Completion removes the state label from the merged Release PR.
+          permission-pull-requests: write
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
