@@ -276,6 +276,16 @@ class ManagedReleaseTests(unittest.TestCase):
             "GH_TOKEN: ${{ steps.policy-token.outputs.token }}", authorize
         )
 
+    def test_publication_completion_uses_pull_request_write_permission(self) -> None:
+        workflow = (
+            Path(__file__).parents[1] / "workflows" / "publish-release.yml"
+        ).read_text(encoding="utf-8")
+        publish = workflow.split("  publish:", maxsplit=1)[1]
+        token = publish.split("      - name: Release App token", maxsplit=1)[1]
+        token = token.split("\n      - ", maxsplit=1)[0]
+        self.assertIn("permission-pull-requests: write", token)
+        self.assertNotIn("permission-issues: write", token)
+
     def test_release_scan_consumes_the_extracted_oci_layout(self) -> None:
         workflow = (
             Path(__file__).parents[1] / "workflows" / "publish-release.yml"
