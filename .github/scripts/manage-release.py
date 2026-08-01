@@ -610,6 +610,34 @@ def label_names(pr: dict[str, Any]) -> set[str]:
     return {item["name"] for item in labels if isinstance(item, dict) and isinstance(item.get("name"), str)}
 
 
+def remove_pending_release_label(number: int) -> None:
+    issue_endpoint = f"{REPOSITORY_ENDPOINT}/issues/{number}"
+    issue = gh_api(issue_endpoint)
+    if not isinstance(issue, dict):
+        fail("merged Release PR labels are unavailable during completion")
+    if PENDING_LABEL not in label_names(issue):
+        return
+    process = run(
+        [
+            "gh",
+            "api",
+            "-X",
+            "DELETE",
+            f"{issue_endpoint}/labels/{PENDING_LABEL}",
+        ],
+        env={"GH_TOKEN": require_env("GH_TOKEN")},
+        check=False,
+    )
+    reread = gh_api(issue_endpoint)
+    if not isinstance(reread, dict):
+        fail("merged Release PR labels are unavailable after completion")
+    if PENDING_LABEL in label_names(reread):
+        fail(
+            "unable to remove the pending release label "
+            f"(GitHub CLI exit {process.returncode})"
+        )
+
+
 def parse_provenance(body: str) -> tuple[str, int]:
     base_matches = re.findall(r"^<!-- release-base:([0-9a-f]{40}) -->$", body, re.MULTILINE)
     run_matches = re.findall(r"^<!-- release-validation-run:([1-9][0-9]*) -->$", body, re.MULTILINE)
@@ -1393,19 +1421,7 @@ def complete_release(args: argparse.Namespace, config: dict[str, Any]) -> None:
     )
     if not complete:
         fail("managed Release did not record completion")
-    process = run(
-        [
-            "gh",
-            "api",
-            "-X",
-            "DELETE",
-            f"{REPOSITORY_ENDPOINT}/issues/{number}/labels/release%3Apending",
-        ],
-        env={"GH_TOKEN": require_env("GH_TOKEN")},
-        check=False,
-    )
-    if process.returncode != 0 and "HTTP 404" not in process.stderr:
-        fail("unable to remove the pending release label")
+    remove_pending_release_label(number)
     print(f"Completed managed Release {args.tag}")
 
 

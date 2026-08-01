@@ -65,6 +65,60 @@ class ManagedReleaseTests(unittest.TestCase):
             with self.subTest(value=value), self.assertRaises(release.ReleaseError):
                 release.release_by_id(value)
 
+    def test_pending_label_cleanup_uses_authoritative_state(self) -> None:
+        issue_endpoint = f"{release.REPOSITORY_ENDPOINT}/issues/42"
+        pending = {"name": release.PENDING_LABEL}
+        retained = {"name": "release:version-locked"}
+        failed_delete = release.subprocess.CompletedProcess([], 1, "", "not found")
+        with (
+            patch.dict(release.os.environ, {"GH_TOKEN": "token"}, clear=True),
+            patch.object(
+                release,
+                "gh_api",
+                side_effect=[
+                    {"labels": [pending, retained]},
+                    {"labels": [retained]},
+                ],
+            ) as github,
+            patch.object(release, "run", return_value=failed_delete) as command,
+        ):
+            release.remove_pending_release_label(42)
+        self.assertEqual(github.call_count, 2)
+        command.assert_called_once_with(
+            [
+                "gh",
+                "api",
+                "-X",
+                "DELETE",
+                f"{issue_endpoint}/labels/{release.PENDING_LABEL}",
+            ],
+            env={"GH_TOKEN": "token"},
+            check=False,
+        )
+
+        with (
+            patch.object(release, "gh_api", return_value={"labels": []}) as github,
+            patch.object(release, "run") as command,
+        ):
+            release.remove_pending_release_label(42)
+        github.assert_called_once_with(issue_endpoint)
+        command.assert_not_called()
+
+    def test_pending_label_cleanup_fails_if_state_does_not_change(self) -> None:
+        pending = {"name": release.PENDING_LABEL}
+        failed_delete = release.subprocess.CompletedProcess([], 1, "", "forbidden")
+        with (
+            patch.dict(release.os.environ, {"GH_TOKEN": "token"}, clear=True),
+            patch.object(
+                release,
+                "gh_api",
+                side_effect=[{"labels": [pending]}, {"labels": [pending]}],
+            ),
+            patch.object(release, "run", return_value=failed_delete),
+            self.assertRaisesRegex(release.ReleaseError, "GitHub CLI exit 1"),
+        ):
+            release.remove_pending_release_label(42)
+
     def test_app_git_identity_uses_rest_bot_and_process_environment(self) -> None:
         login = "release-manager[bot]"
         response = {"id": 1234, "login": login, "type": "Bot"}
