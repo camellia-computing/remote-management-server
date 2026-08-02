@@ -53,7 +53,7 @@ requires-dist = [
     { name = "django", specifier = ">=6.0,<7.0" },
     { name = "gunicorn", specifier = ">=26,<27" },
     { name = "openpyxl", specifier = ">=3.1,<4" },
-    { name = "psycopg", extras = ["binary"], specifier = ">=3.3,<4" },
+    { name = "psycopg", extras = ["binary"], specifier = ">=3.3.4,<4" },
     { name = "pynacl", specifier = ">=1.6,<2" },
     { name = "requests", specifier = ">=2.32,<3" },
     { name = "whitenoise", specifier = ">=6.12,<7" },
