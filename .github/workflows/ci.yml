@@ -234,7 +234,9 @@ jobs:
         env:
           CAMELLIA_REMOTE_MANAGEMENT_IMAGE: ghcr.io/example/management@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
           CAMELLIA_REMOTE_SECRET_KEY: ci-only-production-secret-key-with-sufficient-length-000
+          CAMELLIA_REMOTE_DATA_ENCRYPTION_KEY_ID: ci-primary-v1
           CAMELLIA_REMOTE_DATA_ENCRYPTION_KEY: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
+          CAMELLIA_REMOTE_DATA_ENCRYPTION_V1_KEY_ID: ci-primary-v1
           CAMELLIA_REMOTE_DEVICE_VERIFICATION_TOKEN: ci-device-verification-token-with-sufficient-length
           CAMELLIA_REMOTE_DATABASE_PASSWORD: "test:@/%# strong password"
           CAMELLIA_REMOTE_ALLOWED_HOSTS: api.example.test
@@ -345,7 +347,9 @@ jobs:
         env:
           CAMELLIA_REMOTE_DEBUG: "false"
           CAMELLIA_REMOTE_SECRET_KEY: ci-only-production-secret-key-with-sufficient-length-000
+          CAMELLIA_REMOTE_DATA_ENCRYPTION_KEY_ID: ci-primary-v1
           CAMELLIA_REMOTE_DATA_ENCRYPTION_KEY: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
+          CAMELLIA_REMOTE_DATA_ENCRYPTION_V1_KEY_ID: ci-primary-v1
           CAMELLIA_REMOTE_DEVICE_VERIFICATION_TOKEN: ci-device-verification-token-with-sufficient-length
           CAMELLIA_REMOTE_CSRF_TRUSTED_ORIGINS: https://127.0.0.1:21114
           CAMELLIA_REMOTE_API_SERVER: https://127.0.0.1:21114
@@ -437,7 +441,9 @@ jobs:
             --network host \
             -e CAMELLIA_REMOTE_DEBUG=false \
             -e CAMELLIA_REMOTE_SECRET_KEY=ci-only-production-secret-key-with-sufficient-length-000 \
+            -e CAMELLIA_REMOTE_DATA_ENCRYPTION_KEY_ID=ci-primary-v1 \
             -e CAMELLIA_REMOTE_DATA_ENCRYPTION_KEY=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA= \
+            -e CAMELLIA_REMOTE_DATA_ENCRYPTION_V1_KEY_ID=ci-primary-v1 \
             -e CAMELLIA_REMOTE_DEVICE_VERIFICATION_TOKEN=ci-device-verification-token-with-sufficient-length \
             -e CAMELLIA_REMOTE_DATABASE_URL=postgres://camellia_remote_container_ci:ci-postgres-password@127.0.0.1:5432/camellia_remote_container_ci \
             -e CAMELLIA_REMOTE_DATABASE_SSLMODE=disable \
@@ -462,7 +468,9 @@ jobs:
             --security-opt no-new-privileges:true \
             -e CAMELLIA_REMOTE_DEBUG=false \
             -e CAMELLIA_REMOTE_SECRET_KEY=ci-only-production-secret-key-with-sufficient-length-000 \
+            -e CAMELLIA_REMOTE_DATA_ENCRYPTION_KEY_ID=ci-primary-v1 \
             -e CAMELLIA_REMOTE_DATA_ENCRYPTION_KEY=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA= \
+            -e CAMELLIA_REMOTE_DATA_ENCRYPTION_V1_KEY_ID=ci-primary-v1 \
             -e CAMELLIA_REMOTE_DEVICE_VERIFICATION_TOKEN=ci-device-verification-token-with-sufficient-length \
             -e CAMELLIA_REMOTE_DATABASE_URL=postgres://camellia_remote_container_ci:ci-postgres-password@127.0.0.1:5432/camellia_remote_container_ci \
             -e CAMELLIA_REMOTE_DATABASE_SSLMODE=disable \

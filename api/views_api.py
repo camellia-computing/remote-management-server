@@ -33,6 +33,7 @@ from joserfc.jwk import KeySet
 from joserfc.jwt import JWTClaimsRegistry
 
 # from django.forms.models import model_to_dict
+from api.encrypted_fields import verify_key_canary
 from api.models import (
     AddressBookProfile,
     AddressBookRule,
@@ -40,6 +41,7 @@ from api.models import (
     AddressBookShare,
     AlarmLog,
     ConnLog,
+    DataEncryptionKeyState,
     DeviceGroup,
     FileLog,
     LoginAttempt,
@@ -1504,6 +1506,24 @@ def health_ready(request):
             cursor.execute("SELECT 1")
             cursor.fetchone()
         RemoteDevice.objects.order_by("pk").values_list("pk", flat=True).first()
+        key_states = list(
+            DataEncryptionKeyState.objects.order_by("key_id")[: settings.MAX_DATA_ENCRYPTION_KEYS + 1]
+        )
+        primary_key_id = getattr(settings, "DATA_ENCRYPTION_PRIMARY_KEY_ID", "")
+        if (
+            not key_states
+            or len(key_states) > settings.MAX_DATA_ENCRYPTION_KEYS
+            or [state.key_id for state in key_states if state.is_primary] != [primary_key_id]
+            or any(
+                not verify_key_canary(
+                    state.key_id,
+                    state.key_fingerprint,
+                    state.encrypted_canary,
+                )
+                for state in key_states
+            )
+        ):
+            raise ValidationError("Data-encryption key inventory does not match this replica")
     except Exception as exc:  # noqa: BLE001 - readiness normalizes backend failures
         logger.warning("readiness database check failed: %s", type(exc).__name__)
         return JsonResponse({"status": "not_ready"}, status=503)

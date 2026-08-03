@@ -5,6 +5,7 @@ import ipaddress
 import os
 import re
 from pathlib import Path
+from types import MappingProxyType
 from urllib.parse import unquote, urlsplit
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -69,6 +70,50 @@ def canonical_base64_bytes(value, expected_size):
     return decoded
 
 
+DATA_ENCRYPTION_KEY_ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,31}$")
+MAX_DATA_ENCRYPTION_KEYS = 8
+
+
+def data_encryption_key_id(value, setting_name):
+    normalized = value.strip().lower()
+    if value != normalized or not DATA_ENCRYPTION_KEY_ID_RE.fullmatch(normalized):
+        raise ImproperlyConfigured(
+            f"{setting_name} must be a lowercase key ID containing 1-32 letters, digits, '.', '_' or '-'"
+        )
+    return normalized
+
+
+def data_encryption_legacy_keys(value):
+    keys = {}
+    if not value.strip():
+        return keys
+    for entry in value.split(","):
+        key_id_raw, separator, encoded_key = entry.strip().partition(":")
+        if not separator:
+            raise ImproperlyConfigured(
+                "CAMELLIA_REMOTE_DATA_ENCRYPTION_LEGACY_KEYS entries must use key-id:canonical-base64"
+            )
+        key_id = data_encryption_key_id(
+            key_id_raw,
+            "CAMELLIA_REMOTE_DATA_ENCRYPTION_LEGACY_KEYS key ID",
+        )
+        key = canonical_base64_bytes(encoded_key, 32)
+        if key is None:
+            raise ImproperlyConfigured(
+                "CAMELLIA_REMOTE_DATA_ENCRYPTION_LEGACY_KEYS values must encode exactly 32 bytes"
+            )
+        if key_id in keys:
+            raise ImproperlyConfigured("CAMELLIA_REMOTE_DATA_ENCRYPTION_LEGACY_KEYS contains a duplicate key ID")
+        if key in keys.values():
+            raise ImproperlyConfigured("CAMELLIA_REMOTE_DATA_ENCRYPTION_LEGACY_KEYS aliases one key under multiple IDs")
+        keys[key_id] = key
+    if len(keys) >= MAX_DATA_ENCRYPTION_KEYS:
+        raise ImproperlyConfigured(
+            f"CAMELLIA_REMOTE_DATA_ENCRYPTION_LEGACY_KEYS supports at most {MAX_DATA_ENCRYPTION_KEYS - 1} keys"
+        )
+    return keys
+
+
 def valid_https_url(value, *, allow_query=True):
     if not isinstance(value, str) or not value or len(value) > 2048:
         return False
@@ -113,6 +158,37 @@ elif DEBUG:
     DATA_ENCRYPTION_KEY_BYTES = hashlib.sha256(f"development-data-key:{SECRET_KEY}".encode()).digest()
 else:
     raise ImproperlyConfigured("CAMELLIA_REMOTE_DATA_ENCRYPTION_KEY is required when CAMELLIA_REMOTE_DEBUG is false")
+
+_data_encryption_key_id = os.environ.get("CAMELLIA_REMOTE_DATA_ENCRYPTION_KEY_ID", "").strip()
+if not _data_encryption_key_id:
+    if DEBUG:
+        _data_encryption_key_id = "debug-primary"
+    else:
+        raise ImproperlyConfigured(
+            "CAMELLIA_REMOTE_DATA_ENCRYPTION_KEY_ID is required when CAMELLIA_REMOTE_DEBUG is false"
+        )
+DATA_ENCRYPTION_PRIMARY_KEY_ID = data_encryption_key_id(
+    _data_encryption_key_id,
+    "CAMELLIA_REMOTE_DATA_ENCRYPTION_KEY_ID",
+)
+_data_encryption_keys = data_encryption_legacy_keys(
+    os.environ.get("CAMELLIA_REMOTE_DATA_ENCRYPTION_LEGACY_KEYS", "")
+)
+if DATA_ENCRYPTION_PRIMARY_KEY_ID in _data_encryption_keys:
+    raise ImproperlyConfigured("The primary data-encryption key ID must not also be a legacy key ID")
+if DATA_ENCRYPTION_KEY_BYTES in _data_encryption_keys.values():
+    raise ImproperlyConfigured("The primary data-encryption key must not be aliased as a legacy key")
+_data_encryption_keys[DATA_ENCRYPTION_PRIMARY_KEY_ID] = DATA_ENCRYPTION_KEY_BYTES
+DATA_ENCRYPTION_KEYS = MappingProxyType(_data_encryption_keys)
+DATA_ENCRYPTION_V1_KEY_ID = data_encryption_key_id(
+    os.environ.get(
+        "CAMELLIA_REMOTE_DATA_ENCRYPTION_V1_KEY_ID",
+        DATA_ENCRYPTION_PRIMARY_KEY_ID,
+    ),
+    "CAMELLIA_REMOTE_DATA_ENCRYPTION_V1_KEY_ID",
+)
+if DATA_ENCRYPTION_V1_KEY_ID not in DATA_ENCRYPTION_KEYS:
+    raise ImproperlyConfigured("CAMELLIA_REMOTE_DATA_ENCRYPTION_V1_KEY_ID must identify a configured key")
 
 DEFAULT_AUTO_FIELD = "django.db.models.AutoField"
 ALLOWED_HOSTS = env_csv("CAMELLIA_REMOTE_ALLOWED_HOSTS", ["127.0.0.1", "localhost"])

@@ -11,16 +11,20 @@ from unittest.mock import patch
 from django.contrib.auth.models import Group
 from django.core.exceptions import ImproperlyConfigured, ValidationError
 from django.core.management import call_command
+from django.core.management.base import CommandError
 from django.db import connection, transaction
 from django.test import SimpleTestCase, TestCase, override_settings
 from django.utils import timezone
+from nacl.secret import SecretBox
 
+from api.encrypted_fields import FIELD_PREFIX, encrypt_text, key_canary, key_fingerprint
 from api.formatting import format_bytes
 from api.models import (
     AddressBookProfile,
     AddressBookRule,
     AlarmLog,
     ConnLog,
+    DataEncryptionKeyState,
     DeviceGroup,
     FileLog,
     LoginAttempt,
@@ -40,6 +44,8 @@ from camellia_remote_management.settings import (
     _database_host,
     _database_text,
     _database_tls_options,
+    data_encryption_key_id,
+    data_encryption_legacy_keys,
     env_bool,
     env_choice,
     env_int,
@@ -80,6 +86,26 @@ class UtilityContractTests(SimpleTestCase):
 
 
 class SettingsParserTests(SimpleTestCase):
+    def test_data_encryption_key_ids_and_legacy_keyring_are_strict(self):
+        first_key = base64.b64encode(b"a" * 32).decode()
+        second_key = base64.b64encode(b"b" * 32).decode()
+        self.assertEqual(data_encryption_key_id("key-2026.08", "TEST_KEY_ID"), "key-2026.08")
+        self.assertEqual(
+            data_encryption_legacy_keys(f"old-a:{first_key},old-b:{second_key}"),
+            {"old-a": b"a" * 32, "old-b": b"b" * 32},
+        )
+        for value in ("", "UPPERCASE", "-leading", "x" * 33, "contains space"):
+            with self.subTest(value=value), self.assertRaises(ImproperlyConfigured):
+                data_encryption_key_id(value, "TEST_KEY_ID")
+        for value in (
+            "missing-separator",
+            "duplicate:" + first_key + ",duplicate:" + second_key,
+            "first:" + first_key + ",alias:" + first_key,
+            "invalid:not-base64",
+        ):
+            with self.subTest(value=value), self.assertRaises(ImproperlyConfigured):
+                data_encryption_legacy_keys(value)
+
     def test_boolean_values_are_explicit_and_case_insensitive(self):
         with patch.dict(os.environ, {"TEST_BOOLEAN": "YeS"}):
             self.assertTrue(env_bool("TEST_BOOLEAN"))
@@ -404,8 +430,9 @@ class ApiContractTests(ApiTestMixin, TestCase):
                 ["test-state"],
             )
             stored_nonce, stored_verifier = cursor.fetchone()
-        self.assertTrue(stored_nonce.startswith("secretbox:v1:"))
-        self.assertTrue(stored_verifier.startswith("secretbox:v1:"))
+        envelope_prefix = f"{FIELD_PREFIX}{project_settings.DATA_ENCRYPTION_PRIMARY_KEY_ID}:"
+        self.assertTrue(stored_nonce.startswith(envelope_prefix))
+        self.assertTrue(stored_verifier.startswith(envelope_prefix))
         self.assertNotIn("test-nonce", stored_nonce)
         self.assertNotIn("test-code-verifier", stored_verifier)
 
@@ -581,8 +608,9 @@ class ApiContractTests(ApiTestMixin, TestCase):
                 [second.pk],
             )
             second_raw_rhash = cursor.fetchone()[0]
-        self.assertTrue(raw_rhash.startswith("secretbox:v1:"))
-        self.assertTrue(raw_password.startswith("secretbox:v1:"))
+        envelope_prefix = f"{FIELD_PREFIX}{project_settings.DATA_ENCRYPTION_PRIMARY_KEY_ID}:"
+        self.assertTrue(raw_rhash.startswith(envelope_prefix))
+        self.assertTrue(raw_password.startswith(envelope_prefix))
         self.assertNotIn("same-sensitive-value", raw_rhash)
         self.assertNotEqual(raw_rhash, raw_password)
         self.assertNotEqual(raw_rhash, second_raw_rhash)
@@ -594,7 +622,7 @@ class ApiContractTests(ApiTestMixin, TestCase):
         with connection.cursor() as cursor:
             cursor.execute(
                 "UPDATE api_remotepeer SET rhash = %s WHERE id = %s",
-                ["secretbox:v1:AAAA", first.pk],
+                [f"{envelope_prefix}AAAA", first.pk],
             )
         with self.assertRaises(ValidationError):
             first.refresh_from_db()
@@ -1772,6 +1800,33 @@ class SensitiveIngestionTests(ApiTestMixin, TestCase):
 class OperationalEndpointTests(TestCase):
     @override_settings(
         DEVICE_VERIFICATION_TOKEN="v" * 48,
+        SECURE_SSL_REDIRECT=False,
+    )
+    def test_readiness_rejects_a_wrong_but_well_formed_data_key(self):
+        pending = OidcPendingAuth.objects.create(
+            state="readiness-key-check",
+            poll_code_hash=hashlib.sha256(b"readiness-poll-code").hexdigest(),
+            provider="example",
+            nonce="readiness-nonce",
+            code_verifier="readiness-code-verifier",
+        )
+        wrong_key = b"w" * 32
+
+        with override_settings(
+            DATA_ENCRYPTION_KEY_BYTES=wrong_key,
+            DATA_ENCRYPTION_PRIMARY_KEY_ID="wrong-key",
+            DATA_ENCRYPTION_KEYS={"wrong-key": wrong_key},
+            DATA_ENCRYPTION_V1_KEY_ID="wrong-key",
+        ):
+            with self.assertRaises(ValidationError):
+                pending.refresh_from_db()
+            response = self.client.get("/health/ready")
+
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.json(), {"status": "not_ready"})
+
+    @override_settings(
+        DEVICE_VERIFICATION_TOKEN="v" * 48,
         SECURE_PROXY_SSL_HEADER=("HTTP_X_FORWARDED_PROTO", "https"),
         SECURE_SSL_REDIRECT=True,
     )
@@ -1803,3 +1858,208 @@ class OperationalEndpointTests(TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json(), {"status": "live"})
+
+
+class DataEncryptionRotationTests(TestCase):
+    def test_rotation_is_resumable_and_legacy_key_retirement_is_explicit(self):
+        old_key_id = project_settings.DATA_ENCRYPTION_PRIMARY_KEY_ID
+        old_key = project_settings.DATA_ENCRYPTION_KEYS[old_key_id]
+        pending = OidcPendingAuth.objects.create(
+            state="rotation-state",
+            poll_code_hash=hashlib.sha256(b"rotation-poll-code").hexdigest(),
+            provider="example",
+            nonce="legacy-v1-nonce",
+            code_verifier="old-v2-verifier",
+        )
+        legacy_ciphertext = SecretBox(old_key).encrypt(b"legacy-v1-nonce")
+        legacy_envelope = "secretbox:v1:" + base64.b64encode(bytes(legacy_ciphertext)).decode()
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "UPDATE api_oidcpendingauth SET nonce = %s WHERE state = %s",
+                [legacy_envelope, pending.pk],
+            )
+
+        new_key_id = "rotation-2026-08"
+        new_key = b"n" * 32
+        rotated_prefix = f"{FIELD_PREFIX}{new_key_id}:"
+        rotation_settings = {
+            "DATA_ENCRYPTION_KEY_BYTES": new_key,
+            "DATA_ENCRYPTION_KEYS": {old_key_id: old_key, new_key_id: new_key},
+            "DATA_ENCRYPTION_PRIMARY_KEY_ID": new_key_id,
+            "DATA_ENCRYPTION_V1_KEY_ID": old_key_id,
+            "DEVICE_VERIFICATION_TOKEN": "v" * 48,
+            "SECURE_SSL_REDIRECT": False,
+        }
+        with override_settings(**rotation_settings):
+            first_output = StringIO()
+            call_command(
+                "rotate_data_encryption",
+                batch_size=1,
+                max_batches=1,
+                stdout=first_output,
+            )
+            first_result = json.loads(first_output.getvalue())
+            self.assertEqual(first_result["rewritten"], 1)
+            self.assertEqual(first_result["batches"], 1)
+
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    "SELECT nonce, code_verifier FROM api_oidcpendingauth WHERE state = %s",
+                    [pending.pk],
+                )
+                first_nonce, first_verifier = cursor.fetchone()
+            self.assertTrue(first_nonce.startswith(rotated_prefix))
+            self.assertFalse(first_verifier.startswith(rotated_prefix))
+
+            call_command("rotate_data_encryption", batch_size=1, stdout=StringIO())
+            pending.refresh_from_db()
+            self.assertEqual(pending.nonce, "legacy-v1-nonce")
+            self.assertEqual(pending.code_verifier, "old-v2-verifier")
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    "SELECT nonce, code_verifier FROM api_oidcpendingauth WHERE state = %s",
+                    [pending.pk],
+                )
+                rotated_nonce, rotated_verifier = cursor.fetchone()
+            self.assertTrue(rotated_nonce.startswith(rotated_prefix))
+            self.assertTrue(rotated_verifier.startswith(rotated_prefix))
+            self.assertEqual(
+                list(DataEncryptionKeyState.objects.filter(is_primary=True).values_list("key_id", flat=True)),
+                [new_key_id],
+            )
+            self.assertEqual(self.client.get("/health/ready").status_code, 200)
+
+            call_command(
+                "rotate_data_encryption",
+                retire_key_id=old_key_id,
+                stdout=StringIO(),
+            )
+            self.assertFalse(DataEncryptionKeyState.objects.filter(key_id=old_key_id).exists())
+
+    def test_rotation_does_not_retire_a_referenced_key(self):
+        old_key_id = project_settings.DATA_ENCRYPTION_PRIMARY_KEY_ID
+        old_key = project_settings.DATA_ENCRYPTION_KEYS[old_key_id]
+        OidcPendingAuth.objects.create(
+            state="referenced-key-state",
+            poll_code_hash=hashlib.sha256(b"referenced-key-poll-code").hexdigest(),
+            provider="example",
+            nonce="nonce",
+            code_verifier="verifier",
+        )
+        new_key_id = "retirement-candidate"
+        new_key = b"r" * 32
+        with (
+            override_settings(
+                DATA_ENCRYPTION_KEY_BYTES=new_key,
+                DATA_ENCRYPTION_KEYS={old_key_id: old_key, new_key_id: new_key},
+                DATA_ENCRYPTION_PRIMARY_KEY_ID=new_key_id,
+                DATA_ENCRYPTION_V1_KEY_ID=old_key_id,
+            ),
+            self.assertRaisesMessage(CommandError, "still referenced"),
+        ):
+            call_command(
+                "rotate_data_encryption",
+                max_batches=1,
+                retire_key_id=old_key_id,
+                stdout=StringIO(),
+            )
+
+    def test_bounded_rotation_makes_progress_across_repeated_invocations(self):
+        old_key_id = project_settings.DATA_ENCRYPTION_PRIMARY_KEY_ID
+        old_key = project_settings.DATA_ENCRYPTION_KEYS[old_key_id]
+        for index in range(2):
+            OidcPendingAuth.objects.create(
+                state=f"bounded-rotation-{index}",
+                poll_code_hash=hashlib.sha256(f"bounded-poll-{index}".encode()).hexdigest(),
+                provider="example",
+                nonce=f"nonce-{index}",
+                code_verifier=f"verifier-{index}",
+            )
+        new_key_id = "bounded-primary"
+        new_key = b"b" * 32
+        with override_settings(
+            DATA_ENCRYPTION_KEY_BYTES=new_key,
+            DATA_ENCRYPTION_KEYS={old_key_id: old_key, new_key_id: new_key},
+            DATA_ENCRYPTION_PRIMARY_KEY_ID=new_key_id,
+            DATA_ENCRYPTION_V1_KEY_ID=old_key_id,
+        ):
+            remaining = []
+            for _index in range(4):
+                output = StringIO()
+                call_command(
+                    "rotate_data_encryption",
+                    batch_size=1,
+                    max_batches=1,
+                    stdout=output,
+                )
+                result = json.loads(output.getvalue())
+                self.assertEqual(result["rewritten"], 1)
+                remaining.append(result["remaining"])
+
+        self.assertEqual(remaining, [3, 2, 1, 0])
+
+    def test_full_rotation_authenticates_existing_primary_envelopes(self):
+        pending = OidcPendingAuth.objects.create(
+            state="corrupt-primary-envelope",
+            poll_code_hash=hashlib.sha256(b"corrupt-primary-poll").hexdigest(),
+            provider="example",
+            nonce="nonce-to-corrupt",
+            code_verifier="valid-verifier",
+        )
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT nonce FROM api_oidcpendingauth WHERE state = %s",
+                [pending.pk],
+            )
+            envelope = cursor.fetchone()[0]
+            prefix, encoded = envelope.rsplit(":", 1)
+            ciphertext = bytearray(base64.b64decode(encoded))
+            ciphertext[-1] ^= 1
+            cursor.execute(
+                "UPDATE api_oidcpendingauth SET nonce = %s WHERE state = %s",
+                [f"{prefix}:{base64.b64encode(ciphertext).decode()}", pending.pk],
+            )
+
+        with self.assertRaisesMessage(CommandError, "authentication failed"):
+            call_command("rotate_data_encryption", stdout=StringIO())
+
+    def test_key_id_like_wildcards_do_not_hide_non_primary_values(self):
+        primary_key_id = "key_a"
+        confusing_key_id = "keyxa"
+        primary_key = b"p" * 32
+        confusing_key = b"x" * 32
+        default_key_id = project_settings.DATA_ENCRYPTION_PRIMARY_KEY_ID
+        default_key = project_settings.DATA_ENCRYPTION_KEYS[default_key_id]
+        keyring = {
+            default_key_id: default_key,
+            primary_key_id: primary_key,
+            confusing_key_id: confusing_key,
+        }
+        with override_settings(
+            DATA_ENCRYPTION_KEY_BYTES=primary_key,
+            DATA_ENCRYPTION_KEYS=keyring,
+            DATA_ENCRYPTION_PRIMARY_KEY_ID=primary_key_id,
+            DATA_ENCRYPTION_V1_KEY_ID=default_key_id,
+        ):
+            DataEncryptionKeyState.objects.create(
+                key_id=confusing_key_id,
+                key_fingerprint=key_fingerprint(confusing_key),
+                encrypted_canary=key_canary(confusing_key_id),
+                is_primary=False,
+            )
+            pending = OidcPendingAuth.objects.create(
+                state="wildcard-key-id",
+                poll_code_hash=hashlib.sha256(b"wildcard-key-poll").hexdigest(),
+                provider="example",
+                nonce="primary-value",
+                code_verifier="primary-verifier",
+            )
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    "UPDATE api_oidcpendingauth SET nonce = %s WHERE state = %s",
+                    [encrypt_text("confusing-value", key_id=confusing_key_id), pending.pk],
+                )
+            output = StringIO()
+            call_command("rotate_data_encryption", dry_run=True, stdout=output)
+
+        self.assertEqual(json.loads(output.getvalue())["remaining"], 1)
