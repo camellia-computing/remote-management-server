@@ -1,6 +1,6 @@
 # Camellia Remote Management Server
 
-Camellia Remote 的生产管理平面：提供账号与设备管理、地址簿、策略、审计、插件签名以及锁定版本的 Web 客户端。生产环境只支持 PostgreSQL；SQLite 仅用于显式 `CAMELLIA_REMOTE_DEBUG=true` 的本地开发。
+Camellia Remote 的生产管理平面：提供账号与设备管理、地址簿、策略、审计以及锁定版本的 Web 客户端。生产环境只支持 PostgreSQL；SQLite 仅用于显式 `CAMELLIA_REMOTE_DEBUG=true` 的本地开发。在线插件签名目前保持禁用，直到仓库具备版本化 artifact envelope、实际验签消费者和受审批签发流程。
 
 ## 架构与边界
 
