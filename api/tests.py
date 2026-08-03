@@ -14,7 +14,6 @@ from django.core.management import call_command
 from django.db import connection, transaction
 from django.test import SimpleTestCase, TestCase, override_settings
 from django.utils import timezone
-from nacl.signing import SigningKey
 
 from api.formatting import format_bytes
 from api.models import (
@@ -1229,20 +1228,6 @@ class ApiContractTests(ApiTestMixin, TestCase):
         self.assertEqual(response.status_code, 401, response.content)
         self.assertFalse(RemoteToken.objects.filter(device__owner=self.user).exists())
 
-    def test_plugin_sign_requires_configured_signing_key(self):
-        admin_token = self._login(
-            "admin",
-            "admin-pass",
-            rid="900000001",
-            uuid=device_uuid("admin-device"),
-        )
-        response = self._post_json(
-            "/lic/web/api/plugin-sign",
-            {"msg": [1, 2, 3], "plugin_id": "sample", "version": "1.0.0"},
-            token=admin_token,
-        )
-        self.assertEqual(response.status_code, 503)
-
     @override_settings(ALLOW_REGISTRATION=True)
     def test_first_public_registration_never_bootstraps_an_administrator(self):
         UserProfile.objects.all().delete()
@@ -1272,25 +1257,29 @@ class ApiContractTests(ApiTestMixin, TestCase):
         self.assertEqual(mismatch.json()["code"], 0)
         self.assertFalse(UserProfile.objects.filter(username="second-user").exists())
 
-    @override_settings(PLUGIN_SIGNING_KEY=SigningKey.generate().encode().hex())
-    def test_plugin_sign_is_an_admin_only_operation(self):
-        user_token = self._login("alice", "alice-pass")
+    @override_settings(PLUGIN_SIGNING_KEY="00" * 32)
+    def test_plugin_raw_signing_oracle_is_not_routed(self):
         admin_token = self._login(
             "admin",
             "admin-pass",
             rid="900000001",
             uuid=device_uuid("admin-device"),
         )
-        payload = {"msg": [1, 2, 3], "plugin_id": "sample", "version": "1.0.0"}
-
-        self.assertEqual(self._post_json("/lic/web/api/plugin-sign", payload).status_code, 401)
-        self.assertEqual(
-            self._post_json("/lic/web/api/plugin-sign", payload, token=user_token).status_code,
-            403,
+        payloads = (
+            {"msg": []},
+            {"msg": [True, False, 255]},
+            {"msg": [9, 8, 7], "plugin_id": "alpha", "version": "1.0.0"},
+            {"msg": [9, 8, 7], "plugin_id": "beta", "version": "2.0.0"},
         )
-        signed = self._post_json("/lic/web/api/plugin-sign", payload, token=admin_token)
-        self.assertEqual(signed.status_code, 200, signed.content)
-        self.assertEqual(len(signed.json()["signed_msg"]), 67)
+
+        for payload in payloads:
+            with self.subTest(payload=payload):
+                response = self._post_json(
+                    "/lic/web/api/plugin-sign",
+                    payload,
+                    token=admin_token,
+                )
+                self.assertEqual(response.status_code, 404, response.content)
 
     def test_device_group_delete_detaches_devices(self):
         admin_token = self._login(

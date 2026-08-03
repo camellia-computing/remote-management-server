@@ -1,6 +1,6 @@
 # Camellia Remote Management Server
 
-Production management plane for Camellia Remote: accounts, devices, address books, policy, auditing, plugin signing, and a commit-pinned Web client. Production supports PostgreSQL only; SQLite is restricted to explicit `CAMELLIA_REMOTE_DEBUG=true` development.
+Production management plane for Camellia Remote: accounts, devices, address books, policy, auditing, and a commit-pinned Web client. Production supports PostgreSQL only; SQLite is restricted to explicit `CAMELLIA_REMOTE_DEBUG=true` development. Online plugin signing remains disabled until the repositories provide a versioned artifact envelope, a real verification consumer, and an approval-backed signing workflow.
 
 The service listens on port 21114 behind a TLS reverse proxy. Keep PostgreSQL and the backend network private. The initial single-region target is 99.9% availability, RPO at most one hour, and RTO at most four hours.
 

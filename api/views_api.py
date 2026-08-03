@@ -31,7 +31,6 @@ from django.utils.translation import gettext as _
 from joserfc import jwt
 from joserfc.jwk import KeySet
 from joserfc.jwt import JWTClaimsRegistry
-from nacl.signing import SigningKey
 
 # from django.forms.models import model_to_dict
 from api.models import (
@@ -59,7 +58,6 @@ from api.tag_colors import normalize_tag_color
 logger = logging.getLogger(__name__)
 EFFECTIVE_SECONDS = 7200
 MAX_DEPLOY_KEY_LEN = 512
-MAX_PLUGIN_SIGN_MSG_BYTES = 64 * 1024
 OIDC_PENDING_MINUTES = settings.OIDC_PENDING_RETENTION_MINUTES
 OIDC_MAX_PENDING_PER_IP = 20
 OIDC_DOCUMENT_MAX_BYTES = 1024 * 1024
@@ -744,23 +742,6 @@ def _request_content_length(request):
         return int(request.META.get("CONTENT_LENGTH", "0") or 0)
     except (TypeError, ValueError):
         return -1
-
-
-def _plugin_signing_key():
-    raw = getattr(settings, "PLUGIN_SIGNING_KEY", "").strip()
-    if not raw:
-        return None
-    for decoder in (
-        lambda value: base64.b64decode(value, validate=True),
-        lambda value: binascii.unhexlify(value),
-    ):
-        try:
-            key = decoder(raw)
-        except (binascii.Error, ValueError):
-            continue
-        if len(key) == 32:
-            return SigningKey(key)
-    return None
 
 
 def _personal_guid(user):
@@ -1939,39 +1920,6 @@ def devices_verify_deployment(request):
         owner__is_active=True,
     ).exists()
     return HttpResponse(status=204 if authorized else 404)
-
-
-def plugin_sign(request):
-    _token, user = _get_token_user(request)
-    if not user:
-        _log_event(request, "api_plugin_sign_unauthorized", level="warning")
-        return JsonResponse({"error": "Invalid token"}, status=401)
-    if not user.is_admin:
-        _log_event(request, "api_plugin_sign_denied", level="warning", username=user.username)
-        return JsonResponse({"error": "Admin required"}, status=403)
-    signing_key = _plugin_signing_key()
-    if signing_key is None:
-        _log_event(request, "api_plugin_sign_not_configured", level="warning")
-        return JsonResponse({"error": "Plugin signing key is not configured"}, status=503)
-    postdata = _load_json_object(request)
-    msg = postdata.get("msg", [])
-    if not isinstance(msg, list) or len(msg) > MAX_PLUGIN_SIGN_MSG_BYTES:
-        _log_event(request, "api_plugin_sign_invalid_msg", level="warning")
-        return JsonResponse({"error": "Invalid msg"}, status=400)
-    for item in msg:
-        if not isinstance(item, int) or item < 0 or item > 255:
-            _log_event(request, "api_plugin_sign_invalid_byte", level="warning")
-            return JsonResponse({"error": "Invalid msg"}, status=400)
-    signed_msg = bytes(signing_key.sign(bytes(msg)))
-    _log_event(
-        request,
-        "api_plugin_sign_ok",
-        level="debug",
-        username=user.username,
-        plugin_id=str(postdata.get("plugin_id", "")),
-        version=str(postdata.get("version", "")),
-    )
-    return JsonResponse({"signed_msg": list(signed_msg)})
 
 
 def record(request):

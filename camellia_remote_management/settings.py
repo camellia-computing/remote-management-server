@@ -208,7 +208,6 @@ if not DEBUG:
             )
     if canonical_base64_bytes(RS_PUB_KEY, 32) is None:
         raise ImproperlyConfigured("CAMELLIA_REMOTE_RS_PUB_KEY must encode exactly 32 bytes")
-PLUGIN_SIGNING_KEY = os.environ.get("CAMELLIA_REMOTE_PLUGIN_SIGNING_KEY", "").strip()
 DEVICE_VERIFICATION_TOKEN = os.environ.get("CAMELLIA_REMOTE_DEVICE_VERIFICATION_TOKEN", "").strip()
 if DEVICE_VERIFICATION_TOKEN and (
     not 32 <= len(DEVICE_VERIFICATION_TOKEN) <= 512
