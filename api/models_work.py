@@ -16,6 +16,29 @@ from .encrypted_fields import EncryptedTextField
 ALARM_TYPES = (0, 1, 2, 6, 7, 8, 9)
 
 
+class DataEncryptionKeyState(models.Model):
+    """Database-side inventory of keys required to decrypt retained rows."""
+
+    key_id = models.CharField(max_length=32, primary_key=True)
+    key_fingerprint = models.CharField(max_length=64, unique=True)
+    encrypted_canary = models.TextField()
+    is_primary = models.BooleanField(default=False)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ("key_id",)
+        constraints = [
+            models.UniqueConstraint(
+                fields=("is_primary",),
+                condition=models.Q(is_primary=True),
+                name="one_primary_data_encryption_key",
+            ),
+        ]
+
+    def __str__(self):
+        return self.key_id
+
+
 class RemoteToken(models.Model):
     """A single rotating session token bound to one managed device."""
 
