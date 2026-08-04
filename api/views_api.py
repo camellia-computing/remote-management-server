@@ -538,20 +538,51 @@ def _oidc_local_username(claims, issuer, subject, attempt=0):
     return f"{base[: max_length - len(suffix)]}{suffix}"
 
 
+def _validated_oidc_email(claims):
+    if claims.get("email_verified") is not True:
+        return ""
+    email = str(claims.get("email") or "").strip()
+    if not email or len(email) > 254:
+        return ""
+    try:
+        validate_email(email)
+    except ValidationError:
+        return ""
+    return email
+
+
+def _oidc_auto_provision_allowed(provider, claims):
+    if not provider.get("auto_provision", False):
+        return False
+
+    allowed_domains = provider.get("auto_provision_email_domains", ())
+    required_claims = provider.get("auto_provision_required_claims", {})
+    if not allowed_domains and not required_claims:
+        return False
+    if allowed_domains:
+        email = _validated_oidc_email(claims)
+        _local, separator, domain = email.rpartition("@")
+        if not separator or domain.lower() not in allowed_domains:
+            return False
+
+    for claim_name, allowed_values in required_claims.items():
+        claim_value = claims.get(claim_name)
+        claim_values = claim_value if isinstance(claim_value, list) else [claim_value]
+        if not any(isinstance(value, str) and value in allowed_values for value in claim_values):
+            return False
+    return True
+
+
 def _resolve_oidc_user(provider_name, issuer, claims):
+    provider = getattr(settings, "OIDC_PROVIDERS", {}).get(provider_name)
+    if not provider or str(provider.get("issuer") or "").rstrip("/") != issuer:
+        raise ValueError("OIDC provider does not match the validated issuer")
     subject = str(claims.get("sub") or "").strip()
     if not subject or len(subject) > OidcIdentity._meta.get_field("subject").max_length:
         raise ValueError("OIDC subject is invalid")
     last_username = str(claims.get("preferred_username") or claims.get("name") or "").strip()[:255]
-    email = str(claims.get("email") or "").strip()
-    if claims.get("email_verified") is not True:
-        email = ""
-    email = email[:254]
-    if email:
-        try:
-            validate_email(email)
-        except ValidationError:
-            email = ""
+    email = _validated_oidc_email(claims)
+    auto_provision_allowed = _oidc_auto_provision_allowed(provider, claims)
 
     user = None
     for attempt in range(16):
@@ -564,6 +595,8 @@ def _resolve_oidc_user(provider_name, issuer, claims):
                     .first()
                 )
                 if identity:
+                    if identity.is_auto_provisioned and not auto_provision_allowed:
+                        raise PermissionError("OIDC auto-provision policy no longer permits this identity")
                     user = identity.user
                     identity.provider = provider_name
                     identity.last_username = last_username
@@ -577,6 +610,8 @@ def _resolve_oidc_user(provider_name, issuer, claims):
                         ]
                     )
                 else:
+                    if not auto_provision_allowed:
+                        raise PermissionError("OIDC identity is not pre-authorized")
                     username = _oidc_local_username(
                         claims,
                         issuer,
@@ -594,13 +629,16 @@ def _resolve_oidc_user(provider_name, issuer, claims):
                         subject=subject,
                         provider=provider_name,
                         user=user,
+                        is_auto_provisioned=True,
                         last_username=last_username,
                         last_email=email,
                     )
             break
-        except IntegrityError:
+        except (IntegrityError, ValidationError):
             identity = OidcIdentity.objects.select_related("user").filter(issuer=issuer, subject=subject).first()
             if identity:
+                if identity.is_auto_provisioned and not auto_provision_allowed:
+                    raise PermissionError("OIDC auto-provision policy no longer permits this identity") from None
                 user = identity.user
                 break
     if user is None:

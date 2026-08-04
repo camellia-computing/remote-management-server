@@ -146,6 +146,24 @@ admin.site.register(models.UserProfile, UserAdmin)
 admin.site.register(models.RemoteToken, models.RemoteTokenAdmin)
 
 
+class OidcIdentityAdmin(admin.ModelAdmin):
+    list_display = (
+        "provider",
+        "issuer",
+        "subject",
+        "user",
+        "is_auto_provisioned",
+        "updated_at",
+    )
+    list_filter = ("provider", "is_auto_provisioned", "updated_at")
+    search_fields = ("issuer", "subject", "user__username", "last_username", "last_email")
+    autocomplete_fields = ("user",)
+    readonly_fields = ("last_username", "last_email", "created_at", "updated_at")
+
+
+admin.site.register(models.OidcIdentity, OidcIdentityAdmin)
+
+
 class SecretPreservingAdminForm(forms.ModelForm):
     """Keep encrypted values write-only in Django admin forms."""
 

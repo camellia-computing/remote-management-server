@@ -878,6 +878,7 @@ class OidcIdentity(models.Model):
         on_delete=models.CASCADE,
         related_name="oidc_identities",
     )
+    is_auto_provisioned = models.BooleanField(verbose_name="Policy-managed auto provision", default=False)
     last_username = models.CharField(verbose_name="Last Username", max_length=255, blank=True, default="")
     last_email = models.EmailField(verbose_name="Last Email", max_length=254, blank=True, default="")
     created_at = models.DateTimeField(verbose_name="Created At", default=timezone.now)

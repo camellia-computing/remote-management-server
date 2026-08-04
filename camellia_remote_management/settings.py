@@ -2,6 +2,7 @@ import base64
 import binascii
 import hashlib
 import ipaddress
+import json
 import os
 import re
 from pathlib import Path
@@ -50,6 +51,58 @@ def env_int(name, default, min_value=None, max_value=None):
     if max_value is not None and value > max_value:
         raise ImproperlyConfigured(f"{name} must be at most {max_value}")
     return value
+
+
+def oidc_auto_provision_email_domains(value):
+    domains = []
+    for item in value.replace(";", ",").split(","):
+        domain = item.strip().lower()
+        if not domain:
+            continue
+        if not re.fullmatch(
+            r"(?=.{1,253}\Z)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+"
+            r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?",
+            domain,
+        ):
+            raise ImproperlyConfigured(
+                "CAMELLIA_REMOTE_OIDC_AUTO_PROVISION_EMAIL_DOMAINS must contain exact lowercase DNS domains"
+            )
+        domains.append(domain)
+    return tuple(dict.fromkeys(domains))
+
+
+def oidc_auto_provision_required_claims(value):
+    if not value.strip():
+        return MappingProxyType({})
+    if len(value.encode("utf-8")) > 16 * 1024:
+        raise ImproperlyConfigured("CAMELLIA_REMOTE_OIDC_AUTO_PROVISION_REQUIRED_CLAIMS is too large")
+    try:
+        payload = json.loads(value)
+    except json.JSONDecodeError as exc:
+        raise ImproperlyConfigured("CAMELLIA_REMOTE_OIDC_AUTO_PROVISION_REQUIRED_CLAIMS must be a JSON object") from exc
+    if not isinstance(payload, dict) or not 1 <= len(payload) <= 32:
+        raise ImproperlyConfigured(
+            "CAMELLIA_REMOTE_OIDC_AUTO_PROVISION_REQUIRED_CLAIMS must contain 1-32 claim allowlists"
+        )
+    claims = {}
+    for name, configured_values in payload.items():
+        if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9_.:-]{1,64}", name):
+            raise ImproperlyConfigured("OIDC auto-provision claim names are invalid")
+        values = [configured_values] if isinstance(configured_values, str) else configured_values
+        if not isinstance(values, list) or not 1 <= len(values) <= 64:
+            raise ImproperlyConfigured("OIDC auto-provision claim allowlists must contain 1-64 strings")
+        normalized = []
+        for item in values:
+            if (
+                not isinstance(item, str)
+                or not item
+                or len(item.encode("utf-8")) > 512
+                or any(ord(character) < 32 for character in item)
+            ):
+                raise ImproperlyConfigured("OIDC auto-provision claim values must be bounded non-empty strings")
+            normalized.append(item)
+        claims[name] = tuple(dict.fromkeys(normalized))
+    return MappingProxyType(claims)
 
 
 def env_choice(name, default, choices):
@@ -304,6 +357,13 @@ _oidc_issuer = os.environ.get("CAMELLIA_REMOTE_OIDC_ISSUER", "").strip()
 _oidc_client_id = os.environ.get("CAMELLIA_REMOTE_OIDC_CLIENT_ID", "").strip()
 _oidc_client_secret = os.environ.get("CAMELLIA_REMOTE_OIDC_CLIENT_SECRET", "").strip()
 _oidc_redirect_uri = os.environ.get("CAMELLIA_REMOTE_OIDC_REDIRECT_URI", "").strip()
+_oidc_auto_provision = env_bool("CAMELLIA_REMOTE_OIDC_AUTO_PROVISION", False)
+_oidc_auto_provision_email_domains = oidc_auto_provision_email_domains(
+    os.environ.get("CAMELLIA_REMOTE_OIDC_AUTO_PROVISION_EMAIL_DOMAINS", "")
+)
+_oidc_auto_provision_required_claims = oidc_auto_provision_required_claims(
+    os.environ.get("CAMELLIA_REMOTE_OIDC_AUTO_PROVISION_REQUIRED_CLAIMS", "")
+)
 _oidc_values = (
     _oidc_name,
     _oidc_issuer,
@@ -316,6 +376,14 @@ if any(_oidc_values) and not all(_oidc_values):
         "CAMELLIA_REMOTE_OIDC_NAME, CAMELLIA_REMOTE_OIDC_ISSUER, CAMELLIA_REMOTE_OIDC_CLIENT_ID, "
         "CAMELLIA_REMOTE_OIDC_CLIENT_SECRET and CAMELLIA_REMOTE_OIDC_REDIRECT_URI must be configured together"
     )
+if (_oidc_auto_provision or _oidc_auto_provision_email_domains or _oidc_auto_provision_required_claims) and not all(
+    _oidc_values
+):
+    raise ImproperlyConfigured("OIDC auto-provision policy requires a complete OIDC provider configuration")
+if not _oidc_auto_provision and (_oidc_auto_provision_email_domains or _oidc_auto_provision_required_claims):
+    raise ImproperlyConfigured("OIDC auto-provision policy cannot be configured while auto-provision is disabled")
+if _oidc_auto_provision and not (_oidc_auto_provision_email_domains or _oidc_auto_provision_required_claims):
+    raise ImproperlyConfigured("OIDC auto-provision requires an email-domain or exact-claim policy")
 if all(_oidc_values):
     if not re.fullmatch(r"[A-Za-z0-9._-]{1,64}", _oidc_name):
         raise ImproperlyConfigured("CAMELLIA_REMOTE_OIDC_NAME contains unsupported characters")
@@ -346,6 +414,9 @@ if all(_oidc_values):
         "redirect_uri": _oidc_redirect_uri,
         "scope": _oidc_scope,
         "allowed_hosts": _oidc_allowed_hosts,
+        "auto_provision": _oidc_auto_provision,
+        "auto_provision_email_domains": _oidc_auto_provision_email_domains,
+        "auto_provision_required_claims": _oidc_auto_provision_required_claims,
     }
 
 ALLOW_REGISTRATION = env_bool("CAMELLIA_REMOTE_ALLOW_REGISTRATION", False)
