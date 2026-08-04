@@ -34,7 +34,7 @@ urlpatterns = [
     url(r"^currentUser$", credential_stateless_api(views_api.currentUser, "POST")),
     url(r"^sysinfo_ver$", stateless_api(views_api.sysinfo_ver, "POST")),
     url(r"^sysinfo$", stateless_api(views_api.sysinfo, "POST")),
-    url(r"^heartbeat$", stateless_api(views_api.heartbeat, "POST")),
+    url(r"^heartbeat$", credential_stateless_api(views_api.heartbeat, "POST")),
     url(r"^record$", stateless_api(views_api.record, "POST")),
     url(r"^devices/cli$", stateless_api(views_api.devices_cli, "POST")),
     url(r"^devices/proof-challenge$", stateless_api(views_api.devices_proof_challenge, "POST")),

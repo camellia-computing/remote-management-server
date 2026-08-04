@@ -76,6 +76,7 @@ from camellia_remote_management.access_logging import normalized_route
 
 logger = logging.getLogger(__name__)
 EFFECTIVE_SECONDS = 7200
+DEVICE_LEASE_SECONDS = 60
 MAX_DEPLOY_KEY_LEN = 512
 OIDC_PENDING_MINUTES = settings.OIDC_PENDING_RETENTION_MINUTES
 OIDC_MAX_PENDING_PER_IP = 20
@@ -263,6 +264,15 @@ def _get_device_token_user(request, rid, device_uuid):
     if token.device.rid != rid or token.device.uuid != device_uuid:
         return token, None
     return token, user
+
+
+def _revoked_device_lease(rid, device_uuid):
+    return {
+        "version": 1,
+        "state": "revoked",
+        "id": rid,
+        "uuid": device_uuid,
+    }
 
 
 def _get_active_token_device(token, user):
@@ -1507,7 +1517,13 @@ def heartbeat(request):
     token, user = _get_device_token_user(request, rid, device_uuid)
     if not token or not user:
         _log_event(request, "api_heartbeat_unauthorized", level="warning", rid=rid)
-        return JsonResponse({"error": "Invalid device token"}, status=401)
+        return JsonResponse(
+            {
+                "error": "Invalid device token",
+                "device_lease": _revoked_device_lease(rid, device_uuid),
+            },
+            status=401,
+        )
     with transaction.atomic():
         try:
             device = _device_by_identity(rid, device_uuid, for_update=True)
@@ -1523,17 +1539,53 @@ def heartbeat(request):
                 uuid=device_uuid,
             )
             return JsonResponse(
-                {"error": "Device is not active for this account"},
+                {
+                    "error": "Device is not active for this account",
+                    "device_lease": _revoked_device_lease(rid, device_uuid),
+                },
                 status=403,
             )
         device.ip_address = get_client_ip(request)
-        device.save(update_fields=["ip_address", "update_time"])
+        now = timezone.now()
 
-        # Sliding expiry is extended only after the device authorization is
-        # revalidated while holding the same transaction lock.
-        token.expires_at = timezone.now() + datetime.timedelta(seconds=EFFECTIVE_SECONDS)
-        token.save(update_fields=["expires_at"])
-    response = {}
+        # Do not save the previously loaded token instance: a concurrent
+        # credential revocation may already have deleted it. A conditional
+        # update cannot resurrect a deleted row and binds renewal to the
+        # freshly locked device owner's current credential generation.
+        renewed = RemoteToken.objects.filter(
+            pk=token.pk,
+            device=device,
+            subject_user=device.owner,
+            credential_hash=device.owner.get_session_auth_hash(),
+            expires_at__gt=now,
+        ).update(expires_at=now + datetime.timedelta(seconds=EFFECTIVE_SECONDS))
+        if renewed != 1:
+            _log_event(
+                request,
+                "api_heartbeat_credential_revoked",
+                level="warning",
+                username=user.username,
+                rid=rid,
+                uuid=device_uuid,
+            )
+            return JsonResponse(
+                {
+                    "error": "Invalid device token",
+                    "device_lease": _revoked_device_lease(rid, device_uuid),
+                },
+                status=401,
+            )
+        device.save(update_fields=["ip_address", "update_time"])
+    response = {
+        "device_lease": {
+            "version": 1,
+            "state": "active",
+            "id": device.rid,
+            "uuid": device.uuid,
+            "deployment_generation": device.deployment_generation,
+            "valid_for_seconds": DEVICE_LEASE_SECONDS,
+        }
+    }
     try:
         client_modified = int(postdata.get("modified_at", 0))
     except (TypeError, ValueError):
@@ -3781,11 +3833,20 @@ def user_delete(request, guid):
         if target.id == admin_user.id:
             return JsonResponse({"error": "Cannot delete current user"}, status=400)
         username = target.username
-        device_ids = list(RemoteDevice.objects.filter(owner=target).values_list("pk", flat=True))
+        # Keep the user -> device -> credential lock order used by session
+        # issuance. Heartbeat locks the device before conditionally renewing
+        # its credential, so deleting credentials before locking devices could
+        # deadlock with a concurrent heartbeat.
+        device_ids = list(
+            RemoteDevice.objects.select_for_update()
+            .filter(owner=target)
+            .order_by("pk")
+            .values_list("pk", flat=True)
+        )
         DeviceProofChallenge.objects.filter(device_id__in=device_ids).delete()
         DeviceRecoveryApproval.objects.filter(device_id__in=device_ids).delete()
         RemoteToken.objects.filter(device__owner=target).delete()
-        RemoteDevice.objects.filter(owner=target).update(
+        RemoteDevice.objects.filter(pk__in=device_ids).update(
             owner=None,
             public_key_hash=None,
             is_active=False,

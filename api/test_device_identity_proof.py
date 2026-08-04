@@ -20,7 +20,9 @@ from django.test import (
 from django.utils import timezone
 from nacl.signing import SigningKey
 
+from api import views_api
 from api.admin_user import RemoteDeviceAdminCustom
+from api.credential_sessions import revoke_user_credentials
 from api.device_identity import (
     MAX_DEPLOYMENT_GENERATION,
     MAX_OUTSTANDING_CHALLENGES_PER_IP,
@@ -35,6 +37,7 @@ from api.models import (
     RemoteToken,
     UserProfile,
 )
+from api.views_api import _issue_access_token
 
 DEVICE_UUID = base64.b64encode(b"auth-016-device").decode("ascii")
 
@@ -66,6 +69,15 @@ class DeviceIdentityProofTests(TestCase):
     def post_json(self, path, payload, token=None):
         headers = {"HTTP_AUTHORIZATION": f"Bearer {token}"} if token else {}
         return self.client.post(
+            path,
+            data=json.dumps(payload),
+            content_type="application/json",
+            **headers,
+        )
+
+    def delete_json(self, path, payload, token=None):
+        headers = {"HTTP_AUTHORIZATION": f"Bearer {token}"} if token else {}
+        return self.client.delete(
             path,
             data=json.dumps(payload),
             content_type="application/json",
@@ -118,6 +130,52 @@ class DeviceIdentityProofTests(TestCase):
         }
         return self.post_json("/api/login", payload)
 
+    def admin_bearer(self):
+        operator = UserProfile.objects.create_superuser(
+            username="lease-operator",
+            password="operator-pass",  # noqa: S106 - isolated test credential
+        )
+        operator_device = RemoteDevice.objects.create(
+            rid="987654321",
+            uuid=base64.b64encode(b"lease-operator-device").decode("ascii"),
+            public_key_hash=hashlib.sha256(b"operator-device-key").hexdigest(),
+            owner=operator,
+            is_active=True,
+            cpu="-",
+            hostname="-",
+            memory="-",
+            os="-",
+            username="",
+            version="-",
+        )
+        return _issue_access_token(operator, operator_device)[1]
+
+    def login_bearer(self):
+        proof, _message = self.proof("login", self.old_key)
+        login = self.login_with_proof(proof)
+        self.assertEqual(login.status_code, 200, login.content)
+        return login.json()["access_token"]
+
+    def assert_bound_revoked_heartbeat(self, bearer, rid=None, device_uuid=None):
+        rid = self.device.rid if rid is None else rid
+        device_uuid = self.device.uuid if device_uuid is None else device_uuid
+        heartbeat = self.post_json(
+            "/api/heartbeat",
+            {"id": rid, "uuid": device_uuid, "modified_at": 0},
+            token=bearer,
+        )
+        self.assertEqual(heartbeat.status_code, 401, heartbeat.content)
+        self.assertEqual(heartbeat.headers.get("Cache-Control"), "no-store, private")
+        self.assertEqual(
+            heartbeat.json()["device_lease"],
+            {
+                "version": 1,
+                "state": "revoked",
+                "id": rid,
+                "uuid": device_uuid,
+            },
+        )
+
     def test_deployed_device_login_requires_current_key_proof(self):
         response = self.account_login()
 
@@ -165,6 +223,149 @@ class DeviceIdentityProofTests(TestCase):
         )
         expected = hmac.new(b"v" * 48, message.encode(), hashlib.sha256).digest()
         self.assertEqual(body["assertion"], base64.b64encode(expected).decode("ascii"))
+
+    def test_active_heartbeat_issues_a_bounded_device_lease(self):
+        proof, _message = self.proof("login", self.old_key)
+        login = self.login_with_proof(proof)
+        self.assertEqual(login.status_code, 200, login.content)
+
+        heartbeat = self.post_json(
+            "/api/heartbeat",
+            {"id": self.device.rid, "uuid": self.device.uuid, "modified_at": 0},
+            token=login.json()["access_token"],
+        )
+
+        self.assertEqual(heartbeat.status_code, 200, heartbeat.content)
+        self.assertEqual(heartbeat.headers.get("Cache-Control"), "no-store, private")
+        self.assertEqual(
+            heartbeat.json()["device_lease"],
+            {
+                "version": 1,
+                "state": "active",
+                "id": self.device.rid,
+                "uuid": self.device.uuid,
+                "deployment_generation": 0,
+                "valid_for_seconds": 60,
+            },
+        )
+
+    def test_heartbeat_revocation_race_cannot_renew_a_deleted_token(self):
+        bearer = self.login_bearer()
+        token = RemoteToken.objects.get(device=self.device)
+        original_expiry = token.expires_at
+
+        with mock.patch("api.views_api.RemoteToken.objects.filter") as token_filter:
+            token_filter.return_value.update.return_value = 0
+            heartbeat = self.post_json(
+                "/api/heartbeat",
+                {"id": self.device.rid, "uuid": self.device.uuid, "modified_at": 0},
+                token=bearer,
+            )
+
+        self.assertEqual(heartbeat.status_code, 401, heartbeat.content)
+        self.assertEqual(
+            heartbeat.json()["device_lease"],
+            {
+                "version": 1,
+                "state": "revoked",
+                "id": self.device.rid,
+                "uuid": self.device.uuid,
+            },
+        )
+        token.refresh_from_db()
+        self.assertEqual(token.expires_at, original_expiry)
+
+    def test_concurrent_device_denial_returns_a_bound_revocation_heartbeat(self):
+        bearer = self.login_bearer()
+        token = RemoteToken.objects.get(device=self.device)
+        self.device.is_active = False
+        self.device.save(update_fields=("is_active", "update_time"))
+
+        with mock.patch(
+            "api.views_api._get_device_token_user",
+            return_value=(token, self.user),
+        ):
+            heartbeat = self.post_json(
+                "/api/heartbeat",
+                {"id": self.device.rid, "uuid": self.device.uuid, "modified_at": 0},
+                token=bearer,
+            )
+
+        self.assertEqual(heartbeat.status_code, 403, heartbeat.content)
+        self.assertEqual(
+            heartbeat.json()["device_lease"],
+            {
+                "version": 1,
+                "state": "revoked",
+                "id": self.device.rid,
+                "uuid": self.device.uuid,
+            },
+        )
+
+    def test_revoked_heartbeat_returns_a_bound_revocation_state(self):
+        bearer = self.login_bearer()
+        self.device.is_active = False
+        self.device.save(update_fields=("is_active", "update_time"))
+        RemoteToken.objects.filter(device=self.device).delete()
+
+        self.assert_bound_revoked_heartbeat(bearer)
+
+    def test_device_disable_returns_a_bound_revocation_heartbeat(self):
+        bearer = self.login_bearer()
+        disabled = self.post_json(
+            f"/api/devices/{self.device.pk}/disable",
+            {},
+            token=self.admin_bearer(),
+        )
+        self.assertEqual(disabled.status_code, 200, disabled.content)
+
+        self.assert_bound_revoked_heartbeat(bearer)
+
+    def test_device_delete_returns_a_bound_revocation_heartbeat(self):
+        bearer = self.login_bearer()
+        rid, device_uuid = self.device.rid, self.device.uuid
+        deleted = self.delete_json(
+            f"/api/devices/{self.device.pk}",
+            {},
+            token=self.admin_bearer(),
+        )
+        self.assertEqual(deleted.status_code, 200, deleted.content)
+
+        self.assert_bound_revoked_heartbeat(bearer, rid, device_uuid)
+
+    def test_user_disable_returns_a_bound_revocation_heartbeat(self):
+        bearer = self.login_bearer()
+        disabled = self.post_json(
+            f"/api/users/{self.user.pk}/disable",
+            {},
+            token=self.admin_bearer(),
+        )
+        self.assertEqual(disabled.status_code, 200, disabled.content)
+
+        self.assert_bound_revoked_heartbeat(bearer)
+
+    def test_user_delete_returns_a_bound_revocation_heartbeat(self):
+        bearer = self.login_bearer()
+        rid, device_uuid = self.device.rid, self.device.uuid
+        deleted = self.delete_json(
+            f"/api/users/{self.user.pk}",
+            {},
+            token=self.admin_bearer(),
+        )
+        self.assertEqual(deleted.status_code, 200, deleted.content)
+
+        self.assert_bound_revoked_heartbeat(bearer, rid, device_uuid)
+
+    def test_force_logout_returns_a_bound_revocation_heartbeat(self):
+        bearer = self.login_bearer()
+        revoked = self.post_json(
+            "/api/users/force-logout",
+            {"user_guids": [str(self.user.pk)]},
+            token=self.admin_bearer(),
+        )
+        self.assertEqual(revoked.status_code, 200, revoked.content)
+
+        self.assert_bound_revoked_heartbeat(bearer)
 
     def test_current_key_login_consumes_challenge_once(self):
         proof, _message = self.proof("login", self.old_key)
@@ -492,6 +693,59 @@ class PostgreSQLDeviceIdentityProofTests(TransactionTestCase):
         response = self.post_json(self.client, "/api/login", self.login_payload(proof))
         self.assertEqual(response.status_code, 200, response.content)
         return response.json()["access_token"]
+
+    @skipUnlessDBFeature("has_select_for_update")
+    def test_concurrent_revocation_cannot_be_renewed_by_stale_heartbeat_auth(self):
+        bearer = self.login_bearer()
+        authenticated = threading.Event()
+        resume_heartbeat = threading.Event()
+
+        original_get_device_token_user = views_api._get_device_token_user
+
+        def pause_after_auth(request, rid, device_uuid):
+            result = original_get_device_token_user(request, rid, device_uuid)
+            authenticated.set()
+            if not resume_heartbeat.wait(timeout=20):
+                raise TimeoutError("heartbeat revocation barrier timed out")
+            return result
+
+        def heartbeat():
+            close_old_connections()
+            try:
+                return self.post_json(
+                    Client(),
+                    "/api/heartbeat",
+                    {"id": self.device.rid, "uuid": self.device.uuid, "modified_at": 0},
+                    token=bearer,
+                )
+            finally:
+                connections.close_all()
+
+        with mock.patch(
+            "api.views_api._get_device_token_user",
+            side_effect=pause_after_auth,
+        ):
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                pending_heartbeat = executor.submit(heartbeat)
+                self.assertTrue(authenticated.wait(timeout=20))
+                try:
+                    revocation = revoke_user_credentials((self.user.pk,))
+                finally:
+                    resume_heartbeat.set()
+                response = pending_heartbeat.result(timeout=30)
+
+        self.assertEqual(revocation.deleted_tokens, 1)
+        self.assertEqual(response.status_code, 401, response.content)
+        self.assertEqual(
+            response.json()["device_lease"],
+            {
+                "version": 1,
+                "state": "revoked",
+                "id": self.device.rid,
+                "uuid": self.device.uuid,
+            },
+        )
+        self.assertFalse(RemoteToken.objects.filter(device=self.device).exists())
 
     @staticmethod
     def run_concurrently(payloads, token=None):
