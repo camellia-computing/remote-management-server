@@ -40,12 +40,18 @@ class DataEncryptionKeyState(models.Model):
 
 
 class RemoteToken(models.Model):
-    """A single rotating session token bound to one managed device."""
+    """A single rotating session token bound to one device and immutable subject."""
 
     device = models.OneToOneField(
         "RemoteDevice",
         on_delete=models.CASCADE,
         related_name="session_token",
+    )
+    subject_user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="remote_tokens",
+        editable=False,
     )
     access_token = models.CharField(
         verbose_name=_("access_token"),
@@ -64,8 +70,8 @@ class RemoteToken(models.Model):
 
 
 class RemoteTokenAdmin(admin.ModelAdmin):
-    list_display = ("device", "device_owner", "expires_at")
-    search_fields = ("device__owner__username", "device__rid")
+    list_display = ("device", "subject_user", "device_owner", "expires_at")
+    search_fields = ("subject_user__username", "device__owner__username", "device__rid")
     list_filter = ("create_time", "expires_at")  # 过滤器
 
     @admin.display(description=_("归属用户"), ordering="device__owner__username")

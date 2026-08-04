@@ -33,7 +33,11 @@ from joserfc.jwk import KeySet
 from joserfc.jwt import JWTClaimsRegistry
 
 # from django.forms.models import model_to_dict
-from api.credential_sessions import CredentialGenerationExhausted, revoke_user_credentials
+from api.credential_sessions import (
+    CredentialGenerationExhausted,
+    revoke_device_credentials,
+    revoke_user_credentials,
+)
 from api.encrypted_fields import verify_key_canary
 from api.login_admission import complete_login_success, reserve_login_attempt
 from api.models import (
@@ -118,6 +122,7 @@ def _get_token_user(request):
         return None, None
     token = (
         RemoteToken.objects.select_related(
+            "subject_user__strategy",
             "device__owner__strategy",
             "device__device_group__strategy",
             "device__strategy",
@@ -130,11 +135,12 @@ def _get_token_user(request):
     if _token_expired(token):
         token.delete()
         return None, None
-    user = token.device.owner if token.device_id else None
-    if not user:
+    device = token.device if token.device_id else None
+    user = token.subject_user if token.subject_user_id else None
+    if not device or not user:
         token.delete()
         return None, None
-    if user and not user.is_active:
+    if not device.is_active or device.owner_id != user.id or not user.is_active:
         token.delete()
         return None, None
     if not secrets.compare_digest(token.credential_hash, user.get_session_auth_hash()):
@@ -157,17 +163,16 @@ def _issue_access_token(user, device):
     expires_at = timezone.now() + datetime.timedelta(seconds=EFFECTIVE_SECONDS)
     raw_token = secrets.token_urlsafe(32)
     with transaction.atomic():
-        locked_user = UserProfile.objects.select_for_update().get(pk=user.pk)
-        if not locked_user.is_active:
+        locked_user = UserProfile.objects.select_for_update().filter(pk=user.pk).first()
+        if not locked_user or not locked_user.is_active:
             raise PermissionError("User is inactive")
-        locked_device = RemoteDevice.objects.select_for_update().get(
-            pk=device.pk,
-        )
-        if locked_device.owner_id != locked_user.id or not locked_device.is_active:
+        locked_device = RemoteDevice.objects.select_for_update().filter(pk=device.pk).first()
+        if not locked_device or locked_device.owner_id != locked_user.id or not locked_device.is_active:
             raise PermissionError("Device ownership mismatch")
         token, _created = RemoteToken.objects.update_or_create(
             device=locked_device,
             defaults={
+                "subject_user": locked_user,
                 "access_token": _hash_token(raw_token),
                 "credential_hash": locked_user.get_session_auth_hash(),
                 "expires_at": expires_at,
@@ -235,7 +240,7 @@ def _deployment_identity(rid, device_uuid, public_key):
 def _revoke_device_tokens(device):
     if not device:
         return 0
-    return RemoteToken.objects.filter(device=device).delete()[0]
+    return revoke_device_credentials((device.pk,))
 
 
 def _get_device_token_user(request, rid, device_uuid):
@@ -3772,13 +3777,19 @@ def device_status(request, guid, action):
     admin_user, error = _require_admin(request, f"api_device_{action}")
     if error:
         return error
-    device = _device_by_guid(guid)
-    if not device:
-        return JsonResponse({"error": "Device not found"}, status=404)
-    device.is_active = action == "enable"
-    device.save(update_fields=["is_active", "update_time"])
-    if not device.is_active:
-        _revoke_device_tokens(device)
+    device_pk = _numeric_pk(guid)
+    with transaction.atomic():
+        device = (
+            RemoteDevice.objects.select_for_update().filter(pk=device_pk).first()
+            if device_pk is not None
+            else None
+        )
+        if not device:
+            return JsonResponse({"error": "Device not found"}, status=404)
+        device.is_active = action == "enable"
+        device.save(update_fields=["is_active", "update_time"])
+        if not device.is_active:
+            _revoke_device_tokens(device)
     _log_event(request, f"api_device_{action}", username=admin_user.username, rid=device.rid)
     return JsonResponse(_serialize_device(device))
 
@@ -3787,12 +3798,18 @@ def device_delete(request, guid):
     admin_user, error = _require_admin(request, "api_device_delete")
     if error:
         return error
-    device = _device_by_guid(guid)
-    if not device:
-        return JsonResponse({"error": "Device not found"}, status=404)
-    rid = device.rid
-    _revoke_device_tokens(device)
-    device.delete()
+    device_pk = _numeric_pk(guid)
+    with transaction.atomic():
+        device = (
+            RemoteDevice.objects.select_for_update().filter(pk=device_pk).first()
+            if device_pk is not None
+            else None
+        )
+        if not device:
+            return JsonResponse({"error": "Device not found"}, status=404)
+        rid = device.rid
+        _revoke_device_tokens(device)
+        device.delete()
     _log_event(request, "api_device_deleted", username=admin_user.username, rid=rid)
     return JsonResponse({"result": "OK"})
 
@@ -3806,7 +3823,14 @@ def device_assign(request, guid):
     value = data.get("value")
     owner_changed = False
     device_pk = _numeric_pk(guid)
+    owner = _user_by_identifier(value, active_only=True) if typ == "user_name" else None
+    if typ == "user_name" and not owner:
+        return JsonResponse({"error": "Active user not found"}, status=404)
     with transaction.atomic():
+        if owner:
+            owner = UserProfile.objects.select_for_update().filter(pk=owner.pk, is_active=True).first()
+            if not owner:
+                return JsonResponse({"error": "Active user not found"}, status=404)
         device = (
             RemoteDevice.objects.select_for_update(of=("self",)).select_related("owner").filter(pk=device_pk).first()
             if device_pk is not None
@@ -3815,9 +3839,6 @@ def device_assign(request, guid):
         if not device:
             return JsonResponse({"error": "Device not found"}, status=404)
         if typ == "user_name":
-            owner = _user_by_identifier(value, active_only=True)
-            if not owner:
-                return JsonResponse({"error": "Active user not found"}, status=404)
             owner_changed = device.owner_id != owner.id
             device.owner = owner
         elif typ == "device_group_name":
@@ -3883,8 +3904,8 @@ def device_assign(request, guid):
         else:
             return JsonResponse({"error": "Invalid assign type"}, status=400)
         device.save()
-    if owner_changed:
-        _revoke_device_tokens(device)
+        if owner_changed:
+            _revoke_device_tokens(device)
     _log_event(request, "api_device_assigned", username=admin_user.username, rid=device.rid, typ=typ)
     return JsonResponse(_serialize_device(device))
 

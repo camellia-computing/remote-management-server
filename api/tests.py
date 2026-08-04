@@ -685,6 +685,7 @@ class ApiContractTests(ApiTestMixin, TestCase):
         device = self._device(owner=self.user)
         token = RemoteToken.objects.create(
             device=device,
+            subject_user=self.user,
             access_token="a" * 64,
             expires_at=now - datetime.timedelta(minutes=1),
         )
@@ -1142,7 +1143,9 @@ class ApiContractTests(ApiTestMixin, TestCase):
             {"id": "123456789", "uuid": DEFAULT_DEVICE_UUID},
             token=token,
         )
-        self.assertEqual(heartbeat.status_code, 403)
+        # Disabling the device invalidates its bearer before endpoint-specific
+        # authorization and does not disclose device state to the old token.
+        self.assertEqual(heartbeat.status_code, 401)
 
     @override_settings(DEVICE_VERIFICATION_TOKEN="v" * 48)
     def test_device_deployment_is_bound_to_uuid_key_and_active_owner(self):

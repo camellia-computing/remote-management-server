@@ -9,7 +9,7 @@ from django.db import transaction
 from django.utils.translation import gettext as _
 
 from api import models
-from api.credential_sessions import revoke_user_credentials
+from api.credential_sessions import revoke_device_credentials, revoke_user_credentials
 
 
 class UserCreationForm(forms.ModelForm):
@@ -270,6 +270,25 @@ class RemoteDeviceAdminForm(SecretPreservingAdminForm):
 
 class RemoteDeviceAdminCustom(models.RemoteDeviceAdmin):
     form = RemoteDeviceAdminForm
+
+    @staticmethod
+    def _credential_state(device):
+        return (
+            device.owner_id,
+            device.is_active,
+            device.rid,
+            device.uuid,
+            device.public_key_hash,
+        )
+
+    def save_model(self, request, obj, form, change):
+        with transaction.atomic():
+            previous = (
+                models.RemoteDevice.objects.select_for_update().filter(pk=obj.pk).first() if change and obj.pk else None
+            )
+            super().save_model(request, obj, form, change)
+            if previous and self._credential_state(previous) != self._credential_state(obj):
+                revoke_device_credentials((obj.pk,))
 
 
 admin.site.register(models.RemoteTag, models.RemoteTagAdmin)
