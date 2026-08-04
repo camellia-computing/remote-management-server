@@ -418,6 +418,7 @@ INSTALLED_APPS = [
 ]
 
 MIDDLEWARE = [
+    "api.middleware.SafeAccessLogMiddleware",
     "django.middleware.security.SecurityMiddleware",
     "django.middleware.csp.ContentSecurityPolicyMiddleware",
     "whitenoise.middleware.WhiteNoiseMiddleware",
@@ -668,10 +669,16 @@ LOGGING = {
             "datefmt": "%Y-%m-%d %H:%M:%S",
         },
     },
+    "filters": {
+        "safe_django_request": {
+            "()": "camellia_remote_management.access_logging.SafeDjangoRequestFilter",
+        },
+    },
     "handlers": {
         "console": {
             "class": "logging.StreamHandler",
             "formatter": "standard",
+            "filters": ["safe_django_request"],
             "level": LOG_LEVEL,
         },
     },

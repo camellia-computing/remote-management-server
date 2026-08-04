@@ -41,6 +41,7 @@ from api.models import (
 from api.request_utils import client_ip
 from api.tag_colors import normalize_tag_color, tag_color_css
 from api.xlsx import safe_csv_writer, xlsx_response
+from camellia_remote_management.access_logging import normalized_route
 
 logger = logging.getLogger(__name__)
 MAX_AB_PEERS = 10_000
@@ -63,7 +64,7 @@ def _log_event(request, event, level="info", **extra):
         "event": event,
         "user": username,
         "ip": _client_ip(request),
-        "path": getattr(request, "path", ""),
+        "route": normalized_route(getattr(request, "resolver_match", None)),
         "method": getattr(request, "method", ""),
     }
     payload.update({k: v for k, v in extra.items() if v is not None})
@@ -1211,7 +1212,7 @@ def share(request, share_token=None):
             request,
             "front_share_accept",
             username=request.user.username,
-            token_prefix=link.token_prefix,
+            token_id=link.shash[:16],
             imported=len(imports),
         )
         return _share_message(

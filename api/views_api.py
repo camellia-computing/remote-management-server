@@ -56,6 +56,7 @@ from api.models import (
 )
 from api.request_utils import client_ip, load_json_body, load_json_object
 from api.tag_colors import normalize_tag_color
+from camellia_remote_management.access_logging import normalized_route
 
 logger = logging.getLogger(__name__)
 EFFECTIVE_SECONDS = 7200
@@ -625,7 +626,7 @@ def _log_event(request, event, level="info", **extra):
         "event": event,
         "user": username,
         "ip": get_client_ip(request),
-        "path": getattr(request, "path", ""),
+        "route": normalized_route(getattr(request, "resolver_match", None)),
         "method": getattr(request, "method", ""),
     }
     payload.update({k: v for k, v in extra.items() if v is not None})
@@ -1986,7 +1987,7 @@ def record(request):
         except OSError:
             _log_event(request, "api_record_storage_error", level="error", username=user.username, rid=token.device.rid)
             return JsonResponse({"error": "Recording storage failed"}, status=500)
-        _log_event(request, "api_record_new", level="info", username=user.username, rid=token.device.rid, file=filename)
+        _log_event(request, "api_record_new", level="info", username=user.username, rid=token.device.rid)
         return HttpResponse("")
     if record_type in ("part", "tail"):
         try:
@@ -2029,9 +2030,6 @@ def record(request):
             level="debug",
             username=user.username,
             rid=token.device.rid,
-            file=filename,
-            offset=offset,
-            size=len(data),
         )
         return HttpResponse("")
     if record_type == "remove":
@@ -2051,9 +2049,7 @@ def record(request):
         except OSError:
             _log_event(request, "api_record_storage_error", level="error", username=user.username, rid=token.device.rid)
             return JsonResponse({"error": "Recording storage failed"}, status=500)
-        _log_event(
-            request, "api_record_remove", level="info", username=user.username, rid=token.device.rid, file=filename
-        )
+        _log_event(request, "api_record_remove", level="info", username=user.username, rid=token.device.rid)
         return HttpResponse("")
     return JsonResponse({"error": "Invalid type"}, status=400)
 

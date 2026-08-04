@@ -19,6 +19,7 @@ MAX_REQUESTS="${CAMELLIA_REMOTE_GUNICORN_MAX_REQUESTS:-1000}"
 MAX_REQUESTS_JITTER="${CAMELLIA_REMOTE_GUNICORN_MAX_REQUESTS_JITTER:-100}"
 FORWARDED_ALLOW_IPS="${CAMELLIA_REMOTE_GUNICORN_FORWARDED_ALLOW_IPS:-127.0.0.1}"
 RECORD_DIR="${CAMELLIA_REMOTE_RECORD_UPLOAD_ROOT:-$APP_DIR/records}"
+ACCESS_LOG_FORMAT='method=%(m)s route=%(route)s status=%(s)s bytes=%(B)s duration_us=%(D)s request_id=%(request_id)s'
 
 require_integer_range() {
     variable_name="$1"
@@ -76,6 +77,8 @@ exec gunicorn camellia_remote_management.wsgi:application \
     --max-requests-jitter "$MAX_REQUESTS_JITTER" \
     --worker-tmp-dir /tmp \
     --forwarded-allow-ips "$FORWARDED_ALLOW_IPS" \
+    --logger-class camellia_remote_management.access_logging.SafeAccessLogger \
+    --access-logformat "$ACCESS_LOG_FORMAT" \
     --access-logfile "-" \
     --error-logfile "-" \
     --capture-output
