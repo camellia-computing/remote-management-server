@@ -34,6 +34,7 @@ from joserfc.jwt import JWTClaimsRegistry
 
 # from django.forms.models import model_to_dict
 from api.encrypted_fields import verify_key_canary
+from api.login_admission import complete_login_success, reserve_login_attempt
 from api.models import (
     AddressBookProfile,
     AddressBookRule,
@@ -44,7 +45,6 @@ from api.models import (
     DataEncryptionKeyState,
     DeviceGroup,
     FileLog,
-    LoginAttempt,
     OidcIdentity,
     OidcPendingAuth,
     RemoteDevice,
@@ -56,6 +56,7 @@ from api.models import (
 )
 from api.request_utils import client_ip, load_json_body, load_json_object
 from api.tag_colors import normalize_tag_color
+from camellia_remote_management.access_logging import normalized_route
 
 logger = logging.getLogger(__name__)
 EFFECTIVE_SECONDS = 7200
@@ -63,9 +64,6 @@ MAX_DEPLOY_KEY_LEN = 512
 OIDC_PENDING_MINUTES = settings.OIDC_PENDING_RETENTION_MINUTES
 OIDC_MAX_PENDING_PER_IP = 20
 OIDC_DOCUMENT_MAX_BYTES = 1024 * 1024
-LOGIN_LOCK_MAX_FAILURES = 10
-LOGIN_LOCK_MAX_IP_FAILURES = 100
-LOGIN_LOCK_WINDOW_MINUTES = settings.LOGIN_ATTEMPT_RETENTION_MINUTES
 MAX_DEVICE_UUID_TEXT_LEN = 344
 MAX_AUDIT_INFO_BYTES = 16 * 1024
 MAX_AUDIT_NOTE_BYTES = 16 * 1024
@@ -625,7 +623,7 @@ def _log_event(request, event, level="info", **extra):
         "event": event,
         "user": username,
         "ip": get_client_ip(request),
-        "path": getattr(request, "path", ""),
+        "route": normalized_route(getattr(request, "resolver_match", None)),
         "method": getattr(request, "method", ""),
     }
     payload.update({k: v for k, v in extra.items() if v is not None})
@@ -1271,21 +1269,6 @@ def _ensure_personal_device_peer(user, device):
     return peer
 
 
-def _login_locked(ip, username):
-    window_start = timezone.now() - datetime.timedelta(minutes=LOGIN_LOCK_WINDOW_MINUTES)
-    attempts = LoginAttempt.objects.filter(Q(ip=ip) & Q(created_at__gte=window_start))
-    if attempts.count() >= LOGIN_LOCK_MAX_IP_FAILURES:
-        return True
-    return attempts.filter(Q(username=username.casefold())).count() >= LOGIN_LOCK_MAX_FAILURES
-
-
-def _record_login_failure(ip, username):
-    LoginAttempt.objects.create(
-        ip=ip or "0.0.0.0",  # noqa: S104 - non-routable audit sentinel, not a bind address
-        username=username.casefold()[:150],
-    )
-
-
 def login(request):
     result = {}
     data = _load_json_object(request)
@@ -1308,12 +1291,12 @@ def login(request):
         _log_event(request, "api_login_invalid_payload", level="warning", username=username)
         return JsonResponse({"error": "Invalid login payload"}, status=400)
     client_ip = get_client_ip(request)
-    if _login_locked(client_ip, username):
+    admission = reserve_login_attempt(client_ip, username)
+    if admission is None:
         _log_event(request, "api_login_locked", level="warning", username=username)
         return JsonResponse({"error": _("尝试次数过多，请稍后再试。")}, status=429)
     user = auth.authenticate(username=username, password=password)
     if not user:
-        _record_login_failure(client_ip, username)
         result["error"] = _("帐号或密码错误！请重试，多次重试后将被锁定IP！")
         _log_event(request, "api_login_failed", level="warning", username=username)
         return JsonResponse(result, status=401)
@@ -1345,7 +1328,7 @@ def login(request):
             request, "api_login_denied", level="warning", username=username, reason="device_identity_race", rid=rid
         )
         return JsonResponse({"error": "Device identity conflict"}, status=409)
-    LoginAttempt.objects.filter(Q(ip=client_ip) & Q(username=username.casefold())).delete()
+    complete_login_success(admission)
 
     _ensure_personal_device_peer(user, device)
 
@@ -1986,7 +1969,7 @@ def record(request):
         except OSError:
             _log_event(request, "api_record_storage_error", level="error", username=user.username, rid=token.device.rid)
             return JsonResponse({"error": "Recording storage failed"}, status=500)
-        _log_event(request, "api_record_new", level="info", username=user.username, rid=token.device.rid, file=filename)
+        _log_event(request, "api_record_new", level="info", username=user.username, rid=token.device.rid)
         return HttpResponse("")
     if record_type in ("part", "tail"):
         try:
@@ -2029,9 +2012,6 @@ def record(request):
             level="debug",
             username=user.username,
             rid=token.device.rid,
-            file=filename,
-            offset=offset,
-            size=len(data),
         )
         return HttpResponse("")
     if record_type == "remove":
@@ -2051,9 +2031,7 @@ def record(request):
         except OSError:
             _log_event(request, "api_record_storage_error", level="error", username=user.username, rid=token.device.rid)
             return JsonResponse({"error": "Recording storage failed"}, status=500)
-        _log_event(
-            request, "api_record_remove", level="info", username=user.username, rid=token.device.rid, file=filename
-        )
+        _log_event(request, "api_record_remove", level="info", username=user.username, rid=token.device.rid)
         return HttpResponse("")
     return JsonResponse({"error": "Invalid type"}, status=400)
 

@@ -27,6 +27,7 @@ from api.models import (
     DataEncryptionKeyState,
     DeviceGroup,
     FileLog,
+    LoginAdmissionLock,
     LoginAttempt,
     OidcPendingAuth,
     RemoteDevice,
@@ -685,6 +686,10 @@ class ApiContractTests(ApiTestMixin, TestCase):
         LoginAttempt.objects.filter(pk=attempt.pk).update(
             created_at=now - datetime.timedelta(hours=1),
         )
+        admission_lock = LoginAdmissionLock.objects.create(ip="192.0.2.1")
+        LoginAdmissionLock.objects.filter(pk=admission_lock.pk).update(
+            updated_at=now - datetime.timedelta(hours=1),
+        )
         oidc = OidcPendingAuth.objects.create(
             state="expired-state",
             poll_code_hash="b" * 64,
@@ -715,6 +720,7 @@ class ApiContractTests(ApiTestMixin, TestCase):
         call_command("purge_expired_state", "--dry-run", stdout=output)
         self.assertTrue(RemoteToken.objects.filter(pk=token.pk).exists())
         self.assertTrue(LoginAttempt.objects.filter(pk=attempt.pk).exists())
+        self.assertTrue(LoginAdmissionLock.objects.filter(pk=admission_lock.pk).exists())
         self.assertTrue(OidcPendingAuth.objects.filter(pk=oidc.pk).exists())
         self.assertFalse(ShareLink.objects.get(pk=recent_expired_share.pk).is_expired)
         self.assertTrue(ShareLink.objects.filter(pk=retained_share.pk).exists())
@@ -723,6 +729,7 @@ class ApiContractTests(ApiTestMixin, TestCase):
         call_command("purge_expired_state", stdout=StringIO())
         self.assertFalse(RemoteToken.objects.filter(pk=token.pk).exists())
         self.assertFalse(LoginAttempt.objects.filter(pk=attempt.pk).exists())
+        self.assertFalse(LoginAdmissionLock.objects.filter(pk=admission_lock.pk).exists())
         self.assertFalse(OidcPendingAuth.objects.filter(pk=oidc.pk).exists())
         recent_expired_share.refresh_from_db()
         self.assertTrue(recent_expired_share.is_expired)
@@ -738,6 +745,7 @@ class ApiContractTests(ApiTestMixin, TestCase):
                 "expired_oidc_sessions": 0,
                 "expired_share_links_marked": 0,
                 "login_attempts": 0,
+                "login_admission_locks": 0,
                 "retained_share_links": 0,
             },
         )

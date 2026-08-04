@@ -903,6 +903,7 @@ class LoginAttempt(models.Model):
 
     ip = models.GenericIPAddressField(verbose_name="IP")
     username = models.CharField(verbose_name="用户名", max_length=150, blank=True, default="")
+    scope_hash = models.CharField(verbose_name="Rate Scope Hash", max_length=64, default="")
     created_at = models.DateTimeField(verbose_name="Created At", auto_now_add=True, db_index=True)
 
     class Meta:
@@ -914,10 +915,28 @@ class LoginAttempt(models.Model):
                 fields=["ip", "username", "-created_at"],
                 name="login_attempt_scope_lookup",
             ),
+            models.Index(
+                fields=["ip", "scope_hash", "-created_at"],
+                name="login_attempt_atomic_scope",
+            ),
         ]
 
     def __str__(self):
         return f"{self.ip} {self.username}"
+
+
+class LoginAdmissionLock(models.Model):
+    """One database row serializes all login budgets for an IP address."""
+
+    ip = models.GenericIPAddressField(primary_key=True, verbose_name="IP")
+    updated_at = models.DateTimeField(auto_now=True, db_index=True)
+
+    class Meta:
+        verbose_name = _("登录准入锁")
+        verbose_name_plural = _("登录准入锁列表")
+
+    def __str__(self):
+        return self.ip
 
 
 class ShareLinkAdmin(admin.ModelAdmin):

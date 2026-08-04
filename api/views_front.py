@@ -24,6 +24,7 @@ from django.utils import timezone
 from django.utils.translation import gettext as _
 
 from api.formatting import format_bytes
+from api.login_admission import REGISTER_SCOPE, complete_login_success, reserve_login_attempt
 from api.models import (
     AddressBookProfile,
     AddressBookRule,
@@ -31,7 +32,6 @@ from api.models import (
     AddressBookShare,
     ConnLog,
     FileLog,
-    LoginAttempt,
     RemoteDevice,
     RemotePeer,
     RemoteTag,
@@ -41,6 +41,7 @@ from api.models import (
 from api.request_utils import client_ip
 from api.tag_colors import normalize_tag_color, tag_color_css
 from api.xlsx import safe_csv_writer, xlsx_response
+from camellia_remote_management.access_logging import normalized_route
 
 logger = logging.getLogger(__name__)
 MAX_AB_PEERS = 10_000
@@ -63,7 +64,7 @@ def _log_event(request, event, level="info", **extra):
         "event": event,
         "user": username,
         "ip": _client_ip(request),
-        "path": getattr(request, "path", ""),
+        "route": normalized_route(getattr(request, "resolver_match", None)),
         "method": getattr(request, "method", ""),
     }
     payload.update({k: v for k, v in extra.items() if v is not None})
@@ -203,15 +204,13 @@ def user_login(request):
     ):
         return JsonResponse({"code": 0, "msg": _("登录信息无效。")}, status=400)
 
-    from api.views_api import _login_locked, _record_login_failure
-
     client_ip = _client_ip(request)
-    if _login_locked(client_ip, username):
+    admission = reserve_login_attempt(client_ip, username)
+    if admission is None:
         _log_event(request, "front_login_locked", level="warning", username=username)
         return JsonResponse({"code": 0, "msg": _("尝试次数过多，请稍后再试。")}, status=429)
     user = auth.authenticate(username=username, password=password)
     if not user:
-        _record_login_failure(client_ip, username)
         _log_event(request, "front_login_failed", level="warning", username=username)
         return JsonResponse({"code": 0, "msg": _("帐号或密码错误！")}, status=401)
     if user and not user.is_active:
@@ -222,10 +221,7 @@ def user_login(request):
         )
     if user:
         auth.login(request, user)
-        LoginAttempt.objects.filter(
-            ip=client_ip,
-            username=username.casefold(),
-        ).delete()
+        complete_login_success(admission)
         _log_event(request, "front_login_success", username=username)
         return JsonResponse({"code": 1, "url": "/api/home"})
     return JsonResponse({"code": 0, "msg": _("帐号或密码错误！")})
@@ -248,13 +244,10 @@ def user_register(request):
     username = request.POST.get("user", "").strip()
     password1 = request.POST.get("pwd", "")
     password2 = request.POST.get("repassword", "")
-    from api.views_api import _login_locked, _record_login_failure
-
     client_ip = _client_ip(request)
-    rate_key = f"register:{username}"
-    if _login_locked(client_ip, rate_key):
+    admission = reserve_login_attempt(client_ip, username, scope=REGISTER_SCOPE)
+    if admission is None:
         return JsonResponse({"code": 0, "msg": _("尝试次数过多，请稍后再试。")}, status=429)
-    _record_login_failure(client_ip, rate_key)
 
     if not 3 <= len(username) <= UserProfile._meta.get_field("username").max_length or any(
         ord(character) < 32 for character in username
@@ -1211,7 +1204,7 @@ def share(request, share_token=None):
             request,
             "front_share_accept",
             username=request.user.username,
-            token_prefix=link.token_prefix,
+            token_id=link.shash[:16],
             imported=len(imports),
         )
         return _share_message(
