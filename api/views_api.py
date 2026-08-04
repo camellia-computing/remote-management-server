@@ -33,6 +33,7 @@ from joserfc.jwk import KeySet
 from joserfc.jwt import JWTClaimsRegistry
 
 # from django.forms.models import model_to_dict
+from api.credential_sessions import CredentialGenerationExhausted, revoke_user_credentials
 from api.encrypted_fields import verify_key_canary
 from api.login_admission import complete_login_success, reserve_login_attempt
 from api.models import (
@@ -136,6 +137,9 @@ def _get_token_user(request):
     if user and not user.is_active:
         token.delete()
         return None, None
+    if not secrets.compare_digest(token.credential_hash, user.get_session_auth_hash()):
+        token.delete()
+        return None, None
     return token, user
 
 
@@ -153,15 +157,19 @@ def _issue_access_token(user, device):
     expires_at = timezone.now() + datetime.timedelta(seconds=EFFECTIVE_SECONDS)
     raw_token = secrets.token_urlsafe(32)
     with transaction.atomic():
+        locked_user = UserProfile.objects.select_for_update().get(pk=user.pk)
+        if not locked_user.is_active:
+            raise PermissionError("User is inactive")
         locked_device = RemoteDevice.objects.select_for_update().get(
             pk=device.pk,
         )
-        if locked_device.owner_id != user.id or not locked_device.is_active:
+        if locked_device.owner_id != locked_user.id or not locked_device.is_active:
             raise PermissionError("Device ownership mismatch")
         token, _created = RemoteToken.objects.update_or_create(
             device=locked_device,
             defaults={
                 "access_token": _hash_token(raw_token),
+                "credential_hash": locked_user.get_session_auth_hash(),
                 "expires_at": expires_at,
             },
         )
@@ -264,6 +272,12 @@ class DeviceIdentityConflict(Exception):
     pass
 
 
+class _OidcPolicyRevocationRequired(Exception):
+    def __init__(self, user_id):
+        self.user_id = user_id
+        super().__init__("OIDC policy revocation is required")
+
+
 def _device_by_identity(rid, device_uuid, *, for_update=False):
     queryset = RemoteDevice.objects
     if for_update:
@@ -304,12 +318,15 @@ def _claim_session_device(
     for attempt in range(2):
         try:
             with transaction.atomic():
+                locked_user = UserProfile.objects.select_for_update().get(pk=user.pk)
+                if not locked_user.is_active:
+                    raise PermissionError("User is inactive")
                 device = _device_by_identity(
                     rid,
                     device_uuid,
                     for_update=True,
                 )
-                if device and (not device.is_active or (device.owner_id and device.owner_id != user.id)):
+                if device and (not device.is_active or (device.owner_id and device.owner_id != locked_user.id)):
                     raise PermissionError("Device is unavailable")
                 if not device:
                     return RemoteDevice.objects.create(
@@ -322,11 +339,11 @@ def _claim_session_device(
                         username="",
                         version="-",
                         ip_address=ip_address,
-                        owner=user,
+                        owner=locked_user,
                     )
                 update_fields = []
                 if device.owner_id is None:
-                    device.owner = user
+                    device.owner = locked_user
                     update_fields.append("owner")
                 if ip_address and device.ip_address != ip_address:
                     device.ip_address = ip_address
@@ -538,20 +555,51 @@ def _oidc_local_username(claims, issuer, subject, attempt=0):
     return f"{base[: max_length - len(suffix)]}{suffix}"
 
 
+def _validated_oidc_email(claims):
+    if claims.get("email_verified") is not True:
+        return ""
+    email = str(claims.get("email") or "").strip()
+    if not email or len(email) > 254:
+        return ""
+    try:
+        validate_email(email)
+    except ValidationError:
+        return ""
+    return email
+
+
+def _oidc_auto_provision_allowed(provider, claims):
+    if not provider.get("auto_provision", False):
+        return False
+
+    allowed_domains = provider.get("auto_provision_email_domains", ())
+    required_claims = provider.get("auto_provision_required_claims", {})
+    if not allowed_domains and not required_claims:
+        return False
+    if allowed_domains:
+        email = _validated_oidc_email(claims)
+        _local, separator, domain = email.rpartition("@")
+        if not separator or domain.lower() not in allowed_domains:
+            return False
+
+    for claim_name, allowed_values in required_claims.items():
+        claim_value = claims.get(claim_name)
+        claim_values = claim_value if isinstance(claim_value, list) else [claim_value]
+        if not any(isinstance(value, str) and value in allowed_values for value in claim_values):
+            return False
+    return True
+
+
 def _resolve_oidc_user(provider_name, issuer, claims):
+    provider = getattr(settings, "OIDC_PROVIDERS", {}).get(provider_name)
+    if not provider or str(provider.get("issuer") or "").rstrip("/") != issuer:
+        raise ValueError("OIDC provider does not match the validated issuer")
     subject = str(claims.get("sub") or "").strip()
     if not subject or len(subject) > OidcIdentity._meta.get_field("subject").max_length:
         raise ValueError("OIDC subject is invalid")
     last_username = str(claims.get("preferred_username") or claims.get("name") or "").strip()[:255]
-    email = str(claims.get("email") or "").strip()
-    if claims.get("email_verified") is not True:
-        email = ""
-    email = email[:254]
-    if email:
-        try:
-            validate_email(email)
-        except ValidationError:
-            email = ""
+    email = _validated_oidc_email(claims)
+    auto_provision_allowed = _oidc_auto_provision_allowed(provider, claims)
 
     user = None
     for attempt in range(16):
@@ -564,6 +612,8 @@ def _resolve_oidc_user(provider_name, issuer, claims):
                     .first()
                 )
                 if identity:
+                    if identity.is_auto_provisioned and not auto_provision_allowed:
+                        raise _OidcPolicyRevocationRequired(identity.user_id)
                     user = identity.user
                     identity.provider = provider_name
                     identity.last_username = last_username
@@ -577,6 +627,8 @@ def _resolve_oidc_user(provider_name, issuer, claims):
                         ]
                     )
                 else:
+                    if not auto_provision_allowed:
+                        raise PermissionError("OIDC identity is not pre-authorized")
                     username = _oidc_local_username(
                         claims,
                         issuer,
@@ -594,13 +646,20 @@ def _resolve_oidc_user(provider_name, issuer, claims):
                         subject=subject,
                         provider=provider_name,
                         user=user,
+                        is_auto_provisioned=True,
                         last_username=last_username,
                         last_email=email,
                     )
             break
-        except IntegrityError:
+        except _OidcPolicyRevocationRequired as exc:
+            revoke_user_credentials((exc.user_id,))
+            raise PermissionError("OIDC auto-provision policy no longer permits this identity") from None
+        except (IntegrityError, ValidationError):
             identity = OidcIdentity.objects.select_related("user").filter(issuer=issuer, subject=subject).first()
             if identity:
+                if identity.is_auto_provisioned and not auto_provision_allowed:
+                    revoke_user_credentials((identity.user_id,))
+                    raise PermissionError("OIDC auto-provision policy no longer permits this identity") from None
                 user = identity.user
                 break
     if user is None:
@@ -1351,14 +1410,11 @@ def logout(request):
 
 def currentUser(request):
     result = {}
-    token, user = _get_token_user(request)
+    _token, user = _get_token_user(request)
 
     if not user:
         _log_event(request, "api_current_user_failed", level="warning")
         return JsonResponse({"error": "Invalid token"}, status=401)
-    if token:
-        # Tokens are stored hashed; echo back the raw token the client presented.
-        result["access_token"] = _get_bearer_token(request)
     result["type"] = "access_token"
     result["name"] = user.username
     result["status"] = 1 if user.is_active else 0
@@ -1591,8 +1647,11 @@ def oidc_auth(request):
 
 
 def oidc_auth_query(request):
-    poll_code = str(request.GET.get("code", "")).strip()
-    if not poll_code or len(poll_code) > 128:
+    data = _load_json_object(request)
+    poll_code = str(data.get("code", "")).strip()
+    rid = data.get("id", "")
+    device_uuid = data.get("uuid", "")
+    if not poll_code or len(poll_code) > 128 or not _valid_device_identity(rid, device_uuid):
         return JsonResponse({"error": "No authed oidc is found"})
     with transaction.atomic():
         session = (
@@ -1603,6 +1662,8 @@ def oidc_auth_query(request):
         )
         if not session:
             return JsonResponse({"error": "No authed oidc is found"})
+        if not secrets.compare_digest(session.rid, rid) or not secrets.compare_digest(session.device_uuid, device_uuid):
+            return JsonResponse({"error": "OIDC authorization failed"}, status=403)
         if timezone.now() - session.created_at > datetime.timedelta(minutes=OIDC_PENDING_MINUTES):
             session.delete()
             return JsonResponse({"error": "OIDC authorization timeout"}, status=408)
@@ -3578,15 +3639,29 @@ def user_status(request, guid, action):
     admin_user, error = _require_admin(request, f"api_user_{action}")
     if error:
         return error
-    target = _user_by_guid(guid)
-    if not target:
-        return JsonResponse({"error": "User not found"}, status=404)
-    if target.id == admin_user.id and action == "disable":
-        return JsonResponse({"error": "Cannot disable current user"}, status=400)
-    target.is_active = action == "enable"
-    target.save(update_fields=["is_active"])
-    if not target.is_active:
-        RemoteToken.objects.filter(device__owner=target).delete()
+    try:
+        with transaction.atomic():
+            target_pk = _numeric_pk(guid)
+            target = (
+                UserProfile.objects.select_for_update().filter(pk=target_pk).first() if target_pk is not None else None
+            )
+            if not target:
+                return JsonResponse({"error": "User not found"}, status=404)
+            if target.id == admin_user.id and action == "disable":
+                return JsonResponse({"error": "Cannot disable current user"}, status=400)
+            target.is_active = action == "enable"
+            target.save(update_fields=["is_active"])
+            if not target.is_active:
+                revoke_user_credentials((target.pk,))
+    except CredentialGenerationExhausted:
+        _log_event(
+            request,
+            f"api_user_{action}_failed",
+            level="error",
+            username=admin_user.username,
+            target=guid,
+        )
+        return JsonResponse({"error": "Credential revocation failed"}, status=409)
     _log_event(request, f"api_user_{action}", username=admin_user.username, target=target.username)
     return JsonResponse(_serialize_user(target))
 
@@ -3623,11 +3698,25 @@ def users_force_logout(request):
     guids = _identifier_list(data.get("user_guids"), numeric=True)
     if guids is None:
         return JsonResponse({"error": "Invalid user list"}, status=400)
-    deleted = RemoteToken.objects.filter(
-        device__owner_id__in=guids,
-    ).delete()[0]
-    _log_event(request, "api_users_force_logout", username=admin_user.username, deleted=deleted)
-    return JsonResponse({"result": "OK", "deleted": deleted})
+    try:
+        revocation = revoke_user_credentials(guids)
+    except CredentialGenerationExhausted:
+        _log_event(request, "api_users_force_logout_failed", level="error", username=admin_user.username)
+        return JsonResponse({"error": "Credential revocation failed"}, status=409)
+    _log_event(
+        request,
+        "api_users_force_logout",
+        username=admin_user.username,
+        deleted=revocation.deleted_tokens,
+        revoked_users=revocation.revoked_users,
+    )
+    return JsonResponse(
+        {
+            "result": "OK",
+            "deleted": revocation.deleted_tokens,
+            "revoked_users": revocation.revoked_users,
+        }
+    )
 
 
 def devices(request):

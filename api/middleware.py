@@ -3,6 +3,7 @@ import secrets
 from django.http import JsonResponse
 
 from api.request_utils import InvalidJsonPayload
+from api.response_security import CREDENTIAL_RESPONSE_MARKER, protect_credential_response
 from camellia_remote_management.access_logging import (
     ACCESS_ROUTE_ENV,
     REQUEST_ID_ENV,
@@ -25,6 +26,9 @@ class SafeAccessLogMiddleware:
             response = self.get_response(request)
         finally:
             request.META[ACCESS_ROUTE_ENV] = normalized_route(getattr(request, "resolver_match", None))
+        resolver_match = getattr(request, "resolver_match", None)
+        if resolver_match and getattr(resolver_match.func, CREDENTIAL_RESPONSE_MARKER, False):
+            protect_credential_response(response)
         response[REQUEST_ID_HEADER] = request_id
         return response
 

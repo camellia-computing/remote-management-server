@@ -393,10 +393,10 @@ class ApiContractTests(ApiTestMixin, TestCase):
         self.assertNotEqual(stored.access_token, token)
         self.assertEqual(stored.access_token, hashlib.sha256(token.encode()).hexdigest())
 
-        # currentUser echoes the presented raw token, never the stored hash.
+        # currentUser validates the bearer without making another response-body copy.
         response = self._post_json("/api/currentUser", {}, token=token)
         self.assertEqual(response.status_code, 200, response.content)
-        self.assertEqual(response.json()["access_token"], token)
+        self.assertNotIn("access_token", response.json())
 
     def test_relogin_rotates_the_stored_token(self):
         first = self._login("alice", "alice-pass")
@@ -437,9 +437,15 @@ class ApiContractTests(ApiTestMixin, TestCase):
         self.assertNotIn("test-nonce", stored_nonce)
         self.assertNotIn("test-code-verifier", stored_verifier)
 
-        state_is_not_a_poll_secret = self.client.get("/api/oidc/auth-query?code=test-state")
+        state_is_not_a_poll_secret = self._post_json(
+            "/api/oidc/auth-query",
+            {"code": "test-state", "id": "123456789", "uuid": DEFAULT_DEVICE_UUID},
+        )
         self.assertNotIn("access_token", state_is_not_a_poll_secret.json())
-        response = self.client.get(f"/api/oidc/auth-query?code={poll_code}")
+        response = self._post_json(
+            "/api/oidc/auth-query",
+            {"code": poll_code, "id": "123456789", "uuid": DEFAULT_DEVICE_UUID},
+        )
         self.assertEqual(response.status_code, 200, response.content)
         self.assertIn("access_token", response.json())
         self.assertNotEqual(response.json()["access_token"], poll_code)

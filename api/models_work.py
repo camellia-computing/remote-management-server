@@ -53,6 +53,7 @@ class RemoteToken(models.Model):
         unique=True,
         editable=False,
     )
+    credential_hash = models.CharField(max_length=64, default="", editable=False)
     create_time = models.DateTimeField(verbose_name=_("登录时间"), auto_now_add=True)
     expires_at = models.DateTimeField(verbose_name=_("过期时间"), db_index=True)
 
@@ -878,6 +879,7 @@ class OidcIdentity(models.Model):
         on_delete=models.CASCADE,
         related_name="oidc_identities",
     )
+    is_auto_provisioned = models.BooleanField(verbose_name="Policy-managed auto provision", default=False)
     last_username = models.CharField(verbose_name="Last Username", max_length=255, blank=True, default="")
     last_email = models.EmailField(verbose_name="Last Email", max_length=254, blank=True, default="")
     created_at = models.DateTimeField(verbose_name="Created At", default=timezone.now)

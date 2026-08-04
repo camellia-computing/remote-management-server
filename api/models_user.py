@@ -4,8 +4,9 @@ from django.contrib.auth.models import (
     PermissionsMixin,
 )
 from django.contrib.auth.validators import UnicodeUsernameValidator
-from django.db import models
+from django.db import models, router, transaction
 from django.db.models.functions import Lower
+from django.utils.crypto import salted_hmac
 from django.utils.translation import gettext_lazy as _
 
 
@@ -55,6 +56,7 @@ class UserProfile(AbstractBaseUser, PermissionsMixin):
     )
     is_active = models.BooleanField(_("是否激活"), default=True)
     is_admin = models.BooleanField(_("是否管理员"), default=False)
+    credential_generation = models.PositiveBigIntegerField(default=0, editable=False)
 
     objects = MyUserManager()
 
@@ -75,6 +77,35 @@ class UserProfile(AbstractBaseUser, PermissionsMixin):
 
     def has_module_perms(self, app_label):
         return self.is_active and (self.is_admin or self.is_superuser)
+
+    def _get_session_auth_hash(self, secret=None):
+        """Bind every Django session to the user's revocation generation."""
+
+        return salted_hmac(
+            "django.contrib.auth.models.AbstractBaseUser.get_session_auth_hash",
+            f"{self.credential_generation}:{self.password}",
+            secret=secret,
+            algorithm="sha256",
+        ).hexdigest()
+
+    def save(self, *args, **kwargs):
+        """Never let a stale model instance move credential generation backward."""
+
+        if not self.pk:
+            return super().save(*args, **kwargs)
+        database = kwargs.get("using") or router.db_for_write(type(self), instance=self)
+        with transaction.atomic(using=database):
+            current_generation = (
+                type(self)
+                .objects.using(database)
+                .select_for_update()
+                .filter(pk=self.pk)
+                .values_list("credential_generation", flat=True)
+                .first()
+            )
+            if current_generation is not None:
+                self.credential_generation = current_generation
+            return super().save(*args, **kwargs)
 
     @property
     def is_staff(self):
