@@ -3,6 +3,7 @@ from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.http import require_http_methods
 
 from api import views_api, views_front
+from api.response_security import credential_response
 
 
 def stateless_api(view, *methods):
@@ -15,14 +16,22 @@ def browser_view(view, *methods):
     return require_http_methods(methods)(view)
 
 
+def credential_stateless_api(view, *methods):
+    return credential_response(stateless_api(view, *methods))
+
+
+def credential_browser_view(view, *methods):
+    return credential_response(browser_view(view, *methods))
+
+
 urlpatterns = [
     url(r"^login-options$", stateless_api(views_api.login_options, "GET")),
-    url(r"^oidc/auth$", stateless_api(views_api.oidc_auth, "POST")),
-    url(r"^oidc/auth-query$", stateless_api(views_api.oidc_auth_query, "GET")),
-    url(r"^oidc/callback$", stateless_api(views_api.oidc_callback, "GET")),
-    url(r"^login$", stateless_api(views_api.login, "POST")),
-    url(r"^logout$", stateless_api(views_api.logout, "POST")),
-    url(r"^currentUser$", stateless_api(views_api.currentUser, "POST")),
+    url(r"^oidc/auth$", credential_stateless_api(views_api.oidc_auth, "POST")),
+    url(r"^oidc/auth-query$", credential_stateless_api(views_api.oidc_auth_query, "POST")),
+    url(r"^oidc/callback$", credential_stateless_api(views_api.oidc_callback, "GET")),
+    url(r"^login$", credential_stateless_api(views_api.login, "POST")),
+    url(r"^logout$", credential_stateless_api(views_api.logout, "POST")),
+    url(r"^currentUser$", credential_stateless_api(views_api.currentUser, "POST")),
     url(r"^sysinfo_ver$", stateless_api(views_api.sysinfo_ver, "POST")),
     url(r"^sysinfo$", stateless_api(views_api.sysinfo, "POST")),
     url(r"^heartbeat$", stateless_api(views_api.heartbeat, "POST")),
@@ -37,11 +46,11 @@ urlpatterns = [
     url(r"^audit$", stateless_api(views_api.audit_root, "PUT")),
     url(r"^ab/settings$", stateless_api(views_api.ab_settings, "POST")),
     url(r"^ab/personal$", stateless_api(views_api.ab_personal, "POST")),
-    url(r"^ab/shared/profiles$", stateless_api(views_api.ab_shared_profiles, "POST")),
+    url(r"^ab/shared/profiles$", credential_stateless_api(views_api.ab_shared_profiles, "POST")),
     url(r"^ab/shared/add$", stateless_api(views_api.ab_shared_add, "POST")),
     url(r"^ab/shared/update/profile$", stateless_api(views_api.ab_shared_update_profile, "PUT")),
     url(r"^ab/shared$", stateless_api(views_api.ab_shared_delete, "DELETE")),
-    url(r"^ab/peers$", stateless_api(views_api.ab_peers, "POST")),
+    url(r"^ab/peers$", credential_stateless_api(views_api.ab_peers, "POST")),
     url(r"^ab/tags/(?P<guid>[^/]+)$", stateless_api(views_api.ab_tags, "POST")),
     url(r"^ab/peer/add/(?P<guid>[^/]+)$", stateless_api(views_api.ab_peer_add, "POST")),
     url(r"^ab/peer/update/(?P<guid>[^/]+)$", stateless_api(views_api.ab_peer_update, "PUT")),
@@ -108,10 +117,10 @@ urlpatterns = [
     url(r"^ab_rules$", browser_view(views_front.ab_rules, "GET", "POST")),
     url(r"^ab_audit$", browser_view(views_front.ab_audit, "GET")),
     url(r"^down_peers$", browser_view(views_front.down_peers, "GET")),
-    url(r"^share$", browser_view(views_front.share, "GET", "POST")),
+    url(r"^share$", credential_browser_view(views_front.share, "GET", "POST")),
     url(
         r"^share/(?P<share_token>[A-Za-z0-9_-]{32,128})$",
-        browser_view(views_front.share, "GET", "POST"),
+        credential_browser_view(views_front.share, "GET", "POST"),
     ),
     url(r"^conn_log$", browser_view(views_front.conn_log, "GET")),
     url(r"^file_log$", browser_view(views_front.file_log, "GET")),

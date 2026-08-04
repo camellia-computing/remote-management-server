@@ -1389,14 +1389,11 @@ def logout(request):
 
 def currentUser(request):
     result = {}
-    token, user = _get_token_user(request)
+    _token, user = _get_token_user(request)
 
     if not user:
         _log_event(request, "api_current_user_failed", level="warning")
         return JsonResponse({"error": "Invalid token"}, status=401)
-    if token:
-        # Tokens are stored hashed; echo back the raw token the client presented.
-        result["access_token"] = _get_bearer_token(request)
     result["type"] = "access_token"
     result["name"] = user.username
     result["status"] = 1 if user.is_active else 0
@@ -1629,8 +1626,11 @@ def oidc_auth(request):
 
 
 def oidc_auth_query(request):
-    poll_code = str(request.GET.get("code", "")).strip()
-    if not poll_code or len(poll_code) > 128:
+    data = _load_json_object(request)
+    poll_code = str(data.get("code", "")).strip()
+    rid = data.get("id", "")
+    device_uuid = data.get("uuid", "")
+    if not poll_code or len(poll_code) > 128 or not _valid_device_identity(rid, device_uuid):
         return JsonResponse({"error": "No authed oidc is found"})
     with transaction.atomic():
         session = (
@@ -1641,6 +1641,8 @@ def oidc_auth_query(request):
         )
         if not session:
             return JsonResponse({"error": "No authed oidc is found"})
+        if not secrets.compare_digest(session.rid, rid) or not secrets.compare_digest(session.device_uuid, device_uuid):
+            return JsonResponse({"error": "OIDC authorization failed"}, status=403)
         if timezone.now() - session.created_at > datetime.timedelta(minutes=OIDC_PENDING_MINUTES):
             session.delete()
             return JsonResponse({"error": "OIDC authorization timeout"}, status=408)
