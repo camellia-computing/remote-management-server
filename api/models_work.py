@@ -53,6 +53,7 @@ class RemoteToken(models.Model):
         unique=True,
         editable=False,
     )
+    credential_hash = models.CharField(max_length=64, default="", editable=False)
     create_time = models.DateTimeField(verbose_name=_("登录时间"), auto_now_add=True)
     expires_at = models.DateTimeField(verbose_name=_("过期时间"), db_index=True)
 

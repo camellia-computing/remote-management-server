@@ -5,9 +5,11 @@ from django.contrib.auth.admin import UserAdmin as BaseUserAdmin
 from django.contrib.auth.forms import ReadOnlyPasswordHashField
 from django.contrib.auth.models import Group
 from django.core.exceptions import ValidationError
+from django.db import transaction
 from django.utils.translation import gettext as _
 
 from api import models
+from api.credential_sessions import revoke_user_credentials
 
 
 class UserCreationForm(forms.ModelForm):
@@ -141,6 +143,21 @@ class UserAdmin(BaseUserAdmin):
     ordering = ("username",)
     filter_horizontal = ("groups",)
 
+    def save_model(self, request, obj, form, change):
+        with transaction.atomic():
+            was_active = (
+                models.UserProfile.objects.select_for_update()
+                .filter(pk=obj.pk)
+                .values_list("is_active", flat=True)
+                .first()
+                if change and obj.pk
+                else None
+            )
+            super().save_model(request, obj, form, change)
+            if was_active and not obj.is_active:
+                revoke_user_credentials((obj.pk,))
+                obj.refresh_from_db(fields=("credential_generation",))
+
 
 admin.site.register(models.UserProfile, UserAdmin)
 admin.site.register(models.RemoteToken, models.RemoteTokenAdmin)
@@ -159,6 +176,39 @@ class OidcIdentityAdmin(admin.ModelAdmin):
     search_fields = ("issuer", "subject", "user__username", "last_username", "last_email")
     autocomplete_fields = ("user",)
     readonly_fields = ("last_username", "last_email", "created_at", "updated_at")
+
+    @staticmethod
+    def _authorization_state(identity):
+        return (
+            identity.provider,
+            identity.issuer,
+            identity.subject,
+            identity.user_id,
+            identity.is_auto_provisioned,
+        )
+
+    def save_model(self, request, obj, form, change):
+        with transaction.atomic():
+            previous = (
+                models.OidcIdentity.objects.select_for_update().filter(pk=obj.pk).first() if change and obj.pk else None
+            )
+            super().save_model(request, obj, form, change)
+            if previous and self._authorization_state(previous) != self._authorization_state(obj):
+                revoke_user_credentials({previous.user_id, obj.user_id})
+
+    def delete_model(self, request, obj):
+        with transaction.atomic():
+            identity = models.OidcIdentity.objects.select_for_update().filter(pk=obj.pk).first()
+            user_id = identity.user_id if identity else obj.user_id
+            super().delete_model(request, obj)
+            revoke_user_credentials((user_id,))
+
+    def delete_queryset(self, request, queryset):
+        with transaction.atomic():
+            locked_queryset = queryset.select_for_update().order_by("pk")
+            user_ids = set(locked_queryset.values_list("user_id", flat=True))
+            super().delete_queryset(request, locked_queryset)
+            revoke_user_credentials(user_ids)
 
 
 admin.site.register(models.OidcIdentity, OidcIdentityAdmin)
