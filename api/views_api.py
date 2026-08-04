@@ -38,6 +38,15 @@ from api.credential_sessions import (
     revoke_device_credentials,
     revoke_user_credentials,
 )
+from api.device_identity import (
+    DeviceProofError,
+    DeviceRecoveryRequired,
+    consume_deployment_proof,
+    consume_session_proof,
+    create_recovery_approval,
+    deployment_assertion,
+    issue_proof_challenge,
+)
 from api.encrypted_fields import verify_key_canary
 from api.login_admission import complete_login_success, reserve_login_attempt
 from api.models import (
@@ -49,6 +58,8 @@ from api.models import (
     ConnLog,
     DataEncryptionKeyState,
     DeviceGroup,
+    DeviceProofChallenge,
+    DeviceRecoveryApproval,
     FileLog,
     OidcIdentity,
     OidcPendingAuth,
@@ -240,6 +251,8 @@ def _deployment_identity(rid, device_uuid, public_key):
 def _revoke_device_tokens(device):
     if not device:
         return 0
+    DeviceProofChallenge.objects.filter(device=device).delete()
+    DeviceRecoveryApproval.objects.filter(device=device, consumed_at__isnull=True).delete()
     return revoke_device_credentials((device.pk,))
 
 
@@ -314,6 +327,8 @@ def _claim_session_device(
     device_uuid,
     ip_address="",
     device_info=None,
+    device_proof=None,
+    proof_purpose=None,
 ):
     """Return the one device row a login session is allowed to claim."""
 
@@ -334,7 +349,7 @@ def _claim_session_device(
                 if device and (not device.is_active or (device.owner_id and device.owner_id != locked_user.id)):
                     raise PermissionError("Device is unavailable")
                 if not device:
-                    return RemoteDevice.objects.create(
+                    device = RemoteDevice.objects.create(
                         rid=rid,
                         cpu="-",
                         hostname=hostname,
@@ -346,22 +361,30 @@ def _claim_session_device(
                         ip_address=ip_address,
                         owner=locked_user,
                     )
-                update_fields = []
-                if device.owner_id is None:
-                    device.owner = locked_user
-                    update_fields.append("owner")
-                if ip_address and device.ip_address != ip_address:
-                    device.ip_address = ip_address
-                    update_fields.append("ip_address")
-                if hostname != "-" and device.hostname != hostname:
-                    device.hostname = hostname
-                    update_fields.append("hostname")
-                if operating_system != "-" and device.os != operating_system:
-                    device.os = operating_system
-                    update_fields.append("os")
-                if update_fields:
-                    update_fields.append("update_time")
-                    device.save(update_fields=update_fields)
+                else:
+                    update_fields = []
+                    if device.owner_id is None:
+                        device.owner = locked_user
+                        update_fields.append("owner")
+                    if ip_address and device.ip_address != ip_address:
+                        device.ip_address = ip_address
+                        update_fields.append("ip_address")
+                    if hostname != "-" and device.hostname != hostname:
+                        device.hostname = hostname
+                        update_fields.append("hostname")
+                    if operating_system != "-" and device.os != operating_system:
+                        device.os = operating_system
+                        update_fields.append("os")
+                    if update_fields:
+                        update_fields.append("update_time")
+                        device.save(update_fields=update_fields)
+                if device.public_key_hash or device_proof:
+                    consume_session_proof(
+                        proof=device_proof,
+                        purpose=proof_purpose,
+                        device=device,
+                        user=locked_user,
+                    )
                 return device
         except IntegrityError:
             if attempt:
@@ -1369,20 +1392,23 @@ def login(request):
         return JsonResponse({"error": _("账号已被禁用")}, status=403)
 
     try:
-        device = _claim_session_device(
-            user,
-            rid,
-            uuid,
-            client_ip,
-            device_info,
-        )
-        _token, raw_token = _issue_access_token(user, device)
+        with transaction.atomic():
+            device = _claim_session_device(
+                user,
+                rid,
+                uuid,
+                client_ip,
+                device_info,
+                data.get("device_proof"),
+                DeviceProofChallenge.PURPOSE_LOGIN,
+            )
+            _token, raw_token = _issue_access_token(user, device)
     except DeviceIdentityConflict:
         _log_event(
             request, "api_login_denied", level="warning", username=username, reason="device_identity_conflict", rid=rid
         )
         return JsonResponse({"error": "Device identity conflict"}, status=409)
-    except PermissionError:
+    except (PermissionError, DeviceProofError):
         _log_event(
             request, "api_login_denied", level="warning", username=username, reason="device_unavailable", rid=rid
         )
@@ -1592,7 +1618,8 @@ def oidc_auth(request):
     if not _valid_device_identity(rid, device_uuid):
         return JsonResponse({"error": "Invalid device identity"}, status=400)
     device_info = _validated_login_device_info(data.get("deviceInfo", {}))
-    if device_info is None:
+    device_proof = data.get("device_proof", {})
+    if device_info is None or not isinstance(device_proof, dict):
         return JsonResponse({"error": "Invalid deviceInfo"}, status=400)
 
     now = timezone.now()
@@ -1634,6 +1661,7 @@ def oidc_auth(request):
             rid=rid,
             device_uuid=device_uuid,
             device_info=device_info,
+            device_proof=device_proof,
             nonce=nonce,
             code_verifier=code_verifier,
             status=OidcPendingAuth.STATUS_PENDING,
@@ -1688,12 +1716,14 @@ def oidc_auth_query(request):
                 session.device_uuid,
                 session.request_ip,
                 session.device_info,
+                session.device_proof,
+                DeviceProofChallenge.PURPOSE_OIDC,
             )
             _token, raw_token = _issue_access_token(user, device)
         except (DeviceIdentityConflict, IntegrityError):
             session.delete()
             return JsonResponse({"error": "OIDC authorization failed"}, status=409)
-        except PermissionError:
+        except (PermissionError, DeviceProofError):
             session.delete()
             return JsonResponse({"error": "OIDC authorization failed"}, status=403)
         body = _auth_body(user, raw_token)
@@ -1871,6 +1901,47 @@ def devices_cli(request):
     return HttpResponse("")
 
 
+def devices_proof_challenge(request):
+    postdata = _load_json_object(request)
+    purpose = str(postdata.get("purpose", "")).strip()
+    rid = str(postdata.get("id", "")).strip()
+    uuid_value = str(postdata.get("uuid", "")).strip()
+    public_key = str(postdata.get("pk", "")).strip()
+    if not _valid_device_identity(rid, uuid_value):
+        return JsonResponse({"error": "Invalid device identity"}, status=400)
+
+    token = user = None
+    if purpose == DeviceProofChallenge.PURPOSE_DEPLOY:
+        token, user = _get_token_user(request)
+        device = token.device if token and user else None
+        if not device or device.uuid != uuid_value:
+            return JsonResponse({"error": "Invalid device token"}, status=401)
+    elif purpose not in (
+        DeviceProofChallenge.PURPOSE_LOGIN,
+        DeviceProofChallenge.PURPOSE_OIDC,
+    ):
+        return JsonResponse({"error": "Invalid proof purpose"}, status=400)
+    else:
+        try:
+            device = _device_by_identity(rid, uuid_value)
+        except DeviceIdentityConflict:
+            return JsonResponse({"error": "Device identity conflict"}, status=409)
+    try:
+        body = issue_proof_challenge(
+            purpose=purpose,
+            rid=rid,
+            device_uuid=uuid_value,
+            public_key_text=public_key,
+            request_ip=get_client_ip(request),
+            device=device,
+            user=user,
+        )
+    except DeviceProofError as exc:
+        status = 429 if "Too many" in str(exc) else 400
+        return JsonResponse({"error": str(exc)}, status=status)
+    return JsonResponse(body)
+
+
 def devices_deploy(request):
     token, user = _get_token_user(request)
     if not user:
@@ -1883,6 +1954,7 @@ def devices_deploy(request):
     rid = str(postdata.get("id", "")).strip()
     uuid_value = str(postdata.get("uuid", "")).strip()
     pk = str(postdata.get("pk", "")).strip()
+    device_proof = postdata.get("device_proof")
     identity = _deployment_identity(rid, uuid_value, pk)
     if identity is None or len(pk) > MAX_DEPLOY_KEY_LEN:
         _log_event(request, "api_devices_deploy_invalid_input", level="warning", username=user.username, rid=rid)
@@ -1941,14 +2013,25 @@ def devices_deploy(request):
             old_rid = device.rid
             old_uuid = device.uuid
             old_key_hash = device.public_key_hash
+            proof_result = consume_deployment_proof(
+                proof=device_proof,
+                device=device,
+                user=user,
+                new_rid=rid,
+                new_uuid=uuid_value,
+            )
             device.rid = rid
             device.uuid = uuid_value
-            device.public_key_hash = public_key_hash
+            device.public_key_hash = proof_result.public_key_hash
             device.owner = user
             device.ip_address = get_client_ip(request)
             device.save()
             if old_rid != rid or old_uuid != uuid_value or (old_key_hash and old_key_hash != public_key_hash):
                 _revoke_device_tokens(device)
+    except DeviceRecoveryRequired:
+        return JsonResponse({"result": "RECOVERY_REQUIRED"}, status=409)
+    except DeviceProofError:
+        return JsonResponse({"error": "Invalid device proof"}, status=403)
     except IntegrityError:
         _log_event(request, "api_devices_deploy_conflict", level="warning", username=user.username, rid=rid)
         return JsonResponse({"result": "ID_TAKEN"}, status=409)
@@ -1975,20 +2058,35 @@ def devices_verify_deployment(request):
     rid = str(postdata.get("id", "")).strip()
     uuid_value = str(postdata.get("uuid", "")).strip()
     public_key_hash = str(postdata.get("public_key_hash", "")).strip().lower()
+    request_nonce = str(postdata.get("request_nonce", "")).strip()
     if (
         not re.fullmatch(r"[A-Za-z0-9_-]{6,16}", rid)
         or _decode_canonical_base64(uuid_value, max_decoded_bytes=256) is None
         or not re.fullmatch(r"[0-9a-f]{64}", public_key_hash)
+        or len(request_nonce) > 128
     ):
         return HttpResponse(status=400)
-    authorized = RemoteDevice.objects.filter(
+    device = RemoteDevice.objects.filter(
         rid=rid,
         uuid=uuid_value,
         public_key_hash=public_key_hash,
         is_active=True,
         owner__is_active=True,
-    ).exists()
-    return HttpResponse(status=204 if authorized else 404)
+    ).first()
+    if not device:
+        return HttpResponse(status=404)
+    try:
+        body = deployment_assertion(
+            secret=expected_token,
+            rid=rid,
+            device_uuid=uuid_value,
+            key_hash=public_key_hash,
+            generation=device.deployment_generation,
+            request_nonce=request_nonce,
+        )
+    except DeviceProofError:
+        return HttpResponse(status=400)
+    return JsonResponse(body)
 
 
 def record(request):
@@ -3683,6 +3781,9 @@ def user_delete(request, guid):
         if target.id == admin_user.id:
             return JsonResponse({"error": "Cannot delete current user"}, status=400)
         username = target.username
+        device_ids = list(RemoteDevice.objects.filter(owner=target).values_list("pk", flat=True))
+        DeviceProofChallenge.objects.filter(device_id__in=device_ids).delete()
+        DeviceRecoveryApproval.objects.filter(device_id__in=device_ids).delete()
         RemoteToken.objects.filter(device__owner=target).delete()
         RemoteDevice.objects.filter(owner=target).update(
             owner=None,
@@ -3792,6 +3893,44 @@ def device_status(request, guid, action):
             _revoke_device_tokens(device)
     _log_event(request, f"api_device_{action}", username=admin_user.username, rid=device.rid)
     return JsonResponse(_serialize_device(device))
+
+
+def device_approve_recovery(request, guid):
+    admin_user, error = _require_admin(request, "api_device_approve_recovery")
+    if error:
+        return error
+    device_pk = _numeric_pk(guid)
+    public_key = str(_load_json_object(request).get("pk", "")).strip()
+    with transaction.atomic():
+        device = (
+            RemoteDevice.objects.select_for_update().filter(pk=device_pk).first()
+            if device_pk is not None
+            else None
+        )
+        if not device:
+            return JsonResponse({"error": "Device not found"}, status=404)
+        if not device.is_active or not device.owner_id or not device.public_key_hash:
+            return JsonResponse({"error": "Device is not eligible for recovery"}, status=409)
+        try:
+            approval = create_recovery_approval(
+                device=device,
+                public_key_text=public_key,
+                admin_user=admin_user,
+            )
+        except DeviceProofError:
+            return JsonResponse({"error": "Invalid public key"}, status=400)
+    _log_event(
+        request,
+        "api_device_recovery_approved",
+        username=admin_user.username,
+        rid=device.rid,
+    )
+    return JsonResponse(
+        {
+            "result": "OK",
+            "expires_at": int(approval.expires_at.timestamp()),
+        }
+    )
 
 
 def device_delete(request, guid):

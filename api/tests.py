@@ -16,6 +16,7 @@ from django.db import connection, transaction
 from django.test import SimpleTestCase, TestCase, override_settings
 from django.utils import timezone
 from nacl.secret import SecretBox
+from nacl.signing import SigningKey
 
 from api.encrypted_fields import FIELD_PREFIX, encrypt_text, key_canary, key_fingerprint
 from api.formatting import format_bytes
@@ -215,6 +216,7 @@ class ApiTestMixin:
             password="alice-pass",
             email="alice@example.test",
         )
+        self.device_signing_keys = {}
 
     def _post_json(self, path, payload, token=None):
         headers = self._auth_headers(token)
@@ -248,27 +250,48 @@ class ApiTestMixin:
         return {"HTTP_AUTHORIZATION": f"Bearer {token}"} if token else {}
 
     def _login(self, username, password, rid="123456789", uuid=DEFAULT_DEVICE_UUID):
+        payload = {
+            "username": username,
+            "password": password,
+            "id": rid,
+            "uuid": uuid,
+            "type": "client",
+            "deviceInfo": {
+                "os": "linux",
+                "type": "client",
+                "name": "desktop",
+            },
+        }
+        signing_key = self.device_signing_keys.get((rid, uuid))
+        if signing_key is not None:
+            payload["device_proof"] = self._device_proof("login", signing_key, rid, uuid)
         response = self._post_json(
             "/api/login",
-            {
-                "username": username,
-                "password": password,
-                "id": rid,
-                "uuid": uuid,
-                "type": "client",
-                "deviceInfo": {
-                    "os": "linux",
-                    "type": "client",
-                    "name": "desktop",
-                },
-            },
+            payload,
         )
         self.assertEqual(response.status_code, 200, response.content)
         body = response.json()
         self.assertIn("access_token", body)
         return body["access_token"]
 
+    def _device_proof(self, purpose, signing_key, rid, uuid, token=None):
+        public_key = base64.b64encode(bytes(signing_key.verify_key)).decode("ascii")
+        challenge = self._post_json(
+            "/api/devices/proof-challenge",
+            {"purpose": purpose, "id": rid, "uuid": uuid, "pk": public_key},
+            token=token,
+        )
+        self.assertEqual(challenge.status_code, 200, challenge.content)
+        challenge_body = challenge.json()
+        signature = signing_key.sign(challenge_body["message"].encode("utf-8")).signature
+        return {
+            "challenge": challenge_body["challenge"],
+            "public_key": public_key,
+            "signature": base64.b64encode(signature).decode("ascii"),
+        }
+
     def _device(self, owner=None, rid="123456789", uuid=DEFAULT_DEVICE_UUID, **overrides):
+        signing_key = SigningKey.generate()
         data = {
             "rid": rid,
             "cpu": "-",
@@ -278,11 +301,14 @@ class ApiTestMixin:
             "uuid": uuid,
             "username": "desktop-user",
             "version": "2.0.0",
-            "public_key_hash": hashlib.sha256(uuid.encode()).hexdigest(),
+            "public_key_hash": hashlib.sha256(bytes(signing_key.verify_key)).hexdigest(),
             "owner": owner,
         }
         data.update(overrides)
-        return RemoteDevice.objects.create(**data)
+        device = RemoteDevice.objects.create(**data)
+        if "public_key_hash" not in overrides:
+            self.device_signing_keys[(rid, uuid)] = signing_key
+        return device
 
     @staticmethod
     def _personal_profile(user):
@@ -749,6 +775,8 @@ class ApiContractTests(ApiTestMixin, TestCase):
             {key: value for key, value in result.items() if key != "dry_run"},
             {
                 "expired_access_tokens": 0,
+                "expired_device_proof_challenges": 0,
+                "expired_device_recovery_approvals": 0,
                 "expired_oidc_sessions": 0,
                 "expired_share_links_marked": 0,
                 "login_attempts": 0,
@@ -1151,21 +1179,29 @@ class ApiContractTests(ApiTestMixin, TestCase):
     def test_device_deployment_is_bound_to_uuid_key_and_active_owner(self):
         managed_uuid = base64.b64encode(b"managed-device").decode()
         token = self._login("alice", "alice-pass", uuid=managed_uuid)
-        public_key = base64.b64encode(bytes(range(32))).decode()
+        signing_key = SigningKey.generate()
+        public_key = base64.b64encode(bytes(signing_key.verify_key)).decode()
+        proof = self._device_proof("deploy", signing_key, "123456789", managed_uuid, token=token)
         deployed = self._post_json(
             "/api/devices/deploy",
-            {"id": "123456789", "uuid": managed_uuid, "pk": public_key},
+            {
+                "id": "123456789",
+                "uuid": managed_uuid,
+                "pk": public_key,
+                "device_proof": proof,
+            },
             token=token,
         )
         self.assertEqual(deployed.status_code, 200, deployed.content)
         device = RemoteDevice.objects.get(rid="123456789")
         self.assertEqual(device.uuid, managed_uuid)
-        self.assertEqual(device.public_key_hash, hashlib.sha256(bytes(range(32))).hexdigest())
+        self.assertEqual(device.public_key_hash, hashlib.sha256(bytes(signing_key.verify_key)).hexdigest())
 
         payload = {
             "id": device.rid,
             "uuid": device.uuid,
             "public_key_hash": device.public_key_hash,
+            "request_nonce": base64.b64encode(b"v" * 32).decode("ascii"),
         }
         self.assertEqual(self._post_json("/api/devices/verify-deployment", payload).status_code, 401)
         verified = self._post_json(
@@ -1173,7 +1209,8 @@ class ApiContractTests(ApiTestMixin, TestCase):
             payload,
             token="v" * 48,
         )
-        self.assertEqual(verified.status_code, 204, verified.content)
+        self.assertEqual(verified.status_code, 200, verified.content)
+        self.assertEqual(verified.json()["deployment_generation"], 1)
 
         payload["public_key_hash"] = "0" * 64
         denied = self._post_json(
@@ -1204,7 +1241,8 @@ class ApiContractTests(ApiTestMixin, TestCase):
     def test_device_deployment_rejects_noncanonical_identity_and_id_takeover(self):
         first_uuid = base64.b64encode(b"first-device").decode()
         token = self._login("alice", "alice-pass", uuid=first_uuid)
-        public_key = base64.b64encode(bytes(range(32))).decode()
+        signing_key = SigningKey.generate()
+        public_key = base64.b64encode(bytes(signing_key.verify_key)).decode()
         malformed = self._post_json(
             "/api/devices/deploy",
             {"id": "123456789", "uuid": "not-base64", "pk": public_key},
@@ -1214,7 +1252,18 @@ class ApiContractTests(ApiTestMixin, TestCase):
 
         first = self._post_json(
             "/api/devices/deploy",
-            {"id": "123456789", "uuid": first_uuid, "pk": public_key},
+            {
+                "id": "123456789",
+                "uuid": first_uuid,
+                "pk": public_key,
+                "device_proof": self._device_proof(
+                    "deploy",
+                    signing_key,
+                    "123456789",
+                    first_uuid,
+                    token=token,
+                ),
+            },
             token=token,
         )
         self.assertEqual(first.status_code, 200, first.content)

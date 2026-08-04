@@ -270,6 +270,10 @@ class RemoteDeviceAdminForm(SecretPreservingAdminForm):
 
 class RemoteDeviceAdminCustom(models.RemoteDeviceAdmin):
     form = RemoteDeviceAdminForm
+    readonly_fields = ("rid", "uuid", "public_key_hash", "deployment_generation")
+
+    def has_add_permission(self, request):
+        return False
 
     @staticmethod
     def _credential_state(device):
@@ -286,8 +290,20 @@ class RemoteDeviceAdminCustom(models.RemoteDeviceAdmin):
             previous = (
                 models.RemoteDevice.objects.select_for_update().filter(pk=obj.pk).first() if change and obj.pk else None
             )
+            if previous and (
+                previous.rid != obj.rid
+                or previous.uuid != obj.uuid
+                or previous.public_key_hash != obj.public_key_hash
+                or previous.deployment_generation != obj.deployment_generation
+            ):
+                raise ValidationError(_("设备身份只能通过密钥证明或管理员恢复审批修改。"))
             super().save_model(request, obj, form, change)
             if previous and self._credential_state(previous) != self._credential_state(obj):
+                models.DeviceProofChallenge.objects.filter(device=obj).delete()
+                models.DeviceRecoveryApproval.objects.filter(
+                    device=obj,
+                    consumed_at__isnull=True,
+                ).delete()
                 revoke_device_credentials((obj.pk,))
 
 

@@ -55,6 +55,10 @@ Gunicorn访问日志只输出method、固定路由模式、status、bytes、dura
 
 地址簿和待处理OIDC中的secret使用带key ID的`secretbox:v2` envelope认证加密；数据库key inventory保存不含业务明文的canary和fingerprint，readiness会拒绝错误key或replica配置分裂。连接凭据只通过已认证且通过地址簿权限校验的运行时 API 返回。Django 管理表单将其作为只写字段，CSV/Excel 导出不包含连接凭据。
 
+设备身份使用一次性`camellia-device-proof-v1` challenge。已部署设备的密码/OIDC登录必须由当前Ed25519设备私钥签名；首次部署由新设备密钥签名；主动换钥必须由旧钥与新钥对同一challenge双签。旧钥丢失时，管理员只能通过`POST /api/devices/<device-id>/approve-recovery`预先批准一个精确的新公钥；批准有效期10分钟、仅可消费一次，成功后设备代际递增且旧bearer立即撤销。Client必须逐字段验证canonical message后才能签名，不能把Management响应当作任意消息签名请求。
+
+Identity Server对`POST /api/devices/verify-deployment`的每次请求提供随机32字节nonce；Management返回30秒有效、以共享验证密钥HMAC-SHA256签名并绑定rid、UUID、公钥哈希、设备代际与nonce的`camellia-deployment-assertion-v1` JSON。旧的静态204契约已删除；Management、Client和Server必须协调升级，Server只允许更高代际替换已持久化身份。
+
 轮换时先把新ID/key设为primary，将旧key按`old-id:Base64`放入`CAMELLIA_REMOTE_DATA_ENCRYPTION_LEGACY_KEYS`，并让`CAMELLIA_REMOTE_DATA_ENCRYPTION_V1_KEY_ID`继续指向产生旧v1行的key。先运行`python manage.py rotate_data_encryption --dry-run`，再以有界batch正式运行；命令可以用`--max-batches`中断并安全续跑。所有batch完成后必须再执行一次不带`--max-batches`的命令，认证验证全部primary envelope。只有该完整验证和readiness通过，并确认所有保留backup不再依赖旧key后，才可运行`--retire-key-id OLD_ID`；删除旧secret时还要把`CAMELLIA_REMOTE_DATA_ENCRYPTION_V1_KEY_ID`切换到仍配置的key。key inventory只记录ID、SHA-256 fingerprint和加密canary，不记录key material。
 
 ## OCI + systemd 部署
@@ -79,7 +83,7 @@ Compose 默认仅在同主机、不可从外部路由的 `backend` 网络内使�
 
 ## 备份、恢复与运维
 
-每小时定时器生成 PostgreSQL custom-format 备份并在写入完成后原子重命名。每五分钟的清理任务删除过期登录失败记录、OIDC 会话和访问令牌，标记过期分享链接，并按配置的保留期删除已消费或已过期链接。备份目录必须位于独立、加密且受监控的存储；至少每天复制到故障域外，并按季度执行恢复演练。
+每小时定时器生成 PostgreSQL custom-format 备份并在写入完成后原子重命名。每五分钟的清理任务删除过期登录失败记录、OIDC 会话、设备证明challenge、设备恢复批准和访问令牌，标记过期分享链接，并按配置的保留期删除已消费或已过期链接。备份目录必须位于独立、加密且受监控的存储；至少每天复制到故障域外，并按季度执行恢复演练。
 
 恢复流程：停止应用、创建空数据库、用与生产相同主版本的 `pg_restore --clean --if-exists --no-owner --no-acl` 恢复、执行迁移和 `manage.py check --deploy`、验证 `/health/ready`，最后恢复流量。不得在未演练的情况下覆盖现有数据库。
 

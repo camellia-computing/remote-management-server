@@ -37,6 +37,7 @@ urlpatterns = [
     url(r"^heartbeat$", stateless_api(views_api.heartbeat, "POST")),
     url(r"^record$", stateless_api(views_api.record, "POST")),
     url(r"^devices/cli$", stateless_api(views_api.devices_cli, "POST")),
+    url(r"^devices/proof-challenge$", stateless_api(views_api.devices_proof_challenge, "POST")),
     url(r"^devices/deploy$", stateless_api(views_api.devices_deploy, "POST")),
     url(r"^devices/verify-deployment$", stateless_api(views_api.devices_verify_deployment, "POST")),
     url(
@@ -79,6 +80,10 @@ urlpatterns = [
     url(
         r"^devices/(?P<guid>[^/]+)/enable$",
         stateless_api(lambda request, guid: views_api.device_status(request, guid, "enable"), "POST"),
+    ),
+    url(
+        r"^devices/(?P<guid>[^/]+)/approve-recovery$",
+        stateless_api(views_api.device_approve_recovery, "POST"),
     ),
     url(r"^devices/(?P<guid>[^/]+)/assign$", stateless_api(views_api.device_assign, "POST")),
     url(r"^devices/(?P<guid>[^/]+)$", stateless_api(views_api.device_delete, "DELETE")),
