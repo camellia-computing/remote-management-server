@@ -42,7 +42,7 @@ def _safe_route(environ):
     return "<unmatched>"
 
 
-def _safe_request_id(environ):
+def safe_request_id(environ):
     request_id = environ.get(REQUEST_ID_ENV)
     if isinstance(request_id, str) and _REQUEST_ID_RE.fullmatch(request_id):
         return request_id
@@ -80,7 +80,7 @@ class SafeAccessLogger(Logger):
             "s": _safe_status(resp),
             "B": _safe_bytes(resp),
             "D": _duration_microseconds(request_time),
-            "request_id": _safe_request_id(environ),
+            "request_id": safe_request_id(environ),
         }
 
 
@@ -98,6 +98,6 @@ class SafeDjangoRequestFilter(Filter):
         record.args = (
             status,
             normalized_route(getattr(request, "resolver_match", None)),
-            _safe_request_id(getattr(request, "META", {})),
+            safe_request_id(getattr(request, "META", {})),
         )
         return True

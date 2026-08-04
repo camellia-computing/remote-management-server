@@ -407,7 +407,7 @@ LANGUAGE_CODE = os.environ.get("CAMELLIA_REMOTE_LANGUAGE_CODE", "zh-hans")
 # Application definition
 
 INSTALLED_APPS = [
-    "django.contrib.admin",
+    "api.admin_config.CamelliaAdminConfig",
     "django.contrib.auth",
     "django.contrib.contenttypes",
     "django.contrib.sessions",
