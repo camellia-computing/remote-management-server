@@ -40,12 +40,18 @@ class DataEncryptionKeyState(models.Model):
 
 
 class RemoteToken(models.Model):
-    """A single rotating session token bound to one managed device."""
+    """A single rotating session token bound to one device and immutable subject."""
 
     device = models.OneToOneField(
         "RemoteDevice",
         on_delete=models.CASCADE,
         related_name="session_token",
+    )
+    subject_user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="remote_tokens",
+        editable=False,
     )
     access_token = models.CharField(
         verbose_name=_("access_token"),
@@ -63,9 +69,81 @@ class RemoteToken(models.Model):
         verbose_name_plural = _("令牌列表")
 
 
+class DeviceProofChallenge(models.Model):
+    """Short-lived, one-use challenge for device key possession proofs."""
+
+    PURPOSE_LOGIN = "login"
+    PURPOSE_OIDC = "oidc"
+    PURPOSE_DEPLOY = "deploy"
+    PURPOSE_CHOICES = (
+        (PURPOSE_LOGIN, "Password login"),
+        (PURPOSE_OIDC, "OIDC login"),
+        (PURPOSE_DEPLOY, "Deployment"),
+    )
+
+    code_hash = models.CharField(max_length=64, unique=True, editable=False)
+    purpose = models.CharField(max_length=16, choices=PURPOSE_CHOICES)
+    rid = models.CharField(max_length=16)
+    device_uuid = models.CharField(max_length=344)
+    public_key_hash = models.CharField(max_length=64)
+    deployment_generation = models.PositiveBigIntegerField(default=0)
+    device = models.ForeignKey(
+        "RemoteDevice",
+        null=True,
+        blank=True,
+        on_delete=models.CASCADE,
+        related_name="proof_challenges",
+    )
+    subject_user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        null=True,
+        blank=True,
+        on_delete=models.CASCADE,
+        related_name="device_proof_challenges",
+    )
+    request_ip = models.GenericIPAddressField(
+        default="0.0.0.0",  # noqa: S104 - non-routable rate-limit sentinel, not a bind address
+        db_index=True,
+    )
+    expires_at = models.DateTimeField(db_index=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ("-created_at",)
+        indexes = [models.Index(fields=("request_ip", "expires_at"), name="device_proof_ip_exp_idx")]
+
+
+class DeviceRecoveryApproval(models.Model):
+    """Administrator approval for one lost-key replacement."""
+
+    device = models.ForeignKey(
+        "RemoteDevice",
+        on_delete=models.CASCADE,
+        related_name="recovery_approvals",
+    )
+    public_key_hash = models.CharField(max_length=64)
+    approved_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="approved_device_recoveries",
+    )
+    expires_at = models.DateTimeField(db_index=True)
+    consumed_at = models.DateTimeField(null=True, blank=True, default=None)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ("-created_at",)
+        indexes = [
+            models.Index(
+                fields=("device", "public_key_hash", "expires_at"),
+                name="device_recovery_lookup_idx",
+            )
+        ]
+
+
 class RemoteTokenAdmin(admin.ModelAdmin):
-    list_display = ("device", "device_owner", "expires_at")
-    search_fields = ("device__owner__username", "device__rid")
+    list_display = ("device", "subject_user", "device_owner", "expires_at")
+    search_fields = ("subject_user__username", "device__owner__username", "device__rid")
     list_filter = ("create_time", "expires_at")  # 过滤器
 
     @admin.display(description=_("归属用户"), ordering="device__owner__username")
@@ -203,6 +281,7 @@ class RemoteDevice(models.Model):
         default=None,
         unique=True,
     )
+    deployment_generation = models.PositiveBigIntegerField(default=0, editable=False)
     username = models.CharField(verbose_name=_("系统用户名"), max_length=100, blank=True)
     version = models.CharField(verbose_name=_("客户端版本"), max_length=100)
     ip_address = models.GenericIPAddressField(
@@ -830,6 +909,7 @@ class OidcPendingAuth(models.Model):
         blank=True,
         default=dict,
     )
+    device_proof = models.JSONField(blank=True, default=dict)
     nonce = EncryptedTextField(verbose_name="OIDC Nonce", max_length=64)
     code_verifier = EncryptedTextField(verbose_name="PKCE Code Verifier", max_length=128)
     status = models.CharField(verbose_name="Status", max_length=16, default=STATUS_PENDING, db_index=True)

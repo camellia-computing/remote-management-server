@@ -18,6 +18,16 @@ class CredentialRevocation:
     deleted_tokens: int
 
 
+def revoke_device_credentials(device_ids):
+    """Delete every bearer bound to the selected device rows."""
+
+    normalized_ids = {int(device_id) for device_id in device_ids if not isinstance(device_id, bool)}
+    normalized_ids = {device_id for device_id in normalized_ids if device_id > 0}
+    if not normalized_ids:
+        return 0
+    return RemoteToken.objects.filter(device_id__in=sorted(normalized_ids)).delete()[0]
+
+
 def revoke_user_credentials(user_ids):
     """Atomically invalidate every credential issued for the selected users."""
 

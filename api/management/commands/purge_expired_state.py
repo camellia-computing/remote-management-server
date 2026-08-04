@@ -7,7 +7,15 @@ from django.db import transaction
 from django.db.models import Q
 from django.utils import timezone
 
-from api.models import LoginAdmissionLock, LoginAttempt, OidcPendingAuth, RemoteToken, ShareLink
+from api.models import (
+    DeviceProofChallenge,
+    DeviceRecoveryApproval,
+    LoginAdmissionLock,
+    LoginAttempt,
+    OidcPendingAuth,
+    RemoteToken,
+    ShareLink,
+)
 
 
 class Command(BaseCommand):
@@ -29,6 +37,8 @@ class Command(BaseCommand):
         login_attempts = LoginAttempt.objects.filter(created_at__lt=login_cutoff)
         login_admission_locks = LoginAdmissionLock.objects.filter(updated_at__lt=login_cutoff)
         oidc_sessions = OidcPendingAuth.objects.filter(created_at__lt=oidc_cutoff)
+        device_proof_challenges = DeviceProofChallenge.objects.filter(expires_at__lte=now)
+        device_recovery_approvals = DeviceRecoveryApproval.objects.filter(expires_at__lte=now)
         access_tokens = RemoteToken.objects.filter(expires_at__lte=now)
         expired_share_links = ShareLink.objects.filter(expires_at__lte=now, is_expired=False)
         retained_share_links = ShareLink.objects.filter(
@@ -39,6 +49,8 @@ class Command(BaseCommand):
         result = {
             "expired_access_tokens": access_tokens.count(),
             "expired_oidc_sessions": oidc_sessions.count(),
+            "expired_device_proof_challenges": device_proof_challenges.count(),
+            "expired_device_recovery_approvals": device_recovery_approvals.count(),
             "expired_share_links_marked": expired_share_links.count(),
             "login_attempts": login_attempts.count(),
             "login_admission_locks": login_admission_locks.count(),
@@ -49,6 +61,8 @@ class Command(BaseCommand):
                 login_attempts.delete()
                 login_admission_locks.delete()
                 oidc_sessions.delete()
+                device_proof_challenges.delete()
+                device_recovery_approvals.delete()
                 access_tokens.delete()
                 expired_share_links.update(is_expired=True)
                 retained_share_links.delete()
