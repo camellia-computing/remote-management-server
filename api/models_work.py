@@ -1358,6 +1358,138 @@ class RequestRateLease(models.Model):
         return f"{self.scope}:{self.group}:{self.request_id}"
 
 
+class RecordingUpload(models.Model):
+    """Durable authority for one versioned recording upload."""
+
+    STATE_ACTIVE = "active"
+    STATE_FINALIZED = "finalized"
+    STATE_ABORTED = "aborted"
+    STATE_CHOICES = (
+        (STATE_ACTIVE, "Active"),
+        (STATE_FINALIZED, "Finalized"),
+        (STATE_ABORTED, "Aborted"),
+    )
+
+    upload_id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    create_id = models.UUIDField(editable=False)
+    device = models.ForeignKey(
+        RemoteDevice,
+        on_delete=models.CASCADE,
+        related_name="recording_uploads",
+        editable=False,
+    )
+    owner_id_at_create = models.PositiveBigIntegerField(editable=False)
+    deployment_generation = models.PositiveBigIntegerField(editable=False)
+    filename = models.CharField(max_length=255, editable=False)
+    state = models.CharField(max_length=12, choices=STATE_CHOICES, default=STATE_ACTIVE, editable=False)
+    committed_offset = models.PositiveBigIntegerField(default=0, editable=False)
+    revision = models.PositiveBigIntegerField(default=0, editable=False)
+    expected_size = models.PositiveBigIntegerField(null=True, blank=True, editable=False)
+    expected_digest = models.CharField(max_length=64, blank=True, default="", editable=False)
+    created_at = models.DateTimeField(auto_now_add=True, editable=False)
+    heartbeat_at = models.DateTimeField(default=timezone.now, db_index=True, editable=False)
+    updated_at = models.DateTimeField(auto_now=True, editable=False)
+    finalized_at = models.DateTimeField(null=True, blank=True, editable=False)
+    aborted_at = models.DateTimeField(null=True, blank=True, editable=False)
+
+    class Meta:
+        ordering = ("created_at", "upload_id")
+        constraints = [
+            models.UniqueConstraint(
+                fields=("device", "create_id"),
+                name="unique_recording_create_id",
+            ),
+            models.UniqueConstraint(
+                fields=("device", "filename"),
+                name="unique_recording_filename",
+            ),
+            models.CheckConstraint(
+                condition=(
+                    models.Q(
+                        state="active",
+                        finalized_at__isnull=True,
+                        aborted_at__isnull=True,
+                        expected_size__isnull=True,
+                        expected_digest="",
+                    )
+                    | models.Q(
+                        state="finalized",
+                        finalized_at__isnull=False,
+                        aborted_at__isnull=True,
+                        expected_size__isnull=False,
+                    )
+                    & ~models.Q(expected_digest="")
+                    | models.Q(
+                        state="aborted",
+                        finalized_at__isnull=True,
+                        aborted_at__isnull=False,
+                        expected_size__isnull=True,
+                        expected_digest="",
+                    )
+                ),
+                name="valid_recording_upload_state",
+            ),
+            models.CheckConstraint(
+                condition=models.Q(expected_size__isnull=True) | models.Q(committed_offset=models.F("expected_size")),
+                name="recording_final_size_committed",
+            ),
+            models.CheckConstraint(
+                condition=(
+                    models.Q(revision=0, committed_offset=0) | models.Q(revision__gte=1, committed_offset__gte=1)
+                ),
+                name="valid_recording_upload_position",
+            ),
+        ]
+
+    def __str__(self):
+        return f"{self.device_id}:{self.filename}:{self.state}"
+
+
+class RecordingUploadChunk(models.Model):
+    """Committed chunk receipt used to answer ambiguous retries."""
+
+    upload = models.ForeignKey(
+        RecordingUpload,
+        on_delete=models.CASCADE,
+        related_name="chunks",
+        editable=False,
+    )
+    chunk_id = models.UUIDField(editable=False)
+    offset = models.PositiveBigIntegerField(editable=False)
+    length = models.PositiveIntegerField(editable=False)
+    digest = models.CharField(max_length=64, editable=False)
+    revision = models.PositiveBigIntegerField(editable=False)
+    committed_at = models.DateTimeField(auto_now_add=True, editable=False)
+
+    class Meta:
+        ordering = ("upload_id", "revision")
+        constraints = [
+            models.UniqueConstraint(
+                fields=("upload", "chunk_id"),
+                name="unique_recording_chunk_id",
+            ),
+            models.UniqueConstraint(
+                fields=("upload", "revision"),
+                name="unique_recording_chunk_revision",
+            ),
+            models.UniqueConstraint(
+                fields=("upload", "offset"),
+                name="unique_recording_chunk_offset",
+            ),
+            models.CheckConstraint(
+                condition=models.Q(length__gte=1),
+                name="positive_recording_chunk_length",
+            ),
+            models.CheckConstraint(
+                condition=models.Q(revision__gte=1),
+                name="positive_recording_chunk_revision",
+            ),
+        ]
+
+    def __str__(self):
+        return f"{self.upload_id}:{self.revision}:{self.offset}+{self.length}"
+
+
 class ShareLinkAdmin(admin.ModelAdmin):
     list_display = (
         "token_prefix",

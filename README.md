@@ -57,6 +57,8 @@ Gunicorn访问日志只输出method、固定路由模式、status、bytes、dura
 
 超限响应为429，并带有有界`Retry-After`、`RateLimit-Limit`和`Cache-Control: no-store`；共享admission后端异常时稳定返回503且不泄露数据库错误。五分钟cleanup timer回收过期bucket和崩溃残留lease，lease时间必须大于Gunicorn允许的最长请求生命周期。`.env.example`列出service、source、credential、recording bytes、concurrency和本地容量上限。应用限流不能替代edge/WAF、反向代理连接/body/带宽上限或只允许内部访问health endpoint；启用forwarded headers时，可信proxy CIDR必须覆盖且代理必须删除客户端自带的来源头，否则source预算没有可信安全边界。
 
+录像上传只接受`version=2`协议；旧`new/part/tail/remove`请求返回426，Client与Management必须协调升级。Client先持久化随机`create_id`，Management签发绑定device owner与deployment generation的`upload_id`。每个chunk携带offset、revision、随机chunk ID、长度和SHA-256；服务端只有在staging文件`fsync`且数据库receipt提交后才确认新的权威offset/revision，相同chunk可在响应丢失后幂等重放，status也必须精确匹配该chunk receipt，不能只凭offset前进就确认。部分写会截回最后已提交offset。`finalize`必须匹配完整长度和SHA-256，随后在同一filesystem内原子rename并`fsync`来源和目标目录后发布，且永久拒绝追加或abort；active staging不作为完成录像提供。Client重启从Unix 0600/Windows录像目录ACL保护的双槽校验sidecar恢复待确认chunk/finalize，无法证明本地录像已正常关闭时只执行幂等abort。上传行、chunk receipt、staging过期与总容量/retention仍必须由后续storage-governance策略有界清理，不能手工删除数据库状态或把`.uploads/*.part`当成完成品。
+
 地址簿和待处理OIDC中的secret使用带key ID的`secretbox:v2` envelope认证加密；数据库key inventory保存不含业务明文的canary和fingerprint，readiness会拒绝错误key或replica配置分裂。shared profile的默认连接密码不再存入通用`info` JSON，而是迁移到显式加密字段；profile列表永不加载或返回该字段，Client仅在目标RID已存在且当前地址簿权限有效时调用目标绑定的即时credential API。连接凭据只通过已认证且通过地址簿权限校验的运行时 API 返回。Django 管理表单将其作为只写字段，CSV/Excel 导出不包含连接凭据。
 
 地址簿ACL审计与对应权限变更在同一事务提交。审计行保存profile GUID、名称和owner的不可变快照；删除profile会先写入tombstone，再把历史行的业务外键置空，因此API、Web、Admin或owner级联删除都不会抹除已有ACL历史。Django Admin只允许查看这些审计行，不允许新增、修改或删除。

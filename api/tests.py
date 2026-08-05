@@ -1897,6 +1897,7 @@ class SensitiveIngestionTests(ApiTestMixin, TestCase):
     def test_record_upload_is_authenticated_sequential_and_device_isolated(self):
         self._device(owner=self.user)
         token = self._login("alice", "alice-pass")
+        create_id = "11111111-1111-4111-8111-111111111111"
         with tempfile.TemporaryDirectory() as upload_root:
             with self.settings(
                 RECORD_UPLOAD_ROOT=Path(upload_root),
@@ -1905,41 +1906,62 @@ class SensitiveIngestionTests(ApiTestMixin, TestCase):
                 DATA_UPLOAD_MAX_MEMORY_SIZE=1024,
             ):
                 self.assertEqual(
-                    self._raw_record("type=new&file=session.webm", b"").status_code,
+                    self._raw_record(
+                        f"version=2&type=new&file=session.webm&create_id={create_id}",
+                        b"",
+                    ).status_code,
                     401,
                 )
-                created = self._raw_record("type=new&file=session.webm", b"", token)
-                self.assertEqual(created.status_code, 200, created.content)
-                traversal = self._raw_record("type=new&file=../session.webm", b"", token)
+                created = self._raw_record(
+                    f"version=2&type=new&file=session.webm&create_id={create_id}",
+                    b"",
+                    token,
+                )
+                self.assertEqual(created.status_code, 201, created.content)
+                state = created.json()
+                traversal = self._raw_record(
+                    "version=2&type=new&file=../session.webm&create_id=22222222-2222-4222-8222-222222222222",
+                    b"",
+                    token,
+                )
                 self.assertEqual(traversal.status_code, 400)
 
                 from api.views_api import _record_file_lock
 
-                recording = next(Path(upload_root).glob("*/session.webm"))
-                with _record_file_lock(recording.parent, "session.webm"):
+                staging = next(Path(upload_root).glob("*/.uploads/*.part"))
+                base_dir = staging.parent.parent
+                with _record_file_lock(base_dir, state["upload_id"]):
                     busy = self._raw_record(
-                        "type=part&file=session.webm&offset=0&length=4",
+                        "version=2&type=part"
+                        f"&upload_id={state['upload_id']}&offset=0&revision=0&length=4"
+                        f"&digest={hashlib.sha256(b'data').hexdigest()}"
+                        "&chunk_id=33333333-3333-4333-8333-333333333333",
                         b"data",
                         token,
                     )
                 self.assertEqual(busy.status_code, 423)
 
                 first = self._raw_record(
-                    "type=part&file=session.webm&offset=0&length=4",
+                    "version=2&type=part"
+                    f"&upload_id={state['upload_id']}&offset=0&revision=0&length=4"
+                    f"&digest={hashlib.sha256(b'data').hexdigest()}"
+                    "&chunk_id=33333333-3333-4333-8333-333333333333",
                     b"data",
                     token,
                 )
                 self.assertEqual(first.status_code, 200, first.content)
                 conflict = self._raw_record(
-                    "type=part&file=session.webm&offset=0&length=4",
+                    "version=2&type=part"
+                    f"&upload_id={state['upload_id']}&offset=0&revision=0&length=4"
+                    f"&digest={hashlib.sha256(b'evil').hexdigest()}"
+                    "&chunk_id=33333333-3333-4333-8333-333333333333",
                     b"evil",
                     token,
                 )
                 self.assertEqual(conflict.status_code, 409)
 
-                files = list(Path(upload_root).glob("*/session.webm"))
-                self.assertEqual(len(files), 1)
-                self.assertEqual(files[0].read_bytes(), b"data")
+                self.assertEqual(staging.read_bytes(), b"data")
+                self.assertEqual(list(Path(upload_root).glob("*/session.webm")), [])
 
     def test_audit_ingestion_and_notes_are_scoped_to_authenticated_participants(self):
         host_uuid = device_uuid("host-device")

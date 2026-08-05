@@ -1,17 +1,13 @@
 import base64
 import binascii
-import contextlib
 import datetime
 import functools
 import hashlib
 import ipaddress
 import json
 import logging
-import os
 import re
 import secrets
-import stat
-import time
 import uuid
 from urllib.parse import urlsplit
 
@@ -31,6 +27,8 @@ from django.utils.translation import gettext as _
 from joserfc import jwt
 from joserfc.jwk import KeySet
 from joserfc.jwt import JWTClaimsRegistry
+
+from api import recording_uploads
 
 # from django.forms.models import model_to_dict
 from api.address_book_authorization import (
@@ -101,7 +99,6 @@ MAX_AB_TAGS_PER_PEER = 32
 MAX_AB_PROFILE_PASSWORD_BYTES = 240
 MAX_MANAGEMENT_BATCH_ITEMS = 500
 MAX_ALLOWED_INCOMINGS = 500
-RECORD_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]{1,255}$")
 OIDC_SAFE_ID_TOKEN_ALGORITHMS = frozenset(
     {
         "RS256",
@@ -744,116 +741,7 @@ def _log_event(request, event, level="info", **extra):
     log_fn("event=%s details=%s", event, details)
 
 
-def _record_dir():
-    return os.fspath(settings.RECORD_UPLOAD_ROOT)
-
-
-def _safe_record_name(name):
-    if not isinstance(name, str) or name != os.path.basename(name):
-        return ""
-    return name if RECORD_NAME_RE.fullmatch(name) else ""
-
-
-def _record_device_dir(token):
-    namespace = hashlib.sha256(
-        (f"{token.device.owner_id}\0{token.device.rid}\0{token.device.uuid}").encode()
-    ).hexdigest()
-    return os.path.join(_record_dir(), namespace)
-
-
-def _secure_directory(path):
-    try:
-        os.mkdir(path, 0o700)
-    except FileExistsError:
-        pass
-    directory_stat = os.lstat(path)
-    if not stat.S_ISDIR(directory_stat.st_mode) or stat.S_ISLNK(directory_stat.st_mode):
-        raise OSError("Recording directory is not a real directory")
-    if directory_stat.st_mode & 0o077:
-        os.chmod(path, 0o700)
-
-
-def _ensure_record_device_dir(token):
-    root = _record_dir()
-    _secure_directory(root)
-    device_dir = _record_device_dir(token)
-    _secure_directory(device_dir)
-    return device_dir
-
-
-def _fsync_directory(path):
-    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
-    directory_fd = os.open(path, flags)
-    try:
-        os.fsync(directory_fd)
-    finally:
-        os.close(directory_fd)
-
-
-@contextlib.contextmanager
-def _record_file_lock(base_dir, filename):
-    lock_dir = os.path.join(base_dir, ".locks")
-    _secure_directory(lock_dir)
-    lock_name = hashlib.sha256(filename.encode()).hexdigest() + ".lock"
-    lock_path = os.path.join(lock_dir, lock_name)
-    lock_fd = None
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0)
-    for _attempt in range(2):
-        try:
-            lock_fd = os.open(lock_path, flags, 0o600)
-            break
-        except FileExistsError:
-            try:
-                lock_stat = os.lstat(lock_path)
-            except FileNotFoundError:
-                continue
-            if not stat.S_ISREG(lock_stat.st_mode) or time.time() - lock_stat.st_mtime <= 300:
-                raise BlockingIOError("Recording is busy") from None
-            try:
-                os.unlink(lock_path)
-            except FileNotFoundError:
-                continue
-    if lock_fd is None:
-        raise BlockingIOError("Recording is busy")
-    try:
-        os.write(lock_fd, f"{os.getpid()} {time.time_ns()}\n".encode())
-        os.fsync(lock_fd)
-        yield
-    finally:
-        os.close(lock_fd)
-        try:
-            os.unlink(lock_path)
-        except FileNotFoundError:
-            pass
-
-
-def _open_record_file(filepath, flags):
-    fd = os.open(
-        filepath,
-        flags | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
-        0o600,
-    )
-    file_stat = os.fstat(fd)
-    if not stat.S_ISREG(file_stat.st_mode):
-        os.close(fd)
-        raise OSError("Recording path is not a regular file")
-    return fd
-
-
-def _write_all(fd, data):
-    written = 0
-    while written < len(data):
-        count = os.write(fd, data[written:])
-        if count <= 0:
-            raise OSError("Recording write did not make progress")
-        written += count
-
-
-def _request_content_length(request):
-    try:
-        return int(request.META.get("CONTENT_LENGTH", "0") or 0)
-    except (TypeError, ValueError):
-        return -1
+_record_file_lock = recording_uploads._record_file_lock
 
 
 def _personal_guid(user):
@@ -2227,110 +2115,7 @@ def record(request):
     if not token or not user or not _get_active_token_device(token, user):
         _log_event(request, "api_record_unauthorized", level="warning")
         return JsonResponse({"error": "Invalid device token"}, status=401)
-    record_type = request.GET.get("type", "")
-    filename = _safe_record_name(request.GET.get("file", ""))
-    if not filename:
-        _log_event(request, "api_record_invalid_file", level="warning")
-        return JsonResponse({"error": "Invalid file"}, status=400)
-    content_length = _request_content_length(request)
-    max_chunk = settings.RECORD_UPLOAD_MAX_CHUNK_BYTES
-    if content_length < 0 or content_length > max_chunk:
-        return JsonResponse({"error": "Upload chunk is too large"}, status=413)
-    try:
-        base_dir = _ensure_record_device_dir(token)
-    except OSError:
-        _log_event(
-            request,
-            "api_record_storage_error",
-            level="error",
-            username=user.username,
-            rid=token.device.rid,
-        )
-        return JsonResponse({"error": "Recording storage failed"}, status=500)
-    filepath = os.path.join(base_dir, filename)
-    if record_type == "new":
-        if content_length != 0:
-            return JsonResponse({"error": "New recording body must be empty"}, status=400)
-        try:
-            with _record_file_lock(base_dir, filename):
-                fd = _open_record_file(filepath, os.O_WRONLY | os.O_CREAT | os.O_EXCL)
-                try:
-                    os.fsync(fd)
-                finally:
-                    os.close(fd)
-                _fsync_directory(base_dir)
-        except BlockingIOError:
-            return JsonResponse({"error": "Recording is busy"}, status=423)
-        except FileExistsError:
-            return JsonResponse({"error": "Recording already exists"}, status=409)
-        except OSError:
-            _log_event(request, "api_record_storage_error", level="error", username=user.username, rid=token.device.rid)
-            return JsonResponse({"error": "Recording storage failed"}, status=500)
-        _log_event(request, "api_record_new", level="info", username=user.username, rid=token.device.rid)
-        return HttpResponse("")
-    if record_type in ("part", "tail"):
-        try:
-            offset = int(request.GET.get("offset", "0"))
-            declared_length = int(request.GET.get("length", "-1"))
-        except (TypeError, ValueError):
-            return JsonResponse({"error": "Invalid upload range"}, status=400)
-        if offset < 0 or declared_length != content_length:
-            return JsonResponse({"error": "Invalid upload range"}, status=400)
-        data = request.body or b""
-        if len(data) != content_length:
-            return JsonResponse({"error": "Incomplete upload body"}, status=400)
-        if record_type == "tail" and offset != 0:
-            return JsonResponse({"error": "Invalid tail offset"}, status=400)
-        try:
-            with _record_file_lock(base_dir, filename):
-                fd = _open_record_file(filepath, os.O_RDWR)
-                try:
-                    current_size = os.fstat(fd).st_size
-                    if record_type == "part":
-                        if offset != current_size:
-                            return JsonResponse({"error": "Upload offset conflict"}, status=409)
-                        if current_size + len(data) > settings.RECORD_UPLOAD_MAX_FILE_BYTES:
-                            return JsonResponse({"error": "Recording is too large"}, status=413)
-                    os.lseek(fd, offset, os.SEEK_SET)
-                    _write_all(fd, data)
-                    os.fsync(fd)
-                finally:
-                    os.close(fd)
-        except BlockingIOError:
-            return JsonResponse({"error": "Recording is busy"}, status=423)
-        except FileNotFoundError:
-            return JsonResponse({"error": "Recording does not exist"}, status=404)
-        except OSError:
-            _log_event(request, "api_record_storage_error", level="error", username=user.username, rid=token.device.rid)
-            return JsonResponse({"error": "Recording storage failed"}, status=500)
-        _log_event(
-            request,
-            "api_record_write",
-            level="debug",
-            username=user.username,
-            rid=token.device.rid,
-        )
-        return HttpResponse("")
-    if record_type == "remove":
-        if content_length != 0:
-            return JsonResponse({"error": "Remove recording body must be empty"}, status=400)
-        try:
-            with _record_file_lock(base_dir, filename):
-                file_stat = os.lstat(filepath)
-                if not stat.S_ISREG(file_stat.st_mode):
-                    return JsonResponse({"error": "Invalid recording path"}, status=400)
-                os.unlink(filepath)
-                _fsync_directory(base_dir)
-        except BlockingIOError:
-            return JsonResponse({"error": "Recording is busy"}, status=423)
-        except FileNotFoundError:
-            pass
-        except OSError:
-            _log_event(request, "api_record_storage_error", level="error", username=user.username, rid=token.device.rid)
-            return JsonResponse({"error": "Recording storage failed"}, status=500)
-        _log_event(request, "api_record_remove", level="info", username=user.username, rid=token.device.rid)
-        return HttpResponse("")
-    return JsonResponse({"error": "Invalid type"}, status=400)
+    return recording_uploads.handle_record_upload(request, token)
 
 
 def audit_with_type(request, typ):
