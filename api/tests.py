@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import tempfile
+import uuid
 from io import BytesIO, StringIO
 from pathlib import Path
 from unittest.mock import patch
@@ -1992,6 +1993,8 @@ class SensitiveIngestionTests(ApiTestMixin, TestCase):
             uuid=outsider_uuid,
         )
         new_event = {
+            "version": 2,
+            "event_id": str(uuid.uuid4()),
             "action": "new",
             "id": "111111111",
             "uuid": host_uuid,
@@ -2003,13 +2006,17 @@ class SensitiveIngestionTests(ApiTestMixin, TestCase):
 
         self.assertEqual(self._post_json("/api/audit/conn", new_event).status_code, 401)
         created = self._post_json("/api/audit/conn", new_event, token=host_token)
-        self.assertEqual(created.status_code, 200, created.content)
+        self.assertEqual(created.status_code, 201, created.content)
+        audit_session_id = created.json()["audit_session_id"]
         replayed = self._post_json("/api/audit/conn", new_event, token=host_token)
         self.assertEqual(replayed.status_code, 200, replayed.content)
         self.assertEqual(ConnLog.objects.count(), 1)
         updated = self._post_json(
             "/api/audit/conn",
             {
+                "version": 2,
+                "event_id": str(uuid.uuid4()),
+                "audit_session_id": audit_session_id,
                 "id": "111111111",
                 "uuid": host_uuid,
                 "conn_id": 7,
@@ -2028,11 +2035,11 @@ class SensitiveIngestionTests(ApiTestMixin, TestCase):
         self.assertEqual(connection_log.two_factor, 1)
 
         active = self.client.get(
-            "/api/audit/conn/active?id=111111111&session_id=99&conn_type=0",
+            f"/api/audit/conn/active?version=2&event_id={uuid.uuid4()}&id=111111111&session_id=99&conn_type=0",
             **self._auth_headers(controller_token),
         )
         self.assertEqual(active.status_code, 200, active.content)
-        guid = active.json()
+        guid = active.json()["audit_session_id"]
         self.assertTrue(guid)
         connection_log.refresh_from_db()
         self.assertEqual(str(connection_log.guid), guid)
@@ -2040,19 +2047,34 @@ class SensitiveIngestionTests(ApiTestMixin, TestCase):
 
         direct_note = self._post_json(
             "/api/audit/conn",
-            {"id": "111111111", "session_id": 99, "note": "during session"},
+            {
+                "version": 2,
+                "event_id": str(uuid.uuid4()),
+                "audit_session_id": audit_session_id,
+                "note": "during session",
+            },
             token=controller_token,
         )
         self.assertEqual(direct_note.status_code, 200, direct_note.content)
         denied = self._put_json(
             "/api/audit",
-            {"guid": guid, "note": "tampered"},
+            {
+                "version": 2,
+                "event_id": str(uuid.uuid4()),
+                "audit_session_id": audit_session_id,
+                "note": "tampered",
+            },
             token=outsider_token,
         )
         self.assertEqual(denied.status_code, 404)
         allowed = self._put_json(
             "/api/audit",
-            {"guid": guid, "note": "approved"},
+            {
+                "version": 2,
+                "event_id": str(uuid.uuid4()),
+                "audit_session_id": audit_session_id,
+                "note": "approved",
+            },
             token=controller_token,
         )
         self.assertEqual(allowed.status_code, 200, allowed.content)
@@ -2060,6 +2082,9 @@ class SensitiveIngestionTests(ApiTestMixin, TestCase):
         self.assertEqual(connection_log.note, "approved")
 
         close_event = {
+            "version": 2,
+            "event_id": str(uuid.uuid4()),
+            "audit_session_id": audit_session_id,
             "action": "close",
             "id": "111111111",
             "uuid": host_uuid,
@@ -2077,19 +2102,47 @@ class SensitiveIngestionTests(ApiTestMixin, TestCase):
 
         restarted_process_event = {
             **new_event,
+            "event_id": str(uuid.uuid4()),
             "session_id": 100,
         }
-        self.assertEqual(
-            self._post_json(
-                "/api/audit/conn",
-                restarted_process_event,
-                token=host_token,
-            ).status_code,
-            200,
+        restarted = self._post_json(
+            "/api/audit/conn",
+            restarted_process_event,
+            token=host_token,
         )
+        self.assertEqual(restarted.status_code, 201, restarted.content)
+        restarted_audit_session_id = restarted.json()["audit_session_id"]
+        restarted_update = self._post_json(
+            "/api/audit/conn",
+            {
+                "version": 2,
+                "event_id": str(uuid.uuid4()),
+                "audit_session_id": restarted_audit_session_id,
+                "action": "update",
+                "id": "111111111",
+                "uuid": host_uuid,
+                "conn_id": 7,
+                "session_id": 100,
+                "peer": ["222222222", "bob"],
+                "type": 0,
+                "primary_auth": 3,
+                "two_factor": 1,
+            },
+            token=host_token,
+        )
+        self.assertEqual(restarted_update.status_code, 200, restarted_update.content)
+        restarted_active = self.client.get(
+            f"/api/audit/conn/active?version=2&event_id={uuid.uuid4()}&id=111111111&session_id=100&conn_type=0",
+            **self._auth_headers(controller_token),
+        )
+        self.assertEqual(restarted_active.status_code, 200, restarted_active.content)
+        self.assertEqual(restarted_active.json()["audit_session_id"], restarted_audit_session_id)
         self.assertEqual(ConnLog.objects.count(), 2)
 
         file_event = {
+            "version": 2,
+            "event_id": str(uuid.uuid4()),
+            "audit_session_id": restarted_audit_session_id,
             "id": "111111111",
             "uuid": host_uuid,
             "peer_id": "222222222",
@@ -2114,6 +2167,9 @@ class SensitiveIngestionTests(ApiTestMixin, TestCase):
         self.assertEqual(file_log.details["files"], [["report.pdf", 4096]])
 
         alarm_event = {
+            "version": 2,
+            "event_id": str(uuid.uuid4()),
+            "audit_session_id": restarted_audit_session_id,
             "id": "111111111",
             "uuid": host_uuid,
             "typ": AlarmLog.TYPE_SESSION_SCOPE_VIOLATION,

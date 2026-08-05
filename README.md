@@ -63,6 +63,8 @@ Gunicorn访问日志只输出method、固定路由模式、status、bytes、dura
 
 地址簿ACL审计与对应权限变更在同一事务提交。审计行保存profile GUID、名称和owner的不可变快照；删除profile会先写入tombstone，再把历史行的业务外键置空，因此API、Web、Admin或owner级联删除都不会抹除已有ACL历史。Django Admin只允许查看这些审计行，不允许新增、修改或删除。
 
+连接审计只接受`version=2`；旧Client固定返回426。Host设备用一次性UUIDv4 event创建连接后，由Management签发绑定host device、owner和deployment generation的不可猜测`audit_session_id`。关键连接事实只能从未设置值单向确定，close后永久冻结；controller必须以自己的active device bearer领取同一session capability，note每次写入都保留previous/new值、actor和单调sequence。File与Alarm只有在host和controller两端都完成绑定、两端设备代际仍有效且连接仍active时才会写入，并分别通过真实外键引用同一Connection和append-only event。重复event ID只有在session、kind、actor、设备和完整payload完全一致时才幂等确认；冲突、旧代际、owner变化或跨session重放均fail closed。设备或用户删除会让实时authority引用失效，但创建/绑定时的device PK、RID、UUID、owner、generation和每个event actor ID快照仍保留。Connection、Event、File和Alarm在Django Admin中全部只读，任何纠正必须新增可追踪事件，不能改写历史行。
+
 设备身份使用一次性`camellia-device-proof-v1` challenge。已部署设备的密码/OIDC登录必须由当前Ed25519设备私钥签名；首次部署由新设备密钥签名；主动换钥必须由旧钥与新钥对同一challenge双签。旧钥丢失时，管理员只能通过`POST /api/devices/<device-id>/approve-recovery`预先批准一个精确的新公钥；批准有效期10分钟、仅可消费一次，成功后设备代际递增且旧bearer立即撤销。Client必须逐字段验证canonical message后才能签名，不能把Management响应当作任意消息签名请求。
 
 设备heartbeat成功时返回绑定rid、UUID和deployment generation的60秒`device_lease`，并继续以15秒idle/3秒active节奏续租。禁用、删除、owner失效或统一credential撤销后，旧bearer的heartbeat返回绑定同一rid/UUID的显式`revoked`状态；Client必须立即停止新入站连接并关闭现有direct/relay/file/terminal会话。网络或Management故障不伪装成显式撤销，但最后一个有效lease到期后同样fail closed。
