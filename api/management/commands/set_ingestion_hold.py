@@ -43,7 +43,10 @@ class Command(BaseCommand):
         model = RecordingUpload if options["kind"] == "recording" else ConnLog
         lookup = {"pk": resource_id} if model is RecordingUpload else {"guid": resource_id}
         with transaction.atomic():
-            resource = model.objects.select_for_update().filter(**lookup).first()
+            resources = model.objects.select_for_update()
+            if model is RecordingUpload:
+                resources = resources.defer("encrypted_data_key")
+            resource = resources.filter(**lookup).first()
             if resource is None:
                 raise CommandError("retention resource does not exist")
             resource.retention_hold = bool(options["hold"])

@@ -23,6 +23,7 @@ ENCRYPTED_COLUMNS = (
     ("api_remotedevice", "id", "address_book_password"),
     ("api_oidcpendingauth", "state", "nonce"),
     ("api_oidcpendingauth", "state", "code_verifier"),
+    ("api_recordingupload", "upload_id", "encrypted_data_key"),
 )
 MAX_REPORTED_ERRORS = 20
 

@@ -60,7 +60,7 @@ def _expired_aborted(upload, cutoff):
 def _expire_active_upload(upload_id, cutoff, now):
     tomb_path = None
     with transaction.atomic():
-        upload = RecordingUpload.objects.select_for_update().filter(pk=upload_id).first()
+        upload = RecordingUpload.objects.select_for_update().defer("encrypted_data_key").filter(pk=upload_id).first()
         if upload is None or not _stale_active(upload, cutoff):
             return False
         base_dir = _existing_recording_base(upload)
@@ -93,7 +93,7 @@ def _expire_active_upload(upload_id, cutoff, now):
 def _purge_finalized_upload(upload_id, cutoff):
     tomb_path = None
     with transaction.atomic():
-        upload = RecordingUpload.objects.select_for_update().filter(pk=upload_id).first()
+        upload = RecordingUpload.objects.select_for_update().defer("encrypted_data_key").filter(pk=upload_id).first()
         if upload is None or not _expired_finalized(upload, cutoff):
             return False
         base_dir = _existing_recording_base(upload)
@@ -122,7 +122,7 @@ def _purge_finalized_upload(upload_id, cutoff):
 
 def _purge_aborted_upload(upload_id, cutoff):
     with transaction.atomic():
-        upload = RecordingUpload.objects.select_for_update().filter(pk=upload_id).first()
+        upload = RecordingUpload.objects.select_for_update().defer("encrypted_data_key").filter(pk=upload_id).first()
         if upload is None or not _expired_aborted(upload, cutoff):
             return False
         upload.delete()

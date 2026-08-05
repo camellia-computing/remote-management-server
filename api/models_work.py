@@ -13,6 +13,8 @@ from django.utils.translation import gettext_lazy as _
 
 from .address_book_errors import AuthorizationGenerationExhausted
 from .encrypted_fields import EncryptedTextField
+from .recording_crypto import FORMAT_VERSION as RECORDING_ENCRYPTION_VERSION
+from .recording_crypto import HEADER_SIZE as RECORDING_HEADER_SIZE
 
 ALARM_TYPES = (0, 1, 2, 6, 7, 8, 9)
 POLICY_ASSIGNMENT_FIELDS = frozenset(
@@ -1580,7 +1582,10 @@ class RecordingUpload(models.Model):
     storage_namespace = models.CharField(max_length=64, editable=False)
     filename = models.CharField(max_length=255, editable=False)
     state = models.CharField(max_length=12, choices=STATE_CHOICES, default=STATE_ACTIVE, editable=False)
+    encryption_version = models.PositiveSmallIntegerField(editable=False)
+    encrypted_data_key = EncryptedTextField(max_length=44, editable=False)
     committed_offset = models.PositiveBigIntegerField(default=0, editable=False)
+    storage_offset = models.PositiveBigIntegerField(editable=False)
     revision = models.PositiveBigIntegerField(default=0, editable=False)
     expected_size = models.PositiveBigIntegerField(null=True, blank=True, editable=False)
     expected_digest = models.CharField(max_length=64, blank=True, default="", editable=False)
@@ -1639,6 +1644,15 @@ class RecordingUpload(models.Model):
                     models.Q(revision=0, committed_offset=0) | models.Q(revision__gte=1, committed_offset__gte=1)
                 ),
                 name="valid_recording_upload_position",
+            ),
+            models.CheckConstraint(
+                condition=models.Q(encryption_version=RECORDING_ENCRYPTION_VERSION) & ~models.Q(encrypted_data_key=""),
+                name="valid_recording_crypto_format",
+            ),
+            models.CheckConstraint(
+                condition=models.Q(storage_offset__gte=RECORDING_HEADER_SIZE)
+                & models.Q(storage_offset__gt=models.F("committed_offset")),
+                name="recording_ciphertext_offset",
             ),
         ]
         indexes = [
