@@ -53,6 +53,10 @@ python scripts/test_release_metadata.py
 
 Gunicorn访问日志只输出method、固定路由模式、status、bytes、duration和服务端生成的request ID；不会输出raw URL/query、Referer、User-Agent或客户端地址。反向代理必须采用同一边界，禁止重新记录OIDC code/state、分享token、audit/session/device参数或recording filename。
 
+生产环境强制启用请求准入控制，设置`CAMELLIA_REMOTE_RATE_LIMIT_ENABLED=false`会直接阻止启动。每个进程先用有界、基于monotonic clock的内存窗口，在URL解析、session和数据库访问前约束global/source入口；`/health/live`与`/health/ready`只豁免共享数据库状态，仍受该本地入口上限保护。随后PostgreSQL以原子fixed window和短期concurrency lease统一约束多replica的global/service、IPv4 `/32`或IPv6 `/64` source、route、bearer credential、actor credential generation、device deployment generation以及recording声明字节。表中只保存domain-separated SHA-256标识和固定scope/group，不保存原始IP、token、actor或device值；这些hash是用于限流的pseudonymous标识，不应视为匿名化数据。
+
+超限响应为429，并带有有界`Retry-After`、`RateLimit-Limit`和`Cache-Control: no-store`；共享admission后端异常时稳定返回503且不泄露数据库错误。五分钟cleanup timer回收过期bucket和崩溃残留lease，lease时间必须大于Gunicorn允许的最长请求生命周期。`.env.example`列出service、source、credential、recording bytes、concurrency和本地容量上限。应用限流不能替代edge/WAF、反向代理连接/body/带宽上限或只允许内部访问health endpoint；启用forwarded headers时，可信proxy CIDR必须覆盖且代理必须删除客户端自带的来源头，否则source预算没有可信安全边界。
+
 地址簿和待处理OIDC中的secret使用带key ID的`secretbox:v2` envelope认证加密；数据库key inventory保存不含业务明文的canary和fingerprint，readiness会拒绝错误key或replica配置分裂。shared profile的默认连接密码不再存入通用`info` JSON，而是迁移到显式加密字段；profile列表永不加载或返回该字段，Client仅在目标RID已存在且当前地址簿权限有效时调用目标绑定的即时credential API。连接凭据只通过已认证且通过地址簿权限校验的运行时 API 返回。Django 管理表单将其作为只写字段，CSV/Excel 导出不包含连接凭据。
 
 地址簿ACL审计与对应权限变更在同一事务提交。审计行保存profile GUID、名称和owner的不可变快照；删除profile会先写入tombstone，再把历史行的业务外键置空，因此API、Web、Admin或owner级联删除都不会抹除已有ACL历史。Django Admin只允许查看这些审计行，不允许新增、修改或删除。

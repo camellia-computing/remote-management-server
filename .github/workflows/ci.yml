@@ -261,6 +261,7 @@ jobs:
           CAMELLIA_REMOTE_BACKUP_AGE_KEY_ID: ci-backup-v1
           CAMELLIA_REMOTE_BACKUP_DEPLOYMENT_ID: ci-deployment
           CAMELLIA_REMOTE_BACKUP_POSTGRES_MAJOR: "18"
+          CAMELLIA_REMOTE_RATE_LIMIT_ENABLED: "true"
         run: |
           [[ "$CAMELLIA_REMOTE_BACKUP_AGE_RECIPIENT" =~ ^age1[^[:space:]]{20,255}$ ]]
           [[ "$CAMELLIA_REMOTE_BACKUP_AGE_KEY_ID" =~ ^[a-z0-9][a-z0-9._-]{0,31}$ ]]
@@ -380,7 +381,13 @@ jobs:
           CAMELLIA_REMOTE_SECURE_TLS: "true"
           CAMELLIA_REMOTE_SECURE_HSTS_INCLUDE_SUBDOMAINS: "true"
           CAMELLIA_REMOTE_SECURE_HSTS_PRELOAD: "true"
-        run: uv run python manage.py check --deploy --fail-level WARNING
+          CAMELLIA_REMOTE_RATE_LIMIT_ENABLED: "true"
+        run: |
+          uv run python manage.py check --deploy --fail-level WARNING
+          if CAMELLIA_REMOTE_RATE_LIMIT_ENABLED=false uv run python manage.py check >/dev/null 2>&1; then
+            echo "production settings unexpectedly allowed request admission to be disabled" >&2
+            exit 1
+          fi
 
       - name: Fresh database migration
         run: uv run python manage.py migrate --noinput

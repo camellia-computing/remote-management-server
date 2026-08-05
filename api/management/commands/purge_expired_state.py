@@ -14,12 +14,14 @@ from api.models import (
     LoginAttempt,
     OidcPendingAuth,
     RemoteToken,
+    RequestRateBucket,
+    RequestRateLease,
     ShareLink,
 )
 
 
 class Command(BaseCommand):
-    help = "Delete expired authentication state and retained share links."
+    help = "Delete expired authentication, request-admission, and retained share state."
 
     def add_arguments(self, parser):
         parser.add_argument(
@@ -45,6 +47,8 @@ class Command(BaseCommand):
             Q(is_used=True) | Q(expires_at__lte=now),
             create_time__lt=share_cutoff,
         )
+        request_rate_buckets = RequestRateBucket.objects.filter(expires_at__lte=now)
+        request_rate_leases = RequestRateLease.objects.filter(expires_at__lte=now)
 
         result = {
             "expired_access_tokens": access_tokens.count(),
@@ -55,6 +59,8 @@ class Command(BaseCommand):
             "login_attempts": login_attempts.count(),
             "login_admission_locks": login_admission_locks.count(),
             "retained_share_links": retained_share_links.count(),
+            "request_rate_buckets": request_rate_buckets.count(),
+            "request_rate_leases": request_rate_leases.count(),
         }
         if not options["dry_run"]:
             with transaction.atomic():
@@ -66,6 +72,8 @@ class Command(BaseCommand):
                 access_tokens.delete()
                 expired_share_links.update(is_expired=True)
                 retained_share_links.delete()
+                request_rate_buckets.delete()
+                request_rate_leases.delete()
 
         result["dry_run"] = bool(options["dry_run"])
         self.stdout.write(json.dumps(result, sort_keys=True))

@@ -272,6 +272,67 @@ if TRUST_PROXY_HEADERS and not TRUSTED_PROXY_NETWORKS:
         "CAMELLIA_REMOTE_TRUSTED_PROXY_CIDRS is required when CAMELLIA_REMOTE_TRUST_PROXY_HEADERS is enabled"
     )
 
+# Request admission is layered: an in-process ingress cap protects workers
+# before session/database work, while hashed PostgreSQL buckets and leases
+# coordinate route, credential, actor and device limits across replicas.
+REQUEST_RATE_LIMIT_ENABLED = env_bool("CAMELLIA_REMOTE_RATE_LIMIT_ENABLED", True)
+if not DEBUG and not REQUEST_RATE_LIMIT_ENABLED:
+    raise ImproperlyConfigured("CAMELLIA_REMOTE_RATE_LIMIT_ENABLED cannot be disabled in production")
+REQUEST_RATE_LIMIT_GLOBAL_REQUESTS_PER_MINUTE = env_int(
+    "CAMELLIA_REMOTE_RATE_LIMIT_GLOBAL_REQUESTS_PER_MINUTE",
+    12_000,
+    60,
+    100_000,
+)
+REQUEST_RATE_LIMIT_SOURCE_REQUESTS_PER_MINUTE = env_int(
+    "CAMELLIA_REMOTE_RATE_LIMIT_SOURCE_REQUESTS_PER_MINUTE",
+    3_000,
+    10,
+    20_000,
+)
+REQUEST_RATE_LIMIT_CREDENTIAL_REQUESTS_PER_MINUTE = env_int(
+    "CAMELLIA_REMOTE_RATE_LIMIT_CREDENTIAL_REQUESTS_PER_MINUTE",
+    1_200,
+    10,
+    20_000,
+)
+REQUEST_RATE_LIMIT_RECORD_BYTES_PER_MINUTE = env_int(
+    "CAMELLIA_REMOTE_RATE_LIMIT_RECORD_BYTES_PER_MINUTE",
+    256 * 1024 * 1024,
+    1024 * 1024,
+    1024 * 1024 * 1024,
+)
+REQUEST_RATE_LIMIT_GLOBAL_CONCURRENCY = env_int(
+    "CAMELLIA_REMOTE_RATE_LIMIT_GLOBAL_CONCURRENCY",
+    128,
+    4,
+    1024,
+)
+REQUEST_RATE_LIMIT_SOURCE_CONCURRENCY = env_int(
+    "CAMELLIA_REMOTE_RATE_LIMIT_SOURCE_CONCURRENCY",
+    32,
+    1,
+    256,
+)
+REQUEST_RATE_LIMIT_CREDENTIAL_CONCURRENCY = env_int(
+    "CAMELLIA_REMOTE_RATE_LIMIT_CREDENTIAL_CONCURRENCY",
+    8,
+    1,
+    64,
+)
+REQUEST_RATE_LIMIT_LOCAL_CAPACITY = env_int(
+    "CAMELLIA_REMOTE_RATE_LIMIT_LOCAL_CAPACITY",
+    50_000,
+    1_000,
+    500_000,
+)
+REQUEST_RATE_LIMIT_CONCURRENCY_LEASE_SECONDS = env_int(
+    "CAMELLIA_REMOTE_RATE_LIMIT_CONCURRENCY_LEASE_SECONDS",
+    900,
+    30,
+    3600,
+)
+
 # TLS-terminating deployments should set CAMELLIA_REMOTE_SECURE_TLS=true.
 _secure_tls = env_bool("CAMELLIA_REMOTE_SECURE_TLS", False)
 if not DEBUG and not _secure_tls:
@@ -490,13 +551,15 @@ INSTALLED_APPS = [
 
 MIDDLEWARE = [
     "api.middleware.SafeAccessLogMiddleware",
+    "api.rate_limits.IngressRateLimitMiddleware",
     "django.middleware.security.SecurityMiddleware",
     "django.middleware.csp.ContentSecurityPolicyMiddleware",
     "whitenoise.middleware.WhiteNoiseMiddleware",
     "django.contrib.sessions.middleware.SessionMiddleware",
     "django.middleware.common.CommonMiddleware",
-    "django.middleware.csrf.CsrfViewMiddleware",
     "django.contrib.auth.middleware.AuthenticationMiddleware",
+    "api.rate_limits.RateLimitMiddleware",
+    "django.middleware.csrf.CsrfViewMiddleware",
     "django.contrib.messages.middleware.MessageMiddleware",
     "api.middleware.ApiExceptionMiddleware",
     "django.middleware.clickjacking.XFrameOptionsMiddleware",
