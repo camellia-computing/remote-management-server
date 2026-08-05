@@ -150,7 +150,8 @@ class CredentialResponseSecurityTests(TestCase):
             guid="shared-credential-profile",
             name="Shared credentials",
             owner=self.user,
-            info={"password": "profile-password-canary"},
+            info={"theme": "dark"},
+            default_password="profile-password-canary",  # noqa: S106 - isolated credential canary
             rule=3,
         )
         RemotePeer.objects.create(
@@ -161,8 +162,17 @@ class CredentialResponseSecurityTests(TestCase):
 
         profiles = self.post_json("/api/ab/shared/profiles", {}, token=token)
         self.assertEqual(profiles.status_code, 200, profiles.content)
-        self.assertEqual(profiles.json()["data"][0]["info"]["password"], "profile-password-canary")
+        self.assertEqual(profiles.json()["data"][0]["info"], {"theme": "dark"})
         self.assert_never_stored(profiles)
+
+        credential = self.post_json(
+            "/api/ab/shared/credential",
+            {"guid": profile.guid, "id": "246813579"},
+            token=token,
+        )
+        self.assertEqual(credential.status_code, 200, credential.content)
+        self.assertEqual(credential.json()["password"], "profile-password-canary")
+        self.assert_never_stored(credential)
 
         peers = self.post_json(f"/api/ab/peers?ab={profile.guid}", {}, token=token)
         self.assertEqual(peers.status_code, 200, peers.content)

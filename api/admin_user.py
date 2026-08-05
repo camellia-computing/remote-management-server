@@ -314,6 +314,14 @@ class RemoteDeviceAdminCustom(models.RemoteDeviceAdmin):
                 revoke_device_credentials((obj.pk,))
 
 
+class AddressBookProfileAdminForm(SecretPreservingAdminForm):
+    secret_field_names = ("default_password",)
+
+    class Meta:
+        model = models.AddressBookProfile
+        fields = "__all__"
+
+
 admin.site.register(models.RemoteTag, models.RemoteTagAdmin)
 admin.site.register(models.RemotePeer, RemotePeerAdminCustom)
 admin.site.register(models.RemoteDevice, RemoteDeviceAdminCustom)
@@ -343,6 +351,7 @@ def _lock_address_book_profiles(profile_ids):
 
 
 class AddressBookProfileAdmin(admin.ModelAdmin):
+    form = AddressBookProfileAdminForm
     list_display = ("name", "guid", "owner", "rule", "created_at", "updated_at")
     search_fields = ("name", "guid", "owner__username")
     list_filter = ("rule", "created_at", "updated_at")
