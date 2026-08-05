@@ -28,7 +28,7 @@ from joserfc import jwt
 from joserfc.jwk import KeySet
 from joserfc.jwt import JWTClaimsRegistry
 
-from api import recording_uploads
+from api import ingestion_governance, recording_uploads
 
 # from django.forms.models import model_to_dict
 from api.address_book_authorization import (
@@ -1604,6 +1604,7 @@ def health_ready(request):
             )
         ):
             raise ValidationError("Data-encryption key inventory does not match this replica")
+        ingestion_governance.check_recording_storage_capability()
     except Exception as exc:  # noqa: BLE001 - readiness normalizes backend failures
         logger.warning("readiness database check failed: %s", type(exc).__name__)
         return JsonResponse({"status": "not_ready"}, status=503)
@@ -2117,28 +2118,42 @@ def record(request):
     if not token or not user or not _get_active_token_device(token, user):
         _log_event(request, "api_record_unauthorized", level="warning")
         return JsonResponse({"error": "Invalid device token"}, status=401)
+    try:
+        try:
+            required_bytes = int(request.META.get("CONTENT_LENGTH", "0") or 0)
+        except (TypeError, ValueError):
+            required_bytes = 0
+        ingestion_governance.check_recording_storage_capability(max(0, required_bytes))
+    except ingestion_governance.RecordingStorageUnavailable as error:
+        return ingestion_governance.storage_error_response(error)
     return recording_uploads.handle_record_upload(request, token)
 
 
 def audit_with_type(request, typ):
     _log_event(request, "api_audit_dispatch", level="debug", typ=typ)
-    if request.method == "GET":
-        if typ == "conn/active":
-            return _audit_conn_active(request)
+    try:
+        if request.method == "GET":
+            if typ == "conn/active":
+                return _audit_conn_active(request)
+            return JsonResponse({"error": "Not found"}, status=404)
+        if typ == "conn":
+            return _audit_conn(request)
+        if typ == "file":
+            return _audit_file(request)
+        if typ == "alarm":
+            return _audit_alarm(request)
+        _log_event(request, "api_audit_unknown", level="warning", typ=typ)
         return JsonResponse({"error": "Not found"}, status=404)
-    if typ == "conn":
-        return _audit_conn(request)
-    if typ == "file":
-        return _audit_file(request)
-    if typ == "alarm":
-        return _audit_alarm(request)
-    _log_event(request, "api_audit_unknown", level="warning", typ=typ)
-    return JsonResponse({"error": "Not found"}, status=404)
+    except ingestion_governance.IngestionQuotaExceeded as error:
+        return ingestion_governance.quota_response(error)
 
 
 def audit_note(request):
     postdata = _load_json_object(request)
-    return _audit_controller_note_by_capability(request, postdata)
+    try:
+        return _audit_controller_note_by_capability(request, postdata)
+    except ingestion_governance.IngestionQuotaExceeded as error:
+        return ingestion_governance.quota_response(error)
 
 
 def audit_root(request):
@@ -3364,6 +3379,12 @@ def _append_audit_event(connection_log, event_id, kind, actor, reporter_device_u
         return existing, False
     if connection_log.event_revision >= 9_223_372_036_854_775_807:
         raise IntegrityError("Audit event revision exhausted")
+    ingestion_governance.reserve_audit_event(
+        connection_log.owner_id_at_create,
+        connection_log.host_device_id_at_create,
+        connection_log.event_revision,
+        closes_connection=kind == ConnectionAuditEvent.KIND_CLOSED,
+    )
     sequence = connection_log.event_revision + 1
     event = ConnectionAuditEvent.objects.create(
         event_id=event_id,
@@ -3655,6 +3676,7 @@ def _audit_conn(request):
                     ):
                         return JsonResponse({"error": "Connection session conflict"}, status=409)
                 else:
+                    ingestion_governance.reserve_audit_connection(user.id, device.id)
                     connection_log = ConnLog.objects.create(
                         audit_version=AUDIT_PROTOCOL_VERSION,
                         create_id=event_id,

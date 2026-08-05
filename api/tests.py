@@ -796,6 +796,16 @@ class ApiContractTests(ApiTestMixin, TestCase):
                 self.assertNotIn(canary, log_output)
 
     def test_expired_authentication_state_cleanup_is_dry_run_safe_and_idempotent(self):
+        recording_root = self.enterContext(tempfile.TemporaryDirectory())
+        self.enterContext(
+            override_settings(
+                RECORD_UPLOAD_ROOT=Path(recording_root),
+                RECORD_UPLOAD_REQUIRE_MOUNT=False,
+                RECORD_UPLOAD_VOLUME_RESERVE_BYTES=0,
+                RECORD_UPLOAD_VOLUME_RESERVE_INODES=0,
+                RECORD_UPLOAD_CAPABILITY_CACHE_SECONDS=0,
+            )
+        )
         now = timezone.now()
         old = now - datetime.timedelta(days=60)
         device = self._device(owner=self.user)
@@ -893,6 +903,13 @@ class ApiContractTests(ApiTestMixin, TestCase):
                 "retained_share_links": 0,
                 "request_rate_buckets": 0,
                 "request_rate_leases": 0,
+                "recording_active_expired": 0,
+                "recording_finalized_purged": 0,
+                "recording_aborted_purged": 0,
+                "recording_orphan_tombs_purged": 0,
+                "audit_connections_purged": 0,
+                "legacy_file_audits_purged": 0,
+                "legacy_alarm_audits_purged": 0,
             },
         )
 
@@ -2186,6 +2203,35 @@ class SensitiveIngestionTests(ApiTestMixin, TestCase):
 
 
 class OperationalEndpointTests(TestCase):
+    def setUp(self):
+        self.recording_root = tempfile.TemporaryDirectory()
+        self.recording_settings = override_settings(
+            RECORD_UPLOAD_ROOT=Path(self.recording_root.name),
+            RECORD_UPLOAD_REQUIRE_MOUNT=False,
+            RECORD_UPLOAD_VOLUME_RESERVE_BYTES=0,
+            RECORD_UPLOAD_VOLUME_RESERVE_INODES=0,
+            RECORD_UPLOAD_CAPABILITY_CACHE_SECONDS=0,
+        )
+        self.recording_settings.enable()
+
+    def tearDown(self):
+        self.recording_settings.disable()
+        self.recording_root.cleanup()
+
+    @override_settings(
+        DEVICE_VERIFICATION_TOKEN="v" * 48,
+        SECURE_SSL_REDIRECT=False,
+        RECORD_UPLOAD_REQUIRE_MOUNT=False,
+    )
+    def test_readiness_rejects_a_missing_runtime_recording_volume(self):
+        with tempfile.TemporaryDirectory() as parent:
+            missing_root = Path(parent) / "removed-recording-volume"
+            with override_settings(RECORD_UPLOAD_ROOT=missing_root):
+                response = self.client.get("/health/ready")
+
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.json(), {"status": "not_ready"})
+
     @override_settings(
         DEVICE_VERIFICATION_TOKEN="v" * 48,
         SECURE_SSL_REDIRECT=False,
@@ -2250,6 +2296,7 @@ class OperationalEndpointTests(TestCase):
 
 class DataEncryptionRotationTests(TestCase):
     def test_rotation_is_resumable_and_legacy_key_retirement_is_explicit(self):
+        recording_root = self.enterContext(tempfile.TemporaryDirectory())
         old_key_id = project_settings.DATA_ENCRYPTION_PRIMARY_KEY_ID
         old_key = project_settings.DATA_ENCRYPTION_KEYS[old_key_id]
         pending = OidcPendingAuth.objects.create(
@@ -2277,6 +2324,11 @@ class DataEncryptionRotationTests(TestCase):
             "DATA_ENCRYPTION_V1_KEY_ID": old_key_id,
             "DEVICE_VERIFICATION_TOKEN": "v" * 48,
             "SECURE_SSL_REDIRECT": False,
+            "RECORD_UPLOAD_ROOT": Path(recording_root),
+            "RECORD_UPLOAD_REQUIRE_MOUNT": False,
+            "RECORD_UPLOAD_VOLUME_RESERVE_BYTES": 0,
+            "RECORD_UPLOAD_VOLUME_RESERVE_INODES": 0,
+            "RECORD_UPLOAD_CAPABILITY_CACHE_SECONDS": 0,
         }
         with override_settings(**rotation_settings):
             first_output = StringIO()

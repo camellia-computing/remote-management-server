@@ -1,14 +1,28 @@
+import datetime
 import json
+import tempfile
 import uuid
 from concurrent.futures import ThreadPoolExecutor
+from io import StringIO
+from pathlib import Path
 from threading import Barrier
 
 from django.contrib import admin
-from django.db import IntegrityError, close_old_connections, connection, transaction
-from django.test import Client, TestCase, TransactionTestCase
+from django.core.management import call_command
+from django.db import IntegrityError, close_old_connections, connection, connections, transaction
+from django.test import Client, TestCase, TransactionTestCase, override_settings
+from django.utils import timezone
 
 from api import admin_user  # noqa: F401 - importing registers the admin models
-from api.models import AlarmLog, ConnectionAuditEvent, ConnLog, FileLog, RemoteDevice, UserProfile
+from api.models import (
+    AlarmLog,
+    ConnectionAuditEvent,
+    ConnLog,
+    FileLog,
+    PersistentIngestionUsage,
+    RemoteDevice,
+    UserProfile,
+)
 from api.tests import ApiTestMixin, device_uuid
 
 
@@ -56,6 +70,73 @@ class AuditSessionStateMachineTests(ApiTestMixin, TestCase):
         )
         self.assertEqual(updated.status_code, 200, updated.content)
         return ConnLog.objects.get(), audit_session_id
+
+    @override_settings(
+        AUDIT_MAX_EVENTS_PER_CONNECTION=3,
+        AUDIT_MAX_EVENTS_PER_DEVICE=3,
+        AUDIT_MAX_EVENTS_PER_OWNER=3,
+        AUDIT_MAX_EVENTS_GLOBAL=3,
+    )
+    def test_append_only_event_quota_reserves_the_close_event(self):
+        connection, audit_session_id = self._open_connection()
+        self.assertEqual(connection.event_revision, 2)
+
+        denied = self._connection_event(
+            "update",
+            audit_session_id=audit_session_id,
+        )
+
+        self.assertEqual(denied.status_code, 507, denied.content)
+        self.assertEqual(denied.json()["code"], "audit_quota_exceeded")
+        connection.refresh_from_db()
+        self.assertEqual(connection.event_revision, 2)
+        self.assertEqual(connection.events.count(), 2)
+
+        # A deployment may tighten the configured per-connection limit below
+        # an already-active session's revision. Its migration-backfilled close
+        # reservation must still let that historical session terminate.
+        with override_settings(AUDIT_MAX_EVENTS_PER_CONNECTION=2):
+            closed = self._connection_event("close", audit_session_id=audit_session_id)
+
+        self.assertEqual(closed.status_code, 200, closed.content)
+        connection.refresh_from_db()
+        self.assertIsNotNone(connection.conn_end)
+        self.assertEqual(connection.event_revision, 3)
+        self.assertEqual(connection.events.count(), 3)
+        usage = PersistentIngestionUsage.objects.get(kind="audit", scope="global")
+        self.assertEqual((usage.items, usage.events), (1, 3))
+
+    @override_settings(AUDIT_RETENTION_DAYS=1)
+    def test_closed_session_retention_releases_event_ledger_and_respects_hold(self):
+        connection, audit_session_id = self._open_connection()
+        closed = self._connection_event("close", audit_session_id=audit_session_id)
+        self.assertEqual(closed.status_code, 200, closed.content)
+        old = timezone.now() - datetime.timedelta(days=2)
+        ConnLog.objects.filter(pk=connection.pk).update(
+            conn_start=old - datetime.timedelta(hours=1),
+            conn_end=old,
+            retention_hold=True,
+            retention_hold_reason="test hold",
+            retention_hold_at=timezone.now(),
+        )
+
+        with (
+            tempfile.TemporaryDirectory() as recording_root,
+            override_settings(
+                RECORD_UPLOAD_ROOT=Path(recording_root),
+                RECORD_UPLOAD_REQUIRE_MOUNT=False,
+            ),
+        ):
+            call_command("purge_expired_state", batch_size=10, stdout=StringIO())
+            self.assertTrue(ConnLog.objects.filter(pk=connection.pk).exists())
+
+            ConnLog.objects.filter(pk=connection.pk).update(retention_hold=False)
+            call_command("purge_expired_state", batch_size=10, stdout=StringIO())
+
+        self.assertFalse(ConnLog.objects.filter(pk=connection.pk).exists())
+        self.assertEqual(ConnectionAuditEvent.objects.count(), 0)
+        for usage in PersistentIngestionUsage.objects.filter(kind="audit"):
+            self.assertEqual((usage.items, usage.events), (0, 0))
 
     def test_legacy_audit_protocol_is_rejected(self):
         response = self._post_json(
@@ -660,7 +741,7 @@ class AuditSessionConcurrencyTests(ApiTestMixin, TransactionTestCase):
                 )
                 return response.status_code, response.json()
             finally:
-                close_old_connections()
+                connections.close_all()
 
         with ThreadPoolExecutor(max_workers=len(requests)) as executor:
             futures = [executor.submit(send, path, payload) for path, payload in requests]
@@ -736,6 +817,56 @@ class AuditSessionConcurrencyTests(ApiTestMixin, TransactionTestCase):
         )
         self.assertEqual(FileLog.objects.count(), 1)
         self.assertEqual(AlarmLog.objects.count(), 1)
+
+    @override_settings(
+        AUDIT_MAX_EVENTS_PER_CONNECTION=10,
+        AUDIT_MAX_EVENTS_PER_DEVICE=5,
+        AUDIT_MAX_EVENTS_PER_OWNER=5,
+        AUDIT_MAX_EVENTS_GLOBAL=5,
+    )
+    def test_concurrent_connections_cannot_oversell_the_last_retained_event_slot(self):
+        second = self._host_event(
+            "new",
+            conn_id=8,
+            session_id=100,
+            ip="192.0.2.11",
+            type=0,
+            conn_audit_ref="concurrent-ref-two",
+        )
+        self.assertEqual(second.status_code, 201, second.content)
+        second_audit_session_id = second.json()["audit_session_id"]
+
+        def update_payload(audit_session_id, conn_id, session_id, primary_auth):
+            return {
+                "version": 2,
+                "event_id": str(uuid.uuid4()),
+                "action": "update",
+                "audit_session_id": audit_session_id,
+                "id": "111111111",
+                "uuid": self.host_uuid,
+                "conn_id": conn_id,
+                "session_id": session_id,
+                "primary_auth": primary_auth,
+            }
+
+        responses = self._post_concurrently(
+            [
+                (
+                    "/api/audit/conn",
+                    update_payload(self.audit_session_id, 7, 99, 1),
+                ),
+                (
+                    "/api/audit/conn",
+                    update_payload(second_audit_session_id, 8, 100, 3),
+                ),
+            ]
+        )
+
+        self.assertEqual(sorted(status for status, _payload in responses), [200, 507])
+        self.assertEqual(ConnectionAuditEvent.objects.count(), 3)
+        self.assertEqual(sum(ConnLog.objects.values_list("event_revision", flat=True)), 3)
+        usage = PersistentIngestionUsage.objects.get(kind="audit", scope="global")
+        self.assertEqual((usage.items, usage.events), (2, 5))
 
     def test_concurrent_distinct_values_can_set_an_unset_fact_only_once(self):
         payloads = []

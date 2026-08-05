@@ -12,6 +12,7 @@ from django.db import DatabaseError, IntegrityError, transaction
 from django.http import JsonResponse
 from django.utils import timezone
 
+from api import ingestion_governance
 from api.models import RecordingUpload, RecordingUploadChunk
 
 logger = logging.getLogger(__name__)
@@ -86,10 +87,16 @@ def _record_dir():
 
 
 def _record_device_dir(token):
-    namespace = hashlib.sha256(
-        (f"{token.device.owner_id}\0{token.device.rid}\0{token.device.uuid}").encode()
-    ).hexdigest()
+    namespace = ingestion_governance.recording_namespace(
+        token.device.owner_id,
+        token.device.rid,
+        token.device.uuid,
+    )
     return os.path.join(_record_dir(), namespace)
+
+
+def _record_upload_dir(upload):
+    return os.path.join(_record_dir(), upload.storage_namespace)
 
 
 def _secure_directory(path):
@@ -124,6 +131,10 @@ def _stage_path(base_dir, upload_id):
 
 def _aborted_path(base_dir, upload_id):
     return os.path.join(_stage_dir(base_dir), f"{upload_id}.aborted")
+
+
+def _deleting_path(base_dir, upload_id):
+    return os.path.join(_stage_dir(base_dir), f"{upload_id}.deleting")
 
 
 def _final_path(base_dir, upload):
@@ -236,8 +247,10 @@ def _load_bound_upload(token, upload_id, *, for_update=False):
     # in-request state.
     current_device = upload.device
     if (
-        not current_device.is_active
+        current_device is None
+        or not current_device.is_active
         or not current_device.public_key_hash
+        or upload.device_id_at_create != current_device.id
         or upload.owner_id_at_create != current_device.owner_id
         or upload.deployment_generation != current_device.deployment_generation
     ):
@@ -343,11 +356,32 @@ def _create_upload(request, token, content_length):
                     status=409,
                     code="filename_conflict",
                 )
+            usage = ingestion_governance.lock_recording_create_usage(
+                token.device.owner_id,
+                token.device_id,
+            )
+            existing = RecordingUpload.objects.filter(device_id=token.device_id, create_id=create_id).first()
+            if existing is not None:
+                if existing.filename != filename:
+                    raise UploadRequestError(
+                        "Create identity conflicts with another recording",
+                        status=409,
+                        code="create_conflict",
+                    )
+                return JsonResponse(_state_payload(existing), status=200)
+            ingestion_governance.reserve_locked_recording_create(usage)
+            ingestion_governance.check_recording_storage_capability(force=True)
             upload = RecordingUpload.objects.create(
                 create_id=create_id,
                 device_id=token.device_id,
+                device_id_at_create=token.device_id,
                 owner_id_at_create=token.device.owner_id,
                 deployment_generation=token.device.deployment_generation,
+                storage_namespace=ingestion_governance.recording_namespace(
+                    token.device.owner_id,
+                    token.device.rid,
+                    token.device.uuid,
+                ),
                 filename=filename,
             )
             stage_path = _stage_path(base_dir, upload.upload_id)
@@ -480,6 +514,18 @@ def _commit_part(request, token, content_length):
                 )
             if offset + declared_length > settings.RECORD_UPLOAD_MAX_FILE_BYTES:
                 raise UploadRequestError("Recording is too large", status=413, code="recording_too_large")
+            ingestion_governance.reserve_recording_bytes(
+                upload.owner_id_at_create,
+                upload.device_id_at_create,
+                declared_length,
+            )
+            # The authenticated view rejects an unavailable volume before body
+            # materialization. Recheck while the global usage row is locked so
+            # concurrent writers cannot all consume the same final reserve.
+            ingestion_governance.check_recording_storage_capability(
+                declared_length,
+                force=True,
+            )
             base_dir = _ensure_record_device_dir(token)
             with _record_file_lock(base_dir, upload.upload_id):
                 stage_path = _stage_path(base_dir, upload.upload_id)
@@ -584,6 +630,10 @@ def _finalize_upload(request, token, content_length):
                 upload.expected_digest = final_digest
                 upload.finalized_at = timezone.now()
                 upload.heartbeat_at = upload.finalized_at
+                ingestion_governance.finalize_recording_usage(
+                    upload.owner_id_at_create,
+                    upload.device_id_at_create,
+                )
                 upload.save(
                     update_fields=(
                         "state",
@@ -654,6 +704,11 @@ def _abort_upload(request, token, content_length):
                     upload.state = RecordingUpload.STATE_ABORTED
                     upload.aborted_at = timezone.now()
                     upload.heartbeat_at = upload.aborted_at
+                    ingestion_governance.release_active_recording_usage(
+                        upload.owner_id_at_create,
+                        upload.device_id_at_create,
+                        upload.committed_offset,
+                    )
                     upload.save(update_fields=("state", "aborted_at", "heartbeat_at", "updated_at"))
                     payload = _state_payload(upload)
         moved = None
@@ -710,6 +765,10 @@ def handle_record_upload(request, token):
         return handler(request, token, content_length)
     except UploadRequestError as error:
         return _error_response(error)
+    except ingestion_governance.IngestionQuotaExceeded as error:
+        return ingestion_governance.quota_response(error)
+    except ingestion_governance.RecordingStorageUnavailable as error:
+        return ingestion_governance.storage_error_response(error)
     except BlockingIOError:
         return JsonResponse({"error": "Recording is busy", "code": "upload_busy"}, status=423)
     except (DatabaseError, OSError):

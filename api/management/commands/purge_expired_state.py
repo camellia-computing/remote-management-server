@@ -2,11 +2,12 @@ import datetime
 import json
 
 from django.conf import settings
-from django.core.management.base import BaseCommand
+from django.core.management.base import BaseCommand, CommandError
 from django.db import transaction
 from django.db.models import Q
 from django.utils import timezone
 
+from api.ingestion_retention import purge_audit_retention, purge_recording_retention
 from api.models import (
     DeviceProofChallenge,
     DeviceRecoveryApproval,
@@ -29,9 +30,18 @@ class Command(BaseCommand):
             action="store_true",
             help="Report eligible rows without changing the database.",
         )
+        parser.add_argument(
+            "--batch-size",
+            type=int,
+            default=settings.INGESTION_CLEANUP_BATCH_SIZE,
+            help="Maximum number of rows processed per persistent-ingestion category.",
+        )
 
     def handle(self, *args, **options):
         now = timezone.now()
+        batch_size = options["batch_size"]
+        if not 1 <= batch_size <= 1000:
+            raise CommandError("batch-size must be between 1 and 1000")
         login_cutoff = now - datetime.timedelta(minutes=settings.LOGIN_ATTEMPT_RETENTION_MINUTES)
         oidc_cutoff = now - datetime.timedelta(minutes=settings.OIDC_PENDING_RETENTION_MINUTES)
         share_cutoff = now - datetime.timedelta(days=settings.SHARE_LINK_RETENTION_DAYS)
@@ -76,4 +86,18 @@ class Command(BaseCommand):
                 request_rate_leases.delete()
 
         result["dry_run"] = bool(options["dry_run"])
+        result.update(
+            purge_recording_retention(
+                now,
+                batch_size=batch_size,
+                dry_run=bool(options["dry_run"]),
+            )
+        )
+        result.update(
+            purge_audit_retention(
+                now,
+                batch_size=batch_size,
+                dry_run=bool(options["dry_run"]),
+            )
+        )
         self.stdout.write(json.dumps(result, sort_keys=True))
