@@ -1013,7 +1013,20 @@ class ApiContractTests(ApiTestMixin, TestCase):
             token=device_token,
         )
         self.assertEqual(heartbeat.status_code, 200, heartbeat.content)
-        self.assertEqual(heartbeat.json()["strategy"]["config_options"]["quality"], "best")
+        initial_policy = heartbeat.json()["managed_policy"]
+        self.assertEqual(initial_policy["version"], 1)
+        self.assertEqual(initial_policy["id"], "123456789")
+        self.assertEqual(initial_policy["uuid"], DEFAULT_DEVICE_UUID)
+        self.assertEqual(initial_policy["config_options"]["quality"], "best")
+        canonical = json.dumps(
+            initial_policy["config_options"],
+            sort_keys=True,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode()
+        self.assertEqual(initial_policy["digest"], hashlib.sha256(canonical).hexdigest())
+        self.assertNotIn("strategy", heartbeat.json())
+        self.assertNotIn("modified_at", heartbeat.json())
 
         disabled = self._put_json(
             f"/api/strategies/{strategy.guid}/status",
@@ -1029,7 +1042,9 @@ class ApiContractTests(ApiTestMixin, TestCase):
             token=device_token,
         )
         self.assertEqual(heartbeat.status_code, 200, heartbeat.content)
-        self.assertNotIn("strategy", heartbeat.json())
+        tombstone = heartbeat.json()["managed_policy"]
+        self.assertGreater(tombstone["generation"], initial_policy["generation"])
+        self.assertEqual(tombstone["config_options"], {})
 
     def test_strategy_precedence_and_device_policy_is_admin_only(self):
         admin_token = self._login(
@@ -1072,7 +1087,7 @@ class ApiContractTests(ApiTestMixin, TestCase):
             token=device_token,
         )
         self.assertEqual(
-            heartbeat.json()["strategy"]["config_options"]["source"],
+            heartbeat.json()["managed_policy"]["config_options"]["source"],
             "device",
         )
 
@@ -1092,7 +1107,7 @@ class ApiContractTests(ApiTestMixin, TestCase):
             token=device_token,
         )
         self.assertEqual(
-            heartbeat.json()["strategy"]["config_options"]["source"],
+            heartbeat.json()["managed_policy"]["config_options"]["source"],
             "group",
         )
 
@@ -1108,7 +1123,7 @@ class ApiContractTests(ApiTestMixin, TestCase):
             token=device_token,
         )
         self.assertEqual(
-            heartbeat.json()["strategy"]["config_options"]["source"],
+            heartbeat.json()["managed_policy"]["config_options"]["source"],
             "user",
         )
 

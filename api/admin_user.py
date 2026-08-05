@@ -270,7 +270,13 @@ class RemoteDeviceAdminForm(SecretPreservingAdminForm):
 
 class RemoteDeviceAdminCustom(models.RemoteDeviceAdmin):
     form = RemoteDeviceAdminForm
-    readonly_fields = ("rid", "uuid", "public_key_hash", "deployment_generation")
+    readonly_fields = (
+        "rid",
+        "uuid",
+        "public_key_hash",
+        "deployment_generation",
+        "policy_generation",
+    )
 
     def has_add_permission(self, request):
         return False

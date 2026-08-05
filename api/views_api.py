@@ -70,6 +70,11 @@ from api.models import (
     StrategyProfile,
     UserProfile,
 )
+from api.policy_generation import (
+    InvalidManagedPolicy,
+    managed_policy_document,
+    normalize_policy_options,
+)
 from api.request_utils import client_ip, load_json_body, load_json_object
 from api.tag_colors import normalize_tag_color
 from camellia_remote_management.access_logging import normalized_route
@@ -89,7 +94,6 @@ MAX_AB_PEERS = 10_000
 MAX_AB_TAGS = 256
 MAX_AB_TAGS_PER_PEER = 32
 MAX_MANAGEMENT_BATCH_ITEMS = 500
-MAX_STRATEGY_OPTIONS_BYTES = 64 * 1024
 MAX_ALLOWED_INCOMINGS = 500
 RECORD_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]{1,255}$")
 OIDC_SAFE_ID_TOKEN_ALGORITHMS = frozenset(
@@ -1022,28 +1026,10 @@ def _json_value(value, *, expected_type, max_bytes):
 
 
 def _strategy_options_value(value):
-    value = _json_value(
-        value,
-        expected_type=dict,
-        max_bytes=MAX_STRATEGY_OPTIONS_BYTES,
-    )
-    if value is None or len(value) > 512:
+    try:
+        return normalize_policy_options(value)
+    except InvalidManagedPolicy:
         return None
-    output = {}
-    for key, option_value in value.items():
-        if (
-            not isinstance(key, str)
-            or not key
-            or len(key) > 128
-            or len(key.encode()) > 512
-            or any(ord(character) < 32 for character in key)
-            or not isinstance(option_value, str)
-            or len(option_value) > 4096
-            or len(option_value.encode()) > 16 * 1024
-        ):
-            return None
-        output[key] = option_value
-    return output
 
 
 def _allowed_incomings_value(value):
@@ -1587,23 +1573,14 @@ def heartbeat(request):
         }
     }
     try:
-        client_modified = int(postdata.get("modified_at", 0))
-    except (TypeError, ValueError):
-        client_modified = 0
-    if device:
+        response["managed_policy"] = managed_policy_document(device)
+    except InvalidManagedPolicy:
         profile = device.effective_strategy()
-        if profile and profile.enabled:
-            server_modified = int(profile.updated_at.timestamp())
-            if server_modified != client_modified:
-                response["modified_at"] = server_modified
-                options = _strategy_options_value(profile.config_options)
-                if options is None:
-                    logger.error(
-                        "event=invalid_strategy_options strategy_id=%s",
-                        profile.pk,
-                    )
-                    return JsonResponse({"error": "Invalid strategy configuration"}, status=503)
-                response["strategy"] = {"config_options": options, "extra": {}}
+        logger.error(
+            "event=invalid_strategy_options strategy_id=%s",
+            profile.pk if profile else None,
+        )
+        return JsonResponse({"error": "Invalid strategy configuration"}, status=503)
     _log_event(request, "api_heartbeat", level="debug", username=user.username, rid=rid, uuid=device_uuid)
     return JsonResponse(response)
 
@@ -1628,9 +1605,7 @@ def health_ready(request):
             cursor.execute("SELECT 1")
             cursor.fetchone()
         RemoteDevice.objects.order_by("pk").values_list("pk", flat=True).first()
-        key_states = list(
-            DataEncryptionKeyState.objects.order_by("key_id")[: settings.MAX_DATA_ENCRYPTION_KEYS + 1]
-        )
+        key_states = list(DataEncryptionKeyState.objects.order_by("key_id")[: settings.MAX_DATA_ENCRYPTION_KEYS + 1])
         primary_key_id = getattr(settings, "DATA_ENCRYPTION_PRIMARY_KEY_ID", "")
         if (
             not key_states
@@ -3838,10 +3813,7 @@ def user_delete(request, guid):
         # its credential, so deleting credentials before locking devices could
         # deadlock with a concurrent heartbeat.
         device_ids = list(
-            RemoteDevice.objects.select_for_update()
-            .filter(owner=target)
-            .order_by("pk")
-            .values_list("pk", flat=True)
+            RemoteDevice.objects.select_for_update().filter(owner=target).order_by("pk").values_list("pk", flat=True)
         )
         DeviceProofChallenge.objects.filter(device_id__in=device_ids).delete()
         DeviceRecoveryApproval.objects.filter(device_id__in=device_ids).delete()
@@ -3942,9 +3914,7 @@ def device_status(request, guid, action):
     device_pk = _numeric_pk(guid)
     with transaction.atomic():
         device = (
-            RemoteDevice.objects.select_for_update().filter(pk=device_pk).first()
-            if device_pk is not None
-            else None
+            RemoteDevice.objects.select_for_update().filter(pk=device_pk).first() if device_pk is not None else None
         )
         if not device:
             return JsonResponse({"error": "Device not found"}, status=404)
@@ -3964,9 +3934,7 @@ def device_approve_recovery(request, guid):
     public_key = str(_load_json_object(request).get("pk", "")).strip()
     with transaction.atomic():
         device = (
-            RemoteDevice.objects.select_for_update().filter(pk=device_pk).first()
-            if device_pk is not None
-            else None
+            RemoteDevice.objects.select_for_update().filter(pk=device_pk).first() if device_pk is not None else None
         )
         if not device:
             return JsonResponse({"error": "Device not found"}, status=404)
@@ -4001,9 +3969,7 @@ def device_delete(request, guid):
     device_pk = _numeric_pk(guid)
     with transaction.atomic():
         device = (
-            RemoteDevice.objects.select_for_update().filter(pk=device_pk).first()
-            if device_pk is not None
-            else None
+            RemoteDevice.objects.select_for_update().filter(pk=device_pk).first() if device_pk is not None else None
         )
         if not device:
             return JsonResponse({"error": "Device not found"}, status=404)
