@@ -324,14 +324,13 @@ def get_single_info(uid):
             profile__guid=personal_guid,
         )
     }
-    devices = (
-        RemoteDevice.objects.filter(Q(owner_id=uid) | Q(rid__in=address_book_peers.keys()))
-        .select_related(
-            "owner__strategy",
-            "device_group__strategy",
-            "strategy",
-        )
-        .distinct()
+    # A saved RID is address-book metadata, not authority to read another
+    # owner's inventory. Non-owned peers stay in address_book_peers and are
+    # normalized below with unknown status and empty inventory fields.
+    devices = RemoteDevice.objects.filter(owner_id=uid).select_related(
+        "owner__strategy",
+        "device_group__strategy",
+        "strategy",
     )
     now = timezone.now()
     items = {}
