@@ -1013,7 +1013,20 @@ class ApiContractTests(ApiTestMixin, TestCase):
             token=device_token,
         )
         self.assertEqual(heartbeat.status_code, 200, heartbeat.content)
-        self.assertEqual(heartbeat.json()["strategy"]["config_options"]["quality"], "best")
+        initial_policy = heartbeat.json()["managed_policy"]
+        self.assertEqual(initial_policy["version"], 1)
+        self.assertEqual(initial_policy["id"], "123456789")
+        self.assertEqual(initial_policy["uuid"], DEFAULT_DEVICE_UUID)
+        self.assertEqual(initial_policy["config_options"]["quality"], "best")
+        canonical = json.dumps(
+            initial_policy["config_options"],
+            sort_keys=True,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode()
+        self.assertEqual(initial_policy["digest"], hashlib.sha256(canonical).hexdigest())
+        self.assertNotIn("strategy", heartbeat.json())
+        self.assertNotIn("modified_at", heartbeat.json())
 
         disabled = self._put_json(
             f"/api/strategies/{strategy.guid}/status",
@@ -1029,7 +1042,9 @@ class ApiContractTests(ApiTestMixin, TestCase):
             token=device_token,
         )
         self.assertEqual(heartbeat.status_code, 200, heartbeat.content)
-        self.assertNotIn("strategy", heartbeat.json())
+        tombstone = heartbeat.json()["managed_policy"]
+        self.assertGreater(tombstone["generation"], initial_policy["generation"])
+        self.assertEqual(tombstone["config_options"], {})
 
     def test_strategy_precedence_and_device_policy_is_admin_only(self):
         admin_token = self._login(
@@ -1072,7 +1087,7 @@ class ApiContractTests(ApiTestMixin, TestCase):
             token=device_token,
         )
         self.assertEqual(
-            heartbeat.json()["strategy"]["config_options"]["source"],
+            heartbeat.json()["managed_policy"]["config_options"]["source"],
             "device",
         )
 
@@ -1092,7 +1107,7 @@ class ApiContractTests(ApiTestMixin, TestCase):
             token=device_token,
         )
         self.assertEqual(
-            heartbeat.json()["strategy"]["config_options"]["source"],
+            heartbeat.json()["managed_policy"]["config_options"]["source"],
             "group",
         )
 
@@ -1108,7 +1123,7 @@ class ApiContractTests(ApiTestMixin, TestCase):
             token=device_token,
         )
         self.assertEqual(
-            heartbeat.json()["strategy"]["config_options"]["source"],
+            heartbeat.json()["managed_policy"]["config_options"]["source"],
             "user",
         )
 
@@ -1463,6 +1478,125 @@ class ApiContractTests(ApiTestMixin, TestCase):
         self.assertEqual(items["765432100"]["platform"], "Linux")
         self.assertEqual(items["765432101"]["status"], "未知状态")
         self.assertEqual(home_response.context["summary"], {"total": 2, "online": 1, "offline": 0, "unknown": 1})
+
+    @override_settings(
+        STORAGES={
+            "default": {"BACKEND": "django.core.files.storage.FileSystemStorage"},
+            "staticfiles": {"BACKEND": "django.contrib.staticfiles.storage.StaticFilesStorage"},
+        }
+    )
+    def test_front_device_pages_do_not_expose_another_owners_inventory_by_rid(self):
+        self._device(
+            owner=self.user,
+            rid="765432100",
+            uuid=device_uuid("alice-owned-device"),
+            cpu="ALICE-CPU-CANARY",
+            hostname="ALICE-HOST-CANARY",
+            memory="ALICE-MEMORY-CANARY",
+            version="ALICE-VERSION-CANARY",
+            ip_address="192.0.2.10",
+        )
+        bob = UserProfile.objects.create_user(username="bob-inventory-owner", password="bob-pass")
+        bob_device = self._device(
+            owner=bob,
+            rid="765432199",
+            uuid=device_uuid("bob-owned-device"),
+            cpu="BOB-CPU-INVENTORY-CANARY",
+            hostname="BOB-HOST-INVENTORY-CANARY",
+            memory="BOB-MEMORY-INVENTORY-CANARY",
+            os="BOB-OS-INVENTORY-CANARY",
+            username="BOB-USER-INVENTORY-CANARY",
+            version="BOB-VERSION-INVENTORY-CANARY",
+            ip_address="203.0.113.77",
+        )
+        bob_update_time = datetime.datetime(2037, 2, 3, 4, 5, tzinfo=datetime.UTC)
+        RemoteDevice.objects.filter(pk=bob_device.pk).update(update_time=bob_update_time)
+        bob_device.refresh_from_db()
+
+        personal_profile = self._personal_profile(self.user)
+        RemotePeer.objects.create(
+            profile=personal_profile,
+            rid=bob_device.rid,
+            username="ALICE-SAVED-USER",
+            hostname="ALICE-SAVED-HOST",
+            alias="Alice saved Bob",
+            note="Alice private note",
+            platform="ALICE-SAVED-PLATFORM",
+        )
+
+        self.client.force_login(self.user)
+        with self.assertLogs("api.views_front", level="INFO") as alice_logs:
+            alice_work = self.client.get("/api/work")
+            alice_home = self.client.get("/api/home")
+        self.client.force_login(bob)
+        bob_work = self.client.get("/api/work")
+        self.client.force_login(self.admin)
+        admin_work = self.client.get("/api/work?show_type=admin")
+
+        for response in (alice_work, alice_home, bob_work, admin_work):
+            self.assertEqual(response.status_code, 200, response.content)
+
+        bob_owned_item = {item["rid"]: item for item in bob_work.context["page_obj"]}[bob_device.rid]
+        self.assertEqual(bob_owned_item["cpu"], "BOB-CPU-INVENTORY-CANARY")
+        self.assertEqual(bob_owned_item["hostname"], "BOB-HOST-INVENTORY-CANARY")
+        admin_item = {item["rid"]: item for item in admin_work.context["page_obj"]}[bob_device.rid]
+        self.assertEqual(admin_item["cpu"], "BOB-CPU-INVENTORY-CANARY")
+        self.assertEqual(admin_item["ip_address"], "203.0.113.77")
+
+        alice_items = {item["rid"]: item for item in alice_work.context["page_obj"]}
+        self.assertEqual(set(alice_items), {"765432100", bob_device.rid})
+        self.assertEqual(alice_items["765432100"]["cpu"], "ALICE-CPU-CANARY")
+        address_book_item = alice_items[bob_device.rid]
+        self.assertEqual(address_book_item["alias"], "Alice saved Bob")
+        self.assertEqual(address_book_item["note"], "Alice private note")
+        self.assertEqual(address_book_item["platform"], "ALICE-SAVED-PLATFORM")
+        self.assertEqual(address_book_item["username"], "ALICE-SAVED-USER")
+        self.assertEqual(address_book_item["hostname"], "ALICE-SAVED-HOST")
+        self.assertEqual(address_book_item["status"], "未知状态")
+        for field in ("version", "os", "cpu", "memory", "ip_address", "create_time", "update_time"):
+            with self.subTest(field=field):
+                self.assertEqual(address_book_item[field], "")
+
+        inventory_canaries = (
+            "BOB-CPU-INVENTORY-CANARY",
+            "BOB-HOST-INVENTORY-CANARY",
+            "BOB-MEMORY-INVENTORY-CANARY",
+            "BOB-OS-INVENTORY-CANARY",
+            "BOB-USER-INVENTORY-CANARY",
+            "BOB-VERSION-INVENTORY-CANARY",
+            "203.0.113.77",
+            "2037-02-03 04:05",
+        )
+        for response in (alice_work, alice_home):
+            for canary in inventory_canaries:
+                with self.subTest(path=response.request["PATH_INFO"], canary=canary):
+                    self.assertNotContains(response, canary)
+        alice_log_output = "\n".join(alice_logs.output)
+        for canary in inventory_canaries:
+            with self.subTest(channel="log", canary=canary):
+                self.assertNotIn(canary, alice_log_output)
+        self.assertContains(alice_work, "Alice saved Bob")
+        self.assertContains(alice_work, "Alice private note")
+        self.assertContains(alice_work, "ALICE-SAVED-PLATFORM")
+        self.assertContains(alice_work, "未知状态")
+        self.assertContains(bob_work, "BOB-CPU-INVENTORY-CANARY")
+        self.assertContains(admin_work, "BOB-CPU-INVENTORY-CANARY")
+
+        bob_device.owner = self.user
+        bob_device.save(update_fields=("owner",))
+        self.client.force_login(self.user)
+        transferred_work = self.client.get("/api/work")
+        self.assertContains(transferred_work, "BOB-CPU-INVENTORY-CANARY")
+        transferred_item = {item["rid"]: item for item in transferred_work.context["page_obj"]}[bob_device.rid]
+        self.assertEqual(transferred_item["status"], "在线")
+
+        bob_device.owner = bob
+        bob_device.save(update_fields=("owner",))
+        revoked_work = self.client.get("/api/work")
+        self.assertNotContains(revoked_work, "BOB-CPU-INVENTORY-CANARY")
+        revoked_item = {item["rid"]: item for item in revoked_work.context["page_obj"]}[bob_device.rid]
+        self.assertEqual(revoked_item["cpu"], "")
+        self.assertEqual(revoked_item["status"], "未知状态")
 
     @override_settings(
         STORAGES={

@@ -2,6 +2,7 @@ import secrets
 
 from django.http import JsonResponse
 
+from api.address_book_errors import AuthorizationGenerationExhausted
 from api.request_utils import InvalidJsonPayload
 from api.response_security import CREDENTIAL_RESPONSE_MARKER, protect_credential_response
 from camellia_remote_management.access_logging import (
@@ -45,4 +46,9 @@ class ApiExceptionMiddleware:
     def process_exception(self, request, exception):
         if isinstance(exception, InvalidJsonPayload):
             return JsonResponse({"error": "Invalid JSON payload"}, status=400)
+        if isinstance(exception, AuthorizationGenerationExhausted):
+            return JsonResponse(
+                {"error": "Address-book authorization generation exhausted"},
+                status=409,
+            )
         return None

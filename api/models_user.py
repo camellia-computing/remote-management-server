@@ -10,7 +10,41 @@ from django.utils.crypto import salted_hmac
 from django.utils.translation import gettext_lazy as _
 
 
-class MyUserManager(BaseUserManager):
+class UserProfileQuerySet(models.QuerySet):
+    def update(self, **kwargs):
+        if not {"strategy", "strategy_id"}.intersection(kwargs):
+            return super().update(**kwargs)
+        from api.policy_generation import (
+            bump_device_policy_generations,
+            device_ids_affected_by_users,
+        )
+
+        with transaction.atomic(using=self.db):
+            user_ids = list(
+                self.select_related(None).select_for_update(of=("self",)).order_by("pk").values_list("pk", flat=True)
+            )
+            device_ids = device_ids_affected_by_users(user_ids, using=self.db)
+            updated = super().update(**kwargs)
+            bump_device_policy_generations(device_ids, using=self.db)
+            return updated
+
+    def delete(self):
+        from api.policy_generation import (
+            bump_device_policy_generations,
+            device_ids_affected_by_users,
+        )
+
+        with transaction.atomic(using=self.db):
+            user_ids = list(
+                self.select_related(None).select_for_update(of=("self",)).order_by("pk").values_list("pk", flat=True)
+            )
+            device_ids = device_ids_affected_by_users(user_ids, using=self.db)
+            result = super().delete()
+            bump_device_policy_generations(device_ids, using=self.db)
+            return result
+
+
+class MyUserManager(BaseUserManager.from_queryset(UserProfileQuerySet)):
     use_in_migrations = True
 
     def create_user(self, username, password=None, **extra_fields):
@@ -94,18 +128,46 @@ class UserProfile(AbstractBaseUser, PermissionsMixin):
         if not self.pk:
             return super().save(*args, **kwargs)
         database = kwargs.get("using") or router.db_for_write(type(self), instance=self)
+        from api.policy_generation import (
+            bump_device_policy_generations,
+            device_ids_affected_by_users,
+        )
+
         with transaction.atomic(using=database):
-            current_generation = (
+            current = (
                 type(self)
                 .objects.using(database)
                 .select_for_update()
                 .filter(pk=self.pk)
-                .values_list("credential_generation", flat=True)
+                .values("credential_generation", "strategy_id")
                 .first()
             )
-            if current_generation is not None:
-                self.credential_generation = current_generation
-            return super().save(*args, **kwargs)
+            if current is None:
+                return super().save(*args, **kwargs)
+            self.credential_generation = current["credential_generation"]
+            result = super().save(*args, **kwargs)
+            update_fields = kwargs.get("update_fields")
+            strategy_may_change = update_fields is None or bool({"strategy", "strategy_id"}.intersection(update_fields))
+            if strategy_may_change and current["strategy_id"] != self.strategy_id:
+                device_ids = device_ids_affected_by_users((self.pk,), using=database)
+                bump_device_policy_generations(device_ids, using=database)
+            return result
+
+    def delete(self, *args, **kwargs):
+        if not self.pk:
+            return super().delete(*args, **kwargs)
+        database = kwargs.get("using") or router.db_for_write(type(self), instance=self)
+        from api.policy_generation import (
+            bump_device_policy_generations,
+            device_ids_affected_by_users,
+        )
+
+        with transaction.atomic(using=database):
+            type(self).objects.using(database).select_for_update().get(pk=self.pk)
+            device_ids = device_ids_affected_by_users((self.pk,), using=database)
+            result = super().delete(*args, **kwargs)
+            bump_device_policy_generations(device_ids, using=database)
+            return result
 
     @property
     def is_staff(self):

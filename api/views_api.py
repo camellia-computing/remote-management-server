@@ -33,6 +33,10 @@ from joserfc.jwk import KeySet
 from joserfc.jwt import JWTClaimsRegistry
 
 # from django.forms.models import model_to_dict
+from api.address_book_authorization import (
+    bump_locked_authorization_generation,
+    lock_profile_access,
+)
 from api.credential_sessions import (
     CredentialGenerationExhausted,
     revoke_device_credentials,
@@ -70,6 +74,11 @@ from api.models import (
     StrategyProfile,
     UserProfile,
 )
+from api.policy_generation import (
+    InvalidManagedPolicy,
+    managed_policy_document,
+    normalize_policy_options,
+)
 from api.request_utils import client_ip, load_json_body, load_json_object
 from api.tag_colors import normalize_tag_color
 from camellia_remote_management.access_logging import normalized_route
@@ -89,7 +98,6 @@ MAX_AB_PEERS = 10_000
 MAX_AB_TAGS = 256
 MAX_AB_TAGS_PER_PEER = 32
 MAX_MANAGEMENT_BATCH_ITEMS = 500
-MAX_STRATEGY_OPTIONS_BYTES = 64 * 1024
 MAX_ALLOWED_INCOMINGS = 500
 RECORD_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]{1,255}$")
 OIDC_SAFE_ID_TOKEN_ALGORITHMS = frozenset(
@@ -912,6 +920,8 @@ def _audit_ab_rule(profile, actor, action, target_type, target_name, rule, detai
     )
     if payload is None:
         payload = {}
+    if isinstance(payload, dict):
+        payload.setdefault("authorization_generation", profile.authorization_generation)
     AddressBookRuleAudit.objects.create(
         profile=profile,
         actor=actor if actor and getattr(actor, "id", None) else None,
@@ -942,6 +952,20 @@ def _get_profile_access(user, guid):
 
 def _can_write_rule(rule):
     return rule in (2, 3)
+
+
+def _lock_profile_for_content_write(user, profile):
+    current, owner, rule = lock_profile_access(user, profile.pk)
+    if not current or not owner or not _can_write_rule(rule):
+        return None, None, 0
+    return current, owner, rule
+
+
+def _lock_profile_for_management(user, profile):
+    current, _owner, _rule = lock_profile_access(user, profile.pk)
+    if not current or (not user.is_admin and str(current.owner_id) != str(user.pk)):
+        return None
+    return current
 
 
 def _safe_tags(tags):
@@ -1022,28 +1046,10 @@ def _json_value(value, *, expected_type, max_bytes):
 
 
 def _strategy_options_value(value):
-    value = _json_value(
-        value,
-        expected_type=dict,
-        max_bytes=MAX_STRATEGY_OPTIONS_BYTES,
-    )
-    if value is None or len(value) > 512:
+    try:
+        return normalize_policy_options(value)
+    except InvalidManagedPolicy:
         return None
-    output = {}
-    for key, option_value in value.items():
-        if (
-            not isinstance(key, str)
-            or not key
-            or len(key) > 128
-            or len(key.encode()) > 512
-            or any(ord(character) < 32 for character in key)
-            or not isinstance(option_value, str)
-            or len(option_value) > 4096
-            or len(option_value.encode()) > 16 * 1024
-        ):
-            return None
-        output[key] = option_value
-    return output
 
 
 def _allowed_incomings_value(value):
@@ -1354,15 +1360,19 @@ def _ensure_personal_device_peer(user, device):
     if not device or not device.public_key_hash:
         return None
     profile = _ensure_personal_profile(user)
-    peer, _created = RemotePeer.objects.get_or_create(
-        profile=profile,
-        rid=device.rid,
-        defaults={
-            "username": device.username or "",
-            "hostname": device.hostname or "",
-            "platform": device.os or "",
-        },
-    )
+    with transaction.atomic():
+        profile, owner, rule = lock_profile_access(user, profile.pk)
+        if not profile or not owner or not _can_write_rule(rule) or profile.guid != _personal_guid(user):
+            return None
+        peer, _created = RemotePeer.objects.get_or_create(
+            profile=profile,
+            rid=device.rid,
+            defaults={
+                "username": device.username or "",
+                "hostname": device.hostname or "",
+                "platform": device.os or "",
+            },
+        )
     return peer
 
 
@@ -1587,23 +1597,14 @@ def heartbeat(request):
         }
     }
     try:
-        client_modified = int(postdata.get("modified_at", 0))
-    except (TypeError, ValueError):
-        client_modified = 0
-    if device:
+        response["managed_policy"] = managed_policy_document(device)
+    except InvalidManagedPolicy:
         profile = device.effective_strategy()
-        if profile and profile.enabled:
-            server_modified = int(profile.updated_at.timestamp())
-            if server_modified != client_modified:
-                response["modified_at"] = server_modified
-                options = _strategy_options_value(profile.config_options)
-                if options is None:
-                    logger.error(
-                        "event=invalid_strategy_options strategy_id=%s",
-                        profile.pk,
-                    )
-                    return JsonResponse({"error": "Invalid strategy configuration"}, status=503)
-                response["strategy"] = {"config_options": options, "extra": {}}
+        logger.error(
+            "event=invalid_strategy_options strategy_id=%s",
+            profile.pk if profile else None,
+        )
+        return JsonResponse({"error": "Invalid strategy configuration"}, status=503)
     _log_event(request, "api_heartbeat", level="debug", username=user.username, rid=rid, uuid=device_uuid)
     return JsonResponse(response)
 
@@ -1628,9 +1629,7 @@ def health_ready(request):
             cursor.execute("SELECT 1")
             cursor.fetchone()
         RemoteDevice.objects.order_by("pk").values_list("pk", flat=True).first()
-        key_states = list(
-            DataEncryptionKeyState.objects.order_by("key_id")[: settings.MAX_DATA_ENCRYPTION_KEYS + 1]
-        )
+        key_states = list(DataEncryptionKeyState.objects.order_by("key_id")[: settings.MAX_DATA_ENCRYPTION_KEYS + 1])
         primary_key_id = getattr(settings, "DATA_ENCRYPTION_PRIMARY_KEY_ID", "")
         if (
             not key_states
@@ -1916,6 +1915,9 @@ def devices_cli(request):
                     raise ValueError("Invalid user_name")
                 profile = _get_or_create_profile(device.owner, ab_name) if ab_name else None
                 profile = profile or _ensure_personal_profile(device.owner)
+                profile, current_owner, current_rule = lock_profile_access(device.owner, profile.pk)
+                if not profile or not current_owner or not _can_write_rule(current_rule):
+                    raise PermissionError("Address-book authorization changed")
                 guid = profile.guid
                 is_personal = guid == _personal_guid(device.owner)
                 tags = [ab_tag] if ab_tag else []
@@ -1936,6 +1938,16 @@ def devices_cli(request):
                         tag_name=ab_tag,
                         defaults={"tag_color": ""},
                     )
+    except PermissionError:
+        _log_event(
+            request,
+            "api_devices_cli_denied",
+            level="warning",
+            username=user.username,
+            rid=rid,
+            reason="address_book_authorization_changed",
+        )
+        return JsonResponse({"error": "Address-book authorization changed"}, status=403)
     except ValueError:
         _log_event(
             request,
@@ -2401,17 +2413,25 @@ def ab_shared_add(request):
     if _is_reserved_ab_profile_name(name):
         return JsonResponse({"error": "Reserved name"}, status=400)
     profile = _get_or_create_profile(user, name)
-    profile.note = note
+    parsed_info = None
     if info is not None:
-        info = _json_value(
+        parsed_info = _json_value(
             info,
             expected_type=(dict, list),
             max_bytes=16 * 1024,
         )
-        if info is None:
+        if parsed_info is None:
             return JsonResponse({"error": "Invalid info"}, status=400)
-        profile.info = info
-    profile.save()
+    with transaction.atomic():
+        profile = _lock_profile_for_management(user, profile)
+        if not profile:
+            return JsonResponse({"error": "Authorization changed"}, status=403)
+        profile.note = note
+        update_fields = ["note", "updated_at"]
+        if parsed_info is not None:
+            profile.info = parsed_info
+            update_fields.append("info")
+        profile.save(update_fields=update_fields)
     _log_event(request, "api_ab_shared_add", username=user.username, guid=profile.guid, name=name)
     return JsonResponse({"code": 1, "guid": profile.guid})
 
@@ -2474,7 +2494,16 @@ def ab_shared_update_profile(request):
         "info": profile.info,
     }
     with transaction.atomic():
-        profile = AddressBookProfile.objects.select_for_update().get(pk=profile.pk)
+        profile = _lock_profile_for_management(user, profile)
+        if not profile:
+            return JsonResponse({"error": "Authorization changed"}, status=403)
+        target_owner = new_owner or profile.owner
+        if (
+            AddressBookProfile.objects.filter(owner=target_owner, name=profile_values["name"])
+            .exclude(pk=profile.pk)
+            .exists()
+        ):
+            return JsonResponse({"error": "Owner already has an address book with this name"}, status=409)
         profile.name = profile_values["name"]
         profile.note = profile_values["note"]
         profile.info = profile_values["info"]
@@ -2497,14 +2526,15 @@ def ab_shared_delete(request):
         return JsonResponse({"error": "Invalid data"}, status=400)
     if len(postdata) > 100:
         return JsonResponse({"error": "Too many address books"}, status=400)
-    candidates = AddressBookProfile.objects.filter(guid__in=[str(x) for x in postdata])
-    if not user.is_admin:
-        candidates = candidates.filter(owner=user)
-    candidates = candidates.exclude(guid__startswith="personal-")
-    guids = list(candidates.values_list("guid", flat=True))
+    requested_guids = [str(value) for value in postdata]
     with transaction.atomic():
-        candidates.delete()
-        deleted = len(guids)
+        candidates = AddressBookProfile.objects.select_for_update().filter(guid__in=requested_guids)
+        if not user.is_admin:
+            candidates = candidates.filter(owner=user)
+        candidates = candidates.exclude(guid__startswith="personal-").order_by("pk")
+        locked_ids = list(candidates.values_list("pk", flat=True))
+        AddressBookProfile.objects.filter(pk__in=locked_ids).delete()
+        deleted = len(locked_ids)
     _log_event(request, "api_ab_shared_delete", username=user.username, count=deleted)
     return JsonResponse({"code": 1, "deleted": deleted})
 
@@ -2585,119 +2615,131 @@ def ab_rule(request):
                 {"error": "Specify exactly one rule target"},
                 status=400,
             )
+        target_user = None
+        target_group = None
         if user_name:
             target_user = _user_by_identifier(user_name, active_only=True)
             if not target_user:
                 return JsonResponse({"error": "User not found"}, status=404)
-            if target_user.id == profile.owner_id:
-                return JsonResponse({"error": "Owner already has full access"}, status=400)
-            share, created = AddressBookShare.objects.update_or_create(
-                profile=profile,
-                user=target_user,
-                defaults={"rule": rule_value},
-            )
-            _audit_ab_rule(
-                profile,
-                user,
-                "share_add" if created else "share_update",
-                "user",
-                target_user.username,
-                rule_value,
-                {"guid": str(share.guid)},
-            )
-            _log_event(
-                request,
-                "api_ab_rule_add",
-                username=user.username,
-                guid=guid,
-                rule=rule_value,
-                user=target_user.username,
-            )
-            return JsonResponse({"guid": share.guid, "rule": share.rule})
-        if group_name:
-            group = Group.objects.filter(Q(name=group_name)).first()
-            if not group:
+        elif group_name:
+            target_group = Group.objects.filter(Q(name=group_name)).first()
+            if not target_group:
                 return JsonResponse({"error": "Group not found"}, status=404)
-            rule_obj, created = AddressBookRule.objects.update_or_create(
-                profile=profile,
-                target_key=f"group:{group.id}",
-                defaults={
-                    "group": group,
-                    "user": None,
-                    "rule": rule_value,
-                    "is_everyone": False,
-                },
-            )
+        with transaction.atomic():
+            profile = _lock_profile_for_management(user, profile)
+            if not profile:
+                return JsonResponse({"error": "Authorization changed"}, status=403)
+            if target_user:
+                if target_user.id == profile.owner_id:
+                    return JsonResponse({"error": "Owner already has full access"}, status=400)
+                changed, created = AddressBookShare.objects.update_or_create(
+                    profile=profile,
+                    user=target_user,
+                    defaults={"rule": rule_value},
+                )
+                target_type = "user"
+                target_name = target_user.username
+            else:
+                target_key = f"group:{target_group.id}" if target_group else "everyone"
+                changed, created = AddressBookRule.objects.update_or_create(
+                    profile=profile,
+                    target_key=target_key,
+                    defaults={
+                        "group": target_group,
+                        "user": None,
+                        "rule": rule_value,
+                        "is_everyone": target_group is None,
+                    },
+                )
+                target_type = "group" if target_group else "everyone"
+                target_name = target_group.name if target_group else "Everyone"
+            bump_locked_authorization_generation(profile)
             _audit_ab_rule(
                 profile,
                 user,
-                "rule_add" if created else "rule_update",
-                "group",
-                group.name,
+                ("share_add" if created else "share_update")
+                if target_user
+                else ("rule_add" if created else "rule_update"),
+                target_type,
+                target_name,
                 rule_value,
-                {"guid": str(rule_obj.guid)},
+                {"guid": str(changed.guid)},
             )
-            _log_event(request, "api_ab_rule_add", username=user.username, guid=guid, rule=rule_value, group=group.name)
-            return JsonResponse({"guid": rule_obj.guid, "rule": rule_obj.rule})
-        rule_obj, created = AddressBookRule.objects.update_or_create(
-            profile=profile,
-            target_key="everyone",
-            defaults={
-                "group": None,
-                "user": None,
-                "rule": rule_value,
-                "is_everyone": True,
-            },
+        _log_event(
+            request,
+            "api_ab_rule_add",
+            username=user.username,
+            guid=guid,
+            rule=rule_value,
+            target=target_name,
         )
-        _audit_ab_rule(
-            profile,
-            user,
-            "rule_add" if created else "rule_update",
-            "everyone",
-            "Everyone",
-            rule_value,
-            {"guid": str(rule_obj.guid)},
-        )
-        _log_event(request, "api_ab_rule_add", username=user.username, guid=guid, rule=rule_value, target="everyone")
-        return JsonResponse({"guid": rule_obj.guid, "rule": rule_obj.rule})
+        return JsonResponse({"guid": changed.guid, "rule": changed.rule})
+
+    rule_guid = postdata.get("guid", "")
+    rule_value = _valid_ab_rule(postdata.get("rule", 1))
+    if rule_value is None:
+        return JsonResponse({"error": "Invalid rule"}, status=400)
+    if not rule_guid:
+        return JsonResponse({"error": "Invalid guid"}, status=400)
+    share = AddressBookShare.objects.filter(Q(guid=rule_guid)).select_related("profile").first()
+    rule_obj = None
+    if share:
+        profile = share.profile
     else:
-        rule_guid = postdata.get("guid", "")
-        rule_value = _valid_ab_rule(postdata.get("rule", 1))
-        if rule_value is None:
-            return JsonResponse({"error": "Invalid rule"}, status=400)
-        if not rule_guid:
-            return JsonResponse({"error": "Invalid guid"}, status=400)
-        share = AddressBookShare.objects.filter(Q(guid=rule_guid)).select_related("profile").first()
-        if share:
-            profile = share.profile
-            if not user.is_admin and str(profile.owner_id) != str(user.id):
-                return JsonResponse({"error": "No access"}, status=403)
-            share.rule = rule_value
-            share.save()
-            target_name = share.user.username if share.user else ""
-            _audit_ab_rule(profile, user, "share_update", "user", target_name, rule_value, {"guid": str(share.guid)})
-            _log_event(request, "api_ab_rule_update", username=user.username, guid=rule_guid, rule=rule_value)
-            return JsonResponse({"code": 1})
         rule_obj = AddressBookRule.objects.filter(Q(guid=rule_guid)).select_related("profile").first()
         if not rule_obj:
             return JsonResponse({"error": "Not found"}, status=404)
         profile = rule_obj.profile
-        if not user.is_admin and str(profile.owner_id) != str(user.id):
-            return JsonResponse({"error": "No access"}, status=403)
-        rule_obj.rule = rule_value
-        rule_obj.save()
-        if rule_obj.is_everyone:
-            target_type = "everyone"
-            target_name = "Everyone"
-        elif rule_obj.group_id:
-            target_type = "group"
-            target_name = rule_obj.group.name if rule_obj.group else ""
-        else:
+    with transaction.atomic():
+        profile = _lock_profile_for_management(user, profile)
+        if not profile:
+            return JsonResponse({"error": "Authorization changed"}, status=403)
+        if share:
+            share = (
+                AddressBookShare.objects.select_for_update()
+                .select_related("user")
+                .filter(pk=share.pk, profile=profile)
+                .first()
+            )
+            if not share:
+                return JsonResponse({"error": "Not found"}, status=404)
+            share.rule = rule_value
+            share.save(update_fields=("rule",))
             target_type = "user"
-            target_name = rule_obj.user.username if rule_obj.user else ""
-        _audit_ab_rule(profile, user, "rule_update", target_type, target_name, rule_value, {"guid": str(rule_obj.guid)})
-        _log_event(request, "api_ab_rule_update", username=user.username, guid=rule_guid, rule=rule_value)
-        return JsonResponse({"code": 1})
+            target_name = share.user.username if share.user else ""
+            changed = share
+        else:
+            rule_obj = (
+                AddressBookRule.objects.select_for_update()
+                .select_related("user", "group")
+                .filter(pk=rule_obj.pk, profile=profile)
+                .first()
+            )
+            if not rule_obj:
+                return JsonResponse({"error": "Not found"}, status=404)
+            rule_obj.rule = rule_value
+            rule_obj.save(update_fields=("rule", "target_key", "updated_at"))
+            if rule_obj.is_everyone:
+                target_type, target_name = "everyone", "Everyone"
+            elif rule_obj.group_id:
+                target_type = "group"
+                target_name = rule_obj.group.name if rule_obj.group else ""
+            else:
+                target_type = "user"
+                target_name = rule_obj.user.username if rule_obj.user else ""
+            changed = rule_obj
+        bump_locked_authorization_generation(profile)
+        _audit_ab_rule(
+            profile,
+            user,
+            "share_update" if share else "rule_update",
+            target_type,
+            target_name,
+            rule_value,
+            {"guid": str(changed.guid)},
+        )
+    _log_event(request, "api_ab_rule_update", username=user.username, guid=rule_guid, rule=rule_value)
+    return JsonResponse({"code": 1})
 
 
 def ab_rules_delete(request):
@@ -2715,8 +2757,20 @@ def ab_rules_delete(request):
         share = AddressBookShare.objects.filter(Q(guid=rule_guid)).select_related("profile").first()
         if share:
             profile = share.profile
-            if user.is_admin or str(profile.owner_id) == str(user.id):
+            with transaction.atomic():
+                profile = _lock_profile_for_management(user, profile)
+                if not profile:
+                    continue
+                share = (
+                    AddressBookShare.objects.select_for_update()
+                    .select_related("user")
+                    .filter(pk=share.pk, profile=profile)
+                    .first()
+                )
+                if not share:
+                    continue
                 target_name = share.user.username if share.user else ""
+                bump_locked_authorization_generation(profile)
                 _audit_ab_rule(
                     profile, user, "share_delete", "user", target_name, share.rule, {"guid": str(share.guid)}
                 )
@@ -2726,7 +2780,18 @@ def ab_rules_delete(request):
         rule_obj = AddressBookRule.objects.filter(Q(guid=rule_guid)).select_related("profile").first()
         if rule_obj:
             profile = rule_obj.profile
-            if user.is_admin or str(profile.owner_id) == str(user.id):
+            with transaction.atomic():
+                profile = _lock_profile_for_management(user, profile)
+                if not profile:
+                    continue
+                rule_obj = (
+                    AddressBookRule.objects.select_for_update()
+                    .select_related("user", "group")
+                    .filter(pk=rule_obj.pk, profile=profile)
+                    .first()
+                )
+                if not rule_obj:
+                    continue
                 if rule_obj.is_everyone:
                     target_type = "everyone"
                     target_name = "Everyone"
@@ -2736,6 +2801,7 @@ def ab_rules_delete(request):
                 else:
                     target_type = "user"
                     target_name = rule_obj.user.username if rule_obj.user else ""
+                bump_locked_authorization_generation(profile)
                 _audit_ab_rule(
                     profile, user, "rule_delete", target_type, target_name, rule_obj.rule, {"guid": str(rule_obj.guid)}
                 )
@@ -2870,7 +2936,10 @@ def ab_peer_add(request, guid):
         peer_data.pop("hash", None)
     try:
         with transaction.atomic():
-            AddressBookProfile.objects.select_for_update().get(pk=profile.pk)
+            profile, owner, _rule = _lock_profile_for_content_write(user, profile)
+            if not profile:
+                return JsonResponse({"error": "Authorization changed"}, status=403)
+            is_personal = profile.guid == _personal_guid(owner)
             existing = RemotePeer.objects.filter(
                 profile=profile,
                 rid=rid,
@@ -2930,20 +2999,24 @@ def ab_peer_update(request, guid):
         peer_data.pop("password", None)
     else:
         peer_data.pop("hash", None)
-    peer = RemotePeer.objects.filter(profile=profile, rid=rid).first()
-    if not peer:
-        _log_event(
-            request,
-            "api_ab_peer_update_failed",
-            level="warning",
-            username=user.username,
-            guid=guid,
-            rid=rid,
-            reason="not_found",
-        )
-        return JsonResponse({"error": "ID_NOT_FOUND"}, status=404)
     try:
-        _upsert_ab_peer(profile, rid, peer_data, is_personal)
+        with transaction.atomic():
+            profile, owner, _rule = _lock_profile_for_content_write(user, profile)
+            if not profile:
+                return JsonResponse({"error": "Authorization changed"}, status=403)
+            is_personal = profile.guid == _personal_guid(owner)
+            if not RemotePeer.objects.filter(profile=profile, rid=rid).exists():
+                _log_event(
+                    request,
+                    "api_ab_peer_update_failed",
+                    level="warning",
+                    username=user.username,
+                    guid=guid,
+                    rid=rid,
+                    reason="not_found",
+                )
+                return JsonResponse({"error": "ID_NOT_FOUND"}, status=404)
+            _upsert_ab_peer(profile, rid, peer_data, is_personal)
     except ValueError:
         return JsonResponse({"error": "Invalid peer"}, status=400)
     _log_event(request, "api_ab_peer_update", username=user.username, guid=guid, rid=rid)
@@ -2983,7 +3056,11 @@ def ab_peer_delete(request, guid):
             reason="invalid_ids",
         )
         return JsonResponse({"error": "Invalid ids"}, status=400)
-    RemotePeer.objects.filter(profile=profile, rid__in=postdata).delete()
+    with transaction.atomic():
+        profile, _owner, _rule = _lock_profile_for_content_write(user, profile)
+        if not profile:
+            return JsonResponse({"error": "Authorization changed"}, status=403)
+        RemotePeer.objects.filter(profile=profile, rid__in=postdata).delete()
     _log_event(request, "api_ab_peer_delete", username=user.username, guid=guid, count=len(postdata))
     return HttpResponse("")
 
@@ -3015,7 +3092,9 @@ def ab_tag_add(request, guid):
         )
         return JsonResponse({"error": "Invalid tag"}, status=400)
     with transaction.atomic():
-        AddressBookProfile.objects.select_for_update().get(pk=profile.pk)
+        profile, _owner, _rule = _lock_profile_for_content_write(user, profile)
+        if not profile:
+            return JsonResponse({"error": "Authorization changed"}, status=403)
         if (
             not RemoteTag.objects.filter(
                 profile=profile,
@@ -3076,6 +3155,9 @@ def ab_tag_rename(request, guid):
         )
         return JsonResponse({"error": "Invalid tag"}, status=400)
     with transaction.atomic():
+        profile, _owner, _rule = _lock_profile_for_content_write(user, profile)
+        if not profile:
+            return JsonResponse({"error": "Authorization changed"}, status=403)
         old_tag = (
             RemoteTag.objects.select_for_update()
             .filter(
@@ -3131,9 +3213,13 @@ def ab_tag_update(request, guid):
             reason="missing_name",
         )
         return JsonResponse({"error": "Invalid tag"}, status=400)
-    RemoteTag.objects.filter(profile=profile, tag_name=name).update(
-        tag_color=str(color),
-    )
+    with transaction.atomic():
+        profile, _owner, _rule = _lock_profile_for_content_write(user, profile)
+        if not profile:
+            return JsonResponse({"error": "Authorization changed"}, status=403)
+        RemoteTag.objects.filter(profile=profile, tag_name=name).update(
+            tag_color=str(color),
+        )
     _log_event(request, "api_ab_tag_update", username=user.username, guid=guid, tag=name)
     return HttpResponse("")
 
@@ -3171,10 +3257,14 @@ def ab_tag_delete(request, guid):
             reason="invalid_tags",
         )
         return JsonResponse({"error": "Invalid tags"}, status=400)
-    RemoteTag.objects.filter(
-        profile=profile,
-        tag_name__in=postdata,
-    ).delete()
+    with transaction.atomic():
+        profile, _owner, _rule = _lock_profile_for_content_write(user, profile)
+        if not profile:
+            return JsonResponse({"error": "Authorization changed"}, status=403)
+        RemoteTag.objects.filter(
+            profile=profile,
+            tag_name__in=postdata,
+        ).delete()
     _log_event(request, "api_ab_tag_delete", username=user.username, guid=guid, count=len(postdata))
     return HttpResponse("")
 
@@ -3838,10 +3928,7 @@ def user_delete(request, guid):
         # its credential, so deleting credentials before locking devices could
         # deadlock with a concurrent heartbeat.
         device_ids = list(
-            RemoteDevice.objects.select_for_update()
-            .filter(owner=target)
-            .order_by("pk")
-            .values_list("pk", flat=True)
+            RemoteDevice.objects.select_for_update().filter(owner=target).order_by("pk").values_list("pk", flat=True)
         )
         DeviceProofChallenge.objects.filter(device_id__in=device_ids).delete()
         DeviceRecoveryApproval.objects.filter(device_id__in=device_ids).delete()
@@ -3942,9 +4029,7 @@ def device_status(request, guid, action):
     device_pk = _numeric_pk(guid)
     with transaction.atomic():
         device = (
-            RemoteDevice.objects.select_for_update().filter(pk=device_pk).first()
-            if device_pk is not None
-            else None
+            RemoteDevice.objects.select_for_update().filter(pk=device_pk).first() if device_pk is not None else None
         )
         if not device:
             return JsonResponse({"error": "Device not found"}, status=404)
@@ -3964,9 +4049,7 @@ def device_approve_recovery(request, guid):
     public_key = str(_load_json_object(request).get("pk", "")).strip()
     with transaction.atomic():
         device = (
-            RemoteDevice.objects.select_for_update().filter(pk=device_pk).first()
-            if device_pk is not None
-            else None
+            RemoteDevice.objects.select_for_update().filter(pk=device_pk).first() if device_pk is not None else None
         )
         if not device:
             return JsonResponse({"error": "Device not found"}, status=404)
@@ -4001,9 +4084,7 @@ def device_delete(request, guid):
     device_pk = _numeric_pk(guid)
     with transaction.atomic():
         device = (
-            RemoteDevice.objects.select_for_update().filter(pk=device_pk).first()
-            if device_pk is not None
-            else None
+            RemoteDevice.objects.select_for_update().filter(pk=device_pk).first() if device_pk is not None else None
         )
         if not device:
             return JsonResponse({"error": "Device not found"}, status=404)

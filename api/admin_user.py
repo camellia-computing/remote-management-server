@@ -9,6 +9,7 @@ from django.db import transaction
 from django.utils.translation import gettext as _
 
 from api import models
+from api.address_book_authorization import bump_locked_authorization_generation
 from api.credential_sessions import revoke_device_credentials, revoke_user_credentials
 
 
@@ -270,7 +271,13 @@ class RemoteDeviceAdminForm(SecretPreservingAdminForm):
 
 class RemoteDeviceAdminCustom(models.RemoteDeviceAdmin):
     form = RemoteDeviceAdminForm
-    readonly_fields = ("rid", "uuid", "public_key_hash", "deployment_generation")
+    readonly_fields = (
+        "rid",
+        "uuid",
+        "public_key_hash",
+        "deployment_generation",
+        "policy_generation",
+    )
 
     def has_add_permission(self, request):
         return False
@@ -327,16 +334,95 @@ class DeviceGroupAdmin(admin.ModelAdmin):
     list_filter = ("strategy", "updated_at")
 
 
+def _lock_address_book_profiles(profile_ids):
+    return list(
+        models.AddressBookProfile.objects.select_for_update()
+        .filter(pk__in=sorted({profile_id for profile_id in profile_ids if profile_id is not None}))
+        .order_by("pk")
+    )
+
+
 class AddressBookProfileAdmin(admin.ModelAdmin):
     list_display = ("name", "guid", "owner", "rule", "created_at", "updated_at")
     search_fields = ("name", "guid", "owner__username")
     list_filter = ("rule", "created_at", "updated_at")
+
+    def save_model(self, request, obj, form, change):
+        with transaction.atomic():
+            previous = (
+                models.AddressBookProfile.objects.select_for_update().filter(pk=obj.pk).first() if change else None
+            )
+            if change and previous is None:
+                raise ValidationError(_("地址簿已被并发删除，请重新加载。"))
+            if previous:
+                obj.authorization_generation = previous.authorization_generation
+            super().save_model(request, obj, form, change)
+
+    def delete_model(self, request, obj):
+        with transaction.atomic():
+            locked = models.AddressBookProfile.objects.select_for_update().filter(pk=obj.pk).first()
+            if locked:
+                super().delete_model(request, locked)
+
+    def delete_queryset(self, request, queryset):
+        with transaction.atomic():
+            locked_ids = [profile.pk for profile in _lock_address_book_profiles(queryset.values_list("pk", flat=True))]
+            super().delete_queryset(request, models.AddressBookProfile.objects.filter(pk__in=locked_ids))
 
 
 class AddressBookShareAdmin(admin.ModelAdmin):
     list_display = ("profile", "user", "rule", "guid", "created_at")
     search_fields = ("profile__name", "user__username", "guid")
     list_filter = ("rule", "created_at")
+
+    def save_model(self, request, obj, form, change):
+        with transaction.atomic():
+            old_profile_id = (
+                models.AddressBookShare.objects.filter(pk=obj.pk).values_list("profile_id", flat=True).first()
+                if change
+                else None
+            )
+            profiles = _lock_address_book_profiles((old_profile_id, obj.profile_id))
+            locked_profile_ids = {profile.pk for profile in profiles}
+            if change:
+                current = models.AddressBookShare.objects.select_for_update().filter(pk=obj.pk).first()
+                if current is None or current.profile_id not in locked_profile_ids:
+                    raise ValidationError(_("地址簿共享已被并发修改，请重新加载。"))
+            super().save_model(request, obj, form, change)
+            for profile in profiles:
+                bump_locked_authorization_generation(profile)
+
+    def delete_model(self, request, obj):
+        with transaction.atomic():
+            profiles = _lock_address_book_profiles((obj.profile_id,))
+            locked_profile_ids = {profile.pk for profile in profiles}
+            current = models.AddressBookShare.objects.select_for_update().filter(pk=obj.pk).first()
+            if current is None:
+                return
+            if current.profile_id not in locked_profile_ids:
+                raise ValidationError(_("地址簿共享已被并发修改，请重新加载。"))
+            super().delete_model(request, current)
+            for profile in profiles:
+                bump_locked_authorization_generation(profile)
+
+    def delete_queryset(self, request, queryset):
+        with transaction.atomic():
+            rows = list(queryset.values_list("pk", "profile_id"))
+            profiles = _lock_address_book_profiles(profile_id for _pk, profile_id in rows)
+            locked_profile_ids = {profile.pk for profile in profiles}
+            locked_rows = list(
+                models.AddressBookShare.objects.select_for_update()
+                .filter(pk__in=[pk for pk, _profile_id in rows])
+                .order_by("pk")
+            )
+            if any(row.profile_id not in locked_profile_ids for row in locked_rows):
+                raise ValidationError(_("地址簿共享已被并发修改，请重新加载。"))
+            super().delete_queryset(
+                request,
+                models.AddressBookShare.objects.filter(pk__in=[row.pk for row in locked_rows]),
+            )
+            for profile in profiles:
+                bump_locked_authorization_generation(profile)
 
 
 class AlarmLogAdmin(admin.ModelAdmin):
@@ -360,6 +446,55 @@ class AddressBookRuleAdmin(admin.ModelAdmin):
     list_display = ("profile", "rule", "user", "group", "is_everyone", "guid", "updated_at")
     search_fields = ("profile__name", "user__username", "group__name", "guid")
     list_filter = ("rule", "is_everyone", "updated_at")
+
+    def save_model(self, request, obj, form, change):
+        with transaction.atomic():
+            old_profile_id = (
+                models.AddressBookRule.objects.filter(pk=obj.pk).values_list("profile_id", flat=True).first()
+                if change
+                else None
+            )
+            profiles = _lock_address_book_profiles((old_profile_id, obj.profile_id))
+            locked_profile_ids = {profile.pk for profile in profiles}
+            if change:
+                current = models.AddressBookRule.objects.select_for_update().filter(pk=obj.pk).first()
+                if current is None or current.profile_id not in locked_profile_ids:
+                    raise ValidationError(_("地址簿规则已被并发修改，请重新加载。"))
+            super().save_model(request, obj, form, change)
+            for profile in profiles:
+                bump_locked_authorization_generation(profile)
+
+    def delete_model(self, request, obj):
+        with transaction.atomic():
+            profiles = _lock_address_book_profiles((obj.profile_id,))
+            locked_profile_ids = {profile.pk for profile in profiles}
+            current = models.AddressBookRule.objects.select_for_update().filter(pk=obj.pk).first()
+            if current is None:
+                return
+            if current.profile_id not in locked_profile_ids:
+                raise ValidationError(_("地址簿规则已被并发修改，请重新加载。"))
+            super().delete_model(request, current)
+            for profile in profiles:
+                bump_locked_authorization_generation(profile)
+
+    def delete_queryset(self, request, queryset):
+        with transaction.atomic():
+            rows = list(queryset.values_list("pk", "profile_id"))
+            profiles = _lock_address_book_profiles(profile_id for _pk, profile_id in rows)
+            locked_profile_ids = {profile.pk for profile in profiles}
+            locked_rows = list(
+                models.AddressBookRule.objects.select_for_update()
+                .filter(pk__in=[pk for pk, _profile_id in rows])
+                .order_by("pk")
+            )
+            if any(row.profile_id not in locked_profile_ids for row in locked_rows):
+                raise ValidationError(_("地址簿规则已被并发修改，请重新加载。"))
+            super().delete_queryset(
+                request,
+                models.AddressBookRule.objects.filter(pk__in=[row.pk for row in locked_rows]),
+            )
+            for profile in profiles:
+                bump_locked_authorization_generation(profile)
 
 
 class AddressBookRuleAuditAdmin(admin.ModelAdmin):

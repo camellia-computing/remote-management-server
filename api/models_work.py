@@ -5,15 +5,101 @@ from django.conf import settings
 from django.contrib import admin
 from django.contrib.auth.models import Group
 from django.core.exceptions import ValidationError
-from django.db import models
+from django.db import models, router, transaction
 from django.db.models.signals import m2m_changed
 from django.dispatch import receiver
 from django.utils import timezone
 from django.utils.translation import gettext_lazy as _
 
+from .address_book_errors import AuthorizationGenerationExhausted
 from .encrypted_fields import EncryptedTextField
 
 ALARM_TYPES = (0, 1, 2, 6, 7, 8, 9)
+POLICY_ASSIGNMENT_FIELDS = frozenset(
+    ("owner", "owner_id", "device_group", "device_group_id", "strategy", "strategy_id")
+)
+POLICY_CONTENT_FIELDS = frozenset(("config_options", "enabled"))
+
+
+class RemoteDeviceQuerySet(models.QuerySet):
+    def update(self, **kwargs):
+        if "policy_generation" in kwargs:
+            raise ValueError("policy_generation is managed internally")
+        if not POLICY_ASSIGNMENT_FIELDS.intersection(kwargs):
+            return super().update(**kwargs)
+        from api.policy_generation import bump_device_policy_generations
+
+        with transaction.atomic(using=self.db):
+            device_ids = list(
+                self.select_related(None).select_for_update(of=("self",)).order_by("pk").values_list("pk", flat=True)
+            )
+            updated = super().update(**kwargs)
+            bump_device_policy_generations(device_ids, using=self.db)
+            return updated
+
+
+class StrategyProfileQuerySet(models.QuerySet):
+    def update(self, **kwargs):
+        if not POLICY_CONTENT_FIELDS.intersection(kwargs):
+            return super().update(**kwargs)
+        from api.policy_generation import (
+            bump_device_policy_generations,
+            device_ids_affected_by_strategies,
+        )
+
+        with transaction.atomic(using=self.db):
+            strategy_ids = list(
+                self.select_related(None).select_for_update().order_by("pk").values_list("pk", flat=True)
+            )
+            device_ids = device_ids_affected_by_strategies(strategy_ids, using=self.db)
+            updated = super().update(**kwargs)
+            bump_device_policy_generations(device_ids, using=self.db)
+            return updated
+
+    def delete(self):
+        from api.policy_generation import (
+            bump_device_policy_generations,
+            device_ids_affected_by_strategies,
+        )
+
+        with transaction.atomic(using=self.db):
+            strategy_ids = list(
+                self.select_related(None).select_for_update().order_by("pk").values_list("pk", flat=True)
+            )
+            device_ids = device_ids_affected_by_strategies(strategy_ids, using=self.db)
+            result = super().delete()
+            bump_device_policy_generations(device_ids, using=self.db)
+            return result
+
+
+class DeviceGroupQuerySet(models.QuerySet):
+    def update(self, **kwargs):
+        if not {"strategy", "strategy_id"}.intersection(kwargs):
+            return super().update(**kwargs)
+        from api.policy_generation import (
+            bump_device_policy_generations,
+            device_ids_affected_by_groups,
+        )
+
+        with transaction.atomic(using=self.db):
+            group_ids = list(self.select_related(None).select_for_update().order_by("pk").values_list("pk", flat=True))
+            device_ids = device_ids_affected_by_groups(group_ids, using=self.db)
+            updated = super().update(**kwargs)
+            bump_device_policy_generations(device_ids, using=self.db)
+            return updated
+
+    def delete(self):
+        from api.policy_generation import (
+            bump_device_policy_generations,
+            device_ids_affected_by_groups,
+        )
+
+        with transaction.atomic(using=self.db):
+            group_ids = list(self.select_related(None).select_for_update().order_by("pk").values_list("pk", flat=True))
+            device_ids = device_ids_affected_by_groups(group_ids, using=self.db)
+            result = super().delete()
+            bump_device_policy_generations(device_ids, using=self.db)
+            return result
 
 
 class DataEncryptionKeyState(models.Model):
@@ -267,6 +353,8 @@ def validate_peer_tag_profile(sender, instance, action, reverse, pk_set, **kwarg
 
 
 class RemoteDevice(models.Model):
+    objects = RemoteDeviceQuerySet.as_manager()
+
     rid = models.CharField(verbose_name=_("客户端ID"), max_length=16, unique=True)
     cpu = models.CharField(verbose_name="CPU", max_length=100)
     hostname = models.CharField(verbose_name=_("主机名"), max_length=100)
@@ -282,6 +370,7 @@ class RemoteDevice(models.Model):
         unique=True,
     )
     deployment_generation = models.PositiveBigIntegerField(default=0, editable=False)
+    policy_generation = models.PositiveBigIntegerField(default=0, editable=False)
     username = models.CharField(verbose_name=_("系统用户名"), max_length=100, blank=True)
     version = models.CharField(verbose_name=_("客户端版本"), max_length=100)
     ip_address = models.GenericIPAddressField(
@@ -336,6 +425,55 @@ class RemoteDevice(models.Model):
             return self.owner.strategy
         return None
 
+    def save(self, *args, **kwargs):
+        if not self.pk:
+            self.policy_generation = 0
+            return super().save(*args, **kwargs)
+        update_fields = kwargs.get("update_fields")
+        if update_fields is not None and not (POLICY_ASSIGNMENT_FIELDS | {"policy_generation"}).intersection(
+            update_fields
+        ):
+            return super().save(*args, **kwargs)
+        database = kwargs.get("using") or router.db_for_write(type(self), instance=self)
+        from api.policy_generation import bump_device_policy_generations
+
+        with transaction.atomic(using=database):
+            previous = (
+                type(self)
+                ._base_manager.using(database)
+                .select_for_update()
+                .filter(pk=self.pk)
+                .values(
+                    "owner_id",
+                    "device_group_id",
+                    "strategy_id",
+                    "policy_generation",
+                )
+                .first()
+            )
+            if previous is None:
+                return super().save(*args, **kwargs)
+            self.policy_generation = previous["policy_generation"]
+            result = super().save(*args, **kwargs)
+            assignment_fields = {
+                "owner_id": {"owner", "owner_id"},
+                "device_group_id": {"device_group", "device_group_id"},
+                "strategy_id": {"strategy", "strategy_id"},
+            }
+            assignment_changed = (
+                update_fields is None and any(previous[field] != getattr(self, field) for field in assignment_fields)
+            ) or (
+                update_fields is not None
+                and any(
+                    aliases.intersection(update_fields) and previous[field] != getattr(self, field)
+                    for field, aliases in assignment_fields.items()
+                )
+            )
+            if assignment_changed:
+                generations = bump_device_policy_generations((self.pk,), using=database)
+                self.policy_generation = generations[self.pk]
+            return result
+
 
 class RemoteDeviceAdmin(admin.ModelAdmin):
     list_display = (
@@ -347,6 +485,7 @@ class RemoteDeviceAdmin(admin.ModelAdmin):
         "owner",
         "device_group",
         "strategy",
+        "policy_generation",
         "create_time",
         "update_time",
     )
@@ -624,6 +763,8 @@ def validate_share_link_peer_owner(
 
 
 class StrategyProfile(models.Model):
+    objects = StrategyProfileQuerySet.as_manager()
+
     guid = models.UUIDField(unique=True, default=uuid.uuid4, editable=False)
     name = models.CharField(verbose_name=_("策略名称"), max_length=60, unique=True)
     config_options = models.JSONField(verbose_name=_("配置项"), blank=True, default=dict)
@@ -645,8 +786,57 @@ class StrategyProfile(models.Model):
         ):
             raise ValidationError(_("策略配置必须是字符串键值映射。"))
 
+    def save(self, *args, **kwargs):
+        update_fields = kwargs.get("update_fields")
+        if not self.pk or (update_fields is not None and not POLICY_CONTENT_FIELDS.intersection(update_fields)):
+            return super().save(*args, **kwargs)
+        database = kwargs.get("using") or router.db_for_write(type(self), instance=self)
+        from api.policy_generation import (
+            bump_device_policy_generations,
+            device_ids_affected_by_strategies,
+        )
+
+        with transaction.atomic(using=database):
+            previous = (
+                type(self)
+                ._base_manager.using(database)
+                .select_for_update()
+                .filter(pk=self.pk)
+                .values("config_options", "enabled")
+                .first()
+            )
+            result = super().save(*args, **kwargs)
+            changed_fields = (
+                POLICY_CONTENT_FIELDS if update_fields is None else POLICY_CONTENT_FIELDS.intersection(update_fields)
+            )
+            if previous is not None and any(previous[field] != getattr(self, field) for field in changed_fields):
+                device_ids = device_ids_affected_by_strategies(
+                    (self.pk,),
+                    using=database,
+                )
+                bump_device_policy_generations(device_ids, using=database)
+            return result
+
+    def delete(self, *args, **kwargs):
+        if not self.pk:
+            return super().delete(*args, **kwargs)
+        database = kwargs.get("using") or router.db_for_write(type(self), instance=self)
+        from api.policy_generation import (
+            bump_device_policy_generations,
+            device_ids_affected_by_strategies,
+        )
+
+        with transaction.atomic(using=database):
+            type(self)._base_manager.using(database).select_for_update().get(pk=self.pk)
+            device_ids = device_ids_affected_by_strategies((self.pk,), using=database)
+            result = super().delete(*args, **kwargs)
+            bump_device_policy_generations(device_ids, using=database)
+            return result
+
 
 class DeviceGroup(models.Model):
+    objects = DeviceGroupQuerySet.as_manager()
+
     guid = models.UUIDField(unique=True, default=uuid.uuid4, editable=False)
     name = models.CharField(verbose_name=_("设备组名称"), max_length=120, unique=True)
     note = models.TextField(verbose_name=_("备注"), blank=True, default="")
@@ -674,6 +864,47 @@ class DeviceGroup(models.Model):
     def __str__(self):
         return self.name
 
+    def save(self, *args, **kwargs):
+        update_fields = kwargs.get("update_fields")
+        if not self.pk or (update_fields is not None and not {"strategy", "strategy_id"}.intersection(update_fields)):
+            return super().save(*args, **kwargs)
+        database = kwargs.get("using") or router.db_for_write(type(self), instance=self)
+        from api.policy_generation import (
+            bump_device_policy_generations,
+            device_ids_affected_by_groups,
+        )
+
+        with transaction.atomic(using=database):
+            previous_strategy_id = (
+                type(self)
+                ._base_manager.using(database)
+                .select_for_update()
+                .filter(pk=self.pk)
+                .values_list("strategy_id", flat=True)
+                .first()
+            )
+            result = super().save(*args, **kwargs)
+            if previous_strategy_id != self.strategy_id:
+                device_ids = device_ids_affected_by_groups((self.pk,), using=database)
+                bump_device_policy_generations(device_ids, using=database)
+            return result
+
+    def delete(self, *args, **kwargs):
+        if not self.pk:
+            return super().delete(*args, **kwargs)
+        database = kwargs.get("using") or router.db_for_write(type(self), instance=self)
+        from api.policy_generation import (
+            bump_device_policy_generations,
+            device_ids_affected_by_groups,
+        )
+
+        with transaction.atomic(using=database):
+            type(self)._base_manager.using(database).select_for_update().get(pk=self.pk)
+            device_ids = device_ids_affected_by_groups((self.pk,), using=database)
+            result = super().delete(*args, **kwargs)
+            bump_device_policy_generations(device_ids, using=database)
+            return result
+
 
 class AddressBookProfile(models.Model):
     guid = models.CharField(verbose_name=_("地址簿GUID"), max_length=60, unique=True)
@@ -682,6 +913,7 @@ class AddressBookProfile(models.Model):
     note = models.TextField(verbose_name=_("备注"), blank=True, default="")
     rule = models.IntegerField(verbose_name=_("共享权限"), default=1)
     info = models.JSONField(verbose_name=_("扩展信息"), blank=True, default=dict)
+    authorization_generation = models.PositiveBigIntegerField(default=0, editable=False)
     created_at = models.DateTimeField(verbose_name=_("创建时间"), default=timezone.now)
     updated_at = models.DateTimeField(verbose_name=_("更新时间"), auto_now=True)
 
@@ -703,6 +935,41 @@ class AddressBookProfile(models.Model):
     def __str__(self):
         owner = getattr(self.owner, "username", "") or self.owner_id or "-"
         return f"{self.name} ({owner})"
+
+    def save(self, *args, **kwargs):
+        if not self.pk:
+            self.authorization_generation = 0
+            return super().save(*args, **kwargs)
+        update_fields = kwargs.get("update_fields")
+        database = kwargs.get("using") or router.db_for_write(type(self), instance=self)
+        with transaction.atomic(using=database):
+            previous = (
+                type(self)
+                ._base_manager.using(database)
+                .select_for_update()
+                .filter(pk=self.pk)
+                .values("owner_id", "authorization_generation")
+                .first()
+            )
+            if previous is None:
+                return super().save(*args, **kwargs)
+            current_generation = previous["authorization_generation"]
+            requested_generation = self.authorization_generation
+            if update_fields is not None and "authorization_generation" in update_fields:
+                if not isinstance(requested_generation, int) or requested_generation != current_generation + 1:
+                    raise ValueError("authorization_generation is managed internally")
+                if requested_generation > (1 << 63) - 1:
+                    raise AuthorizationGenerationExhausted("Address-book authorization generation exhausted")
+            else:
+                requested_generation = current_generation
+            if previous["owner_id"] != self.owner_id:
+                if current_generation >= (1 << 63) - 1:
+                    raise AuthorizationGenerationExhausted("Address-book authorization generation exhausted")
+                requested_generation = current_generation + 1
+                if update_fields is not None:
+                    kwargs["update_fields"] = tuple({*update_fields, "authorization_generation"})
+            self.authorization_generation = requested_generation
+            return super().save(*args, **kwargs)
 
 
 class AddressBookShare(models.Model):
