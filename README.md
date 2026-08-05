@@ -71,6 +71,9 @@ Identity Server对`POST /api/devices/verify-deployment`的每次请求提供随�
 sudo install -d -m 0755 /opt/camellia-remote-management /etc/camellia-remote-management
 sudo install -m 0644 docker-compose.yaml /opt/camellia-remote-management/
 sudo install -m 0755 deploy/backup-postgres.sh /opt/camellia-remote-management/
+sudo install -d -m 0755 /opt/camellia-remote-management/scripts
+sudo install -m 0755 scripts/backup_envelope.py /opt/camellia-remote-management/scripts/
+sudo install -m 0755 deploy/restore-postgres.sh /opt/camellia-remote-management/
 sudo install -m 0600 .env.example /etc/camellia-remote-management/management.env
 sudo install -m 0644 deploy/systemd/*.service deploy/systemd/*.timer /etc/systemd/system/
 sudo systemctl daemon-reload
@@ -87,9 +90,11 @@ Compose 默认仅在同主机、不可从外部路由的 `backend` 网络内使�
 
 ## 备份、恢复与运维
 
-每小时定时器生成 PostgreSQL custom-format 备份并在写入完成后原子重命名。每五分钟的清理任务删除过期登录失败记录、OIDC 会话、设备证明challenge、设备恢复批准和访问令牌，标记过期分享链接，并按配置的保留期删除已消费或已过期链接。备份目录必须位于独立、加密且受监控的存储；至少每天复制到故障域外，并按季度执行恢复演练。
+每小时定时器使用受审固定版本（当前基线 `age v1.2.1`）的 `/usr/bin/age` recipient，在 PostgreSQL 容器输出 custom-format dump 后立即封装并认证加密；明文不会写入备份目录，最终文件是 `postgres-<UTC时间>-<随机backup-id>.dump.age`，并在完整写入后原子重命名。`CAMELLIA_REMOTE_BACKUP_AGE_RECIPIENT`、`CAMELLIA_REMOTE_BACKUP_AGE_KEY_ID` 和 `CAMELLIA_REMOTE_BACKUP_DEPLOYMENT_ID` 必须显式配置。recipient 对应的恢复 identity 只能放在 root/管理员拥有的 0400 或 0600 文件中，不能放入普通 management runtime 容器、镜像、环境文件或备份 artifact；identity 与应用数据加密 key 必须分离。备份目录必须位于独立、加密且受监控的存储；至少每天复制到故障域外，并按季度执行恢复演练。锁竞争返回退出码 75，监控应将其视为本轮跳过而非成功。
 
-恢复流程：停止应用、创建空数据库、用与生产相同主版本的 `pg_restore --clean --if-exists --no-owner --no-acl` 恢复、执行迁移和 `manage.py check --deploy`、验证 `/health/ready`，最后恢复流量。不得在未演练的情况下覆盖现有数据库。
+恢复流程（必须先在隔离环境演练）：停止应用、创建空数据库、准备 root/管理员拥有且权限为 0400/0600 的 identity，设置与备份一致的 `CAMELLIA_REMOTE_BACKUP_DEPLOYMENT_ID`、`CAMELLIA_REMOTE_DATABASE_NAME`、`CAMELLIA_REMOTE_BACKUP_POSTGRES_MAJOR` 和 `CAMELLIA_REMOTE_BACKUP_AGE_KEY_ID`，然后执行 `CAMELLIA_REMOTE_BACKUP_AGE_IDENTITY_FILE=/etc/camellia-remote-management/backup-identity.txt /opt/camellia-remote-management/restore-postgres.sh /var/backups/camellia-remote-management/postgres-<UTC时间>-<backup-id>.dump.age`。脚本先让 age 完整验证密文，再以 `pg_restore --single-transaction --exit-on-error --no-owner --no-acl` 导入；任何密文、manifest、数据库或 PostgreSQL 主版本不匹配都会 fail closed，且恢复用的短暂明文临时文件在退出时删除。随后执行迁移和 `manage.py check --deploy`、验证 `/health/ready`，最后恢复流量。不得在未演练的情况下覆盖现有数据库。
+
+备份密钥轮换：先生成新的 age recipient/identity，更新 `CAMELLIA_REMOTE_BACKUP_AGE_KEY_ID` 与 recipient 并等待一轮成功备份；保留旧 identity，直到旧文件名范围内的备份均已迁移、恢复验证或按保留策略过期，再撤销旧 recipient。恢复 identity 不得与 `CAMELLIA_REMOTE_DATA_ENCRYPTION_KEY` 共用，任何 key material 不得写入日志。
 
 告警至少覆盖就绪探针、5xx、认证失败激增、数据库容量/连接池、备份新鲜度和证书到期。部署失败时回滚到上一镜像摘要；数据库变更按前向修复处理。
 

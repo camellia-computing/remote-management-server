@@ -49,6 +49,7 @@ ignore = ["E501"]
 "api/tests.py" = ["S105", "S106"]
 "api/test_shared_profile_credentials.py" = ["S105", "S106"]
 "webui2/tests.py" = ["S106"]
+"scripts/test_backup_*.py" = ["S603"]
 
 [tool.pytest.ini_options]
 DJANGO_SETTINGS_MODULE = "camellia_remote_management.settings"
