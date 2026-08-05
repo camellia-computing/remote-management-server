@@ -11,6 +11,7 @@ from django.dispatch import receiver
 from django.utils import timezone
 from django.utils.translation import gettext_lazy as _
 
+from .address_book_errors import AuthorizationGenerationExhausted
 from .encrypted_fields import EncryptedTextField
 
 ALARM_TYPES = (0, 1, 2, 6, 7, 8, 9)
@@ -912,6 +913,7 @@ class AddressBookProfile(models.Model):
     note = models.TextField(verbose_name=_("备注"), blank=True, default="")
     rule = models.IntegerField(verbose_name=_("共享权限"), default=1)
     info = models.JSONField(verbose_name=_("扩展信息"), blank=True, default=dict)
+    authorization_generation = models.PositiveBigIntegerField(default=0, editable=False)
     created_at = models.DateTimeField(verbose_name=_("创建时间"), default=timezone.now)
     updated_at = models.DateTimeField(verbose_name=_("更新时间"), auto_now=True)
 
@@ -933,6 +935,41 @@ class AddressBookProfile(models.Model):
     def __str__(self):
         owner = getattr(self.owner, "username", "") or self.owner_id or "-"
         return f"{self.name} ({owner})"
+
+    def save(self, *args, **kwargs):
+        if not self.pk:
+            self.authorization_generation = 0
+            return super().save(*args, **kwargs)
+        update_fields = kwargs.get("update_fields")
+        database = kwargs.get("using") or router.db_for_write(type(self), instance=self)
+        with transaction.atomic(using=database):
+            previous = (
+                type(self)
+                ._base_manager.using(database)
+                .select_for_update()
+                .filter(pk=self.pk)
+                .values("owner_id", "authorization_generation")
+                .first()
+            )
+            if previous is None:
+                return super().save(*args, **kwargs)
+            current_generation = previous["authorization_generation"]
+            requested_generation = self.authorization_generation
+            if update_fields is not None and "authorization_generation" in update_fields:
+                if not isinstance(requested_generation, int) or requested_generation != current_generation + 1:
+                    raise ValueError("authorization_generation is managed internally")
+                if requested_generation > (1 << 63) - 1:
+                    raise AuthorizationGenerationExhausted("Address-book authorization generation exhausted")
+            else:
+                requested_generation = current_generation
+            if previous["owner_id"] != self.owner_id:
+                if current_generation >= (1 << 63) - 1:
+                    raise AuthorizationGenerationExhausted("Address-book authorization generation exhausted")
+                requested_generation = current_generation + 1
+                if update_fields is not None:
+                    kwargs["update_fields"] = tuple({*update_fields, "authorization_generation"})
+            self.authorization_generation = requested_generation
+            return super().save(*args, **kwargs)
 
 
 class AddressBookShare(models.Model):

@@ -23,6 +23,10 @@ from django.shortcuts import render
 from django.utils import timezone
 from django.utils.translation import gettext as _
 
+from api.address_book_authorization import (
+    bump_locked_authorization_generation,
+    lock_profile_access,
+)
 from api.formatting import format_bytes
 from api.login_admission import REGISTER_SCOPE, complete_login_success, reserve_login_attempt
 from api.models import (
@@ -567,6 +571,20 @@ def _can_write_rule(rule):
     return rule in (2, 3)
 
 
+def _lock_profile_for_content_write(user, profile):
+    current, owner, rule = lock_profile_access(user, profile.pk)
+    if not current or not owner or not _can_write_rule(rule):
+        return None, None, 0
+    return current, owner, rule
+
+
+def _lock_profile_for_management(user, profile):
+    current, _owner, _rule = lock_profile_access(user, profile.pk)
+    if not current or (not user.is_admin and str(current.owner_id) != str(user.pk)):
+        return None
+    return current
+
+
 def _ab_accessible_profiles(user, filter_q=None):
     profiles_qs = AddressBookProfile.objects.select_related("owner")
     if not user.is_admin:
@@ -705,9 +723,11 @@ def _peer_form_payload(post):
     }
 
 
-def _upsert_tag(profile, name, color):
+def _upsert_tag(user, profile, name, color):
     with transaction.atomic():
-        AddressBookProfile.objects.select_for_update().get(pk=profile.pk)
+        profile, _owner, _rule = _lock_profile_for_content_write(user, profile)
+        if not profile:
+            return None
         tag = RemoteTag.objects.filter(
             profile=profile,
             tag_name=name,
@@ -762,9 +782,11 @@ def _resolve_profile_tags(profile, tag_names):
     )
 
 
-def _rename_tag(profile, old, new):
+def _rename_tag(user, profile, old, new):
     with transaction.atomic():
-        AddressBookProfile.objects.select_for_update().get(pk=profile.pk)
+        profile, _owner, _rule = _lock_profile_for_content_write(user, profile)
+        if not profile:
+            return None
         old_tag = (
             RemoteTag.objects.select_for_update()
             .filter(
@@ -788,9 +810,11 @@ def _rename_tag(profile, old, new):
     return True
 
 
-def _delete_tag(profile, name):
+def _delete_tag(user, profile, name):
     with transaction.atomic():
-        AddressBookProfile.objects.select_for_update().get(pk=profile.pk)
+        profile, _owner, _rule = _lock_profile_for_content_write(user, profile)
+        if not profile:
+            return None
         deleted = RemoteTag.objects.filter(
             profile=profile,
             tag_name=name,
@@ -841,29 +865,40 @@ def _apply_rule_change(request, user, action, rule_guid, rule_value=None, detail
             return False, _("规则不存在。")
         if not user.is_admin and str(profile.owner_id) != str(user.id):
             return False, _("无权限操作该地址簿。")
-        if action == "delete_rule":
-            _audit_share(profile, user, "share_delete", share, details)
-            _log_event(
-                request,
-                "front_ab_share_delete",
-                username=user.username,
-                guid=profile.guid,
-                target=share.user.username if share.user else "",
+        with transaction.atomic():
+            profile = _lock_profile_for_management(user, profile)
+            if not profile:
+                return False, _("授权已变更，操作未提交。")
+            share = (
+                AddressBookShare.objects.select_for_update()
+                .select_related("user")
+                .filter(pk=share.pk, profile=profile)
+                .first()
             )
-            share.delete()
-            return True, _("用户共享已删除。")
-        old_rule = share.rule
-        share.rule = rule_value
-        share.save()
-        _audit_share(profile, user, "share_update", share, {"before": old_rule, **(details or {})})
+            if not share:
+                return False, _("规则不存在。")
+            if action == "delete_rule":
+                bump_locked_authorization_generation(profile)
+                _audit_share(profile, user, "share_delete", share, details)
+                event = "front_ab_share_delete"
+                message = _("用户共享已删除。")
+                share.delete()
+            else:
+                old_rule = share.rule
+                share.rule = rule_value
+                share.save(update_fields=("rule",))
+                bump_locked_authorization_generation(profile)
+                _audit_share(profile, user, "share_update", share, {"before": old_rule, **(details or {})})
+                event = "front_ab_share_update"
+                message = _("用户共享已更新。")
         _log_event(
             request,
-            "front_ab_share_update",
+            event,
             username=user.username,
             guid=profile.guid,
             target=share.user.username if share.user else "",
         )
-        return True, _("用户共享已更新。")
+        return True, message
 
     rule_obj = AddressBookRule.objects.filter(Q(guid=rule_guid)).select_related("profile", "user", "group").first()
     if not rule_obj:
@@ -873,17 +908,34 @@ def _apply_rule_change(request, user, action, rule_guid, rule_value=None, detail
         return False, _("规则不存在。")
     if not user.is_admin and str(profile.owner_id) != str(user.id):
         return False, _("无权限操作该地址簿。")
-    if action == "delete_rule":
-        _audit_rule(profile, user, "rule_delete", rule_obj, details)
-        _log_event(request, "front_ab_rule_delete", username=user.username, guid=profile.guid)
-        rule_obj.delete()
-        return True, _("规则已删除。")
-    old_rule = rule_obj.rule
-    rule_obj.rule = rule_value
-    rule_obj.save()
-    _audit_rule(profile, user, "rule_update", rule_obj, {"before": old_rule, **(details or {})})
-    _log_event(request, "front_ab_rule_update", username=user.username, guid=profile.guid)
-    return True, _("规则已更新。")
+    with transaction.atomic():
+        profile = _lock_profile_for_management(user, profile)
+        if not profile:
+            return False, _("授权已变更，操作未提交。")
+        rule_obj = (
+            AddressBookRule.objects.select_for_update()
+            .select_related("user", "group")
+            .filter(pk=rule_obj.pk, profile=profile)
+            .first()
+        )
+        if not rule_obj:
+            return False, _("规则不存在。")
+        if action == "delete_rule":
+            bump_locked_authorization_generation(profile)
+            _audit_rule(profile, user, "rule_delete", rule_obj, details)
+            event = "front_ab_rule_delete"
+            message = _("规则已删除。")
+            rule_obj.delete()
+        else:
+            old_rule = rule_obj.rule
+            rule_obj.rule = rule_value
+            rule_obj.save(update_fields=("rule", "target_key", "updated_at"))
+            bump_locked_authorization_generation(profile)
+            _audit_rule(profile, user, "rule_update", rule_obj, {"before": old_rule, **(details or {})})
+            event = "front_ab_rule_update"
+            message = _("规则已更新。")
+    _log_event(request, event, username=user.username, guid=profile.guid)
+    return True, message
 
 
 def _collect_global_rules(filter_q=None, allowed_guids=None):
@@ -977,6 +1029,8 @@ def _audit_ab_rule(profile, actor, action, target_type, target_name, rule, detai
     if not profile:
         return
     payload = details if isinstance(details, (dict, list)) else {}
+    if isinstance(payload, dict):
+        payload.setdefault("authorization_generation", profile.authorization_generation)
     AddressBookRuleAudit.objects.create(
         profile=profile,
         actor=actor if actor and getattr(actor, "id", None) else None,
@@ -1143,9 +1197,17 @@ def share(request, share_token=None):
                 link.save(update_fields=["is_expired"])
                 return _share_message(request, "错误", "分享链接内容无效。", status=400)
             personal_profile = _ensure_personal_profile(request.user)
-            AddressBookProfile.objects.select_for_update().get(
-                pk=personal_profile.pk,
+            personal_profile, personal_owner, personal_rule = lock_profile_access(
+                request.user,
+                personal_profile.pk,
             )
+            if (
+                not personal_profile
+                or not personal_owner
+                or not _can_write_rule(personal_rule)
+                or personal_profile.guid != _personal_guid(request.user)
+            ):
+                return _share_message(request, "错误", "地址簿授权已变更。", status=403)
             existing_ids = set(
                 RemotePeer.objects.filter(
                     profile=personal_profile,
@@ -1437,16 +1499,22 @@ def ab_manage(request):
             if not target:
                 messages.error(request, _("用户不存在。"))
                 return HttpResponseRedirect("/api/ab_manage")
-            share = AddressBookShare.objects.filter(Q(profile=profile) & Q(user=target)).first()
-            created = False
-            if not share:
-                share = AddressBookShare(profile=profile, user=target, rule=rule_value)
-                created = True
-            else:
-                share.rule = rule_value
-            share.save()
-            action_name = "share_add" if created else "share_update"
-            _audit_share(profile, u, action_name, share, {"created": created})
+            with transaction.atomic():
+                profile = _lock_profile_for_management(u, profile)
+                if not profile:
+                    messages.error(request, _("授权已变更，操作未提交。"))
+                    return HttpResponseRedirect("/api/ab_manage")
+                if target.pk == profile.owner_id:
+                    messages.error(request, _("所属用户已拥有完全权限。"))
+                    return HttpResponseRedirect("/api/ab_manage")
+                share, created = AddressBookShare.objects.update_or_create(
+                    profile=profile,
+                    user=target,
+                    defaults={"rule": rule_value},
+                )
+                bump_locked_authorization_generation(profile)
+                action_name = "share_add" if created else "share_update"
+                _audit_share(profile, u, action_name, share, {"created": created})
             _log_event(request, "front_ab_share_add", username=u.username, guid=profile_guid, target=target.username)
             messages.success(request, _("用户共享已更新。"))
             return HttpResponseRedirect("/api/ab_manage")
@@ -1460,32 +1528,47 @@ def ab_manage(request):
             if not group:
                 messages.error(request, _("用户组不存在。"))
                 return HttpResponseRedirect("/api/ab_manage")
-            rule_obj = AddressBookRule.objects.filter(Q(profile=profile) & Q(group=group)).first()
-            created = False
-            if not rule_obj:
-                rule_obj = AddressBookRule(profile=profile, group=group, rule=rule_value)
-                created = True
-            else:
-                rule_obj.rule = rule_value
-            rule_obj.is_everyone = False
-            rule_obj.save()
-            action_name = "rule_add" if created else "rule_update"
-            _audit_rule(profile, u, action_name, rule_obj, {"created": created})
+            with transaction.atomic():
+                profile = _lock_profile_for_management(u, profile)
+                if not profile:
+                    messages.error(request, _("授权已变更，操作未提交。"))
+                    return HttpResponseRedirect("/api/ab_manage")
+                rule_obj, created = AddressBookRule.objects.update_or_create(
+                    profile=profile,
+                    target_key=f"group:{group.pk}",
+                    defaults={
+                        "group": group,
+                        "user": None,
+                        "rule": rule_value,
+                        "is_everyone": False,
+                    },
+                )
+                bump_locked_authorization_generation(profile)
+                action_name = "rule_add" if created else "rule_update"
+                _audit_rule(profile, u, action_name, rule_obj, {"created": created})
             _log_event(request, "front_ab_rule_group_add", username=u.username, guid=profile_guid, group=group.name)
             messages.success(request, _("组规则已更新。"))
             return HttpResponseRedirect("/api/ab_manage")
 
         if action == "add_everyone_rule":
-            rule_obj = AddressBookRule.objects.filter(Q(profile=profile) & Q(is_everyone=True)).first()
-            created = False
-            if not rule_obj:
-                rule_obj = AddressBookRule(profile=profile, rule=rule_value, is_everyone=True)
-                created = True
-            else:
-                rule_obj.rule = rule_value
-            rule_obj.save()
-            action_name = "rule_add" if created else "rule_update"
-            _audit_rule(profile, u, action_name, rule_obj, {"created": created})
+            with transaction.atomic():
+                profile = _lock_profile_for_management(u, profile)
+                if not profile:
+                    messages.error(request, _("授权已变更，操作未提交。"))
+                    return HttpResponseRedirect("/api/ab_manage")
+                rule_obj, created = AddressBookRule.objects.update_or_create(
+                    profile=profile,
+                    target_key="everyone",
+                    defaults={
+                        "group": None,
+                        "user": None,
+                        "rule": rule_value,
+                        "is_everyone": True,
+                    },
+                )
+                bump_locked_authorization_generation(profile)
+                action_name = "rule_add" if created else "rule_update"
+                _audit_rule(profile, u, action_name, rule_obj, {"created": created})
             _log_event(request, "front_ab_rule_everyone_add", username=u.username, guid=profile_guid)
             messages.success(request, _("Everyone 规则已更新。"))
             return HttpResponseRedirect("/api/ab_manage")
@@ -1659,21 +1742,26 @@ def ab_books(request):
             if not name or note is None:
                 messages.error(request, _("地址簿名称或备注格式无效。"))
                 return HttpResponseRedirect("/api/ab_books")
-            if name != profile.name:
-                if _is_reserved_ab_profile_name(name):
-                    messages.error(request, _("地址簿名称为保留名称。"))
-                    return HttpResponseRedirect("/api/ab_books")
-                if (
-                    AddressBookProfile.objects.filter(Q(owner=profile.owner) & Q(name=name))
-                    .exclude(pk=profile.pk)
-                    .exists()
-                ):
-                    messages.error(request, _("地址簿名称已存在。"))
-                    return HttpResponseRedirect("/api/ab_books")
-                profile.name = name
-            profile.note = note
             try:
-                profile.save()
+                with transaction.atomic():
+                    profile = _lock_profile_for_management(u, profile)
+                    if not profile:
+                        messages.error(request, _("授权已变更，操作未提交。"))
+                        return HttpResponseRedirect("/api/ab_books")
+                    if name != profile.name:
+                        if _is_reserved_ab_profile_name(name):
+                            messages.error(request, _("地址簿名称为保留名称。"))
+                            return HttpResponseRedirect("/api/ab_books")
+                        if (
+                            AddressBookProfile.objects.filter(Q(owner=profile.owner) & Q(name=name))
+                            .exclude(pk=profile.pk)
+                            .exists()
+                        ):
+                            messages.error(request, _("地址簿名称已存在。"))
+                            return HttpResponseRedirect("/api/ab_books")
+                        profile.name = name
+                    profile.note = note
+                    profile.save(update_fields=("name", "note", "updated_at"))
             except IntegrityError:
                 messages.error(request, _("地址簿名称已存在。"))
                 return HttpResponseRedirect("/api/ab_books")
@@ -1693,7 +1781,12 @@ def ab_books(request):
             if not u.is_admin and str(profile.owner_id) != str(u.id):
                 messages.error(request, _("无权限操作该地址簿。"))
                 return HttpResponseRedirect("/api/ab_books")
-            profile.delete()
+            with transaction.atomic():
+                profile = _lock_profile_for_management(u, profile)
+                if not profile:
+                    messages.error(request, _("授权已变更，操作未提交。"))
+                    return HttpResponseRedirect("/api/ab_books")
+                profile.delete()
             _log_event(request, "front_ab_book_delete", username=u.username, guid=guid)
             messages.success(request, _("地址簿已删除。"))
             return HttpResponseRedirect("/api/ab_books")
@@ -1719,25 +1812,28 @@ def ab_books(request):
                 messages.error(request, _("目标用户不存在。"))
                 return HttpResponseRedirect("/api/ab_books")
             if str(profile.owner_id) != str(new_owner.id):
-                if (
-                    AddressBookProfile.objects.filter(
-                        owner=new_owner,
-                        name=profile.name,
-                    )
-                    .exclude(pk=profile.pk)
-                    .exists()
-                ):
-                    messages.error(request, _("目标用户已有同名地址簿。"))
-                    return HttpResponseRedirect("/api/ab_books")
                 try:
                     with transaction.atomic():
-                        profile = AddressBookProfile.objects.select_for_update().get(pk=profile.pk)
+                        profile = _lock_profile_for_management(u, profile)
+                        if not profile:
+                            messages.error(request, _("授权已变更，操作未提交。"))
+                            return HttpResponseRedirect("/api/ab_books")
+                        if (
+                            AddressBookProfile.objects.filter(
+                                owner=new_owner,
+                                name=profile.name,
+                            )
+                            .exclude(pk=profile.pk)
+                            .exists()
+                        ):
+                            messages.error(request, _("目标用户已有同名地址簿。"))
+                            return HttpResponseRedirect("/api/ab_books")
                         profile.owner = new_owner
-                        profile.save(update_fields=["owner", "updated_at"])
                         AddressBookShare.objects.filter(
                             profile=profile,
                             user=new_owner,
                         ).delete()
+                        profile.save(update_fields=["owner", "updated_at"])
                 except IntegrityError:
                     messages.error(request, _("目标用户已有同名地址簿。"))
                     return HttpResponseRedirect("/api/ab_books")
@@ -1883,7 +1979,10 @@ def ab_book(request):
             updated = 0
             if action in ("bulk_tag_add", "bulk_tag_remove", "bulk_tag_replace"):
                 with transaction.atomic():
-                    AddressBookProfile.objects.select_for_update().get(pk=profile.pk)
+                    profile, _owner, _rule = _lock_profile_for_content_write(u, profile)
+                    if not profile:
+                        messages.error(request, _("授权已变更，操作未提交。"))
+                        return HttpResponseRedirect(f"/api/ab_book?guid={guid}")
                     peers = list(peers_qs.select_for_update().prefetch_related("tags"))
                     tags_by_peer = {}
                     required_tags = set()
@@ -1926,14 +2025,31 @@ def ab_book(request):
                 if note_value is None:
                     messages.error(request, _("备注内容过长或格式无效。"))
                     return HttpResponseRedirect(f"/api/ab_book?guid={profile.guid}")
-                updated = peers_qs.update(note=note_value)
+                with transaction.atomic():
+                    profile, _owner, _rule = _lock_profile_for_content_write(u, profile)
+                    if not profile:
+                        messages.error(request, _("授权已变更，操作未提交。"))
+                        return HttpResponseRedirect(f"/api/ab_book?guid={guid}")
+                    updated = RemotePeer.objects.filter(
+                        profile=profile,
+                        rid__in=peer_ids,
+                    ).update(note=note_value)
                 _log_event(request, "front_ab_bulk_note", username=u.username, guid=profile.guid, count=updated)
                 messages.success(request, _("已批量更新 %(count)s 台设备备注。") % {"count": updated})
                 return HttpResponseRedirect(f"/api/ab_book?guid={profile.guid}")
 
             if action == "bulk_peer_delete":
-                deleted = peers_qs.count()
-                peers_qs.delete()
+                with transaction.atomic():
+                    profile, _owner, _rule = _lock_profile_for_content_write(u, profile)
+                    if not profile:
+                        messages.error(request, _("授权已变更，操作未提交。"))
+                        return HttpResponseRedirect(f"/api/ab_book?guid={guid}")
+                    locked_peers = RemotePeer.objects.filter(
+                        profile=profile,
+                        rid__in=peer_ids,
+                    )
+                    deleted = locked_peers.count()
+                    locked_peers.delete()
                 _log_event(request, "front_ab_bulk_delete", username=u.username, guid=profile.guid, count=deleted)
                 messages.success(request, _("已批量删除 %(count)s 台设备。") % {"count": deleted})
                 return HttpResponseRedirect(f"/api/ab_book?guid={profile.guid}")
@@ -1944,7 +2060,11 @@ def ab_book(request):
             if name is None or color is None:
                 messages.error(request, _("标签名称或颜色格式无效。"))
                 return HttpResponseRedirect(f"/api/ab_book?guid={profile.guid}")
-            if not _upsert_tag(profile, name, color):
+            updated = _upsert_tag(u, profile, name, color)
+            if updated is None:
+                messages.error(request, _("授权已变更，操作未提交。"))
+                return HttpResponseRedirect(f"/api/ab_book?guid={guid}")
+            if not updated:
                 messages.error(request, _("地址簿标签数量已达到上限。"))
                 return HttpResponseRedirect(f"/api/ab_book?guid={profile.guid}")
             _log_event(request, "front_ab_tag_add", username=u.username, guid=profile.guid, tag=name)
@@ -1957,7 +2077,11 @@ def ab_book(request):
             if old is None or new is None:
                 messages.error(request, _("标签名称无效。"))
                 return HttpResponseRedirect(f"/api/ab_book?guid={profile.guid}")
-            if not _rename_tag(profile, old, new):
+            renamed = _rename_tag(u, profile, old, new)
+            if renamed is None:
+                messages.error(request, _("授权已变更，操作未提交。"))
+                return HttpResponseRedirect(f"/api/ab_book?guid={guid}")
+            if not renamed:
                 messages.error(request, _("标签不存在。"))
                 return HttpResponseRedirect(f"/api/ab_book?guid={profile.guid}")
             _log_event(request, "front_ab_tag_rename", username=u.username, guid=profile.guid, old=old, new=new)
@@ -1970,7 +2094,11 @@ def ab_book(request):
             if name is None or color is None:
                 messages.error(request, _("标签名称或颜色格式无效。"))
                 return HttpResponseRedirect(f"/api/ab_book?guid={profile.guid}")
-            if not _upsert_tag(profile, name, color):
+            updated = _upsert_tag(u, profile, name, color)
+            if updated is None:
+                messages.error(request, _("授权已变更，操作未提交。"))
+                return HttpResponseRedirect(f"/api/ab_book?guid={guid}")
+            if not updated:
                 messages.error(request, _("地址簿标签数量已达到上限。"))
                 return HttpResponseRedirect(f"/api/ab_book?guid={profile.guid}")
             _log_event(request, "front_ab_tag_update", username=u.username, guid=profile.guid, tag=name)
@@ -1982,7 +2110,9 @@ def ab_book(request):
             if name is None:
                 messages.error(request, _("标签名称无效。"))
                 return HttpResponseRedirect(f"/api/ab_book?guid={profile.guid}")
-            _delete_tag(profile, name)
+            if _delete_tag(u, profile, name) is None:
+                messages.error(request, _("授权已变更，操作未提交。"))
+                return HttpResponseRedirect(f"/api/ab_book?guid={guid}")
             _log_event(request, "front_ab_tag_delete", username=u.username, guid=profile.guid, tag=name)
             messages.success(request, _("标签已删除。"))
             return HttpResponseRedirect(f"/api/ab_book?guid={profile.guid}")
@@ -1994,7 +2124,11 @@ def ab_book(request):
                 return HttpResponseRedirect(f"/api/ab_book?guid={profile.guid}")
             rid = peer_data["rid"]
             with transaction.atomic():
-                AddressBookProfile.objects.select_for_update().get(pk=profile.pk)
+                profile, _owner, _rule = _lock_profile_for_content_write(u, profile)
+                if not profile:
+                    messages.error(request, _("授权已变更，操作未提交。"))
+                    return HttpResponseRedirect(f"/api/ab_book?guid={guid}")
+                is_personal = _is_personal_guid(profile.guid)
                 peer = RemotePeer.objects.filter(
                     profile=profile,
                     rid=rid,
@@ -2052,7 +2186,11 @@ def ab_book(request):
                 return HttpResponseRedirect(f"/api/ab_book?guid={profile.guid}")
             rid = peer_data["rid"]
             with transaction.atomic():
-                AddressBookProfile.objects.select_for_update().get(pk=profile.pk)
+                profile, _owner, _rule = _lock_profile_for_content_write(u, profile)
+                if not profile:
+                    messages.error(request, _("授权已变更，操作未提交。"))
+                    return HttpResponseRedirect(f"/api/ab_book?guid={guid}")
+                is_personal = _is_personal_guid(profile.guid)
                 peer = (
                     RemotePeer.objects.select_for_update()
                     .filter(
@@ -2086,7 +2224,12 @@ def ab_book(request):
             if rid is None:
                 messages.error(request, _("设备 ID 格式无效。"))
                 return HttpResponseRedirect(f"/api/ab_book?guid={profile.guid}")
-            RemotePeer.objects.filter(profile=profile, rid=rid).delete()
+            with transaction.atomic():
+                profile, _owner, _rule = _lock_profile_for_content_write(u, profile)
+                if not profile:
+                    messages.error(request, _("授权已变更，操作未提交。"))
+                    return HttpResponseRedirect(f"/api/ab_book?guid={guid}")
+                RemotePeer.objects.filter(profile=profile, rid=rid).delete()
             _log_event(request, "front_ab_peer_delete", username=u.username, guid=profile.guid, rid=rid)
             messages.success(request, _("设备已删除。"))
             return HttpResponseRedirect(f"/api/ab_book?guid={profile.guid}")
@@ -2241,7 +2384,11 @@ def tag_manage(request):
             if name is None or color is None:
                 messages.error(request, _("标签名称或颜色格式无效。"))
                 return HttpResponseRedirect("/api/tag_manage")
-            if not _upsert_tag(target_profile, name, color):
+            updated = _upsert_tag(u, target_profile, name, color)
+            if updated is None:
+                messages.error(request, _("授权已变更，操作未提交。"))
+                return HttpResponseRedirect("/api/tag_manage")
+            if not updated:
                 messages.error(request, _("地址簿标签数量已达到上限。"))
                 return HttpResponseRedirect("/api/tag_manage")
             _log_event(request, "front_tag_add", username=u.username, guid=profile_guid, tag=name)
@@ -2254,7 +2401,11 @@ def tag_manage(request):
             if name is None or color is None:
                 messages.error(request, _("标签名称或颜色格式无效。"))
                 return HttpResponseRedirect("/api/tag_manage")
-            if not _upsert_tag(target_profile, name, color):
+            updated = _upsert_tag(u, target_profile, name, color)
+            if updated is None:
+                messages.error(request, _("授权已变更，操作未提交。"))
+                return HttpResponseRedirect("/api/tag_manage")
+            if not updated:
                 messages.error(request, _("地址簿标签数量已达到上限。"))
                 return HttpResponseRedirect("/api/tag_manage")
             _log_event(request, "front_tag_update", username=u.username, guid=profile_guid, tag=name)
@@ -2270,7 +2421,11 @@ def tag_manage(request):
             if old == new:
                 messages.success(request, _("标签已重命名。"))
                 return HttpResponseRedirect("/api/tag_manage")
-            if not _rename_tag(target_profile, old, new):
+            renamed = _rename_tag(u, target_profile, old, new)
+            if renamed is None:
+                messages.error(request, _("授权已变更，操作未提交。"))
+                return HttpResponseRedirect("/api/tag_manage")
+            if not renamed:
                 messages.error(request, _("标签不存在。"))
                 return HttpResponseRedirect("/api/tag_manage")
             _log_event(request, "front_tag_rename", username=u.username, guid=profile_guid, old=old, new=new)
@@ -2282,7 +2437,9 @@ def tag_manage(request):
             if name is None:
                 messages.error(request, _("标签名称无效。"))
                 return HttpResponseRedirect("/api/tag_manage")
-            _delete_tag(target_profile, name)
+            if _delete_tag(u, target_profile, name) is None:
+                messages.error(request, _("授权已变更，操作未提交。"))
+                return HttpResponseRedirect("/api/tag_manage")
             _log_event(request, "front_tag_delete", username=u.username, guid=profile_guid, tag=name)
             messages.success(request, _("标签已删除。"))
             return HttpResponseRedirect("/api/tag_manage")
