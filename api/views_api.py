@@ -97,6 +97,7 @@ MAX_AUDIT_FILES = 10
 MAX_AB_PEERS = 10_000
 MAX_AB_TAGS = 256
 MAX_AB_TAGS_PER_PEER = 32
+MAX_AB_PROFILE_PASSWORD_BYTES = 240
 MAX_MANAGEMENT_BATCH_ITEMS = 500
 MAX_ALLOWED_INCOMINGS = 500
 RECORD_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]{1,255}$")
@@ -305,6 +306,10 @@ def _is_active_owned_device(device, user):
 
 
 class DeviceIdentityConflict(Exception):
+    pass
+
+
+class DeviceCredentialFinalizationError(RuntimeError):
     pass
 
 
@@ -1045,6 +1050,56 @@ def _json_value(value, *, expected_type, max_bytes):
     return value if len(encoded) <= max_bytes else None
 
 
+_PROFILE_INFO_FORBIDDEN_KEYS = frozenset(
+    {
+        "credential",
+        "credentials",
+        "password",
+        "rhash",
+        "secret",
+        "token",
+    }
+)
+
+
+def _profile_info_contains_credential(value):
+    if isinstance(value, dict):
+        for key, child in value.items():
+            if isinstance(key, str) and key.casefold() in _PROFILE_INFO_FORBIDDEN_KEYS:
+                return True
+            if _profile_info_contains_credential(child):
+                return True
+    elif isinstance(value, list):
+        return any(_profile_info_contains_credential(child) for child in value)
+    return False
+
+
+def _profile_info_value(value):
+    parsed = _json_value(value, expected_type=(dict, list), max_bytes=16 * 1024)
+    if parsed is None or _profile_info_contains_credential(parsed):
+        return None
+    return parsed
+
+
+def _public_profile_info(value):
+    if isinstance(value, dict):
+        return {
+            key: _public_profile_info(child)
+            for key, child in value.items()
+            if not isinstance(key, str) or key.casefold() not in _PROFILE_INFO_FORBIDDEN_KEYS
+        }
+    if isinstance(value, list):
+        return [_public_profile_info(child) for child in value]
+    return value
+
+
+def _profile_default_password(value):
+    value = _bounded_text_value(value, MAX_AB_PROFILE_PASSWORD_BYTES)
+    if value is None or len(value) > 60:
+        return None
+    return value
+
+
 def _strategy_options_value(value):
     try:
         return normalize_policy_options(value)
@@ -1376,6 +1431,13 @@ def _ensure_personal_device_peer(user, device):
     return peer
 
 
+def _finalize_personal_device_peer(user, device):
+    try:
+        return _ensure_personal_device_peer(user, device)
+    except IntegrityError as exc:
+        raise DeviceCredentialFinalizationError("Personal device peer finalization failed") from exc
+
+
 def login(request):
     result = {}
     data = _load_json_object(request)
@@ -1423,6 +1485,8 @@ def login(request):
                 DeviceProofChallenge.PURPOSE_LOGIN,
             )
             _token, raw_token = _issue_access_token(user, device)
+            _finalize_personal_device_peer(user, device)
+            complete_login_success(admission)
     except DeviceIdentityConflict:
         _log_event(
             request, "api_login_denied", level="warning", username=username, reason="device_identity_conflict", rid=rid
@@ -1438,10 +1502,6 @@ def login(request):
             request, "api_login_denied", level="warning", username=username, reason="device_identity_race", rid=rid
         )
         return JsonResponse({"error": "Device identity conflict"}, status=409)
-    complete_login_success(admission)
-
-    _ensure_personal_device_peer(user, device)
-
     result.update(_auth_body(user, raw_token))
     _log_event(request, "api_login_success", username=user.username, rid=rid)
     return JsonResponse(result)
@@ -2092,6 +2152,7 @@ def devices_deploy(request):
             device.save()
             if old_rid != rid or old_uuid != uuid_value or (old_key_hash and old_key_hash != public_key_hash):
                 _revoke_device_tokens(device)
+            _finalize_personal_device_peer(user, device)
     except DeviceRecoveryRequired:
         return JsonResponse({"result": "RECOVERY_REQUIRED"}, status=409)
     except DeviceProofError:
@@ -2100,7 +2161,6 @@ def devices_deploy(request):
         _log_event(request, "api_devices_deploy_conflict", level="warning", username=user.username, rid=rid)
         return JsonResponse({"result": "ID_TAKEN"}, status=409)
 
-    _ensure_personal_device_peer(user, device)
     _log_event(request, "api_devices_deploy_ok", username=user.username, rid=rid)
     return JsonResponse({"result": "OK"})
 
@@ -2349,7 +2409,7 @@ def ab_shared_profiles(request):
     def add_profile(p, rule_value):
         if not p or _is_personal_guid(p.guid):
             return
-        info = p.info
+        info = _public_profile_info(p.info)
         owner_name = p.owner.username if p.owner else ""
         existing = items.get(p.guid)
         rule_value = int(rule_value or 0)
@@ -2367,19 +2427,23 @@ def ab_shared_profiles(request):
         }
 
     if user.is_admin:
-        for p in AddressBookProfile.objects.all():
+        for p in AddressBookProfile.objects.defer("default_password").all():
             add_profile(p, 3)
     else:
-        for p in AddressBookProfile.objects.filter(Q(owner=user)):
+        for p in AddressBookProfile.objects.defer("default_password").filter(Q(owner=user)):
             add_profile(p, 3)
-        for share in AddressBookShare.objects.filter(Q(user=user)).select_related("profile", "profile__owner"):
+        for share in (
+            AddressBookShare.objects.filter(Q(user=user))
+            .select_related("profile", "profile__owner")
+            .defer("profile__default_password")
+        ):
             add_profile(share.profile, share.rule)
         group_ids = list(user.groups.values_list("id", flat=True))
         rules_qs = AddressBookRule.objects.filter(Q(is_everyone=True))
         if group_ids:
             rules_qs = rules_qs | AddressBookRule.objects.filter(Q(group_id__in=group_ids))
         rules_qs = rules_qs | AddressBookRule.objects.filter(Q(user=user))
-        for r in rules_qs.select_related("profile", "profile__owner"):
+        for r in rules_qs.select_related("profile", "profile__owner").defer("profile__default_password"):
             add_profile(r.profile, r.rule)
     data = list(items.values())
     data.sort(key=lambda x: x.get("name", ""))
@@ -2398,6 +2462,49 @@ def ab_shared_profiles(request):
     return JsonResponse({"total": total, "data": data[start:end]})
 
 
+def ab_shared_credential(request):
+    _token, user = _get_token_user(request)
+    if not user:
+        _log_event(request, "api_ab_shared_credential_unauthorized", level="warning")
+        return JsonResponse({"error": "Invalid token"}, status=401)
+    postdata = _load_json_object(request)
+    guid = _bounded_text_value(postdata.get("guid"), 60, allow_empty=False)
+    rid = _bounded_text_value(postdata.get("id"), 16, allow_empty=False)
+    if guid is None or rid is None or any(ch.isspace() for ch in rid):
+        return JsonResponse({"error": "Invalid target"}, status=400)
+
+    with transaction.atomic():
+        profile_id = AddressBookProfile.objects.filter(guid=guid).values_list("pk", flat=True).first()
+        if profile_id is None or _is_personal_guid(guid):
+            return JsonResponse({"error": "Not found"}, status=404)
+        profile, owner, rule = lock_profile_access(user, profile_id)
+        if not profile or not owner or not rule:
+            _log_event(
+                request,
+                "api_ab_shared_credential_denied",
+                level="warning",
+                username=user.username,
+                guid=guid,
+                rid=rid,
+            )
+            return JsonResponse({"error": "No access"}, status=403)
+        if not RemotePeer.objects.filter(profile_id=profile.pk, rid=rid).exists():
+            return JsonResponse({"error": "Target not found"}, status=404)
+        password = profile.default_password
+        if not password:
+            return JsonResponse({"error": "Default credential not configured"}, status=404)
+
+    _log_event(
+        request,
+        "api_ab_shared_credential_issued",
+        level="info",
+        username=user.username,
+        guid=guid,
+        rid=rid,
+    )
+    return JsonResponse({"password": password})
+
+
 def ab_shared_add(request):
     _token, user = _get_token_user(request)
     if not user:
@@ -2407,21 +2514,22 @@ def ab_shared_add(request):
     name = str(postdata.get("name", "")).strip()
     note = postdata.get("note", "")
     info = postdata.get("info", None)
+    default_password = (
+        _profile_default_password(postdata["default_password"]) if "default_password" in postdata else None
+    )
     if not name or len(name) > 60 or _bounded_text_value(note, 4096) is None:
         _log_event(request, "api_ab_shared_add_failed", level="warning", username=user.username, reason="missing_name")
         return JsonResponse({"error": "Invalid name"}, status=400)
     if _is_reserved_ab_profile_name(name):
         return JsonResponse({"error": "Reserved name"}, status=400)
-    profile = _get_or_create_profile(user, name)
+    if "default_password" in postdata and default_password is None:
+        return JsonResponse({"error": "Invalid default password"}, status=400)
     parsed_info = None
     if info is not None:
-        parsed_info = _json_value(
-            info,
-            expected_type=(dict, list),
-            max_bytes=16 * 1024,
-        )
+        parsed_info = _profile_info_value(info)
         if parsed_info is None:
             return JsonResponse({"error": "Invalid info"}, status=400)
+    profile = _get_or_create_profile(user, name)
     with transaction.atomic():
         profile = _lock_profile_for_management(user, profile)
         if not profile:
@@ -2431,6 +2539,9 @@ def ab_shared_add(request):
         if parsed_info is not None:
             profile.info = parsed_info
             update_fields.append("info")
+        if "default_password" in postdata:
+            profile.default_password = default_password
+            update_fields.append("default_password")
         profile.save(update_fields=update_fields)
     _log_event(request, "api_ab_shared_add", username=user.username, guid=profile.guid, name=name)
     return JsonResponse({"code": 1, "guid": profile.guid})
@@ -2467,12 +2578,13 @@ def ab_shared_update_profile(request):
         if note is None:
             return JsonResponse({"error": "Invalid note"}, status=400)
         profile.note = note
+    default_password = None
+    if "default_password" in postdata:
+        default_password = _profile_default_password(postdata["default_password"])
+        if default_password is None:
+            return JsonResponse({"error": "Invalid default password"}, status=400)
     if "info" in postdata and postdata.get("info") is not None:
-        info = _json_value(
-            postdata.get("info"),
-            expected_type=(dict, list),
-            max_bytes=16 * 1024,
-        )
+        info = _profile_info_value(postdata.get("info"))
         if info is None:
             return JsonResponse({"error": "Invalid info"}, status=400)
         profile.info = info
@@ -2507,6 +2619,8 @@ def ab_shared_update_profile(request):
         profile.name = profile_values["name"]
         profile.note = profile_values["note"]
         profile.info = profile_values["info"]
+        if "default_password" in postdata:
+            profile.default_password = default_password
         old_owner_id = profile.owner_id
         if new_owner and new_owner.id != old_owner_id:
             profile.owner = new_owner

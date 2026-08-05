@@ -43,6 +43,7 @@ from api.models import (
     UserProfile,
 )
 from api.request_utils import client_ip
+from api.response_security import protect_credential_response
 from api.tag_colors import normalize_tag_color, tag_color_css
 from api.xlsx import safe_csv_writer, xlsx_response
 from camellia_remote_management.access_logging import normalized_route
@@ -51,6 +52,18 @@ logger = logging.getLogger(__name__)
 MAX_AB_PEERS = 10_000
 MAX_AB_TAGS = 256
 MAX_AB_TAGS_PER_PEER = 32
+DEVICE_INVENTORY_EXPORT_SCHEMA = "device-inventory-v1"
+DEVICE_INVENTORY_EXPORT_HEADERS = (
+    "rid",
+    "owner_name",
+    "device_group_name",
+    "strategy_name",
+    "version",
+    "os",
+    "enabled",
+    "status",
+    "update_time",
+)
 
 
 def _filename_stamp():
@@ -1087,12 +1100,55 @@ def down_peers(request):
         _log_event(request, "front_export_denied", level="warning", username=u.username)
         return HttpResponseRedirect("/api/work")
 
-    _log_event(request, "front_export_xlsx", username=u.username)
-    all_info = get_all_info()
-    all_fields = [x.name for x in RemoteDevice._meta.get_fields()]
-    all_fields.append("rust_user")
-    rows = [[one.get(name, "-") for name in all_fields] for one in all_info]
-    return xlsx_response("DeviceInfo.xlsx", _("设备信息表"), all_fields, rows)
+    now = timezone.now()
+    rows = []
+    device_inventory = RemoteDevice.objects.values(
+        "rid",
+        "owner__username",
+        "owner__strategy__name",
+        "device_group__name",
+        "device_group__strategy__name",
+        "strategy__name",
+        "version",
+        "os",
+        "is_active",
+        "update_time",
+    )
+    for device in device_inventory:
+        update_time = device["update_time"]
+        strategy_name = (
+            device["strategy__name"] or device["device_group__strategy__name"] or device["owner__strategy__name"] or ""
+        )
+        rows.append(
+            [
+                device["rid"],
+                device["owner__username"] or "",
+                device["device_group__name"] or "",
+                strategy_name,
+                device["version"],
+                device["os"],
+                device["is_active"],
+                _("在线") if (now - update_time).total_seconds() <= 120 else _("离线"),
+                timezone.localtime(update_time).strftime("%Y-%m-%d %H:%M"),
+            ]
+        )
+
+    response = xlsx_response(
+        "DeviceInfo-v1.xlsx",
+        _("设备信息表"),
+        DEVICE_INVENTORY_EXPORT_HEADERS,
+        rows,
+    )
+    response["X-Camellia-Export-Schema"] = DEVICE_INVENTORY_EXPORT_SCHEMA
+    protect_credential_response(response)
+    _log_event(
+        request,
+        "front_export_xlsx",
+        username=u.username,
+        schema=DEVICE_INVENTORY_EXPORT_SCHEMA,
+        count=len(rows),
+    )
+    return response
 
 
 MAX_SHARE_PEERS = 20

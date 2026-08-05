@@ -913,6 +913,7 @@ class AddressBookProfile(models.Model):
     note = models.TextField(verbose_name=_("备注"), blank=True, default="")
     rule = models.IntegerField(verbose_name=_("共享权限"), default=1)
     info = models.JSONField(verbose_name=_("扩展信息"), blank=True, default=dict)
+    default_password = EncryptedTextField(verbose_name=_("默认共享密码"), max_length=60, blank=True, default="")
     authorization_generation = models.PositiveBigIntegerField(default=0, editable=False)
     created_at = models.DateTimeField(verbose_name=_("创建时间"), default=timezone.now)
     updated_at = models.DateTimeField(verbose_name=_("更新时间"), auto_now=True)

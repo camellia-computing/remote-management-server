@@ -8,7 +8,7 @@ import threading
 from unittest import mock
 
 from django.contrib import admin
-from django.db import close_old_connections, connections
+from django.db import IntegrityError, close_old_connections, connections
 from django.test import (
     Client,
     RequestFactory,
@@ -129,6 +129,14 @@ class DeviceIdentityProofTests(TestCase):
             "device_proof": proof,
         }
         return self.post_json("/api/login", payload)
+
+    def post_json_without_raising(self, path, payload, token=None):
+        previous = self.client.raise_request_exception
+        self.client.raise_request_exception = False
+        try:
+            return self.post_json(path, payload, token=token)
+        finally:
+            self.client.raise_request_exception = previous
 
     def admin_bearer(self):
         operator = UserProfile.objects.create_superuser(
@@ -374,6 +382,157 @@ class DeviceIdentityProofTests(TestCase):
         self.assertEqual(first.status_code, 200, first.content)
         replay = self.login_with_proof(proof)
         self.assertEqual(replay.status_code, 403, replay.content)
+        self.assertFalse(DeviceProofChallenge.objects.exists())
+
+    def test_login_finalization_failures_roll_back_token_device_and_proof_for_retry(self):
+        bearer = self.login_bearer()
+        old_token = RemoteToken.objects.get(device=self.device)
+        old_token_hash = old_token.access_token
+        self.device.refresh_from_db()
+        old_hostname = self.device.hostname
+        proof, _message = self.proof("login", self.old_key)
+        payload = {
+            "username": "alice",
+            "password": "alice-pass",
+            "id": self.device.rid,
+            "uuid": self.device.uuid,
+            "deviceInfo": {"os": "Linux", "type": "client", "name": "failed-login-hostname"},
+            "device_proof": proof,
+        }
+
+        finalization_failures = (
+            (
+                "peer_io",
+                "api.views_api._ensure_personal_device_peer",
+                OSError("injected personal peer failure"),
+            ),
+            (
+                "peer_integrity",
+                "api.views_api._ensure_personal_device_peer",
+                IntegrityError("injected personal peer integrity failure"),
+            ),
+            (
+                "admission",
+                "api.views_api.complete_login_success",
+                RuntimeError("injected admission cleanup failure"),
+            ),
+        )
+        for label, target, failure in finalization_failures:
+            with self.subTest(finalizer=label), mock.patch(target, side_effect=failure):
+                failed = self.post_json_without_raising("/api/login", payload)
+
+                self.assertEqual(failed.status_code, 500, failed.content)
+                self.device.refresh_from_db()
+                self.assertEqual(self.device.hostname, old_hostname)
+                self.assertEqual(RemoteToken.objects.get(device=self.device).access_token, old_token_hash)
+                self.assertEqual(DeviceProofChallenge.objects.count(), 1)
+                current = self.post_json("/api/currentUser", {}, token=bearer)
+                self.assertEqual(current.status_code, 200, current.content)
+
+        retried = self.post_json("/api/login", payload)
+        self.assertEqual(retried.status_code, 200, retried.content)
+        self.assertTrue(retried.json()["access_token"])
+        self.device.refresh_from_db()
+        self.assertEqual(self.device.hostname, "failed-login-hostname")
+        self.assertFalse(DeviceProofChallenge.objects.exists())
+
+    def test_deploy_finalization_failure_rolls_back_key_token_and_proof_for_retry(self):
+        bearer = self.login_bearer()
+        old_token_hash = RemoteToken.objects.get(device=self.device).access_token
+        old_key_hash = self.device.public_key_hash
+        old_generation = self.device.deployment_generation
+        rotation_proof, message = self.proof("deploy", self.new_key, token=bearer)
+        rotation_proof.update(
+            {
+                "old_public_key": base64.b64encode(bytes(self.old_key.verify_key)).decode("ascii"),
+                "old_signature": base64.b64encode(self.old_key.sign(message.encode("utf-8")).signature).decode("ascii"),
+            }
+        )
+        payload = {
+            "id": self.device.rid,
+            "uuid": self.device.uuid,
+            "pk": rotation_proof["public_key"],
+            "device_proof": rotation_proof,
+        }
+
+        finalization_failures = (
+            ("io", OSError("injected personal peer failure")),
+            ("integrity", IntegrityError("injected personal peer integrity failure")),
+        )
+        for label, failure in finalization_failures:
+            with (
+                self.subTest(finalizer=label),
+                mock.patch(
+                    "api.views_api._ensure_personal_device_peer",
+                    side_effect=failure,
+                ),
+            ):
+                failed = self.post_json_without_raising("/api/devices/deploy", payload, token=bearer)
+
+                self.assertEqual(failed.status_code, 500, failed.content)
+                self.device.refresh_from_db()
+                self.assertEqual(self.device.public_key_hash, old_key_hash)
+                self.assertEqual(self.device.deployment_generation, old_generation)
+                self.assertEqual(RemoteToken.objects.get(device=self.device).access_token, old_token_hash)
+                self.assertEqual(DeviceProofChallenge.objects.count(), 1)
+                current = self.post_json("/api/currentUser", {}, token=bearer)
+                self.assertEqual(current.status_code, 200, current.content)
+
+        retried = self.post_json("/api/devices/deploy", payload, token=bearer)
+        self.assertEqual(retried.status_code, 200, retried.content)
+        self.device.refresh_from_db()
+        self.assertEqual(self.device.public_key_hash, hashlib.sha256(bytes(self.new_key.verify_key)).hexdigest())
+        self.assertEqual(self.device.deployment_generation, old_generation + 1)
+        self.assertFalse(RemoteToken.objects.filter(device=self.device).exists())
+        self.assertFalse(DeviceProofChallenge.objects.exists())
+
+    def test_lost_login_response_recovers_with_a_fresh_current_key_proof(self):
+        first_proof, _message = self.proof("login", self.old_key)
+        first = self.login_with_proof(first_proof)
+        self.assertEqual(first.status_code, 200, first.content)
+        unknown_token = first.json()["access_token"]
+
+        retry_proof, _message = self.proof("login", self.old_key)
+        recovered = self.login_with_proof(retry_proof)
+
+        self.assertEqual(recovered.status_code, 200, recovered.content)
+        recovered_token = recovered.json()["access_token"]
+        self.assertNotEqual(recovered_token, unknown_token)
+        self.assertEqual(self.post_json("/api/currentUser", {}, token=unknown_token).status_code, 401)
+        self.assertEqual(self.post_json("/api/currentUser", {}, token=recovered_token).status_code, 200)
+        self.assertFalse(DeviceProofChallenge.objects.exists())
+
+    def test_lost_deploy_response_recovers_by_logging_in_with_the_committed_new_key(self):
+        bearer = self.login_bearer()
+        rotation_proof, message = self.proof("deploy", self.new_key, token=bearer)
+        rotation_proof.update(
+            {
+                "old_public_key": base64.b64encode(bytes(self.old_key.verify_key)).decode("ascii"),
+                "old_signature": base64.b64encode(self.old_key.sign(message.encode("utf-8")).signature).decode("ascii"),
+            }
+        )
+        committed = self.post_json(
+            "/api/devices/deploy",
+            {
+                "id": self.device.rid,
+                "uuid": self.device.uuid,
+                "pk": rotation_proof["public_key"],
+                "device_proof": rotation_proof,
+            },
+            token=bearer,
+        )
+        self.assertEqual(committed.status_code, 200, committed.content)
+        self.assertEqual(self.post_json("/api/currentUser", {}, token=bearer).status_code, 401)
+
+        recovery_login_proof, _message = self.proof("login", self.new_key)
+        recovered = self.login_with_proof(recovery_login_proof)
+
+        self.assertEqual(recovered.status_code, 200, recovered.content)
+        recovered_token = recovered.json()["access_token"]
+        self.assertEqual(self.post_json("/api/currentUser", {}, token=recovered_token).status_code, 200)
+        self.device.refresh_from_db()
+        self.assertEqual(self.device.public_key_hash, hashlib.sha256(bytes(self.new_key.verify_key)).hexdigest())
+        self.assertEqual(self.device.deployment_generation, 1)
         self.assertFalse(DeviceProofChallenge.objects.exists())
 
     def test_oidc_poll_consumes_the_bound_current_key_proof_with_token_issue(self):

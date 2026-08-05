@@ -19,6 +19,7 @@ from api.models import DataEncryptionKeyState
 ENCRYPTED_COLUMNS = (
     ("api_remotepeer", "id", "rhash"),
     ("api_remotepeer", "id", "password"),
+    ("api_addressbookprofile", "id", "default_password"),
     ("api_remotedevice", "id", "address_book_password"),
     ("api_oidcpendingauth", "state", "nonce"),
     ("api_oidcpendingauth", "state", "code_verifier"),
@@ -94,8 +95,7 @@ class Command(BaseCommand):
                 references = self._count_key_references(retire_key_id)
                 if references:
                     raise CommandError(
-                        f"Data-encryption key {retire_key_id} is still referenced by "
-                        f"{references} database values"
+                        f"Data-encryption key {retire_key_id} is still referenced by {references} database values"
                     )
                 raise CommandError(
                     "A data-encryption key cannot be retired while database values remain outside "
@@ -150,10 +150,7 @@ class Command(BaseCommand):
         primary_prefix = f"{FIELD_PREFIX}{settings.DATA_ENCRYPTION_PRIMARY_KEY_ID}:"
         while max_batches is None or result["batches"] < max_batches:
             with transaction.atomic():
-                where = (
-                    f"{field_name} IS NOT NULL AND {field_name} <> %s "
-                    f"AND SUBSTR({field_name}, 1, %s) <> %s"
-                )
+                where = f"{field_name} IS NOT NULL AND {field_name} <> %s AND SUBSTR({field_name}, 1, %s) <> %s"
                 params = ["", len(primary_prefix), primary_prefix]
                 if last_pk is not None:
                     where += f" AND {pk_name} > %s"

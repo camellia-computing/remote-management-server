@@ -48,6 +48,7 @@ urlpatterns = [
     url(r"^ab/settings$", stateless_api(views_api.ab_settings, "POST")),
     url(r"^ab/personal$", stateless_api(views_api.ab_personal, "POST")),
     url(r"^ab/shared/profiles$", credential_stateless_api(views_api.ab_shared_profiles, "POST")),
+    url(r"^ab/shared/credential$", credential_stateless_api(views_api.ab_shared_credential, "POST")),
     url(r"^ab/shared/add$", stateless_api(views_api.ab_shared_add, "POST")),
     url(r"^ab/shared/update/profile$", stateless_api(views_api.ab_shared_update_profile, "PUT")),
     url(r"^ab/shared$", stateless_api(views_api.ab_shared_delete, "DELETE")),

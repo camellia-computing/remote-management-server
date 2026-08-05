@@ -47,6 +47,7 @@ ignore = ["E501"]
 [tool.ruff.lint.per-file-ignores]
 "api/migrations/*" = ["I", "S"]
 "api/tests.py" = ["S105", "S106"]
+"api/test_shared_profile_credentials.py" = ["S105", "S106"]
 "webui2/tests.py" = ["S106"]
 
 [tool.pytest.ini_options]

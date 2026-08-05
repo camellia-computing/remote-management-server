@@ -4,7 +4,7 @@ import hashlib
 import json
 import os
 import tempfile
-from io import StringIO
+from io import BytesIO, StringIO
 from pathlib import Path
 from unittest.mock import patch
 
@@ -14,9 +14,11 @@ from django.core.management import call_command
 from django.core.management.base import CommandError
 from django.db import connection, transaction
 from django.test import SimpleTestCase, TestCase, override_settings
+from django.test.utils import CaptureQueriesContext
 from django.utils import timezone
 from nacl.secret import SecretBox
 from nacl.signing import SigningKey
+from openpyxl import load_workbook
 
 from api.encrypted_fields import FIELD_PREFIX, encrypt_text, key_canary, key_fingerprint
 from api.formatting import format_bytes
@@ -704,6 +706,91 @@ class ApiContractTests(ApiTestMixin, TestCase):
         )
         self.assertEqual(exported.status_code, 200, exported.content)
         self.assertNotIn(peer_secret.encode(), exported.content)
+
+    def test_device_inventory_export_uses_a_safe_versioned_allowlist(self):
+        credential_canary = "DEVICE-EXPORT-CREDENTIAL-CANARY"
+        uuid_canary = device_uuid("device-export-uuid-canary")
+        public_key_hash_canary = hashlib.sha256(b"device-export-public-key-canary").hexdigest()
+        device = self._device(
+            owner=self.user,
+            rid="765432188",
+            uuid=uuid_canary,
+            public_key_hash=public_key_hash_canary,
+            address_book_password=credential_canary,
+            version="DEVICE-EXPORT-VERSION-CANARY",
+            os="DEVICE-EXPORT-OS-CANARY",
+        )
+
+        self.client.force_login(self.user)
+        denied = self.client.get("/api/down_peers")
+        self.assertEqual(denied.status_code, 302)
+        self.assertEqual(denied.headers["Location"], "/api/work")
+
+        self.client.force_login(self.admin)
+        with (
+            CaptureQueriesContext(connection) as export_queries,
+            self.assertLogs("api.views_front", level="INFO") as export_logs,
+        ):
+            response = self.client.get("/api/down_peers")
+
+        self.assertEqual(response.status_code, 200, response.content)
+        workbook = load_workbook(BytesIO(response.content), read_only=True, data_only=False)
+        try:
+            worksheet = workbook.active
+            exported_rows = list(worksheet.iter_rows(values_only=True))
+        finally:
+            workbook.close()
+        self.assertEqual(len(exported_rows), 2)
+        headers = tuple(exported_rows[0])
+        values = tuple(exported_rows[1])
+        for forbidden_header in (
+            "id",
+            "uuid",
+            "public_key_hash",
+            "deployment_generation",
+            "policy_generation",
+            "address_book_password",
+        ):
+            with self.subTest(header=forbidden_header):
+                self.assertNotIn(forbidden_header, headers)
+        for canary in (credential_canary, uuid_canary, public_key_hash_canary):
+            with self.subTest(canary=canary):
+                self.assertNotIn(canary, values)
+        export_sql = "\n".join(query["sql"] for query in export_queries.captured_queries)
+        for forbidden_column in ("address_book_password", "uuid", "public_key_hash"):
+            with self.subTest(sql_column=forbidden_column):
+                self.assertNotIn(f'"api_remotedevice"."{forbidden_column}"', export_sql)
+
+        expected_headers = (
+            "rid",
+            "owner_name",
+            "device_group_name",
+            "strategy_name",
+            "version",
+            "os",
+            "enabled",
+            "status",
+            "update_time",
+        )
+        self.assertEqual(headers, expected_headers)
+        exported = dict(zip(headers, values, strict=True))
+        self.assertEqual(exported["rid"], device.rid)
+        self.assertEqual(exported["owner_name"], self.user.username)
+        self.assertEqual(exported["version"], "DEVICE-EXPORT-VERSION-CANARY")
+        self.assertEqual(exported["os"], "DEVICE-EXPORT-OS-CANARY")
+        self.assertIs(exported["enabled"], True)
+        self.assertEqual(response.headers.get("Cache-Control"), "no-store, private")
+        self.assertEqual(response.headers.get("Pragma"), "no-cache")
+        self.assertEqual(response.headers.get("X-Camellia-Export-Schema"), "device-inventory-v1")
+        self.assertEqual(response.headers.get("Content-Disposition"), "attachment; filename=DeviceInfo-v1.xlsx")
+
+        log_output = "\n".join(export_logs.output)
+        self.assertIn('"event": "front_export_xlsx"', log_output)
+        self.assertIn('"schema": "device-inventory-v1"', log_output)
+        self.assertIn('"count": 1', log_output)
+        for canary in (credential_canary, uuid_canary, public_key_hash_canary):
+            with self.subTest(log_canary=canary):
+                self.assertNotIn(canary, log_output)
 
     def test_expired_authentication_state_cleanup_is_dry_run_safe_and_idempotent(self):
         now = timezone.now()
