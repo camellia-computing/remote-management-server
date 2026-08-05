@@ -79,6 +79,7 @@ from api.policy_generation import (
     managed_policy_document,
     normalize_policy_options,
 )
+from api.rate_limits import enforce_authenticated_rate_limit
 from api.request_utils import client_ip, load_json_body, load_json_object
 from api.tag_colors import normalize_tag_color
 from camellia_remote_management.access_logging import normalized_route
@@ -167,6 +168,7 @@ def _get_token_user(request):
     if not secrets.compare_digest(token.credential_hash, user.get_session_auth_hash()):
         token.delete()
         return None, None
+    enforce_authenticated_rate_limit(request, user, device)
     return token, user
 
 

@@ -3,6 +3,12 @@ import secrets
 from django.http import JsonResponse
 
 from api.address_book_errors import AuthorizationGenerationExhausted
+from api.rate_limits import (
+    RateLimitBackendUnavailable,
+    RateLimitRejected,
+    rate_limit_backend_response,
+    rate_limit_response,
+)
 from api.request_utils import InvalidJsonPayload
 from api.response_security import CREDENTIAL_RESPONSE_MARKER, protect_credential_response
 from camellia_remote_management.access_logging import (
@@ -51,4 +57,8 @@ class ApiExceptionMiddleware:
                 {"error": "Address-book authorization generation exhausted"},
                 status=409,
             )
+        if isinstance(exception, RateLimitRejected):
+            return rate_limit_response(exception.admission)
+        if isinstance(exception, RateLimitBackendUnavailable):
+            return rate_limit_backend_response()
         return None

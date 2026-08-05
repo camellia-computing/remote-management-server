@@ -1305,6 +1305,59 @@ class LoginAdmissionLock(models.Model):
         return self.ip
 
 
+class RequestRateBucket(models.Model):
+    """Hashed, fixed-window request budget shared by every replica."""
+
+    key_hash = models.CharField(max_length=64, primary_key=True, editable=False)
+    scope = models.CharField(max_length=24, editable=False)
+    group = models.CharField(max_length=32, editable=False)
+    window_seconds = models.PositiveSmallIntegerField(editable=False)
+    used = models.PositiveBigIntegerField(default=0, editable=False)
+    expires_at = models.DateTimeField(db_index=True, editable=False)
+    updated_at = models.DateTimeField(auto_now=True, editable=False)
+
+    class Meta:
+        ordering = ("expires_at", "key_hash")
+        constraints = [
+            models.CheckConstraint(
+                condition=models.Q(window_seconds__gte=1, window_seconds__lte=3600),
+                name="valid_rate_bucket_window",
+            ),
+        ]
+
+    def __str__(self):
+        return f"{self.scope}:{self.group}:{self.key_hash[:12]}"
+
+
+class RequestRateLease(models.Model):
+    """Short-lived cross-replica concurrency claim; never stores raw identity."""
+
+    request_id = models.CharField(max_length=32, editable=False)
+    key_hash = models.CharField(max_length=64, editable=False)
+    scope = models.CharField(max_length=24, editable=False)
+    group = models.CharField(max_length=32, editable=False)
+    expires_at = models.DateTimeField(db_index=True, editable=False)
+    created_at = models.DateTimeField(auto_now_add=True, editable=False)
+
+    class Meta:
+        ordering = ("expires_at", "pk")
+        constraints = [
+            models.UniqueConstraint(
+                fields=("request_id", "key_hash"),
+                name="unique_rate_lease_request_key",
+            ),
+        ]
+        indexes = [
+            models.Index(
+                fields=("key_hash", "expires_at"),
+                name="rate_lease_key_exp_idx",
+            ),
+        ]
+
+    def __str__(self):
+        return f"{self.scope}:{self.group}:{self.request_id}"
+
+
 class ShareLinkAdmin(admin.ModelAdmin):
     list_display = (
         "token_prefix",

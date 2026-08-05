@@ -225,14 +225,18 @@ jobs:
             .github/scripts/*.sh \
             .github/scripts/tests/*.sh \
             deploy/backup-postgres.sh \
+            deploy/bootstrap-postgres-roles.sh \
             deploy/management-maintenance-guard.sh \
             deploy/management-maintenance.sh \
             deploy/restore-postgres.sh \
+            deploy/start-management-stack.sh \
             run.sh \
             sync_web_client.sh \
             scripts/web_client_revision.sh
           python3 scripts/test_backup_envelope.py
           python3 scripts/test_backup_scripts.py
+          python3 scripts/test_database_roles.py
+          python3 scripts/test_deployment_gate.py
           python3 scripts/test_systemd_maintenance.py
           python3 .github/scripts/test_manage_release.py
           python3 .github/scripts/test_container_release_evidence.py
@@ -249,7 +253,16 @@ jobs:
           CAMELLIA_REMOTE_DATA_ENCRYPTION_KEY: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
           CAMELLIA_REMOTE_DATA_ENCRYPTION_V1_KEY_ID: ci-primary-v1
           CAMELLIA_REMOTE_DEVICE_VERIFICATION_TOKEN: ci-device-verification-token-with-sufficient-length
-          CAMELLIA_REMOTE_DATABASE_PASSWORD: "test:@/%# strong password"
+          CAMELLIA_REMOTE_DATABASE_BOOTSTRAP_USER: ci_bootstrap
+          CAMELLIA_REMOTE_DATABASE_BOOTSTRAP_PASSWORD: "bootstrap test:@/%# password 01"
+          CAMELLIA_REMOTE_DATABASE_MIGRATION_USER: ci_migration
+          CAMELLIA_REMOTE_DATABASE_MIGRATION_PASSWORD: "migration test:@/%# password 02"
+          CAMELLIA_REMOTE_DATABASE_RUNTIME_USER: ci_runtime
+          CAMELLIA_REMOTE_DATABASE_RUNTIME_PASSWORD: "runtime test:@/%# password 03"
+          CAMELLIA_REMOTE_DATABASE_BACKUP_USER: ci_backup
+          CAMELLIA_REMOTE_DATABASE_BACKUP_PASSWORD: "backup test:@/%# password 04"
+          CAMELLIA_REMOTE_DATABASE_PROBE_USER: ci_probe
+          CAMELLIA_REMOTE_DATABASE_PROBE_PASSWORD: "probe test:@/%# password 05"
           CAMELLIA_REMOTE_ALLOWED_HOSTS: api.example.test
           CAMELLIA_REMOTE_CSRF_TRUSTED_ORIGINS: https://api.example.test
           CAMELLIA_REMOTE_API_SERVER: https://api.example.test
@@ -259,13 +272,14 @@ jobs:
           CAMELLIA_REMOTE_BACKUP_AGE_KEY_ID: ci-backup-v1
           CAMELLIA_REMOTE_BACKUP_DEPLOYMENT_ID: ci-deployment
           CAMELLIA_REMOTE_BACKUP_POSTGRES_MAJOR: "18"
+          CAMELLIA_REMOTE_RATE_LIMIT_ENABLED: "true"
         run: |
           [[ "$CAMELLIA_REMOTE_BACKUP_AGE_RECIPIENT" =~ ^age1[^[:space:]]{20,255}$ ]]
           [[ "$CAMELLIA_REMOTE_BACKUP_AGE_KEY_ID" =~ ^[a-z0-9][a-z0-9._-]{0,31}$ ]]
           [[ "$CAMELLIA_REMOTE_BACKUP_DEPLOYMENT_ID" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]]
           [[ "$CAMELLIA_REMOTE_BACKUP_POSTGRES_MAJOR" =~ ^[1-9][0-9]{0,2}$ ]]
           systemd-analyze security --offline=yes deploy/systemd/*.service >/dev/null
-          docker compose --env-file /dev/null -f docker-compose.yaml config --quiet
+          docker compose --profile database-operations --env-file /dev/null -f docker-compose.yaml config --quiet
 
   web_client:
     name: Build pinned Web client
@@ -359,6 +373,7 @@ jobs:
 
       - name: Django checks
         run: |
+          uv run python scripts/test_deployment_gate.py
           uv run python manage.py check
           uv run python manage.py makemigrations --check --dry-run
 
@@ -377,10 +392,28 @@ jobs:
           CAMELLIA_REMOTE_SECURE_TLS: "true"
           CAMELLIA_REMOTE_SECURE_HSTS_INCLUDE_SUBDOMAINS: "true"
           CAMELLIA_REMOTE_SECURE_HSTS_PRELOAD: "true"
-        run: uv run python manage.py check --deploy --fail-level WARNING
+          CAMELLIA_REMOTE_RATE_LIMIT_ENABLED: "true"
+        run: |
+          uv run python manage.py check --deploy --fail-level WARNING
+          if CAMELLIA_REMOTE_RATE_LIMIT_ENABLED=false uv run python manage.py check >/dev/null 2>&1; then
+            echo "production settings unexpectedly allowed request admission to be disabled" >&2
+            exit 1
+          fi
 
       - name: Fresh database migration
         run: uv run python manage.py migrate --noinput
+
+      - name: Verify production PostgreSQL role boundaries
+        env:
+          CAMELLIA_REMOTE_DATABASE_ROLE_TEST_CONFIRM: ephemeral-database-will-be-mutated
+          CAMELLIA_REMOTE_DATABASE_ROLE_TEST_HOST: 127.0.0.1
+          CAMELLIA_REMOTE_DATABASE_ROLE_TEST_PORT: "5432"
+          CAMELLIA_REMOTE_DATABASE_ROLE_TEST_NAME: camellia_remote_ci
+          CAMELLIA_REMOTE_DATABASE_ROLE_TEST_BOOTSTRAP_USER: camellia_remote_ci
+          CAMELLIA_REMOTE_DATABASE_ROLE_TEST_BOOTSTRAP_PASSWORD: ci-postgres-password
+        run: |
+          command -v psql
+          uv run python scripts/test_database_roles.py
 
       - name: Tests
         run: |
@@ -454,6 +487,28 @@ jobs:
         run: |
           docker volume create camellia-remote-management-ci-records
 
+      - name: Bootstrap least-privilege container database roles
+        run: |
+          docker run --rm \
+            --network host \
+            --entrypoint /bin/sh \
+            -v "$PWD/deploy/bootstrap-postgres-roles.sh:/bootstrap-postgres-roles.sh:ro" \
+            -e PGHOST=127.0.0.1 \
+            -e PGPORT=5432 \
+            -e PGDATABASE=camellia_remote_container_ci \
+            -e PGUSER=camellia_remote_container_ci \
+            -e PGPASSWORD=ci-postgres-password \
+            -e CAMELLIA_REMOTE_DATABASE_MIGRATION_USER=container_ci_migration \
+            -e CAMELLIA_REMOTE_DATABASE_MIGRATION_PASSWORD=ci-migration-password-02 \
+            -e CAMELLIA_REMOTE_DATABASE_RUNTIME_USER=container_ci_runtime \
+            -e CAMELLIA_REMOTE_DATABASE_RUNTIME_PASSWORD=ci-runtime-password-03 \
+            -e CAMELLIA_REMOTE_DATABASE_BACKUP_USER=container_ci_backup \
+            -e CAMELLIA_REMOTE_DATABASE_BACKUP_PASSWORD=ci-backup-password-04 \
+            -e CAMELLIA_REMOTE_DATABASE_PROBE_USER=container_ci_probe \
+            -e CAMELLIA_REMOTE_DATABASE_PROBE_PASSWORD=ci-probe-password-05 \
+            postgres:18-alpine@sha256:9a8afca54e7861fd90fab5fdf4c42477a6b1cb7d293595148e674e0a3181de15 \
+            /bootstrap-postgres-roles.sh
+
       - name: Migrate container database
         run: |
           docker run --rm \
@@ -464,7 +519,7 @@ jobs:
             -e CAMELLIA_REMOTE_DATA_ENCRYPTION_KEY=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA= \
             -e CAMELLIA_REMOTE_DATA_ENCRYPTION_V1_KEY_ID=ci-primary-v1 \
             -e CAMELLIA_REMOTE_DEVICE_VERIFICATION_TOKEN=ci-device-verification-token-with-sufficient-length \
-            -e CAMELLIA_REMOTE_DATABASE_URL=postgres://camellia_remote_container_ci:ci-postgres-password@127.0.0.1:5432/camellia_remote_container_ci \
+            -e CAMELLIA_REMOTE_DATABASE_URL=postgres://container_ci_migration:ci-migration-password-02@127.0.0.1:5432/camellia_remote_container_ci \
             -e CAMELLIA_REMOTE_DATABASE_SSLMODE=disable \
             -e CAMELLIA_REMOTE_ALLOWED_HOSTS=127.0.0.1,localhost \
             -e CAMELLIA_REMOTE_CSRF_TRUSTED_ORIGINS=https://api.example.test \
@@ -475,6 +530,41 @@ jobs:
             -v camellia-remote-management-ci-records:/app/records \
             camellia-remote-management-server:ci \
             python manage.py migrate --noinput
+
+      - name: Converge post-migration ACLs and reject runtime DDL
+        run: |
+          docker run --rm \
+            --network host \
+            --entrypoint /bin/sh \
+            -v "$PWD/deploy/bootstrap-postgres-roles.sh:/bootstrap-postgres-roles.sh:ro" \
+            -e PGHOST=127.0.0.1 \
+            -e PGPORT=5432 \
+            -e PGDATABASE=camellia_remote_container_ci \
+            -e PGUSER=camellia_remote_container_ci \
+            -e PGPASSWORD=ci-postgres-password \
+            -e CAMELLIA_REMOTE_DATABASE_MIGRATION_USER=container_ci_migration \
+            -e CAMELLIA_REMOTE_DATABASE_MIGRATION_PASSWORD=ci-migration-password-02 \
+            -e CAMELLIA_REMOTE_DATABASE_RUNTIME_USER=container_ci_runtime \
+            -e CAMELLIA_REMOTE_DATABASE_RUNTIME_PASSWORD=ci-runtime-password-03 \
+            -e CAMELLIA_REMOTE_DATABASE_BACKUP_USER=container_ci_backup \
+            -e CAMELLIA_REMOTE_DATABASE_BACKUP_PASSWORD=ci-backup-password-04 \
+            -e CAMELLIA_REMOTE_DATABASE_PROBE_USER=container_ci_probe \
+            -e CAMELLIA_REMOTE_DATABASE_PROBE_PASSWORD=ci-probe-password-05 \
+            postgres:18-alpine@sha256:9a8afca54e7861fd90fab5fdf4c42477a6b1cb7d293595148e674e0a3181de15 \
+            /bootstrap-postgres-roles.sh
+          if docker run --rm \
+            --network host \
+            -e PGHOST=127.0.0.1 \
+            -e PGPORT=5432 \
+            -e PGDATABASE=camellia_remote_container_ci \
+            -e PGUSER=container_ci_runtime \
+            -e PGPASSWORD=ci-runtime-password-03 \
+            postgres:18-alpine@sha256:9a8afca54e7861fd90fab5fdf4c42477a6b1cb7d293595148e674e0a3181de15 \
+            psql --no-psqlrc --set=ON_ERROR_STOP=1 \
+              --command 'CREATE TABLE public.runtime_must_not_create_tables(id integer)'; then
+            echo "runtime database role unexpectedly created a table" >&2
+            exit 1
+          fi
 
       - name: Start hardened container
         run: |
@@ -491,7 +581,7 @@ jobs:
             -e CAMELLIA_REMOTE_DATA_ENCRYPTION_KEY=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA= \
             -e CAMELLIA_REMOTE_DATA_ENCRYPTION_V1_KEY_ID=ci-primary-v1 \
             -e CAMELLIA_REMOTE_DEVICE_VERIFICATION_TOKEN=ci-device-verification-token-with-sufficient-length \
-            -e CAMELLIA_REMOTE_DATABASE_URL=postgres://camellia_remote_container_ci:ci-postgres-password@127.0.0.1:5432/camellia_remote_container_ci \
+            -e CAMELLIA_REMOTE_DATABASE_URL=postgres://container_ci_runtime:ci-runtime-password-03@127.0.0.1:5432/camellia_remote_container_ci \
             -e CAMELLIA_REMOTE_DATABASE_SSLMODE=disable \
             -e CAMELLIA_REMOTE_ALLOWED_HOSTS=127.0.0.1,localhost \
             -e CAMELLIA_REMOTE_CSRF_TRUSTED_ORIGINS=https://api.example.test \

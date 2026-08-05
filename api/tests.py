@@ -37,6 +37,8 @@ from api.models import (
     RemotePeer,
     RemoteTag,
     RemoteToken,
+    RequestRateBucket,
+    RequestRateLease,
     ShareLink,
     StrategyProfile,
     UserProfile,
@@ -835,6 +837,21 @@ class ApiContractTests(ApiTestMixin, TestCase):
             used_by=self.user,
         )
         ShareLink.objects.filter(pk=retained_share.pk).update(create_time=old)
+        rate_bucket = RequestRateBucket.objects.create(
+            key_hash="e" * 64,
+            scope="source",
+            group="read",
+            window_seconds=60,
+            used=1,
+            expires_at=now - datetime.timedelta(seconds=1),
+        )
+        rate_lease = RequestRateLease.objects.create(
+            request_id="f" * 32,
+            key_hash="f" * 64,
+            scope="source",
+            group="read",
+            expires_at=now - datetime.timedelta(seconds=1),
+        )
 
         output = StringIO()
         call_command("purge_expired_state", "--dry-run", stdout=output)
@@ -844,6 +861,8 @@ class ApiContractTests(ApiTestMixin, TestCase):
         self.assertTrue(OidcPendingAuth.objects.filter(pk=oidc.pk).exists())
         self.assertFalse(ShareLink.objects.get(pk=recent_expired_share.pk).is_expired)
         self.assertTrue(ShareLink.objects.filter(pk=retained_share.pk).exists())
+        self.assertTrue(RequestRateBucket.objects.filter(pk=rate_bucket.pk).exists())
+        self.assertTrue(RequestRateLease.objects.filter(pk=rate_lease.pk).exists())
         self.assertTrue(json.loads(output.getvalue())["dry_run"])
 
         call_command("purge_expired_state", stdout=StringIO())
@@ -854,6 +873,8 @@ class ApiContractTests(ApiTestMixin, TestCase):
         recent_expired_share.refresh_from_db()
         self.assertTrue(recent_expired_share.is_expired)
         self.assertFalse(ShareLink.objects.filter(pk=retained_share.pk).exists())
+        self.assertFalse(RequestRateBucket.objects.filter(pk=rate_bucket.pk).exists())
+        self.assertFalse(RequestRateLease.objects.filter(pk=rate_lease.pk).exists())
 
         second = StringIO()
         call_command("purge_expired_state", stdout=second)
@@ -869,6 +890,8 @@ class ApiContractTests(ApiTestMixin, TestCase):
                 "login_attempts": 0,
                 "login_admission_locks": 0,
                 "retained_share_links": 0,
+                "request_rate_buckets": 0,
+                "request_rate_leases": 0,
             },
         )
 
