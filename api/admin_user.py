@@ -327,6 +327,7 @@ admin.site.register(models.RemotePeer, RemotePeerAdminCustom)
 admin.site.register(models.RemoteDevice, RemoteDeviceAdminCustom)
 admin.site.register(models.ShareLink, models.ShareLinkAdmin)
 admin.site.register(models.ConnLog, models.ConnLogAdmin)
+admin.site.register(models.ConnectionAuditEvent, models.ConnectionAuditEventAdmin)
 admin.site.register(models.FileLog, models.FileLogAdmin)
 
 
@@ -452,6 +453,15 @@ class AlarmLogAdmin(admin.ModelAdmin):
         "reporter__username",
     )
     list_filter = ("typ", "created_at")
+
+    def has_add_permission(self, request):
+        return False
+
+    def has_change_permission(self, request, obj=None):
+        return False
+
+    def has_delete_permission(self, request, obj=None):
+        return False
 
 
 class AddressBookRuleAdmin(admin.ModelAdmin):

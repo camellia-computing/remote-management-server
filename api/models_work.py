@@ -501,6 +501,34 @@ class ConnLog(models.Model):
         editable=False,
         unique=True,
     )
+    audit_version = models.PositiveSmallIntegerField(default=1, editable=False)
+    create_id = models.UUIDField(null=True, blank=True, editable=False)
+    host_device = models.ForeignKey(
+        "RemoteDevice",
+        null=True,
+        blank=True,
+        editable=False,
+        on_delete=models.SET_NULL,
+        related_name="connection_audits",
+    )
+    host_device_id_at_create = models.PositiveBigIntegerField(null=True, blank=True, editable=False)
+    host_device_generation = models.PositiveBigIntegerField(default=0, editable=False)
+    owner_id_at_create = models.PositiveBigIntegerField(null=True, blank=True, editable=False)
+    controller_device = models.ForeignKey(
+        "RemoteDevice",
+        null=True,
+        blank=True,
+        editable=False,
+        on_delete=models.SET_NULL,
+        related_name="controlled_connection_audits",
+    )
+    controller_device_id_at_bind = models.PositiveBigIntegerField(null=True, blank=True, editable=False)
+    controller_device_generation = models.PositiveBigIntegerField(null=True, blank=True, editable=False)
+    controller_owner_id_at_bind = models.PositiveBigIntegerField(null=True, blank=True, editable=False)
+    event_revision = models.PositiveBigIntegerField(default=0, editable=False)
+    retention_hold = models.BooleanField(default=False, db_index=True, editable=False)
+    retention_hold_reason = models.CharField(max_length=512, blank=True, default="", editable=False)
+    retention_hold_at = models.DateTimeField(null=True, blank=True, editable=False)
     conn_id = models.PositiveIntegerField(verbose_name="Connection ID")
     from_ip = models.GenericIPAddressField(verbose_name="From IP")
     from_id = models.CharField(verbose_name="From ID", max_length=16, blank=True, default="")
@@ -579,6 +607,22 @@ class ConnLog(models.Model):
                 condition=models.Q(conn_type__isnull=True) | models.Q(conn_type__gte=0, conn_type__lte=4),
                 name="valid_connection_type",
             ),
+            models.UniqueConstraint(
+                fields=["host_device", "create_id"],
+                condition=models.Q(audit_version=2),
+                name="unique_connection_audit_create",
+            ),
+            models.CheckConstraint(
+                condition=models.Q(audit_version=1)
+                | models.Q(
+                    audit_version=2,
+                    create_id__isnull=False,
+                    host_device_id_at_create__isnull=False,
+                    owner_id_at_create__isnull=False,
+                    event_revision__gte=1,
+                ),
+                name="valid_connection_audit_authority",
+            ),
         ]
         indexes = [
             models.Index(
@@ -588,6 +632,65 @@ class ConnLog(models.Model):
             models.Index(
                 fields=["-conn_start"],
                 name="connection_started_lookup",
+            ),
+            models.Index(
+                fields=["retention_hold", "conn_end"],
+                name="connection_retention_idx",
+            ),
+        ]
+
+
+class ConnectionAuditEvent(models.Model):
+    KIND_OPENED = "opened"
+    KIND_AUTHORIZED = "authorized"
+    KIND_CONTROLLER_BOUND = "controller_bound"
+    KIND_NOTE = "note"
+    KIND_FILE = "file"
+    KIND_ALARM = "alarm"
+    KIND_CLOSED = "closed"
+    KINDS = (
+        (KIND_OPENED, "Opened"),
+        (KIND_AUTHORIZED, "Authorized"),
+        (KIND_CONTROLLER_BOUND, "Controller bound"),
+        (KIND_NOTE, "Note"),
+        (KIND_FILE, "File"),
+        (KIND_ALARM, "Alarm"),
+        (KIND_CLOSED, "Closed"),
+    )
+
+    id = models.AutoField(verbose_name="ID", primary_key=True)
+    event_id = models.UUIDField(editable=False, unique=True)
+    connection = models.ForeignKey(
+        ConnLog,
+        editable=False,
+        on_delete=models.CASCADE,
+        related_name="events",
+    )
+    sequence = models.PositiveBigIntegerField(editable=False)
+    kind = models.CharField(max_length=24, choices=KINDS, editable=False)
+    actor = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        null=True,
+        blank=True,
+        editable=False,
+        on_delete=models.SET_NULL,
+        related_name="connection_audit_events",
+    )
+    actor_id_at_event = models.PositiveBigIntegerField(editable=False)
+    reporter_device_uuid = models.CharField(max_length=344, blank=True, default="", editable=False)
+    details = models.JSONField(blank=True, default=dict, editable=False)
+    created_at = models.DateTimeField(default=timezone.now, editable=False)
+
+    class Meta:
+        ordering = ("connection_id", "sequence")
+        constraints = [
+            models.UniqueConstraint(
+                fields=["connection", "sequence"],
+                name="unique_connection_audit_sequence",
+            ),
+            models.CheckConstraint(
+                condition=models.Q(sequence__gte=1),
+                name="positive_connection_audit_sequence",
             ),
         ]
 
@@ -603,11 +706,37 @@ class ConnLogAdmin(admin.ModelAdmin):
         "conn_type",
         "primary_auth",
         "two_factor",
+        "host_device",
+        "controller_device",
         "conn_start",
         "conn_end",
     )
     search_fields = ("guid", "from_ip", "from_id", "rid", "session_id", "audit_ref")
     list_filter = ("conn_type", "primary_auth", "two_factor", "conn_start", "conn_end")
+
+    def has_add_permission(self, request):
+        return False
+
+    def has_change_permission(self, request, obj=None):
+        return False
+
+    def has_delete_permission(self, request, obj=None):
+        return False
+
+
+class ConnectionAuditEventAdmin(admin.ModelAdmin):
+    list_display = ("connection", "sequence", "kind", "actor_id_at_event", "actor", "created_at")
+    search_fields = ("event_id", "connection__guid", "actor__username")
+    list_filter = ("kind", "created_at")
+
+    def has_add_permission(self, request):
+        return False
+
+    def has_change_permission(self, request, obj=None):
+        return False
+
+    def has_delete_permission(self, request, obj=None):
+        return False
 
 
 class FileLog(models.Model):
@@ -637,6 +766,23 @@ class FileLog(models.Model):
         blank=True,
         default="",
     )
+    audit_version = models.PositiveSmallIntegerField(default=1, editable=False)
+    connection = models.ForeignKey(
+        ConnLog,
+        null=True,
+        blank=True,
+        editable=False,
+        on_delete=models.PROTECT,
+        related_name="file_logs",
+    )
+    event = models.OneToOneField(
+        ConnectionAuditEvent,
+        null=True,
+        blank=True,
+        editable=False,
+        on_delete=models.PROTECT,
+        related_name="file_log",
+    )
 
     class Meta:
         ordering = ("-logged_at",)
@@ -647,6 +793,17 @@ class FileLog(models.Model):
                 condition=models.Q(direction__in=(0, 1)),
                 name="valid_file_transfer_direction",
             ),
+            models.CheckConstraint(
+                condition=models.Q(audit_version=1)
+                | models.Q(audit_version=2, connection__isnull=False, event__isnull=False),
+                name="valid_file_audit_binding",
+            ),
+        ]
+        indexes = [
+            models.Index(
+                fields=["connection", "logged_at"],
+                name="file_legacy_retention_idx",
+            )
         ]
 
 
@@ -663,6 +820,15 @@ class FileLogAdmin(admin.ModelAdmin):
     )
     search_fields = ("file", "remote_id", "user_id", "user_ip")
     list_filter = ("direction", "logged_at")
+
+    def has_add_permission(self, request):
+        return False
+
+    def has_change_permission(self, request, obj=None):
+        return False
+
+    def has_delete_permission(self, request, obj=None):
+        return False
 
 
 def share_link_expiry():
@@ -1150,6 +1316,23 @@ class AlarmLog(models.Model):
         blank=True,
         default="",
     )
+    audit_version = models.PositiveSmallIntegerField(default=1, editable=False)
+    connection = models.ForeignKey(
+        ConnLog,
+        null=True,
+        blank=True,
+        editable=False,
+        on_delete=models.PROTECT,
+        related_name="alarm_logs",
+    )
+    event = models.OneToOneField(
+        ConnectionAuditEvent,
+        null=True,
+        blank=True,
+        editable=False,
+        on_delete=models.PROTECT,
+        related_name="alarm_log",
+    )
 
     class Meta:
         ordering = ("-created_at",)
@@ -1160,6 +1343,17 @@ class AlarmLog(models.Model):
                 condition=models.Q(typ__in=ALARM_TYPES),
                 name="valid_alarm_type",
             ),
+            models.CheckConstraint(
+                condition=models.Q(audit_version=1)
+                | models.Q(audit_version=2, connection__isnull=False, event__isnull=False),
+                name="valid_alarm_audit_binding",
+            ),
+        ]
+        indexes = [
+            models.Index(
+                fields=["connection", "created_at"],
+                name="alarm_legacy_ret_idx",
+            )
         ]
 
     def __str__(self):
@@ -1356,6 +1550,198 @@ class RequestRateLease(models.Model):
 
     def __str__(self):
         return f"{self.scope}:{self.group}:{self.request_id}"
+
+
+class RecordingUpload(models.Model):
+    """Durable authority for one versioned recording upload."""
+
+    STATE_ACTIVE = "active"
+    STATE_FINALIZED = "finalized"
+    STATE_ABORTED = "aborted"
+    STATE_CHOICES = (
+        (STATE_ACTIVE, "Active"),
+        (STATE_FINALIZED, "Finalized"),
+        (STATE_ABORTED, "Aborted"),
+    )
+
+    upload_id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    create_id = models.UUIDField(editable=False)
+    device = models.ForeignKey(
+        RemoteDevice,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="recording_uploads",
+        editable=False,
+    )
+    device_id_at_create = models.PositiveBigIntegerField(editable=False)
+    owner_id_at_create = models.PositiveBigIntegerField(editable=False)
+    deployment_generation = models.PositiveBigIntegerField(editable=False)
+    storage_namespace = models.CharField(max_length=64, editable=False)
+    filename = models.CharField(max_length=255, editable=False)
+    state = models.CharField(max_length=12, choices=STATE_CHOICES, default=STATE_ACTIVE, editable=False)
+    committed_offset = models.PositiveBigIntegerField(default=0, editable=False)
+    revision = models.PositiveBigIntegerField(default=0, editable=False)
+    expected_size = models.PositiveBigIntegerField(null=True, blank=True, editable=False)
+    expected_digest = models.CharField(max_length=64, blank=True, default="", editable=False)
+    created_at = models.DateTimeField(auto_now_add=True, editable=False)
+    heartbeat_at = models.DateTimeField(default=timezone.now, db_index=True, editable=False)
+    updated_at = models.DateTimeField(auto_now=True, editable=False)
+    finalized_at = models.DateTimeField(null=True, blank=True, editable=False)
+    aborted_at = models.DateTimeField(null=True, blank=True, editable=False)
+    retention_hold = models.BooleanField(default=False, db_index=True, editable=False)
+    retention_hold_reason = models.CharField(max_length=512, blank=True, default="", editable=False)
+    retention_hold_at = models.DateTimeField(null=True, blank=True, editable=False)
+
+    class Meta:
+        ordering = ("created_at", "upload_id")
+        constraints = [
+            models.UniqueConstraint(
+                fields=("device", "create_id"),
+                name="unique_recording_create_id",
+            ),
+            models.UniqueConstraint(
+                fields=("device", "filename"),
+                name="unique_recording_filename",
+            ),
+            models.CheckConstraint(
+                condition=(
+                    models.Q(
+                        state="active",
+                        finalized_at__isnull=True,
+                        aborted_at__isnull=True,
+                        expected_size__isnull=True,
+                        expected_digest="",
+                    )
+                    | models.Q(
+                        state="finalized",
+                        finalized_at__isnull=False,
+                        aborted_at__isnull=True,
+                        expected_size__isnull=False,
+                    )
+                    & ~models.Q(expected_digest="")
+                    | models.Q(
+                        state="aborted",
+                        finalized_at__isnull=True,
+                        aborted_at__isnull=False,
+                        expected_size__isnull=True,
+                        expected_digest="",
+                    )
+                ),
+                name="valid_recording_upload_state",
+            ),
+            models.CheckConstraint(
+                condition=models.Q(expected_size__isnull=True) | models.Q(committed_offset=models.F("expected_size")),
+                name="recording_final_size_committed",
+            ),
+            models.CheckConstraint(
+                condition=(
+                    models.Q(revision=0, committed_offset=0) | models.Q(revision__gte=1, committed_offset__gte=1)
+                ),
+                name="valid_recording_upload_position",
+            ),
+        ]
+        indexes = [
+            models.Index(
+                fields=["state", "retention_hold", "heartbeat_at"],
+                name="recording_active_ret_idx",
+            ),
+            models.Index(
+                fields=["state", "retention_hold", "finalized_at"],
+                name="recording_final_ret_idx",
+            ),
+            models.Index(
+                fields=["state", "retention_hold", "aborted_at"],
+                name="recording_abort_ret_idx",
+            ),
+        ]
+
+    def __str__(self):
+        return f"{self.device_id_at_create}:{self.filename}:{self.state}"
+
+
+class RecordingUploadChunk(models.Model):
+    """Committed chunk receipt used to answer ambiguous retries."""
+
+    upload = models.ForeignKey(
+        RecordingUpload,
+        on_delete=models.CASCADE,
+        related_name="chunks",
+        editable=False,
+    )
+    chunk_id = models.UUIDField(editable=False)
+    offset = models.PositiveBigIntegerField(editable=False)
+    length = models.PositiveIntegerField(editable=False)
+    digest = models.CharField(max_length=64, editable=False)
+    revision = models.PositiveBigIntegerField(editable=False)
+    committed_at = models.DateTimeField(auto_now_add=True, editable=False)
+
+    class Meta:
+        ordering = ("upload_id", "revision")
+        constraints = [
+            models.UniqueConstraint(
+                fields=("upload", "chunk_id"),
+                name="unique_recording_chunk_id",
+            ),
+            models.UniqueConstraint(
+                fields=("upload", "revision"),
+                name="unique_recording_chunk_revision",
+            ),
+            models.UniqueConstraint(
+                fields=("upload", "offset"),
+                name="unique_recording_chunk_offset",
+            ),
+            models.CheckConstraint(
+                condition=models.Q(length__gte=1),
+                name="positive_recording_chunk_length",
+            ),
+            models.CheckConstraint(
+                condition=models.Q(revision__gte=1),
+                name="positive_recording_chunk_revision",
+            ),
+        ]
+
+    def __str__(self):
+        return f"{self.upload_id}:{self.revision}:{self.offset}+{self.length}"
+
+
+class PersistentIngestionUsage(models.Model):
+    """Transactionally maintained retained-ingestion quota authority."""
+
+    KIND_RECORDING = "recording"
+    KIND_AUDIT = "audit"
+    KIND_CHOICES = ((KIND_RECORDING, "Recording"), (KIND_AUDIT, "Audit"))
+    SCOPE_GLOBAL = "global"
+    SCOPE_OWNER = "owner"
+    SCOPE_DEVICE = "device"
+    SCOPE_CHOICES = ((SCOPE_GLOBAL, "Global"), (SCOPE_OWNER, "Owner"), (SCOPE_DEVICE, "Device"))
+
+    kind = models.CharField(max_length=12, choices=KIND_CHOICES, editable=False)
+    scope = models.CharField(max_length=8, choices=SCOPE_CHOICES, editable=False)
+    subject_id = models.PositiveBigIntegerField(default=0, editable=False)
+    items = models.PositiveBigIntegerField(default=0, editable=False)
+    active_items = models.PositiveBigIntegerField(default=0, editable=False)
+    committed_bytes = models.PositiveBigIntegerField(default=0, editable=False)
+    events = models.PositiveBigIntegerField(default=0, editable=False)
+    updated_at = models.DateTimeField(auto_now=True, editable=False)
+
+    class Meta:
+        ordering = ("kind", "scope", "subject_id")
+        constraints = [
+            models.UniqueConstraint(
+                fields=("kind", "scope", "subject_id"),
+                name="unique_ingestion_usage_scope",
+            ),
+            models.CheckConstraint(
+                condition=(
+                    models.Q(scope="global", subject_id=0) | models.Q(scope__in=("owner", "device"), subject_id__gte=1)
+                ),
+                name="valid_ingestion_usage_subject",
+            ),
+        ]
+
+    def __str__(self):
+        return f"{self.kind}:{self.scope}:{self.subject_id}"
 
 
 class ShareLinkAdmin(admin.ModelAdmin):

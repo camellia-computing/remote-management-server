@@ -57,9 +57,15 @@ Gunicorn访问日志只输出method、固定路由模式、status、bytes、dura
 
 超限响应为429，并带有有界`Retry-After`、`RateLimit-Limit`和`Cache-Control: no-store`；共享admission后端异常时稳定返回503且不泄露数据库错误。五分钟cleanup timer回收过期bucket和崩溃残留lease，lease时间必须大于Gunicorn允许的最长请求生命周期。`.env.example`列出service、source、credential、recording bytes、concurrency和本地容量上限。应用限流不能替代edge/WAF、反向代理连接/body/带宽上限或只允许内部访问health endpoint；启用forwarded headers时，可信proxy CIDR必须覆盖且代理必须删除客户端自带的来源头，否则source预算没有可信安全边界。
 
+录像上传只接受`version=2`协议；旧`new/part/tail/remove`请求返回426，Client与Management必须协调升级。Client先持久化随机`create_id`，Management签发绑定device owner与deployment generation的`upload_id`。每个chunk携带offset、revision、随机chunk ID、长度和SHA-256；服务端只有在staging文件`fsync`且数据库receipt提交后才确认新的权威offset/revision，相同chunk可在响应丢失后幂等重放，status也必须精确匹配该chunk receipt，不能只凭offset前进就确认。部分写会截回最后已提交offset。`finalize`必须匹配完整长度和SHA-256，随后在同一filesystem内原子rename并`fsync`来源和目标目录后发布，且永久拒绝追加或abort；active staging不作为完成录像提供。Client重启从Unix 0600/Windows录像目录ACL保护的双槽校验sidecar恢复待确认chunk/finalize，无法证明本地录像已正常关闭时只执行幂等abort。
+
+数据库usage ledger在同一事务按device、owner与global锁定并约束active upload、保留文件数、committed bytes，以及Connection/event数量；持续请求的分钟级429预算不能替代这些硬上限。容量超限稳定返回507和有界`Retry-After`，Client保留sidecar并等待，不会每帧重试。readiness与每个已认证record mutation验证record root仍为真实目录、生产专用mount、可写且保有配置的bytes/inodes reserve；volume丢失、只读或接近满时在读取request body前拒绝。五分钟cleanup以有界batch把stale active变为可恢复abort tomb、删除过期finalized bytes/receipt，以及清理已关闭Connection/File/Alarm event；device删除只清live FK，storage namespace与配额归属快照保留到清理。合法保留可用`set_ingestion_hold recording|audit UUID --actor ADMIN --reason TEXT --hold|--release`显式设置，Admin页面不能直接改写。不要手工删除usage rows、数据库状态或把`.uploads`中的part/tomb当成完成品。
+
 地址簿和待处理OIDC中的secret使用带key ID的`secretbox:v2` envelope认证加密；数据库key inventory保存不含业务明文的canary和fingerprint，readiness会拒绝错误key或replica配置分裂。shared profile的默认连接密码不再存入通用`info` JSON，而是迁移到显式加密字段；profile列表永不加载或返回该字段，Client仅在目标RID已存在且当前地址簿权限有效时调用目标绑定的即时credential API。连接凭据只通过已认证且通过地址簿权限校验的运行时 API 返回。Django 管理表单将其作为只写字段，CSV/Excel 导出不包含连接凭据。
 
 地址簿ACL审计与对应权限变更在同一事务提交。审计行保存profile GUID、名称和owner的不可变快照；删除profile会先写入tombstone，再把历史行的业务外键置空，因此API、Web、Admin或owner级联删除都不会抹除已有ACL历史。Django Admin只允许查看这些审计行，不允许新增、修改或删除。
+
+连接审计只接受`version=2`；旧Client固定返回426。Host设备用一次性UUIDv4 event创建连接后，由Management签发绑定host device、owner和deployment generation的不可猜测`audit_session_id`。关键连接事实只能从未设置值单向确定，close后永久冻结；controller必须以自己的active device bearer领取同一session capability，note每次写入都保留previous/new值、actor和单调sequence。File与Alarm只有在host和controller两端都完成绑定、两端设备代际仍有效且连接仍active时才会写入，并分别通过真实外键引用同一Connection和append-only event。重复event ID只有在session、kind、actor、设备和完整payload完全一致时才幂等确认；冲突、旧代际、owner变化或跨session重放均fail closed。设备或用户删除会让实时authority引用失效，但创建/绑定时的device PK、RID、UUID、owner、generation和每个event actor ID快照仍保留。Connection、Event、File和Alarm在Django Admin中全部只读，任何纠正必须新增可追踪事件，不能改写历史行。
 
 设备身份使用一次性`camellia-device-proof-v1` challenge。已部署设备的密码/OIDC登录必须由当前Ed25519设备私钥签名；首次部署由新设备密钥签名；主动换钥必须由旧钥与新钥对同一challenge双签。旧钥丢失时，管理员只能通过`POST /api/devices/<device-id>/approve-recovery`预先批准一个精确的新公钥；批准有效期10分钟、仅可消费一次，成功后设备代际递增且旧bearer立即撤销。Client必须逐字段验证canonical message后才能签名，不能把Management响应当作任意消息签名请求。
 
