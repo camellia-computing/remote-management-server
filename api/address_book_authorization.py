@@ -1,7 +1,8 @@
+from django.core.exceptions import ObjectDoesNotExist
 from django.db import connections, transaction
 
 from api.address_book_errors import AuthorizationGenerationExhausted
-from api.models_work import AddressBookProfile, AddressBookRule, AddressBookShare
+from api.models_work import AddressBookProfile, AddressBookRule, AddressBookRuleAudit, AddressBookShare
 
 MAX_AUTHORIZATION_GENERATION = (1 << 63) - 1
 
@@ -66,6 +67,34 @@ def bump_locked_authorization_generation(profile, *, using=None):
     profile.authorization_generation += 1
     profile.save(using=database, update_fields=("authorization_generation", "updated_at"))
     return profile.authorization_generation
+
+
+def record_profile_tombstone(profile, actor=None, *, using=None):
+    """Persist an immutable profile-deletion snapshot before its FK is nulled."""
+
+    database = using or profile._state.db or "default"
+    try:
+        owner = profile.owner
+    except ObjectDoesNotExist:
+        owner = None
+    owner_name = getattr(owner, "username", "") or ""
+    return AddressBookRuleAudit.objects.using(database).create(
+        profile=profile,
+        profile_guid=str(profile.guid or ""),
+        profile_name=str(profile.name or ""),
+        profile_owner_name=owner_name,
+        actor=actor if actor and getattr(actor, "id", None) else None,
+        action="profile_delete",
+        target_type="profile",
+        target_name=str(profile.name or ""),
+        rule=int(profile.rule or 1),
+        details={
+            "authorization_generation": profile.authorization_generation,
+            "profile_guid": str(profile.guid or ""),
+            "profile_name": str(profile.name or ""),
+            "profile_owner_name": owner_name,
+        },
+    )
 
 
 def lock_and_bump_profiles_for_groups(group_ids, *, using):

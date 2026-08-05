@@ -918,6 +918,9 @@ def _get_rule_access(profile, user):
 def _audit_ab_rule(profile, actor, action, target_type, target_name, rule, details=None):
     if not profile:
         return
+    target_name = target_name or ""
+    if len(target_name) > 150:
+        raise ValueError("Address-book audit target name is too long")
     payload = _json_value(
         details if details is not None else {},
         expected_type=(dict, list),
@@ -927,12 +930,16 @@ def _audit_ab_rule(profile, actor, action, target_type, target_name, rule, detai
         payload = {}
     if isinstance(payload, dict):
         payload.setdefault("authorization_generation", profile.authorization_generation)
+    owner = getattr(profile, "owner", None)
     AddressBookRuleAudit.objects.create(
         profile=profile,
+        profile_guid=str(profile.guid or ""),
+        profile_name=str(profile.name or ""),
+        profile_owner_name=getattr(owner, "username", "") or "",
         actor=actor if actor and getattr(actor, "id", None) else None,
         action=action,
         target_type=target_type,
-        target_name=target_name or "",
+        target_name=target_name,
         rule=int(rule or 1),
         details=payload,
     )
@@ -2646,9 +2653,11 @@ def ab_shared_delete(request):
         if not user.is_admin:
             candidates = candidates.filter(owner=user)
         candidates = candidates.exclude(guid__startswith="personal-").order_by("pk")
-        locked_ids = list(candidates.values_list("pk", flat=True))
-        AddressBookProfile.objects.filter(pk__in=locked_ids).delete()
-        deleted = len(locked_ids)
+        locked_profiles = list(candidates.select_related("owner"))
+        for profile in locked_profiles:
+            profile._audit_actor = user
+            profile.delete()
+        deleted = len(locked_profiles)
     _log_event(request, "api_ab_shared_delete", username=user.username, count=deleted)
     return JsonResponse({"code": 1, "deleted": deleted})
 

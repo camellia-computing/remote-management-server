@@ -55,6 +55,8 @@ Gunicorn访问日志只输出method、固定路由模式、status、bytes、dura
 
 地址簿和待处理OIDC中的secret使用带key ID的`secretbox:v2` envelope认证加密；数据库key inventory保存不含业务明文的canary和fingerprint，readiness会拒绝错误key或replica配置分裂。shared profile的默认连接密码不再存入通用`info` JSON，而是迁移到显式加密字段；profile列表永不加载或返回该字段，Client仅在目标RID已存在且当前地址簿权限有效时调用目标绑定的即时credential API。连接凭据只通过已认证且通过地址簿权限校验的运行时 API 返回。Django 管理表单将其作为只写字段，CSV/Excel 导出不包含连接凭据。
 
+地址簿ACL审计与对应权限变更在同一事务提交。审计行保存profile GUID、名称和owner的不可变快照；删除profile会先写入tombstone，再把历史行的业务外键置空，因此API、Web、Admin或owner级联删除都不会抹除已有ACL历史。Django Admin只允许查看这些审计行，不允许新增、修改或删除。
+
 设备身份使用一次性`camellia-device-proof-v1` challenge。已部署设备的密码/OIDC登录必须由当前Ed25519设备私钥签名；首次部署由新设备密钥签名；主动换钥必须由旧钥与新钥对同一challenge双签。旧钥丢失时，管理员只能通过`POST /api/devices/<device-id>/approve-recovery`预先批准一个精确的新公钥；批准有效期10分钟、仅可消费一次，成功后设备代际递增且旧bearer立即撤销。Client必须逐字段验证canonical message后才能签名，不能把Management响应当作任意消息签名请求。
 
 设备heartbeat成功时返回绑定rid、UUID和deployment generation的60秒`device_lease`，并继续以15秒idle/3秒active节奏续租。禁用、删除、owner失效或统一credential撤销后，旧bearer的heartbeat返回绑定同一rid/UUID的显式`revoked`状态；Client必须立即停止新入站连接并关闭现有direct/relay/file/terminal会话。网络或Management故障不伪装成显式撤销，但最后一个有效lease到期后同样fail closed。
@@ -69,6 +71,11 @@ Identity Server对`POST /api/devices/verify-deployment`的每次请求提供随�
 sudo install -d -m 0755 /opt/camellia-remote-management /etc/camellia-remote-management
 sudo install -m 0644 docker-compose.yaml /opt/camellia-remote-management/
 sudo install -m 0755 deploy/backup-postgres.sh /opt/camellia-remote-management/
+sudo install -d -m 0755 /opt/camellia-remote-management/scripts
+sudo install -m 0755 scripts/backup_envelope.py /opt/camellia-remote-management/scripts/
+sudo install -m 0755 deploy/restore-postgres.sh /opt/camellia-remote-management/
+sudo install -m 0755 deploy/management-maintenance-guard.sh /opt/camellia-remote-management/
+sudo install -m 0755 deploy/management-maintenance.sh /opt/camellia-remote-management/
 sudo install -m 0600 .env.example /etc/camellia-remote-management/management.env
 sudo install -m 0644 deploy/systemd/*.service deploy/systemd/*.timer /etc/systemd/system/
 sudo systemctl daemon-reload
@@ -85,9 +92,15 @@ Compose 默认仅在同主机、不可从外部路由的 `backend` 网络内使�
 
 ## 备份、恢复与运维
 
-每小时定时器生成 PostgreSQL custom-format 备份并在写入完成后原子重命名。每五分钟的清理任务删除过期登录失败记录、OIDC 会话、设备证明challenge、设备恢复批准和访问令牌，标记过期分享链接，并按配置的保留期删除已消费或已过期链接。备份目录必须位于独立、加密且受监控的存储；至少每天复制到故障域外，并按季度执行恢复演练。
+每小时定时器使用受审固定版本（当前基线 `age v1.2.1`）的 `/usr/bin/age` recipient，在 PostgreSQL 容器输出 custom-format dump 后立即封装并认证加密；明文不会写入备份目录，最终文件是 `postgres-<UTC时间>-<随机backup-id>.dump.age`，并在完整写入后原子重命名。`CAMELLIA_REMOTE_BACKUP_AGE_RECIPIENT`、`CAMELLIA_REMOTE_BACKUP_AGE_KEY_ID` 和 `CAMELLIA_REMOTE_BACKUP_DEPLOYMENT_ID` 必须显式配置。recipient 对应的恢复 identity 只能放在 root/管理员拥有的 0400 或 0600 文件中，不能放入普通 management runtime 容器、镜像、环境文件或备份 artifact；identity 与应用数据加密 key 必须分离。备份目录必须位于独立、加密且受监控的存储；至少每天复制到故障域外，并按季度执行恢复演练。锁竞争返回退出码 75，监控应将其视为本轮跳过而非成功。
 
-恢复流程：停止应用、创建空数据库、用与生产相同主版本的 `pg_restore --clean --if-exists --no-owner --no-acl` 恢复、执行迁移和 `manage.py check --deploy`、验证 `/health/ready`，最后恢复流量。不得在未演练的情况下覆盖现有数据库。
+backup/cleanup unit没有启动业务栈的权限：它们只在stack已经是`active`且不存在root-owned maintenance lease时运行；否则`ExecCondition`记录`skipped:not-running`或`skipped:maintenance`并退出，不会创建容器。仅停止stack不再可能被5分钟/hourly/Persistent timer反向解除，但正式维护仍必须显式停timer并保留lease。
+
+恢复流程（必须先在隔离环境演练）：先从反向代理摘流并执行 `sudo /opt/camellia-remote-management/management-maintenance.sh enter --reason restore-INCIDENT-ID`。该命令先原子创建`/run/camellia-remote-management/maintenance.lease`，再停止两个timer、正在执行的backup/cleanup和stack，最后确认官方Compose项目没有残留容器；任一步失败都会保留lease并fail closed。随后只启动隔离的PostgreSQL service、创建空数据库，准备root拥有且权限为0400/0600的identity，设置与备份一致的 `CAMELLIA_REMOTE_BACKUP_DEPLOYMENT_ID`、`CAMELLIA_REMOTE_DATABASE_NAME`、`CAMELLIA_REMOTE_BACKUP_POSTGRES_MAJOR` 和 `CAMELLIA_REMOTE_BACKUP_AGE_KEY_ID`，然后执行 `CAMELLIA_REMOTE_BACKUP_AGE_IDENTITY_FILE=/etc/camellia-remote-management/backup-identity.txt /opt/camellia-remote-management/restore-postgres.sh /var/backups/camellia-remote-management/postgres-<UTC时间>-<backup-id>.dump.age`。脚本先让age完整验证密文，再以 `pg_restore --single-transaction --exit-on-error --no-owner --no-acl` 导入；任何密文、manifest、数据库或PostgreSQL主版本不匹配都会fail closed，且恢复用的短暂明文临时文件在退出时删除。
+
+在lease存在且timer停止期间完成migration、schema/key和隔离readiness验证；不要恢复外部流量。验证后停止所有隔离Compose容器，再执行 `sudo /opt/camellia-remote-management/management-maintenance.sh leave --confirm-validated`。该命令只解除lease，不会自动启动任何服务；随后手动启动stack，验证`/health/ready`，最后才恢复流量并手动启动backup/cleanup timer。`status`子命令可读取当前lease和stack状态。不得通过删除lease文件、让lease自动过期或只停止stack来绕过该状态机，也不得在未演练时覆盖现有数据库。
+
+备份密钥轮换：先生成新的 age recipient/identity，更新 `CAMELLIA_REMOTE_BACKUP_AGE_KEY_ID` 与 recipient 并等待一轮成功备份；保留旧 identity，直到旧文件名范围内的备份均已迁移、恢复验证或按保留策略过期，再撤销旧 recipient。恢复 identity 不得与 `CAMELLIA_REMOTE_DATA_ENCRYPTION_KEY` 共用，任何 key material 不得写入日志。
 
 告警至少覆盖就绪探针、5xx、认证失败激增、数据库容量/连接池、备份新鲜度和证书到期。部署失败时回滚到上一镜像摘要；数据库变更按前向修复处理。
 

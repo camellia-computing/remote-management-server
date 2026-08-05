@@ -213,6 +213,11 @@ jobs:
           advanced-security: false
           annotations: true
 
+      - name: Install pinned age for backup integration tests
+        run: |
+          go install filippo.io/age/cmd/...@v1.2.1
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+
       - name: Lint workflows and shell scripts
         run: |
           go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
@@ -220,9 +225,15 @@ jobs:
             .github/scripts/*.sh \
             .github/scripts/tests/*.sh \
             deploy/backup-postgres.sh \
+            deploy/management-maintenance-guard.sh \
+            deploy/management-maintenance.sh \
+            deploy/restore-postgres.sh \
             run.sh \
             sync_web_client.sh \
             scripts/web_client_revision.sh
+          python3 scripts/test_backup_envelope.py
+          python3 scripts/test_backup_scripts.py
+          python3 scripts/test_systemd_maintenance.py
           python3 .github/scripts/test_manage_release.py
           python3 .github/scripts/test_container_release_evidence.py
           python3 .github/scripts/test_resolve_remote_client_release.py
@@ -244,7 +255,15 @@ jobs:
           CAMELLIA_REMOTE_API_SERVER: https://api.example.test
           CAMELLIA_REMOTE_ID_SERVER: wss://remote.example.test:443
           CAMELLIA_REMOTE_RS_PUB_KEY: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
+          CAMELLIA_REMOTE_BACKUP_AGE_RECIPIENT: age1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq
+          CAMELLIA_REMOTE_BACKUP_AGE_KEY_ID: ci-backup-v1
+          CAMELLIA_REMOTE_BACKUP_DEPLOYMENT_ID: ci-deployment
+          CAMELLIA_REMOTE_BACKUP_POSTGRES_MAJOR: "18"
         run: |
+          [[ "$CAMELLIA_REMOTE_BACKUP_AGE_RECIPIENT" =~ ^age1[^[:space:]]{20,255}$ ]]
+          [[ "$CAMELLIA_REMOTE_BACKUP_AGE_KEY_ID" =~ ^[a-z0-9][a-z0-9._-]{0,31}$ ]]
+          [[ "$CAMELLIA_REMOTE_BACKUP_DEPLOYMENT_ID" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]]
+          [[ "$CAMELLIA_REMOTE_BACKUP_POSTGRES_MAJOR" =~ ^[1-9][0-9]{0,2}$ ]]
           systemd-analyze security --offline=yes deploy/systemd/*.service >/dev/null
           docker compose --env-file /dev/null -f docker-compose.yaml config --quiet
 

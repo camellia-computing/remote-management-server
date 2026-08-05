@@ -849,6 +849,7 @@ def _rule_target_label(target_type):
         "user": _("用户"),
         "group": _("用户组"),
         "everyone": _("所有人"),
+        "profile": _("地址簿"),
     }
     return mapping.get(target_type, target_type)
 
@@ -1040,15 +1041,22 @@ def _summarize_rules(rules):
 def _audit_ab_rule(profile, actor, action, target_type, target_name, rule, details=None):
     if not profile:
         return
+    target_name = target_name or ""
+    if len(target_name) > 150:
+        raise ValueError("Address-book audit target name is too long")
     payload = details if isinstance(details, (dict, list)) else {}
     if isinstance(payload, dict):
         payload.setdefault("authorization_generation", profile.authorization_generation)
+    owner = getattr(profile, "owner", None)
     AddressBookRuleAudit.objects.create(
         profile=profile,
+        profile_guid=str(profile.guid or ""),
+        profile_name=str(profile.name or ""),
+        profile_owner_name=getattr(owner, "username", "") or "",
         actor=actor if actor and getattr(actor, "id", None) else None,
         action=action,
         target_type=target_type,
-        target_name=target_name or "",
+        target_name=target_name,
         rule=int(rule or 1),
         details=payload,
     )
@@ -1841,6 +1849,7 @@ def ab_books(request):
                 if not profile:
                     messages.error(request, _("授权已变更，操作未提交。"))
                     return HttpResponseRedirect("/api/ab_books")
+                profile._audit_actor = u
                 profile.delete()
             _log_event(request, "front_ab_book_delete", username=u.username, guid=guid)
             messages.success(request, _("地址簿已删除。"))
@@ -2869,8 +2878,9 @@ def ab_audit(request):
     audits = AddressBookRuleAudit.objects.select_related("profile", "actor").order_by("-created_at")
     if filter_q:
         audits = audits.filter(
-            Q(profile__name__icontains=filter_q)
-            | Q(profile__guid__icontains=filter_q)
+            Q(profile_name__icontains=filter_q)
+            | Q(profile_guid__icontains=filter_q)
+            | Q(profile_owner_name__icontains=filter_q)
             | Q(actor__username__icontains=filter_q)
             | Q(target_name__icontains=filter_q)
             | Q(action__icontains=filter_q)
@@ -2887,6 +2897,7 @@ def ab_audit(request):
         "rule_add": _("规则新增"),
         "rule_update": _("规则更新"),
         "rule_delete": _("规则删除"),
+        "profile_delete": _("地址簿删除"),
     }
 
     entries = []
@@ -2894,8 +2905,8 @@ def ab_audit(request):
         entries.append(
             {
                 "created_at": audit.created_at,
-                "profile_name": audit.profile.name if audit.profile else "-",
-                "profile_guid": audit.profile.guid if audit.profile else "-",
+                "profile_name": audit.profile_name or (audit.profile.name if audit.profile else "-"),
+                "profile_guid": audit.profile_guid or (audit.profile.guid if audit.profile else "-"),
                 "actor": audit.actor.username if audit.actor else "-",
                 "action": action_labels.get(audit.action, audit.action),
                 "target_type": _rule_target_label(audit.target_type),
