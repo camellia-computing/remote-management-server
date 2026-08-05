@@ -47,6 +47,9 @@ class BackupScriptsTests(unittest.TestCase):
         self.project = self.root / "project"
         self.project.mkdir()
         (self.project / "docker-compose.yaml").write_text("services: {}\n")
+        deploy = self.project / "deploy"
+        deploy.mkdir()
+        (deploy / "bootstrap-postgres-roles.sh").write_text("#!/bin/sh\nexit 0\n")
         self.env_file = self.root / "management.env"
         self.env_file.write_text("CAMELLIA_REMOTE_DATABASE_NAME=camellia_remote\n")
         self.env_file.chmod(0o600)
@@ -63,18 +66,22 @@ class BackupScriptsTests(unittest.TestCase):
                 #!/usr/bin/env python3
                 import os, pathlib, sys
                 args = sys.argv[1:]
-                command = args[-1] if args else ""
                 mode = os.environ.get("FAKE_DOCKER_MODE", "ok")
-                if "SHOW server_version_num" in command:
+                if "database-bootstrap" in args:
+                    raise SystemExit(0)
+                if "database-probe" in args:
+                    print("1")
+                    raise SystemExit(0)
+                if "psql" in args and "SHOW server_version_num" in args:
                     print("180000")
                     raise SystemExit(0)
-                if "pg_dump" in command:
+                if "pg_dump" in args:
                     if mode == "pg_dump-fail":
                         print("pg_dump failed", file=sys.stderr)
                         raise SystemExit(42)
                     sys.stdout.buffer.write(b"PGDUMP-CANARY\\x00custom-format\\n")
                     raise SystemExit(0)
-                if "pg_restore" in command:
+                if "pg_restore" in args:
                     payload = sys.stdin.buffer.read()
                     pathlib.Path(os.environ["FAKE_RESTORE_CAPTURE"]).write_bytes(payload)
                     if mode == "pg_restore-fail":
@@ -86,9 +93,7 @@ class BackupScriptsTests(unittest.TestCase):
             ).lstrip()
         )
         self.fake_docker.chmod(0o755)
-        keygen = subprocess.run(
-            [str(self.age_keygen)], check=True, text=True, capture_output=True
-        )
+        keygen = subprocess.run([str(self.age_keygen)], check=True, text=True, capture_output=True)
         key = keygen.stdout
         self.identity = self.root / "identity.txt"
         self.identity.write_text(key)

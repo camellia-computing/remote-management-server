@@ -60,9 +60,8 @@ destination="$backup_dir/postgres-$timestamp-$backup_id.dump.age"
 trap 'rm -f -- "$temporary"' EXIT HUP INT TERM
 
 compose=(docker compose --env-file "$env_file" -f "$project_dir/docker-compose.yaml")
-# shellcheck disable=SC2016 # The command is evaluated inside the postgres container.
-server_version_num="$("${compose[@]}" exec -T postgres sh -eu -c \
-    'psql --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" --tuples-only --no-align -c "SHOW server_version_num"' \
+server_version_num="$("${compose[@]}" run --rm --no-deps -T database-backup \
+    psql --no-psqlrc --tuples-only --no-align --command 'SHOW server_version_num' \
     | tr -d '[:space:]')"
 [[ "$server_version_num" =~ ^[0-9]+$ ]] || die "PostgreSQL server version is invalid"
 postgres_major="$((server_version_num / 10000))"
@@ -71,9 +70,8 @@ postgres_major="$((server_version_num / 10000))"
 # pg_dump is never written to disk in plaintext. The metadata frame is also
 # encrypted by age, so restore can authenticate deployment/database context.
 set -o pipefail
-# shellcheck disable=SC2016 # The command is evaluated inside the postgres container.
-"${compose[@]}" exec -T postgres sh -eu -c \
-    'pg_dump --format=custom --compress=9 --no-owner --no-acl --username "$POSTGRES_USER" "$POSTGRES_DB"' \
+"${compose[@]}" run --rm --no-deps -T database-backup \
+    pg_dump --format=custom --compress=9 --no-owner --no-acl \
     | python3 "$envelope_helper" pack \
         --backup-id "$backup_id" \
         --created-at "$timestamp" \

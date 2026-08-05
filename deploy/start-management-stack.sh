@@ -85,16 +85,21 @@ assert_no_maintenance_lease
 [[ -d "$project_dir" && ! -L "$project_dir" ]] || die "project directory is missing or symlinked"
 [[ -f "$project_dir/docker-compose.yaml" && ! -L "$project_dir/docker-compose.yaml" ]] ||
     die "docker compose file is missing or symlinked"
+bootstrap_script="$project_dir/deploy/bootstrap-postgres-roles.sh"
+[[ -f "$bootstrap_script" && ! -L "$bootstrap_script" && -r "$bootstrap_script" ]] ||
+    die "database role bootstrap script is missing, symlinked, or unreadable"
 [[ -f "$env_file" && ! -L "$env_file" && -r "$env_file" ]] ||
     die "management environment file is missing, symlinked, or unreadable"
 
 require_canonical_path "$docker_binary" "docker binary"
 require_canonical_path "$project_dir" "project directory"
 require_canonical_path "$project_dir/docker-compose.yaml" "docker compose file"
+require_canonical_path "$bootstrap_script" "database role bootstrap script"
 require_canonical_path "$env_file" "management environment file"
 require_owned_path "$docker_binary" "docker binary"
 require_owned_path "$project_dir" "project directory"
 require_owned_path "$project_dir/docker-compose.yaml" "docker compose file"
+require_owned_path "$bootstrap_script" "database role bootstrap script"
 
 env_mode="$(stat -c '%a' -- "$env_file" 2>/dev/null)" || die "cannot inspect management environment permissions"
 env_owner="$(stat -c '%u' -- "$env_file" 2>/dev/null)" || die "cannot inspect management environment owner"
@@ -139,7 +144,7 @@ fi
 assert_no_maintenance_lease
 
 compose=("$docker_binary" compose --env-file "$env_file" -f "$project_dir/docker-compose.yaml")
-"${compose[@]}" config --quiet
+"${compose[@]}" --profile database-operations config --quiet
 
 # No old application generation may remain online while migration runs.
 "${compose[@]}" stop --timeout 45 management
@@ -151,9 +156,19 @@ if printf '%s\n' "$running_services" | grep -Fxq management; then
 fi
 
 "${compose[@]}" rm --force --stop migrate
+# A fresh or converted volume cannot pass the probe healthcheck until the
+# limited probe role exists. Start PostgreSQL without waiting, converge roles,
+# then require the authenticated healthcheck before migration.
+"${compose[@]}" up --detach postgres
+"${compose[@]}" run --rm --no-deps -T database-bootstrap
 "${compose[@]}" up --detach --wait postgres
 "${compose[@]}" run --rm --no-deps migrate
+# Migrations create new objects as the migration owner. Re-run convergence to
+# validate ownership/default ACLs and make current grants explicit before the
+# runtime credential is allowed online.
+"${compose[@]}" run --rm --no-deps -T database-bootstrap
+"${compose[@]}" run --rm --no-deps -T database-probe
 assert_no_maintenance_lease
 "${compose[@]}" up --detach --wait --no-deps management
 
-echo "stack-started:migration-verified"
+echo "stack-started:database-roles-and-migration-verified"

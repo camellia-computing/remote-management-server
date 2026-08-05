@@ -52,6 +52,7 @@ ignore = ["E501"]
 "scripts/test_backup_*.py" = ["S603"]
 "scripts/test_systemd_maintenance.py" = ["S603"]
 "scripts/test_deployment_gate.py" = ["S603"]
+"scripts/test_database_roles.py" = ["S603", "S607", "S608"]
 
 [tool.pytest.ini_options]
 DJANGO_SETTINGS_MODULE = "camellia_remote_management.settings"

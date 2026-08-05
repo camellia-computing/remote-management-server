@@ -15,8 +15,6 @@ x-application: &application
     CAMELLIA_REMOTE_DATABASE_HOST: ${CAMELLIA_REMOTE_DATABASE_HOST:-postgres}
     CAMELLIA_REMOTE_DATABASE_PORT: ${CAMELLIA_REMOTE_DATABASE_PORT:-5432}
     CAMELLIA_REMOTE_DATABASE_NAME: ${CAMELLIA_REMOTE_DATABASE_NAME:-camellia_remote}
-    CAMELLIA_REMOTE_DATABASE_USER: ${CAMELLIA_REMOTE_DATABASE_USER:-camellia_remote}
-    CAMELLIA_REMOTE_DATABASE_PASSWORD: ${CAMELLIA_REMOTE_DATABASE_PASSWORD:?Set CAMELLIA_REMOTE_DATABASE_PASSWORD}
     CAMELLIA_REMOTE_DATABASE_SSLMODE: ${CAMELLIA_REMOTE_DATABASE_SSLMODE:-disable}
     CAMELLIA_REMOTE_DATABASE_SSLROOTCERT: ${CAMELLIA_REMOTE_DATABASE_SSLROOTCERT:-}
     CAMELLIA_REMOTE_DATABASE_SSLCERT: ${CAMELLIA_REMOTE_DATABASE_SSLCERT:-}
@@ -78,17 +76,42 @@ x-application: &application
   networks:
     - backend
 
+x-database-client: &database-client
+  image: postgres:18-alpine@sha256:9a8afca54e7861fd90fab5fdf4c42477a6b1cb7d293595148e674e0a3181de15
+  pull_policy: always
+  entrypoint: []
+  user: "70:70"
+  read_only: true
+  cap_drop:
+    - ALL
+  security_opt:
+    - no-new-privileges:true
+  tmpfs:
+    - /tmp:size=32m,mode=1777
+  networks:
+    - backend
+  restart: "no"
+
 services:
   postgres:
     image: postgres:18-alpine@sha256:9a8afca54e7861fd90fab5fdf4c42477a6b1cb7d293595148e674e0a3181de15
     environment:
       POSTGRES_DB: ${CAMELLIA_REMOTE_DATABASE_NAME:-camellia_remote}
-      POSTGRES_USER: ${CAMELLIA_REMOTE_DATABASE_USER:-camellia_remote}
-      POSTGRES_PASSWORD: ${CAMELLIA_REMOTE_DATABASE_PASSWORD:?Set CAMELLIA_REMOTE_DATABASE_PASSWORD}
+      POSTGRES_USER: ${CAMELLIA_REMOTE_DATABASE_BOOTSTRAP_USER:?Set the existing or new cluster bootstrap superuser}
+      POSTGRES_PASSWORD: ${CAMELLIA_REMOTE_DATABASE_BOOTSTRAP_PASSWORD:?Set the bootstrap password}
+      CAMELLIA_REMOTE_DATABASE_PROBE_USER: ${CAMELLIA_REMOTE_DATABASE_PROBE_USER:?Set the probe role}
+      CAMELLIA_REMOTE_DATABASE_PROBE_PASSWORD: ${CAMELLIA_REMOTE_DATABASE_PROBE_PASSWORD:?Set the probe password}
     volumes:
       - postgres-data:/var/lib/postgresql
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      test:
+        - CMD-SHELL
+        - >-
+          PGPASSWORD="$${CAMELLIA_REMOTE_DATABASE_PROBE_PASSWORD}"
+          psql --no-psqlrc --host 127.0.0.1
+          --username "$${CAMELLIA_REMOTE_DATABASE_PROBE_USER}"
+          --dbname "$${POSTGRES_DB}" --tuples-only --no-align
+          --command "SELECT 1" | grep -Fxq 1
       interval: 10s
       timeout: 5s
       retries: 10
@@ -96,8 +119,74 @@ services:
     networks:
       - backend
 
+  database-bootstrap:
+    <<: *database-client
+    profiles:
+      - database-operations
+    environment:
+      PGHOST: ${CAMELLIA_REMOTE_DATABASE_HOST:-postgres}
+      PGPORT: ${CAMELLIA_REMOTE_DATABASE_PORT:-5432}
+      PGDATABASE: ${CAMELLIA_REMOTE_DATABASE_NAME:-camellia_remote}
+      PGUSER: ${CAMELLIA_REMOTE_DATABASE_BOOTSTRAP_USER:?Set the existing or new cluster bootstrap superuser}
+      PGPASSWORD: ${CAMELLIA_REMOTE_DATABASE_BOOTSTRAP_PASSWORD:?Set the bootstrap password}
+      PGSSLMODE: ${CAMELLIA_REMOTE_DATABASE_SSLMODE:-disable}
+      CAMELLIA_REMOTE_DATABASE_MIGRATION_USER: ${CAMELLIA_REMOTE_DATABASE_MIGRATION_USER:?Set the migration owner role}
+      CAMELLIA_REMOTE_DATABASE_MIGRATION_PASSWORD: ${CAMELLIA_REMOTE_DATABASE_MIGRATION_PASSWORD:?Set the migration password}
+      CAMELLIA_REMOTE_DATABASE_RUNTIME_USER: ${CAMELLIA_REMOTE_DATABASE_RUNTIME_USER:?Set the runtime role}
+      CAMELLIA_REMOTE_DATABASE_RUNTIME_PASSWORD: ${CAMELLIA_REMOTE_DATABASE_RUNTIME_PASSWORD:?Set the runtime password}
+      CAMELLIA_REMOTE_DATABASE_BACKUP_USER: ${CAMELLIA_REMOTE_DATABASE_BACKUP_USER:?Set the backup role}
+      CAMELLIA_REMOTE_DATABASE_BACKUP_PASSWORD: ${CAMELLIA_REMOTE_DATABASE_BACKUP_PASSWORD:?Set the backup password}
+      CAMELLIA_REMOTE_DATABASE_PROBE_USER: ${CAMELLIA_REMOTE_DATABASE_PROBE_USER:?Set the probe role}
+      CAMELLIA_REMOTE_DATABASE_PROBE_PASSWORD: ${CAMELLIA_REMOTE_DATABASE_PROBE_PASSWORD:?Set the probe password}
+    volumes:
+      - ./deploy/bootstrap-postgres-roles.sh:/usr/local/bin/bootstrap-postgres-roles.sh:ro
+    command: ["/bin/sh", "/usr/local/bin/bootstrap-postgres-roles.sh"]
+
+  database-backup:
+    <<: *database-client
+    profiles:
+      - database-operations
+    environment:
+      PGHOST: ${CAMELLIA_REMOTE_DATABASE_HOST:-postgres}
+      PGPORT: ${CAMELLIA_REMOTE_DATABASE_PORT:-5432}
+      PGDATABASE: ${CAMELLIA_REMOTE_DATABASE_NAME:-camellia_remote}
+      PGUSER: ${CAMELLIA_REMOTE_DATABASE_BACKUP_USER:?Set the backup role}
+      PGPASSWORD: ${CAMELLIA_REMOTE_DATABASE_BACKUP_PASSWORD:?Set the backup password}
+      PGSSLMODE: ${CAMELLIA_REMOTE_DATABASE_SSLMODE:-disable}
+    command: ["psql", "--version"]
+
+  database-restore:
+    <<: *database-client
+    profiles:
+      - database-operations
+    environment:
+      PGHOST: ${CAMELLIA_REMOTE_DATABASE_HOST:-postgres}
+      PGPORT: ${CAMELLIA_REMOTE_DATABASE_PORT:-5432}
+      PGDATABASE: ${CAMELLIA_REMOTE_DATABASE_NAME:-camellia_remote}
+      PGUSER: ${CAMELLIA_REMOTE_DATABASE_MIGRATION_USER:?Set the migration owner role}
+      PGPASSWORD: ${CAMELLIA_REMOTE_DATABASE_MIGRATION_PASSWORD:?Set the migration password}
+      PGSSLMODE: ${CAMELLIA_REMOTE_DATABASE_SSLMODE:-disable}
+    command: ["psql", "--version"]
+
+  database-probe:
+    <<: *database-client
+    profiles:
+      - database-operations
+    environment:
+      PGHOST: ${CAMELLIA_REMOTE_DATABASE_HOST:-postgres}
+      PGPORT: ${CAMELLIA_REMOTE_DATABASE_PORT:-5432}
+      PGDATABASE: ${CAMELLIA_REMOTE_DATABASE_NAME:-camellia_remote}
+      PGUSER: ${CAMELLIA_REMOTE_DATABASE_PROBE_USER:?Set the probe role}
+      PGPASSWORD: ${CAMELLIA_REMOTE_DATABASE_PROBE_PASSWORD:?Set the probe password}
+      PGSSLMODE: ${CAMELLIA_REMOTE_DATABASE_SSLMODE:-disable}
+    command: ["psql", "--no-psqlrc", "--tuples-only", "--no-align", "--command", "SELECT 1"]
+
   migrate:
     <<: *application
+    environment:
+      <<: *application-environment
+      CAMELLIA_REMOTE_DATABASE_USER: ${CAMELLIA_REMOTE_DATABASE_MIGRATION_USER:?Set the migration owner role}
+      CAMELLIA_REMOTE_DATABASE_PASSWORD: ${CAMELLIA_REMOTE_DATABASE_MIGRATION_PASSWORD:?Set the migration password}
     command: ["python", "manage.py", "migrate", "--noinput"]
     depends_on:
       postgres:
@@ -108,6 +197,8 @@ services:
     <<: *application
     environment:
       <<: *application-environment
+      CAMELLIA_REMOTE_DATABASE_USER: ${CAMELLIA_REMOTE_DATABASE_RUNTIME_USER:?Set the runtime role}
+      CAMELLIA_REMOTE_DATABASE_PASSWORD: ${CAMELLIA_REMOTE_DATABASE_RUNTIME_PASSWORD:?Set the runtime password}
       CAMELLIA_REMOTE_BIND_HOST: 0.0.0.0
       CAMELLIA_REMOTE_BIND_PORT: "21114"
       CAMELLIA_REMOTE_RUN_MIGRATIONS: "false"

@@ -32,6 +32,9 @@ def deployment_fixture(root):
     project = root / "project"
     project.mkdir()
     (project / "docker-compose.yaml").write_text("services: {}\n")
+    deploy = project / "deploy"
+    deploy.mkdir()
+    (deploy / "bootstrap-postgres-roles.sh").write_text("#!/bin/sh\nexit 0\n")
     env_file = root / "management.env"
     env_file.write_text("TEST=true\n")
     env_file.chmod(0o600)
@@ -52,7 +55,7 @@ def deployment_fixture(root):
                     raise SystemExit(42)
                 if os.environ.get("FAKE_MANAGEMENT_RUNNING") == "1":
                     print("management")
-            if "run" in args and os.environ.get("FAKE_MIGRATION_FAIL") == "1":
+            if "run" in args and args[-1] == "migrate" and os.environ.get("FAKE_MIGRATION_FAIL") == "1":
                 raise SystemExit(41)
             raise SystemExit(0)
             """
@@ -187,6 +190,9 @@ class DeploymentGateTests(unittest.TestCase):
             lease = root / "maintenance.lease"
             lease.write_text("maintenance\n")
             lease.chmod(0o600)
+            deploy = root / "deploy"
+            deploy.mkdir()
+            (deploy / "bootstrap-postgres-roles.sh").write_text("#!/bin/sh\nexit 0\n")
             result = subprocess.run(
                 [
                     str(CONTROLLER),

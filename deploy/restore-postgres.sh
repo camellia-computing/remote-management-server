@@ -42,6 +42,20 @@ else
     [[ "$env_owner" -eq "$(id -u)" ]] || die "management environment file must be owned by the invoking user"
 fi
 [[ -f "$project_dir/docker-compose.yaml" ]] || die "docker compose file is missing: $project_dir/docker-compose.yaml"
+bootstrap_script="$project_dir/deploy/bootstrap-postgres-roles.sh"
+[[ -f "$bootstrap_script" && ! -L "$bootstrap_script" && -r "$bootstrap_script" ]] ||
+    die "database role bootstrap script is missing, unreadable, or a symlink"
+bootstrap_resolved="$(realpath -e -- "$bootstrap_script" 2>/dev/null)" || die "cannot resolve database role bootstrap script"
+[[ "$bootstrap_resolved" == "$bootstrap_script" ]] || die "database role bootstrap script path must be canonical"
+bootstrap_mode="$(stat -c '%a' -- "$bootstrap_script" 2>/dev/null)" || die "cannot inspect database role bootstrap permissions"
+bootstrap_owner="$(stat -c '%u' -- "$bootstrap_script" 2>/dev/null)" || die "cannot inspect database role bootstrap owner"
+bootstrap_mode_value=$((8#$bootstrap_mode))
+(( (bootstrap_mode_value & 022) == 0 )) || die "database role bootstrap script is writable by group or other users"
+if [[ "$(id -u)" -eq 0 ]]; then
+    [[ "$bootstrap_owner" -eq 0 ]] || die "database role bootstrap script must be owned by root"
+else
+    [[ "$bootstrap_owner" -eq "$(id -u)" ]] || die "database role bootstrap script has an unsafe owner"
+fi
 [[ -n "$identity_file" ]] || die "CAMELLIA_REMOTE_BACKUP_AGE_IDENTITY_FILE is required"
 [[ "$identity_file" = /* ]] || die "restore identity path must be absolute"
 [[ -f "$identity_file" && ! -L "$identity_file" && -r "$identity_file" ]] || die "restore identity is missing, unreadable, or a symlink"
@@ -89,7 +103,10 @@ trap cleanup EXIT HUP INT TERM
 
 set -o pipefail
 "$age_binary" --decrypt --identity "$identity_file" "$backup_path" >"$plaintext_temporary"
-# shellcheck disable=SC2016 # The command is evaluated inside the postgres container.
+# The authenticated artifact is restored only through the migration owner.
+# Bootstrap runs before and after restore so an old superuser-owned volume and
+# newly restored objects both converge to the same least-privilege boundary.
+"${compose[@]}" run --rm --no-deps -T database-bootstrap
 python3 "$envelope_helper" unpack \
         --expect-backup-id "$expected_backup_id" \
         --expect-created-at "$expected_created_at" \
@@ -98,8 +115,10 @@ python3 "$envelope_helper" unpack \
         --expect-postgres-major "$postgres_major_expected" \
         --expect-key-id "$backup_key_id_expected" \
     <"$plaintext_temporary" \
-    | "${compose[@]}" exec -T postgres sh -eu -c \
-        'pg_restore --single-transaction --exit-on-error --format=custom --no-owner --no-acl --dbname "$POSTGRES_DB"'
+    | "${compose[@]}" run --rm --no-deps -T database-restore \
+        pg_restore --single-transaction --exit-on-error --format=custom --no-owner --no-acl
 set +o pipefail
+"${compose[@]}" run --rm --no-deps -T database-bootstrap
+"${compose[@]}" run --rm --no-deps -T database-probe
 
 printf 'restored %s\n' "$backup_path"
