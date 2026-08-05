@@ -371,12 +371,15 @@ class AddressBookProfileAdmin(admin.ModelAdmin):
         with transaction.atomic():
             locked = models.AddressBookProfile.objects.select_for_update().filter(pk=obj.pk).first()
             if locked:
+                locked._audit_actor = request.user
                 super().delete_model(request, locked)
 
     def delete_queryset(self, request, queryset):
         with transaction.atomic():
-            locked_ids = [profile.pk for profile in _lock_address_book_profiles(queryset.values_list("pk", flat=True))]
-            super().delete_queryset(request, models.AddressBookProfile.objects.filter(pk__in=locked_ids))
+            locked_profiles = _lock_address_book_profiles(queryset.values_list("pk", flat=True))
+            for profile in locked_profiles:
+                profile._audit_actor = request.user
+                super().delete_model(request, profile)
 
 
 class AddressBookShareAdmin(admin.ModelAdmin):
@@ -507,9 +510,35 @@ class AddressBookRuleAdmin(admin.ModelAdmin):
 
 
 class AddressBookRuleAuditAdmin(admin.ModelAdmin):
-    list_display = ("profile", "action", "target_type", "target_name", "rule", "actor", "created_at")
-    search_fields = ("profile__name", "target_name", "actor__username")
+    list_display = ("profile_label", "action", "target_type", "target_name", "rule", "actor", "created_at")
+    search_fields = ("profile_name", "profile_guid", "profile_owner_name", "target_name", "actor__username")
     list_filter = ("action", "target_type", "rule", "created_at")
+    readonly_fields = (
+        "profile",
+        "profile_guid",
+        "profile_name",
+        "profile_owner_name",
+        "actor",
+        "action",
+        "target_type",
+        "target_name",
+        "rule",
+        "details",
+        "created_at",
+    )
+
+    @admin.display(description=_("地址簿"))
+    def profile_label(self, obj):
+        return obj.profile_name or (obj.profile.name if obj.profile else "-")
+
+    def has_add_permission(self, request):
+        return False
+
+    def has_change_permission(self, request, obj=None):
+        return False
+
+    def has_delete_permission(self, request, obj=None):
+        return False
 
 
 admin.site.register(models.StrategyProfile, StrategyProfileAdmin)

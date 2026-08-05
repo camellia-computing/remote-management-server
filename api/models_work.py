@@ -6,7 +6,7 @@ from django.contrib import admin
 from django.contrib.auth.models import Group
 from django.core.exceptions import ValidationError
 from django.db import models, router, transaction
-from django.db.models.signals import m2m_changed
+from django.db.models.signals import m2m_changed, pre_delete
 from django.dispatch import receiver
 from django.utils import timezone
 from django.utils.translation import gettext_lazy as _
@@ -1057,7 +1057,16 @@ class AddressBookRule(models.Model):
 
 
 class AddressBookRuleAudit(models.Model):
-    profile = models.ForeignKey(AddressBookProfile, on_delete=models.CASCADE, related_name="rule_audits")
+    profile = models.ForeignKey(
+        AddressBookProfile,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="rule_audits",
+    )
+    profile_guid = models.CharField(max_length=60, default="", db_index=True)
+    profile_name = models.CharField(max_length=60, default="")
+    profile_owner_name = models.CharField(max_length=150, default="")
     actor = models.ForeignKey(
         settings.AUTH_USER_MODEL,
         on_delete=models.SET_NULL,
@@ -1067,7 +1076,7 @@ class AddressBookRuleAudit(models.Model):
     )
     action = models.CharField(max_length=32)
     target_type = models.CharField(max_length=16)
-    target_name = models.CharField(max_length=120, blank=True, default="")
+    target_name = models.CharField(max_length=150, blank=True, default="")
     rule = models.IntegerField(verbose_name=_("共享权限"), default=1)
     details = models.JSONField(blank=True, default=dict)
     created_at = models.DateTimeField(verbose_name=_("创建时间"), default=timezone.now)
@@ -1082,15 +1091,22 @@ class AddressBookRuleAudit(models.Model):
                 name="valid_address_book_audit_rule",
             ),
             models.CheckConstraint(
-                condition=models.Q(
-                    target_type__in=("user", "group", "everyone"),
-                ),
+                condition=models.Q(target_type__in=("user", "group", "everyone", "profile")),
                 name="valid_address_book_audit_target",
             ),
         ]
 
     def __str__(self):
         return f"{self.action} {self.target_type}:{self.target_name}"
+
+
+@receiver(pre_delete, sender=AddressBookProfile)
+def _preserve_address_book_audit(sender, instance, using, **kwargs):
+    """Write a profile tombstone before the profile FK is nulled."""
+
+    from api.address_book_authorization import record_profile_tombstone
+
+    record_profile_tombstone(instance, actor=getattr(instance, "_audit_actor", None), using=using)
 
 
 class AlarmLog(models.Model):
