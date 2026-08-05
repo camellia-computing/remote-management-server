@@ -76,6 +76,7 @@ sudo install -m 0755 scripts/backup_envelope.py /opt/camellia-remote-management/
 sudo install -m 0755 deploy/restore-postgres.sh /opt/camellia-remote-management/
 sudo install -m 0755 deploy/management-maintenance-guard.sh /opt/camellia-remote-management/
 sudo install -m 0755 deploy/management-maintenance.sh /opt/camellia-remote-management/
+sudo install -m 0755 deploy/start-management-stack.sh /opt/camellia-remote-management/
 sudo install -m 0600 .env.example /etc/camellia-remote-management/management.env
 sudo install -m 0644 deploy/systemd/*.service deploy/systemd/*.timer /etc/systemd/system/
 sudo systemctl daemon-reload
@@ -84,7 +85,7 @@ sudo systemctl enable --now camellia-remote-management-backup.timer
 sudo systemctl enable --now camellia-remote-management-cleanup.timer
 ```
 
-生产环境应把 `CAMELLIA_REMOTE_MANAGEMENT_IMAGE` 固定为发布清单记录的 `ghcr.io/...@sha256:...`，不得使用浮动标签。迁移由一次性 `migrate` 容器完成；迁移成功后应用容器才会启动。
+生产环境应把 `CAMELLIA_REMOTE_MANAGEMENT_IMAGE` 固定为发布清单记录的 `ghcr.io/...@sha256:...`，不得使用浮动标签。systemd没有在线`reload`入口；升级必须使用显式stop/start或受审部署流程。每次stack start由单飞controller先停止旧Management、启动并等待PostgreSQL、运行一次性`migrate`，只有迁移成功后才以`restart: no`启动应用。Controller与maintenance enter/leave共用root-owned deployment lock，maintenance lease存在时不会执行Docker命令。Engine或container restart不会自动拉起Management；任何直接启动仍会由`run.sh`的`migrate --check`在Gunicorn绑定端口前拒绝未应用migration。应用崩溃必须告警并进入受控stack start，不能用Docker自动restart绕过migration gate。
 systemd 运维单元仅允许通过本机 Unix socket 调用 Docker；该 socket
 等同宿主机 root 权限，必须只允许 root 访问，并保护部署目录和环境文件不被非特权用户修改。
 

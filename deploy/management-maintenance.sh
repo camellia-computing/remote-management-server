@@ -9,6 +9,7 @@ project_dir="/opt/camellia-remote-management"
 env_file="/etc/camellia-remote-management/management.env"
 systemctl_binary="/usr/bin/systemctl"
 docker_binary="/usr/bin/docker"
+deployment_lock="$lease_dir/deployment.lock"
 stack_unit="camellia-remote-management-stack.service"
 timers=(
     camellia-remote-management-backup.timer
@@ -85,6 +86,34 @@ compose() {
     "$docker_binary" compose --env-file "$env_file" -f "$project_dir/docker-compose.yaml" "$@"
 }
 
+prepare_runtime_dir() {
+    if [[ -e "$lease_dir" || -L "$lease_dir" ]]; then
+        [[ -d "$lease_dir" && ! -L "$lease_dir" ]] || die "maintenance runtime path is unsafe"
+    else
+        install -d -o root -g root -m 0700 "$lease_dir"
+    fi
+    local mode owner mode_value
+    mode="$(stat -c '%a' -- "$lease_dir")"
+    owner="$(stat -c '%u' -- "$lease_dir")"
+    mode_value=$((8#$mode))
+    (( owner == 0 && (mode_value & 077) == 0 )) || die "maintenance runtime directory is unsafe"
+}
+
+acquire_deployment_lock() {
+    prepare_runtime_dir
+    if [[ -e "$deployment_lock" || -L "$deployment_lock" ]]; then
+        [[ -f "$deployment_lock" && ! -L "$deployment_lock" ]] || die "deployment lock is unsafe"
+    fi
+    exec 9>>"$deployment_lock"
+    chmod 0600 "$deployment_lock"
+    local mode owner mode_value
+    mode="$(stat -c '%a' -- "$deployment_lock")"
+    owner="$(stat -c '%u' -- "$deployment_lock")"
+    mode_value=$((8#$mode))
+    (( owner == 0 && (mode_value & 077) == 0 )) || die "deployment lock has unsafe owner or permissions"
+    flock -w 600 9 || die "another deployment operation did not finish within 10 minutes"
+}
+
 if [[ "$command" == "status" ]]; then
     if [[ -e "$lease_file" || -L "$lease_file" ]]; then
         validate_lease
@@ -102,7 +131,9 @@ fi
     die "docker compose file is missing or symlinked"
 
 if [[ "$command" == "enter" ]]; then
-    install -d -o root -g root -m 0700 "$lease_dir"
+    # Deployment start and maintenance transitions share this lock.  The lease
+    # is created only after any in-flight start has reached a terminal state.
+    acquire_deployment_lock
     if [[ -e "$lease_file" || -L "$lease_file" ]]; then
         validate_lease
         echo "maintenance:already-active"
@@ -130,6 +161,7 @@ if [[ "$command" == "enter" ]]; then
     exit 0
 fi
 
+acquire_deployment_lock
 validate_lease
 for unit in "${timers[@]}" "${operation_units[@]}" "$stack_unit"; do
     state="$($systemctl_binary show --property=ActiveState --value "$unit")"

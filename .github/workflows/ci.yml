@@ -228,11 +228,13 @@ jobs:
             deploy/management-maintenance-guard.sh \
             deploy/management-maintenance.sh \
             deploy/restore-postgres.sh \
+            deploy/start-management-stack.sh \
             run.sh \
             sync_web_client.sh \
             scripts/web_client_revision.sh
           python3 scripts/test_backup_envelope.py
           python3 scripts/test_backup_scripts.py
+          python3 scripts/test_deployment_gate.py
           python3 scripts/test_systemd_maintenance.py
           python3 .github/scripts/test_manage_release.py
           python3 .github/scripts/test_container_release_evidence.py
@@ -359,6 +361,7 @@ jobs:
 
       - name: Django checks
         run: |
+          uv run python scripts/test_deployment_gate.py
           uv run python manage.py check
           uv run python manage.py makemigrations --check --dry-run
 

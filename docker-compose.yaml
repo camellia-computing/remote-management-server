@@ -116,9 +116,6 @@ services:
     networks:
       - backend
       - edge
-    depends_on:
-      migrate:
-        condition: service_completed_successfully
     healthcheck:
       test:
         - CMD
@@ -134,7 +131,7 @@ services:
       retries: 3
       start_period: 30s
     stop_grace_period: 45s
-    restart: unless-stopped
+    restart: "no"
 
 networks:
   backend:
