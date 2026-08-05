@@ -308,6 +308,10 @@ class DeviceIdentityConflict(Exception):
     pass
 
 
+class DeviceCredentialFinalizationError(RuntimeError):
+    pass
+
+
 class _OidcPolicyRevocationRequired(Exception):
     def __init__(self, user_id):
         self.user_id = user_id
@@ -1376,6 +1380,13 @@ def _ensure_personal_device_peer(user, device):
     return peer
 
 
+def _finalize_personal_device_peer(user, device):
+    try:
+        return _ensure_personal_device_peer(user, device)
+    except IntegrityError as exc:
+        raise DeviceCredentialFinalizationError("Personal device peer finalization failed") from exc
+
+
 def login(request):
     result = {}
     data = _load_json_object(request)
@@ -1423,6 +1434,8 @@ def login(request):
                 DeviceProofChallenge.PURPOSE_LOGIN,
             )
             _token, raw_token = _issue_access_token(user, device)
+            _finalize_personal_device_peer(user, device)
+            complete_login_success(admission)
     except DeviceIdentityConflict:
         _log_event(
             request, "api_login_denied", level="warning", username=username, reason="device_identity_conflict", rid=rid
@@ -1438,10 +1451,6 @@ def login(request):
             request, "api_login_denied", level="warning", username=username, reason="device_identity_race", rid=rid
         )
         return JsonResponse({"error": "Device identity conflict"}, status=409)
-    complete_login_success(admission)
-
-    _ensure_personal_device_peer(user, device)
-
     result.update(_auth_body(user, raw_token))
     _log_event(request, "api_login_success", username=user.username, rid=rid)
     return JsonResponse(result)
@@ -2092,6 +2101,7 @@ def devices_deploy(request):
             device.save()
             if old_rid != rid or old_uuid != uuid_value or (old_key_hash and old_key_hash != public_key_hash):
                 _revoke_device_tokens(device)
+            _finalize_personal_device_peer(user, device)
     except DeviceRecoveryRequired:
         return JsonResponse({"result": "RECOVERY_REQUIRED"}, status=409)
     except DeviceProofError:
@@ -2100,7 +2110,6 @@ def devices_deploy(request):
         _log_event(request, "api_devices_deploy_conflict", level="warning", username=user.username, rid=rid)
         return JsonResponse({"result": "ID_TAKEN"}, status=409)
 
-    _ensure_personal_device_peer(user, device)
     _log_event(request, "api_devices_deploy_ok", username=user.username, rid=rid)
     return JsonResponse({"result": "OK"})
 
