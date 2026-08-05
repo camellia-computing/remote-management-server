@@ -225,12 +225,15 @@ jobs:
             .github/scripts/*.sh \
             .github/scripts/tests/*.sh \
             deploy/backup-postgres.sh \
+            deploy/management-maintenance-guard.sh \
+            deploy/management-maintenance.sh \
             deploy/restore-postgres.sh \
             run.sh \
             sync_web_client.sh \
             scripts/web_client_revision.sh
           python3 scripts/test_backup_envelope.py
           python3 scripts/test_backup_scripts.py
+          python3 scripts/test_systemd_maintenance.py
           python3 .github/scripts/test_manage_release.py
           python3 .github/scripts/test_container_release_evidence.py
           python3 .github/scripts/test_resolve_remote_client_release.py
