@@ -2,6 +2,9 @@ import datetime
 import hashlib
 import json
 import os
+import select
+import subprocess
+import sys
 import tempfile
 import uuid
 from concurrent.futures import ThreadPoolExecutor
@@ -16,10 +19,10 @@ from django.core.handlers.wsgi import WSGIRequest
 from django.core.management import call_command
 from django.core.management.base import CommandError
 from django.db import DatabaseError, close_old_connections, connection, connections, transaction
-from django.test import Client, TestCase, TransactionTestCase, override_settings
+from django.test import Client, SimpleTestCase, TestCase, TransactionTestCase, override_settings
 from django.utils import timezone
 
-from api import ingestion_governance, recording_crypto, recording_inventory
+from api import ingestion_governance, recording_crypto, recording_inventory, recording_uploads
 from api.models import (
     PersistentIngestionUsage,
     RecordingBackupControl,
@@ -33,6 +36,73 @@ from api.models import (
 )
 
 PROTOCOL_VERSION = "2"
+
+
+class RecordingFileLockTests(SimpleTestCase):
+    def setUp(self):
+        self.root = tempfile.TemporaryDirectory()
+        self.base_dir = Path(self.root.name) / "recording-namespace"
+        self.base_dir.mkdir(mode=0o700)
+
+    def tearDown(self):
+        self.root.cleanup()
+
+    def test_wall_clock_age_never_steals_a_live_namespace_lock(self):
+        with recording_uploads._record_file_lock(self.base_dir):
+            locked_stat = self.base_dir.stat()
+            os.utime(self.base_dir, (1, 1))
+            self.assertFalse((self.base_dir / ".locks").exists())
+            with self.assertRaises(BlockingIOError):
+                with recording_uploads._record_file_lock(self.base_dir):
+                    self.fail("a second holder entered the same recording lock")
+
+        released_stat = self.base_dir.stat()
+        self.assertEqual((released_stat.st_dev, released_stat.st_ino), (locked_stat.st_dev, locked_stat.st_ino))
+        with recording_uploads._record_file_lock(self.base_dir):
+            reacquired_stat = self.base_dir.stat()
+            self.assertEqual(
+                (reacquired_stat.st_dev, reacquired_stat.st_ino),
+                (locked_stat.st_dev, locked_stat.st_ino),
+            )
+
+    def test_process_exit_releases_the_persistent_lock_without_stale_recovery(self):
+        child_code = (
+            "import django, sys\n"
+            "django.setup()\n"
+            "from api import recording_uploads\n"
+            "with recording_uploads._record_file_lock(sys.argv[1]):\n"
+            "    print('locked', flush=True)\n"
+            "    sys.stdin.buffer.read(1)\n"
+        )
+        holder = subprocess.Popen(  # noqa: S603 - fixed interpreter and isolated test child
+            [sys.executable, "-u", "-c", child_code, os.fspath(self.base_dir)],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            readable, _writable, _exceptional = select.select([holder.stdout], [], [], 5)
+            self.assertTrue(readable, "child process did not report recording lock acquisition")
+            self.assertEqual(holder.stdout.readline(), "locked\n")
+            os.utime(self.base_dir, (1, 1))
+            with self.assertRaises(BlockingIOError):
+                with recording_uploads._record_file_lock(self.base_dir):
+                    self.fail("parent entered a recording lock held by a child process")
+            holder.kill()
+            holder.wait(5)
+            with recording_uploads._record_file_lock(self.base_dir):
+                self.assertTrue(self.base_dir.is_dir())
+        finally:
+            if holder.poll() is None:
+                holder.terminate()
+                try:
+                    holder.wait(5)
+                except subprocess.TimeoutExpired:
+                    holder.kill()
+                    holder.wait(5)
+            for stream in (holder.stdin, holder.stdout, holder.stderr):
+                stream.close()
 
 
 class RecordingUploadStateMachineTests(TestCase):

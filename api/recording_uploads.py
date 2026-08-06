@@ -1,10 +1,10 @@
 import contextlib
+import fcntl
 import hashlib
 import logging
 import os
 import re
 import stat
-import time
 import uuid
 
 from django.conf import settings
@@ -20,7 +20,6 @@ logger = logging.getLogger(__name__)
 
 PROTOCOL_VERSION = 2
 DIGEST_LENGTH = 64
-LOCK_STALE_SECONDS = 300
 RECORD_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]{1,255}$")
 
 
@@ -143,40 +142,40 @@ def _fsync_directory(path):
 
 
 @contextlib.contextmanager
-def _record_file_lock(base_dir, identity):
-    lock_dir = os.path.join(base_dir, ".locks")
-    _secure_directory(lock_dir)
-    lock_name = hashlib.sha256(str(identity).encode()).hexdigest() + ".lock"
-    lock_path = os.path.join(lock_dir, lock_name)
-    lock_fd = None
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0)
-    for _attempt in range(2):
-        try:
-            lock_fd = os.open(lock_path, flags, 0o600)
-            break
-        except FileExistsError:
-            try:
-                lock_stat = os.lstat(lock_path)
-            except FileNotFoundError:
-                continue
-            if not stat.S_ISREG(lock_stat.st_mode) or time.time() - lock_stat.st_mtime <= LOCK_STALE_SECONDS:
-                raise BlockingIOError("Recording is busy") from None
-            try:
-                os.unlink(lock_path)
-            except FileNotFoundError:
-                continue
-    if lock_fd is None:
-        raise BlockingIOError("Recording is busy")
+def _record_file_lock(base_dir):
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+    )
+    lock_fd = os.open(base_dir, flags)
     try:
-        os.write(lock_fd, f"{os.getpid()} {time.time_ns()}\n".encode())
-        os.fsync(lock_fd)
+        descriptor_stat = os.fstat(lock_fd)
+        path_stat = os.lstat(base_dir)
+        if (
+            not stat.S_ISDIR(descriptor_stat.st_mode)
+            or stat.S_ISLNK(path_stat.st_mode)
+            or descriptor_stat.st_dev != path_stat.st_dev
+            or descriptor_stat.st_ino != path_stat.st_ino
+            or descriptor_stat.st_uid != os.geteuid()
+        ):
+            raise OSError("Recording namespace is not an owned real directory")
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise BlockingIOError("Recording is busy") from None
+        current_stat = os.lstat(base_dir)
+        if (
+            stat.S_ISLNK(current_stat.st_mode)
+            or current_stat.st_dev != descriptor_stat.st_dev
+            or current_stat.st_ino != descriptor_stat.st_ino
+        ):
+            raise OSError("Recording namespace changed during lock acquisition")
         yield
     finally:
         os.close(lock_fd)
-        try:
-            os.unlink(lock_path)
-        except FileNotFoundError:
-            pass
 
 
 def _open_record_file(filepath, flags):
@@ -483,7 +482,7 @@ def _status_upload(request, token, content_length):
         if upload.state == RecordingUpload.STATE_ACTIVE:
             data_key = _recording_data_key(upload)
             base_dir = _ensure_record_upload_dir(upload)
-            with _record_file_lock(base_dir, upload.upload_id):
+            with _record_file_lock(base_dir):
                 stage_path = _stage_path(base_dir, upload.storage_object_id)
                 final_path = _final_path(base_dir, upload)
                 _reconcile_staging_file(upload, stage_path, final_path, data_key)
@@ -570,7 +569,7 @@ def _commit_part(request, token, content_length):
             )
             data_key = _recording_data_key(upload)
             base_dir = _ensure_record_upload_dir(upload)
-            with _record_file_lock(base_dir, upload.upload_id):
+            with _record_file_lock(base_dir):
                 stage_path = _stage_path(base_dir, upload.storage_object_id)
                 final_path = _final_path(base_dir, upload)
                 _reconcile_staging_file(upload, stage_path, final_path, data_key)
@@ -665,7 +664,7 @@ def _finalize_upload(request, token, content_length):
                 )
             data_key = _recording_data_key(upload)
             base_dir = _ensure_record_upload_dir(upload)
-            with _record_file_lock(base_dir, upload.upload_id):
+            with _record_file_lock(base_dir):
                 stage_path = _stage_path(base_dir, upload.storage_object_id)
                 final_path = _final_path(base_dir, upload)
                 stage_exists = os.path.lexists(stage_path)
@@ -777,7 +776,7 @@ def _abort_upload(request, token, content_length):
                     state=_state_payload(upload),
                 )
             else:
-                with _record_file_lock(base_dir, upload.upload_id):
+                with _record_file_lock(base_dir):
                     stage_path = _stage_path(base_dir, upload.storage_object_id)
                     final_path = _final_path(base_dir, upload)
                     if os.path.lexists(final_path):

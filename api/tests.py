@@ -1951,7 +1951,7 @@ class SensitiveIngestionTests(ApiTestMixin, TestCase):
 
                 staging = next(Path(upload_root).glob("*/.uploads/*.part"))
                 base_dir = staging.parent.parent
-                with _record_file_lock(base_dir, state["upload_id"]):
+                with _record_file_lock(base_dir):
                     busy = self._raw_record(
                         "version=2&type=part"
                         f"&upload_id={state['upload_id']}&offset=0&revision=0&length=4"

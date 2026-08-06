@@ -66,7 +66,7 @@ def _expire_active_upload(upload_id, cutoff, now):
         if upload is None or not _stale_active(upload, cutoff):
             return False
         base_dir = _existing_recording_base(upload)
-        with recording_uploads._record_file_lock(base_dir, upload.upload_id):
+        with recording_uploads._record_file_lock(base_dir):
             stage_path = recording_uploads._stage_path(base_dir, upload.storage_object_id)
             final_path = recording_uploads._final_path(base_dir, upload)
             tomb_path = recording_uploads._aborted_path(base_dir, upload.storage_object_id)
@@ -100,7 +100,7 @@ def _purge_finalized_upload(upload_id, cutoff):
         if upload is None or not _expired_finalized(upload, cutoff):
             return False
         base_dir = _existing_recording_base(upload)
-        with recording_uploads._record_file_lock(base_dir, upload.upload_id):
+        with recording_uploads._record_file_lock(base_dir):
             final_path = recording_uploads._final_path(base_dir, upload)
             tomb_path = recording_uploads._deleting_path(base_dir, upload.storage_object_id)
             final_exists = os.path.lexists(final_path)
@@ -268,7 +268,7 @@ def _purge_recording_orphans(now, *, batch_size, dry_run):
             base_stat = os.lstat(base_dir)
             if not stat.S_ISDIR(base_stat.st_mode) or stat.S_ISLNK(base_stat.st_mode):
                 raise OSError("Recording orphan namespace changed type")
-            with recording_uploads._record_file_lock(base_dir, object_id):
+            with recording_uploads._record_file_lock(base_dir):
                 try:
                     file_stat = os.lstat(path)
                 except FileNotFoundError:
