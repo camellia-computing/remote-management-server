@@ -7,6 +7,6 @@ class ApiConfig(AppConfig):
     verbose_name = _("Camellia 管理")
 
     def ready(self):
-        from api.signals import connect_address_book_signals
+        from api.signals import connect_api_signals
 
-        connect_address_book_signals()
+        connect_api_signals()

@@ -1579,13 +1579,20 @@ class RecordingUpload(models.Model):
     device_id_at_create = models.PositiveBigIntegerField(editable=False)
     owner_id_at_create = models.PositiveBigIntegerField(editable=False)
     deployment_generation = models.PositiveBigIntegerField(editable=False)
-    storage_namespace = models.CharField(max_length=64, editable=False)
+    device_rid_at_create = models.CharField(max_length=16, editable=False)
+    device_uuid_at_create = models.CharField(max_length=344, editable=False)
+    storage_object_id = models.UUIDField(default=uuid.uuid4, editable=False, unique=True)
+    storage_version = models.PositiveSmallIntegerField(default=2, editable=False)
+    storage_namespace = models.CharField(max_length=64, editable=False, unique=True)
     filename = models.CharField(max_length=255, editable=False)
     state = models.CharField(max_length=12, choices=STATE_CHOICES, default=STATE_ACTIVE, editable=False)
     encryption_version = models.PositiveSmallIntegerField(editable=False)
+    data_key_kek_id = models.CharField(max_length=32, editable=False)
     encrypted_data_key = EncryptedTextField(max_length=44, editable=False)
     committed_offset = models.PositiveBigIntegerField(default=0, editable=False)
     storage_offset = models.PositiveBigIntegerField(editable=False)
+    ciphertext_size = models.PositiveBigIntegerField(null=True, blank=True, editable=False)
+    ciphertext_digest = models.CharField(max_length=64, blank=True, default="", editable=False)
     revision = models.PositiveBigIntegerField(default=0, editable=False)
     expected_size = models.PositiveBigIntegerField(null=True, blank=True, editable=False)
     expected_digest = models.CharField(max_length=64, blank=True, default="", editable=False)
@@ -1654,6 +1661,21 @@ class RecordingUpload(models.Model):
                 & models.Q(storage_offset__gt=models.F("committed_offset")),
                 name="recording_ciphertext_offset",
             ),
+            models.CheckConstraint(
+                condition=models.Q(storage_version=2),
+                name="valid_recording_storage_version",
+            ),
+            models.CheckConstraint(
+                condition=(
+                    models.Q(
+                        state="finalized",
+                        ciphertext_size=models.F("storage_offset"),
+                    )
+                    & ~models.Q(ciphertext_digest="")
+                    | ~models.Q(state="finalized") & models.Q(ciphertext_size__isnull=True, ciphertext_digest="")
+                ),
+                name="valid_recording_ciphertext_inventory",
+            ),
         ]
         indexes = [
             models.Index(
@@ -1717,6 +1739,116 @@ class RecordingUploadChunk(models.Model):
 
     def __str__(self):
         return f"{self.upload_id}:{self.revision}:{self.offset}+{self.length}"
+
+
+class RecordingBackupEpoch(models.Model):
+    """Immutable recording inventory captured for one database/volume backup epoch."""
+
+    STATE_PREPARING = "preparing"
+    STATE_READY = "ready"
+    STATE_COMPLETE = "complete"
+    STATE_RESTORED = "restored"
+    STATE_CHOICES = (
+        (STATE_PREPARING, "Preparing"),
+        (STATE_READY, "Ready"),
+        (STATE_COMPLETE, "Complete"),
+        (STATE_RESTORED, "Restored"),
+    )
+
+    epoch_id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    backup_id = models.CharField(max_length=32, unique=True, editable=False)
+    manifest_version = models.PositiveSmallIntegerField(default=1, editable=False)
+    state = models.CharField(max_length=12, choices=STATE_CHOICES, default=STATE_PREPARING, editable=False)
+    requested_at = models.DateTimeField(editable=False)
+    prepared_at = models.DateTimeField(null=True, blank=True, editable=False)
+    completed_at = models.DateTimeField(null=True, blank=True, editable=False)
+    inventory_count = models.PositiveBigIntegerField(default=0, editable=False)
+    object_count = models.PositiveBigIntegerField(default=0, editable=False)
+    inventory_digest = models.CharField(max_length=64, blank=True, default="", editable=False)
+
+    class Meta:
+        ordering = ("-requested_at", "epoch_id")
+        constraints = [
+            models.CheckConstraint(
+                condition=models.Q(manifest_version=1),
+                name="valid_recording_backup_manifest_version",
+            ),
+        ]
+
+
+class RecordingBackupObject(models.Model):
+    """One immutable upload/object mapping in a recording backup manifest."""
+
+    epoch = models.ForeignKey(
+        RecordingBackupEpoch,
+        on_delete=models.CASCADE,
+        related_name="inventory_objects",
+        editable=False,
+    )
+    upload_id = models.UUIDField(editable=False)
+    storage_object_id = models.UUIDField(editable=False)
+    storage_version = models.PositiveSmallIntegerField(editable=False)
+    storage_relative_path = models.CharField(max_length=192, blank=True, default="", editable=False)
+    object_present = models.BooleanField(editable=False)
+    state = models.CharField(max_length=12, editable=False)
+    owner_id_at_create = models.PositiveBigIntegerField(editable=False)
+    device_id_at_create = models.PositiveBigIntegerField(editable=False)
+    device_rid_at_create = models.CharField(max_length=16, editable=False)
+    device_uuid_at_create = models.CharField(max_length=344, editable=False)
+    deployment_generation = models.PositiveBigIntegerField(editable=False)
+    encryption_version = models.PositiveSmallIntegerField(editable=False)
+    data_key_kek_id = models.CharField(max_length=32, editable=False)
+    plaintext_size = models.PositiveBigIntegerField(editable=False)
+    plaintext_digest = models.CharField(max_length=64, blank=True, default="", editable=False)
+    ciphertext_size = models.PositiveBigIntegerField(editable=False)
+    ciphertext_digest = models.CharField(max_length=64, blank=True, default="", editable=False)
+    retention_hold = models.BooleanField(editable=False)
+    retention_hold_reason = models.CharField(max_length=512, blank=True, default="", editable=False)
+    retention_hold_at = models.DateTimeField(null=True, blank=True, editable=False)
+    created_at = models.DateTimeField(editable=False)
+    finalized_at = models.DateTimeField(null=True, blank=True, editable=False)
+    aborted_at = models.DateTimeField(null=True, blank=True, editable=False)
+
+    class Meta:
+        ordering = ("epoch_id", "upload_id")
+        constraints = [
+            models.UniqueConstraint(
+                fields=("epoch", "upload_id"),
+                name="unique_recording_backup_upload",
+            ),
+            models.UniqueConstraint(
+                fields=("epoch", "storage_object_id"),
+                name="unique_recording_backup_object",
+            ),
+            models.UniqueConstraint(
+                fields=("epoch", "storage_relative_path"),
+                condition=~models.Q(storage_relative_path=""),
+                name="unique_recording_backup_path",
+            ),
+        ]
+
+
+class RecordingBackupControl(models.Model):
+    """Singleton row serializing recording mutations with consistent backups."""
+
+    singleton = models.PositiveSmallIntegerField(primary_key=True, default=1, editable=False)
+    active_epoch = models.OneToOneField(
+        RecordingBackupEpoch,
+        null=True,
+        blank=True,
+        editable=False,
+        on_delete=models.PROTECT,
+        related_name="active_control",
+    )
+    updated_at = models.DateTimeField(auto_now=True, editable=False)
+
+    class Meta:
+        constraints = [
+            models.CheckConstraint(
+                condition=models.Q(singleton=1),
+                name="recording_backup_control_singleton",
+            ),
+        ]
 
 
 class PersistentIngestionUsage(models.Model):

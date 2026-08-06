@@ -15,6 +15,7 @@ import stat
 import subprocess
 import tempfile
 import textwrap
+import time
 import unittest
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -38,8 +39,6 @@ class BackupScriptsTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.age, cls.age_keygen = find_age()
-        if cls.age is None:
-            raise unittest.SkipTest("age and age-keygen are required for shell integration")
 
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="camellia-backup-test-")
@@ -58,15 +57,82 @@ class BackupScriptsTests(unittest.TestCase):
         self.tmpdir.mkdir()
         self.fake_bin = self.root / "bin"
         self.fake_bin.mkdir()
+        if self.age is None:
+            self.age = self.fake_bin / "age"
+            self.age_keygen = self.fake_bin / "age-keygen"
+            self.age.write_text(
+                textwrap.dedent(
+                    """
+                    #!/usr/bin/env python3
+                    import hashlib, hmac, pathlib, sys
+                    args = sys.argv[1:]
+                    key = hashlib.sha256(b"camellia-backup-shell-test-adapter").digest()
+                    if "--encrypt" in args:
+                        output = pathlib.Path(args[args.index("--output") + 1])
+                        plaintext = sys.stdin.buffer.read()
+                        ciphertext = bytes(value ^ key[index % len(key)] for index, value in enumerate(plaintext))
+                        output.write_bytes(b"FAKE-AGE-V1\\x00" + ciphertext + hmac.digest(key, ciphertext, "sha256"))
+                        raise SystemExit(0)
+                    if "--decrypt" in args:
+                        artifact = pathlib.Path(args[-1]).read_bytes()
+                        if not artifact.startswith(b"FAKE-AGE-V1\\x00") or len(artifact) < 44:
+                            raise SystemExit(1)
+                        ciphertext, tag = artifact[12:-32], artifact[-32:]
+                        if not hmac.compare_digest(tag, hmac.digest(key, ciphertext, "sha256")):
+                            raise SystemExit(1)
+                        sys.stdout.buffer.write(
+                            bytes(value ^ key[index % len(key)] for index, value in enumerate(ciphertext))
+                        )
+                        raise SystemExit(0)
+                    raise SystemExit(2)
+                    """
+                ).lstrip()
+            )
+            self.age.chmod(0o755)
+            self.age_keygen.write_text(
+                "#!/bin/sh\nprintf '%s\\n' '# public key: age1testtesttesttesttesttesttesttest' "
+                "'AGE-SECRET-KEY-TEST-ONLY'\n"
+            )
+            self.age_keygen.chmod(0o755)
         self.restore_capture = self.root / "restored.dump"
+        self.recording_restore_capture = self.root / "restored.recordings"
         self.fake_docker = self.fake_bin / "docker"
         self.fake_docker.write_text(
             textwrap.dedent(
                 """
                 #!/usr/bin/env python3
-                import os, pathlib, sys
+                import json, os, pathlib, sys
                 args = sys.argv[1:]
                 mode = os.environ.get("FAKE_DOCKER_MODE", "ok")
+                epoch_id = "11111111-1111-4111-8111-111111111111"
+                inventory_digest = "a" * 64
+                if "recording_backup" in args:
+                    operation = args[args.index("recording_backup") + 1]
+                    if operation == "begin":
+                        backup_id = args[args.index("--backup-id") + 1]
+                        requested_at = args[args.index("--requested-at") + 1]
+                        print(json.dumps({
+                            "backup_id": backup_id,
+                            "epoch_id": epoch_id,
+                            "inventory_count": 1,
+                            "inventory_digest": inventory_digest,
+                            "manifest_version": 1,
+                            "object_count": 1,
+                            "requested_at": requested_at,
+                            "state": "ready",
+                        }))
+                        raise SystemExit(0)
+                    if operation == "export":
+                        sys.stdout.buffer.write(b"RECORDING-BUNDLE-CANARY\\x00ciphertext\\n")
+                        raise SystemExit(0)
+                    if operation == "restore":
+                        pathlib.Path(os.environ["FAKE_RECORDING_RESTORE_CAPTURE"]).write_bytes(
+                            sys.stdin.buffer.read()
+                        )
+                        raise SystemExit(0)
+                    if operation in {"finish", "abort", "restore-preflight"}:
+                        print("{}")
+                        raise SystemExit(0)
                 if "database-bootstrap" in args:
                     raise SystemExit(0)
                 if "database-probe" in args:
@@ -119,6 +185,7 @@ class BackupScriptsTests(unittest.TestCase):
                 "CAMELLIA_REMOTE_BACKUP_POSTGRES_MAJOR": "18",
                 "CAMELLIA_REMOTE_DATABASE_NAME": "camellia_remote",
                 "FAKE_RESTORE_CAPTURE": str(self.restore_capture),
+                "FAKE_RECORDING_RESTORE_CAPTURE": str(self.recording_restore_capture),
                 "TMPDIR": str(self.tmpdir),
             }
         )
@@ -142,13 +209,20 @@ class BackupScriptsTests(unittest.TestCase):
         artifacts = list(self.backups.glob("postgres-*.dump.age"))
         self.assertEqual(len(artifacts), 1)
         artifact = artifacts[0]
+        recording_artifacts = list(self.backups.glob("recordings-*.bundle.age"))
+        self.assertEqual(len(recording_artifacts), 1)
         self.assertNotIn(b"PGDUMP-CANARY", artifact.read_bytes())
+        self.assertNotIn(b"RECORDING-BUNDLE-CANARY", recording_artifacts[0].read_bytes())
         self.assertRegex(artifact.name, r"^postgres-[0-9]{8}T[0-9]{6}Z-[0-9a-f]{32}\.dump\.age$")
 
         restored = self.run_restore(artifact)
         self.assertEqual(restored.returncode, 0, restored.stderr)
         self.assertEqual(self.restore_capture.read_bytes(), b"PGDUMP-CANARY\x00custom-format\n")
-        self.assertEqual(list(self.tmpdir.glob("camellia-restore.*")), [])
+        self.assertEqual(
+            self.recording_restore_capture.read_bytes(),
+            b"RECORDING-BUNDLE-CANARY\x00ciphertext\n",
+        )
+        self.assertEqual(list(self.tmpdir.glob("camellia-restore-*")), [])
 
         self.identity.chmod(0o644)
         insecure = self.run_restore(artifact)
@@ -159,6 +233,13 @@ class BackupScriptsTests(unittest.TestCase):
     def test_manifest_expectations_and_ciphertext_tampering_fail(self):
         self.assertEqual(self.run_backup().returncode, 0)
         artifact = next(self.backups.glob("postgres-*.dump.age"))
+        recording_artifact = next(self.backups.glob("recordings-*.bundle.age"))
+        hidden_recording_artifact = recording_artifact.with_suffix(".missing")
+        recording_artifact.rename(hidden_recording_artifact)
+        missing_pair = self.run_restore(artifact)
+        self.assertNotEqual(missing_pair.returncode, 0)
+        self.assertFalse(self.restore_capture.exists())
+        hidden_recording_artifact.rename(recording_artifact)
         for variable, value in (
             ("CAMELLIA_REMOTE_BACKUP_DEPLOYMENT_ID", "other"),
             ("CAMELLIA_REMOTE_DATABASE_NAME", "other_db"),
@@ -169,6 +250,17 @@ class BackupScriptsTests(unittest.TestCase):
                 result = self.run_restore(artifact, **{variable: value})
                 self.assertNotEqual(result.returncode, 0)
 
+        original_recording = recording_artifact.read_bytes()
+        self.assertEqual(self.run_backup().returncode, 0)
+        other_recording = next(
+            path for path in self.backups.glob("recordings-*.bundle.age") if path != recording_artifact
+        )
+        recording_artifact.write_bytes(other_recording.read_bytes())
+        mismatched_pair = self.run_restore(artifact)
+        self.assertNotEqual(mismatched_pair.returncode, 0)
+        self.assertFalse(self.restore_capture.exists())
+        recording_artifact.write_bytes(original_recording)
+
         data = bytearray(artifact.read_bytes())
         data[-1] ^= 1
         artifact.write_bytes(data)
@@ -176,7 +268,7 @@ class BackupScriptsTests(unittest.TestCase):
         result = self.run_restore(artifact)
         self.assertNotEqual(result.returncode, 0)
         self.assertFalse(self.restore_capture.exists())
-        self.assertEqual(list(self.tmpdir.glob("camellia-restore.*")), [])
+        self.assertEqual(list(self.tmpdir.glob("camellia-restore-*")), [])
 
     def test_pg_dump_or_age_failure_leaves_no_artifact_and_lock_is_monitorable(self):
         self.env_file.chmod(0o644)
@@ -187,6 +279,7 @@ class BackupScriptsTests(unittest.TestCase):
         failed_dump = self.run_backup(FAKE_DOCKER_MODE="pg_dump-fail")
         self.assertNotEqual(failed_dump.returncode, 0)
         self.assertEqual(list(self.backups.glob("*.dump.age")), [])
+        self.assertEqual(list(self.backups.glob("*.bundle.age")), [])
         self.assertEqual(list(self.backups.glob("*.tmp")), [])
 
         failing_age = self.fake_bin / "age-fail"
@@ -195,6 +288,7 @@ class BackupScriptsTests(unittest.TestCase):
         failed_age = self.run_backup(CAMELLIA_REMOTE_BACKUP_AGE_BINARY=str(failing_age))
         self.assertNotEqual(failed_age.returncode, 0)
         self.assertEqual(list(self.backups.glob("*.dump.age")), [])
+        self.assertEqual(list(self.backups.glob("*.bundle.age")), [])
         self.assertEqual(list(self.backups.glob("*.tmp")), [])
 
         self.backups.mkdir(exist_ok=True)
@@ -203,6 +297,40 @@ class BackupScriptsTests(unittest.TestCase):
             fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
             collision = self.run_backup()
         self.assertEqual(collision.returncode, 75, collision.stderr)
+
+    def test_retention_removes_only_complete_expired_backup_pairs(self):
+        self.backups.mkdir()
+        expired_timestamp = "20260801T000000Z"
+        expired_id = "1" * 32
+        expired_database = self.backups / f"postgres-{expired_timestamp}-{expired_id}.dump.age"
+        expired_recordings = self.backups / f"recordings-{expired_timestamp}-{expired_id}.bundle.age"
+        expired_database.write_bytes(b"old database")
+        expired_recordings.write_bytes(b"old recordings")
+
+        mixed_timestamp = "20260801T010000Z"
+        mixed_id = "2" * 32
+        mixed_database = self.backups / f"postgres-{mixed_timestamp}-{mixed_id}.dump.age"
+        mixed_recordings = self.backups / f"recordings-{mixed_timestamp}-{mixed_id}.bundle.age"
+        mixed_database.write_bytes(b"old database")
+        mixed_recordings.write_bytes(b"current recordings")
+
+        unpaired_database = self.backups / f"postgres-20260801T020000Z-{'3' * 32}.dump.age"
+        unpaired_recordings = self.backups / f"recordings-20260801T030000Z-{'4' * 32}.bundle.age"
+        unpaired_database.write_bytes(b"unpaired database")
+        unpaired_recordings.write_bytes(b"unpaired recordings")
+
+        old = time.time() - (25 * 60 * 60)
+        for path in (expired_database, expired_recordings, mixed_database, unpaired_database, unpaired_recordings):
+            os.utime(path, (old, old))
+
+        result = self.run_backup(CAMELLIA_REMOTE_BACKUP_RETENTION_HOURS="24")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(expired_database.exists())
+        self.assertFalse(expired_recordings.exists())
+        self.assertTrue(mixed_database.exists())
+        self.assertTrue(mixed_recordings.exists())
+        self.assertTrue(unpaired_database.exists())
+        self.assertTrue(unpaired_recordings.exists())
 
 
 if __name__ == "__main__":

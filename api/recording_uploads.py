@@ -13,7 +13,7 @@ from django.db import DatabaseError, IntegrityError, transaction
 from django.http import JsonResponse
 from django.utils import timezone
 
-from api import ingestion_governance, recording_crypto
+from api import ingestion_governance, recording_crypto, recording_inventory
 from api.models import RecordingUpload, RecordingUploadChunk
 
 logger = logging.getLogger(__name__)
@@ -87,15 +87,6 @@ def _record_dir():
     return os.fspath(settings.RECORD_UPLOAD_ROOT)
 
 
-def _record_device_dir(token):
-    namespace = ingestion_governance.recording_namespace(
-        token.device.owner_id,
-        token.device.rid,
-        token.device.uuid,
-    )
-    return os.path.join(_record_dir(), namespace)
-
-
 def _record_upload_dir(upload):
     return os.path.join(_record_dir(), upload.storage_namespace)
 
@@ -112,12 +103,12 @@ def _secure_directory(path):
         os.chmod(path, 0o700)
 
 
-def _ensure_record_device_dir(token):
+def _ensure_record_upload_dir(upload):
     root = _record_dir()
     _secure_directory(root)
-    device_dir = _record_device_dir(token)
-    _secure_directory(device_dir)
-    return device_dir
+    upload_dir = _record_upload_dir(upload)
+    _secure_directory(upload_dir)
+    return upload_dir
 
 
 def _stage_dir(base_dir):
@@ -139,7 +130,7 @@ def _deleting_path(base_dir, upload_id):
 
 
 def _final_path(base_dir, upload):
-    return os.path.join(base_dir, upload.filename)
+    return os.path.join(base_dir, f"{upload.storage_object_id}.recording")
 
 
 def _fsync_directory(path):
@@ -331,7 +322,7 @@ def _rollback_staging_file(stage_path, offset):
         logger.exception("event=recording_upload_rollback_failed")
 
 
-def _verify_recording_file(upload, path, data_key):
+def _verify_recording_file(upload, path, data_key, *, include_ciphertext_digest=False):
     fd = _open_record_file(path, os.O_RDONLY)
     try:
         return recording_crypto.verify_recording_fd(
@@ -342,6 +333,7 @@ def _verify_recording_file(upload, path, data_key):
             expected_revision=upload.revision,
             expected_storage_offset=upload.storage_offset,
             max_chunk_bytes=settings.RECORD_UPLOAD_MAX_CHUNK_BYTES,
+            include_ciphertext_digest=include_ciphertext_digest,
         )
     finally:
         os.close(fd)
@@ -369,10 +361,10 @@ def _create_upload(request, token, content_length):
     if not filename:
         raise UploadRequestError("Invalid file")
     create_id = _parse_uuid(request.GET.get("create_id", ""), "create_id")
-    base_dir = _ensure_record_device_dir(token)
     stage_created = None
     try:
         with transaction.atomic():
+            recording_inventory.lock_recording_mutation()
             existing = (
                 RecordingUpload.objects.select_for_update()
                 .filter(device_id=token.device_id, create_id=create_id)
@@ -411,23 +403,25 @@ def _create_upload(request, token, content_length):
                 force=True,
             )
             data_key = recording_crypto.generate_data_key()
+            storage_object_id = uuid.uuid4()
             upload = RecordingUpload.objects.create(
                 create_id=create_id,
                 device_id=token.device_id,
                 device_id_at_create=token.device_id,
                 owner_id_at_create=token.device.owner_id,
                 deployment_generation=token.device.deployment_generation,
-                storage_namespace=ingestion_governance.recording_namespace(
-                    token.device.owner_id,
-                    token.device.rid,
-                    token.device.uuid,
-                ),
+                device_rid_at_create=token.device.rid,
+                device_uuid_at_create=token.device.uuid,
+                storage_object_id=storage_object_id,
+                storage_namespace=ingestion_governance.recording_namespace(storage_object_id),
                 filename=filename,
                 encryption_version=recording_crypto.FORMAT_VERSION,
+                data_key_kek_id=settings.DATA_ENCRYPTION_PRIMARY_KEY_ID,
                 encrypted_data_key=recording_crypto.encode_data_key(data_key),
                 storage_offset=recording_crypto.HEADER_SIZE,
             )
-            stage_path = _stage_path(base_dir, upload.upload_id)
+            base_dir = _ensure_record_upload_dir(upload)
+            stage_path = _stage_path(base_dir, upload.storage_object_id)
             fd = _open_record_file(stage_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL)
             stage_created = stage_path
             try:
@@ -484,12 +478,13 @@ def _status_upload(request, token, content_length):
         if chunk_query["length"] <= 0 or chunk_query["length"] > settings.RECORD_UPLOAD_MAX_CHUNK_BYTES:
             raise UploadRequestError("Invalid chunk status length")
     with transaction.atomic():
+        recording_inventory.lock_recording_mutation()
         upload = _load_bound_upload(token, upload_id, for_update=True)
         if upload.state == RecordingUpload.STATE_ACTIVE:
             data_key = _recording_data_key(upload)
-            base_dir = _ensure_record_device_dir(token)
+            base_dir = _ensure_record_upload_dir(upload)
             with _record_file_lock(base_dir, upload.upload_id):
-                stage_path = _stage_path(base_dir, upload.upload_id)
+                stage_path = _stage_path(base_dir, upload.storage_object_id)
                 final_path = _final_path(base_dir, upload)
                 _reconcile_staging_file(upload, stage_path, final_path, data_key)
         queried_chunk_committed = None
@@ -525,6 +520,7 @@ def _commit_part(request, token, content_length):
     rollback = None
     try:
         with transaction.atomic():
+            recording_inventory.lock_recording_mutation()
             upload = _load_bound_upload(token, upload_id, for_update=True)
             receipt = upload.chunks.filter(chunk_id=chunk_id).first()
             if receipt is not None:
@@ -573,9 +569,9 @@ def _commit_part(request, token, content_length):
                 force=True,
             )
             data_key = _recording_data_key(upload)
-            base_dir = _ensure_record_device_dir(token)
+            base_dir = _ensure_record_upload_dir(upload)
             with _record_file_lock(base_dir, upload.upload_id):
-                stage_path = _stage_path(base_dir, upload.upload_id)
+                stage_path = _stage_path(base_dir, upload.storage_object_id)
                 final_path = _final_path(base_dir, upload)
                 _reconcile_staging_file(upload, stage_path, final_path, data_key)
                 rollback = (stage_path, upload.storage_offset)
@@ -639,6 +635,7 @@ def _finalize_upload(request, token, content_length):
     moved = None
     try:
         with transaction.atomic():
+            recording_inventory.lock_recording_mutation()
             upload = _load_bound_upload(token, upload_id, for_update=True)
             if upload.state == RecordingUpload.STATE_FINALIZED:
                 if (
@@ -667,9 +664,9 @@ def _finalize_upload(request, token, content_length):
                     state=_state_payload(upload),
                 )
             data_key = _recording_data_key(upload)
-            base_dir = _ensure_record_device_dir(token)
+            base_dir = _ensure_record_upload_dir(upload)
             with _record_file_lock(base_dir, upload.upload_id):
-                stage_path = _stage_path(base_dir, upload.upload_id)
+                stage_path = _stage_path(base_dir, upload.storage_object_id)
                 final_path = _final_path(base_dir, upload)
                 stage_exists = os.path.lexists(stage_path)
                 final_exists = os.path.lexists(final_path)
@@ -691,7 +688,12 @@ def _finalize_upload(request, token, content_length):
                 if stage_exists:
                     _reconcile_staging_file(upload, stage_path, final_path, data_key)
                 source_path = stage_path if stage_exists else final_path
-                actual_size, actual_digest = _verify_recording_file(upload, source_path, data_key)
+                actual_size, actual_digest, ciphertext_digest = _verify_recording_file(
+                    upload,
+                    source_path,
+                    data_key,
+                    include_ciphertext_digest=True,
+                )
                 if actual_size != final_size or actual_digest != final_digest:
                     raise UploadRequestError(
                         "Final recording digest mismatch",
@@ -700,6 +702,8 @@ def _finalize_upload(request, token, content_length):
                         state=_state_payload(upload),
                     )
                 if upload.state == RecordingUpload.STATE_FINALIZED:
+                    if upload.ciphertext_size != upload.storage_offset or upload.ciphertext_digest != ciphertext_digest:
+                        raise OSError("Published recording inventory is inconsistent")
                     return JsonResponse(_state_payload(upload))
                 if stage_exists:
                     os.rename(stage_path, final_path)
@@ -709,6 +713,8 @@ def _finalize_upload(request, token, content_length):
                 upload.state = RecordingUpload.STATE_FINALIZED
                 upload.expected_size = final_size
                 upload.expected_digest = final_digest
+                upload.ciphertext_size = upload.storage_offset
+                upload.ciphertext_digest = ciphertext_digest
                 upload.finalized_at = timezone.now()
                 upload.heartbeat_at = upload.finalized_at
                 ingestion_governance.finalize_recording_usage(
@@ -720,6 +726,8 @@ def _finalize_upload(request, token, content_length):
                         "state",
                         "expected_size",
                         "expected_digest",
+                        "ciphertext_size",
+                        "ciphertext_digest",
                         "finalized_at",
                         "heartbeat_at",
                         "updated_at",
@@ -750,14 +758,15 @@ def _abort_upload(request, token, content_length):
     tomb_path = None
     try:
         with transaction.atomic():
+            recording_inventory.lock_recording_mutation()
             upload = _load_bound_upload(
                 token,
                 upload_id,
                 for_update=True,
                 include_data_key=False,
             )
-            base_dir = _ensure_record_device_dir(token)
-            tomb_path = _aborted_path(base_dir, upload.upload_id)
+            base_dir = _ensure_record_upload_dir(upload)
+            tomb_path = _aborted_path(base_dir, upload.storage_object_id)
             if upload.state == RecordingUpload.STATE_ABORTED:
                 payload = _state_payload(upload)
             elif upload.state == RecordingUpload.STATE_FINALIZED:
@@ -769,7 +778,7 @@ def _abort_upload(request, token, content_length):
                 )
             else:
                 with _record_file_lock(base_dir, upload.upload_id):
-                    stage_path = _stage_path(base_dir, upload.upload_id)
+                    stage_path = _stage_path(base_dir, upload.storage_object_id)
                     final_path = _final_path(base_dir, upload)
                     if os.path.lexists(final_path):
                         raise UploadRequestError(
@@ -855,6 +864,18 @@ def handle_record_upload(request, token):
         return ingestion_governance.quota_response(error)
     except ingestion_governance.RecordingStorageUnavailable as error:
         return ingestion_governance.storage_error_response(error)
+    except recording_inventory.RecordingBackupInProgress:
+        response = JsonResponse(
+            {
+                "error": "Recording backup checkpoint is in progress",
+                "code": "recording_backup_in_progress",
+                "retryable": True,
+            },
+            status=503,
+        )
+        response["Retry-After"] = "30"
+        response["Cache-Control"] = "no-store"
+        return response
     except BlockingIOError:
         return JsonResponse({"error": "Recording is busy", "code": "upload_busy"}, status=423)
     except (DatabaseError, OSError, ValidationError):

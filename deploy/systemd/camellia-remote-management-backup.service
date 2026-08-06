@@ -1,5 +1,5 @@
 [Unit]
-Description=Back up Camellia Remote Management PostgreSQL
+Description=Back up Camellia Remote Management database and recording inventory
 After=camellia-remote-management-stack.service
 
 [Service]

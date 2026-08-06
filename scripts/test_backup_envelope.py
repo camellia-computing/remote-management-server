@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Deterministic tests for the authenticated PostgreSQL backup envelope."""
+"""Deterministic tests for paired database/recording backup envelopes."""
 
 import json
 import pathlib
@@ -10,6 +10,8 @@ import unittest
 HELPER = pathlib.Path(__file__).with_name("backup_envelope.py")
 BACKUP_ID = "0123456789abcdef0123456789abcdef"
 CREATED_AT = "20260805T120000Z"
+EPOCH_ID = "11111111-1111-4111-8111-111111111111"
+INVENTORY_DIGEST = "a" * 64
 MANIFEST_ARGS = [
     "--backup-id",
     BACKUP_ID,
@@ -23,6 +25,12 @@ MANIFEST_ARGS = [
     "18",
     "--key-id",
     "backup-v1",
+    "--component",
+    "database",
+    "--recording-epoch-id",
+    EPOCH_ID,
+    "--recording-inventory-digest",
+    INVENTORY_DIGEST,
 ]
 EXPECT_ARGS = [
     "--expect-backup-id",
@@ -37,6 +45,12 @@ EXPECT_ARGS = [
     "18",
     "--expect-key-id",
     "backup-v1",
+    "--expect-component",
+    "database",
+    "--expect-recording-epoch-id",
+    EPOCH_ID,
+    "--expect-recording-inventory-digest",
+    INVENTORY_DIGEST,
 ]
 
 
@@ -59,7 +73,7 @@ class BackupEnvelopeTests(unittest.TestCase):
         payload = b"PGDUMP-CANARY\x00" + bytes(range(256))
         packed = invoke(["pack", *MANIFEST_ARGS], payload)
         self.assertEqual(packed.returncode, 0, packed.stderr.decode())
-        self.assertTrue(packed.stdout.startswith(b"CAMELLIA-REMOTE-POSTGRES-BACKUP\x00"))
+        self.assertTrue(packed.stdout.startswith(b"CAMELLIA-REMOTE-CONSISTENT-BACKUP\x00"))
 
         restored = invoke(["unpack", *EXPECT_ARGS], packed.stdout)
         self.assertEqual(restored.returncode, 0, restored.stderr.decode())
@@ -78,9 +92,9 @@ class BackupEnvelopeTests(unittest.TestCase):
         packed = invoke(["pack", *MANIFEST_ARGS], b"payload").stdout
         cases = [
             b"wrong" + packed[5:],
-            packed[: len(b"CAMELLIA-REMOTE-POSTGRES-BACKUP\x00") + 3],
-            packed[: len(b"CAMELLIA-REMOTE-POSTGRES-BACKUP\x00") + 4] + b"\xff\xff\xff\xff",
-            packed[: len(b"CAMELLIA-REMOTE-POSTGRES-BACKUP\x00") + 4 + 1],
+            packed[: len(b"CAMELLIA-REMOTE-CONSISTENT-BACKUP\x00") + 3],
+            packed[: len(b"CAMELLIA-REMOTE-CONSISTENT-BACKUP\x00") + 4] + b"\xff\xff\xff\xff",
+            packed[: len(b"CAMELLIA-REMOTE-CONSISTENT-BACKUP\x00") + 4 + 1],
         ]
         for case in cases:
             with self.subTest(length=len(case)):
@@ -89,25 +103,35 @@ class BackupEnvelopeTests(unittest.TestCase):
 
     def test_manifest_with_extra_or_missing_fields_is_rejected(self):
         packed = invoke(["pack", *MANIFEST_ARGS], b"payload").stdout
-        magic_length = len(b"CAMELLIA-REMOTE-POSTGRES-BACKUP\x00")
+        magic_length = len(b"CAMELLIA-REMOTE-CONSISTENT-BACKUP\x00")
         manifest_length = int.from_bytes(packed[magic_length : magic_length + 4], "big")
         manifest_start = magic_length + 4
         manifest = json.loads(packed[manifest_start : manifest_start + manifest_length])
         manifest["unexpected"] = True
         encoded = json.dumps(manifest, separators=(",", ":"), sort_keys=True).encode()
-        modified = packed[:magic_length] + len(encoded).to_bytes(4, "big") + encoded + packed[manifest_start + manifest_length :]
+        modified = (
+            packed[:magic_length]
+            + len(encoded).to_bytes(4, "big")
+            + encoded
+            + packed[manifest_start + manifest_length :]
+        )
         result = invoke(["unpack", *EXPECT_ARGS], modified)
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(result.stdout, b"")
 
     def test_noncanonical_manifest_encoding_is_rejected(self):
         packed = invoke(["pack", *MANIFEST_ARGS], b"payload").stdout
-        magic_length = len(b"CAMELLIA-REMOTE-POSTGRES-BACKUP\x00")
+        magic_length = len(b"CAMELLIA-REMOTE-CONSISTENT-BACKUP\x00")
         manifest_length = int.from_bytes(packed[magic_length : magic_length + 4], "big")
         manifest_start = magic_length + 4
         encoded = packed[manifest_start : manifest_start + manifest_length]
         noncanonical = json.dumps(json.loads(encoded), ensure_ascii=False).encode()
-        modified = packed[:magic_length] + len(noncanonical).to_bytes(4, "big") + noncanonical + packed[manifest_start + manifest_length :]
+        modified = (
+            packed[:magic_length]
+            + len(noncanonical).to_bytes(4, "big")
+            + noncanonical
+            + packed[manifest_start + manifest_length :]
+        )
         result = invoke(["unpack", *EXPECT_ARGS], modified)
         self.assertNotEqual(result.returncode, 0)
 

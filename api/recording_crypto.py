@@ -147,6 +147,7 @@ def verify_recording_fd(
     expected_revision,
     expected_storage_offset,
     max_chunk_bytes,
+    include_ciphertext_digest=False,
 ):
     """Authenticate a recording and return its plaintext size and SHA-256.
 
@@ -165,6 +166,12 @@ def verify_recording_fd(
     if os.fstat(fd).st_size != expected_storage_offset:
         raise RecordingFormatError("Recording ciphertext format is invalid")
 
+    ciphertext_hasher = hashlib.sha256() if include_ciphertext_digest else None
+    if ciphertext_hasher is not None:
+        header = os.pread(fd, HEADER_SIZE, 0)
+        if len(header) != HEADER_SIZE:
+            raise RecordingFormatError("Recording ciphertext format is invalid")
+        ciphertext_hasher.update(header)
     validate_header_fd(fd, upload_id=upload_id, data_key=data_key)
     full_digest = hashlib.sha256()
     plaintext_size = 0
@@ -187,6 +194,8 @@ def verify_recording_fd(
             raise RecordingFormatError("Recording ciphertext format is invalid")
         digest_bytes = _decode_digest(digest, error_type=RecordingFormatError)
         frame = _read_exact(fd, _RECORD_FRAME.size)
+        if ciphertext_hasher is not None:
+            ciphertext_hasher.update(frame)
         try:
             magic, ciphertext_length, nonce = _RECORD_FRAME.unpack(frame)
         except struct.error as exc:
@@ -199,6 +208,8 @@ def verify_recording_fd(
         ):
             raise RecordingFormatError("Recording ciphertext format is invalid")
         ciphertext = _read_exact(fd, ciphertext_length)
+        if ciphertext_hasher is not None:
+            ciphertext_hasher.update(ciphertext)
         try:
             plaintext = crypto_secretbox_open(ciphertext, nonce, data_key)
         except CryptoError as exc:
@@ -226,7 +237,10 @@ def verify_recording_fd(
         raise RecordingFormatError("Recording ciphertext format is invalid")
     if os.lseek(fd, 0, os.SEEK_CUR) != expected_storage_offset or os.read(fd, 1):
         raise RecordingFormatError("Recording ciphertext format is invalid")
-    return plaintext_size, full_digest.hexdigest()
+    result = (plaintext_size, full_digest.hexdigest())
+    if ciphertext_hasher is not None:
+        return (*result, ciphertext_hasher.hexdigest())
+    return result
 
 
 def _read_exact(fd, length):

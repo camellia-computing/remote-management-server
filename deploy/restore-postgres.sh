@@ -80,6 +80,10 @@ fi
 expected_created_at="${BASH_REMATCH[1]}"
 expected_backup_id="${BASH_REMATCH[2]}"
 [[ "$backup_path" == "$base_name" || "$backup_path" == */"$base_name" ]] || die "backup path is invalid"
+backup_parent="$(dirname -- "$backup_path")"
+recording_backup_path="$backup_parent/recordings-$expected_created_at-$expected_backup_id.bundle.age"
+[[ -f "$recording_backup_path" && ! -L "$recording_backup_path" && -r "$recording_backup_path" ]] || \
+    die "the matching encrypted recording backup is missing, unreadable, or a symlink"
 
 [[ -n "$deployment_id" ]] || die "CAMELLIA_REMOTE_BACKUP_DEPLOYMENT_ID is required"
 [[ -n "$database_name" ]] || die "CAMELLIA_REMOTE_DATABASE_NAME is required"
@@ -94,19 +98,51 @@ compose=(docker compose --env-file "$env_file" -f "$project_dir/docker-compose.y
 # removed on every exit; it prevents a tampered age stream from reaching
 # pg_restore before age has verified its final authentication tag.  The backup
 # artifact itself is always encrypted and no identity contents enter argv/logs.
-plaintext_temporary="$(mktemp "${TMPDIR:-/tmp}/camellia-restore.XXXXXX")" || die "cannot create secure restore temporary"
-chmod 0600 "$plaintext_temporary"
+database_envelope_temporary="$(mktemp "${TMPDIR:-/tmp}/camellia-restore-database.XXXXXX")" || \
+    die "cannot create secure database restore temporary"
+recording_envelope_temporary="$(mktemp "${TMPDIR:-/tmp}/camellia-restore-recordings.XXXXXX")" || \
+    { rm -f -- "$database_envelope_temporary"; die "cannot create secure recording restore temporary"; }
+chmod 0600 "$database_envelope_temporary" "$recording_envelope_temporary"
 cleanup() {
-    rm -f -- "$plaintext_temporary"
+    rm -f -- "$database_envelope_temporary" "$recording_envelope_temporary"
 }
 trap cleanup EXIT HUP INT TERM
 
 set -o pipefail
-"$age_binary" --decrypt --identity "$identity_file" "$backup_path" >"$plaintext_temporary"
+"$age_binary" --decrypt --identity "$identity_file" "$backup_path" >"$database_envelope_temporary"
+"$age_binary" --decrypt --identity "$identity_file" "$recording_backup_path" >"$recording_envelope_temporary"
+pair_json="$(python3 "$envelope_helper" pair "$database_envelope_temporary" "$recording_envelope_temporary")" || \
+    die "database and recording artifacts do not form one authenticated backup epoch"
+pair_values="$(CAMELLIA_REMOTE_BACKUP_PAIR_JSON="$pair_json" \
+    CAMELLIA_REMOTE_EXPECTED_BACKUP_ID="$expected_backup_id" \
+    CAMELLIA_REMOTE_EXPECTED_CREATED_AT="$expected_created_at" \
+    CAMELLIA_REMOTE_EXPECTED_DEPLOYMENT_ID="$deployment_id" \
+    CAMELLIA_REMOTE_EXPECTED_DATABASE_NAME="$database_name" \
+    CAMELLIA_REMOTE_EXPECTED_POSTGRES_MAJOR="$postgres_major_expected" \
+    CAMELLIA_REMOTE_EXPECTED_KEY_ID="$backup_key_id_expected" \
+    python3 -c '
+import json, os
+value = json.loads(os.environ["CAMELLIA_REMOTE_BACKUP_PAIR_JSON"])
+expected = {
+    "backup_id": os.environ["CAMELLIA_REMOTE_EXPECTED_BACKUP_ID"],
+    "created_at": os.environ["CAMELLIA_REMOTE_EXPECTED_CREATED_AT"],
+    "database_name": os.environ["CAMELLIA_REMOTE_EXPECTED_DATABASE_NAME"],
+    "deployment_id": os.environ["CAMELLIA_REMOTE_EXPECTED_DEPLOYMENT_ID"],
+    "key_id": os.environ["CAMELLIA_REMOTE_EXPECTED_KEY_ID"],
+    "postgres_major": os.environ["CAMELLIA_REMOTE_EXPECTED_POSTGRES_MAJOR"],
+}
+if any(value.get(field) != expected_value for field, expected_value in expected.items()):
+    raise SystemExit(1)
+print(value.get("recording_epoch_id", ""), value.get("recording_inventory_digest", ""))
+')" || die "backup epoch metadata is invalid"
+read -r recording_epoch_id recording_inventory_digest <<<"$pair_values"
+[[ "$recording_epoch_id" =~ ^[0-9a-f-]{36}$ ]] || die "backup recording epoch is invalid"
+[[ "$recording_inventory_digest" =~ ^[0-9a-f]{64}$ ]] || die "backup recording inventory digest is invalid"
 # The authenticated artifact is restored only through the migration owner.
 # Bootstrap runs before and after restore so an old superuser-owned volume and
 # newly restored objects both converge to the same least-privilege boundary.
 "${compose[@]}" run --rm --no-deps -T database-bootstrap
+"${compose[@]}" run --rm --no-deps -T management python manage.py recording_backup restore-preflight
 python3 "$envelope_helper" unpack \
         --expect-backup-id "$expected_backup_id" \
         --expect-created-at "$expected_created_at" \
@@ -114,11 +150,31 @@ python3 "$envelope_helper" unpack \
         --expect-database-name "$database_name" \
         --expect-postgres-major "$postgres_major_expected" \
         --expect-key-id "$backup_key_id_expected" \
-    <"$plaintext_temporary" \
+        --expect-component database \
+        --expect-recording-epoch-id "$recording_epoch_id" \
+        --expect-recording-inventory-digest "$recording_inventory_digest" \
+    <"$database_envelope_temporary" \
     | "${compose[@]}" run --rm --no-deps -T database-restore \
         pg_restore --single-transaction --exit-on-error --format=custom --no-owner --no-acl
 set +o pipefail
 "${compose[@]}" run --rm --no-deps -T database-bootstrap
+set -o pipefail
+python3 "$envelope_helper" unpack \
+        --expect-backup-id "$expected_backup_id" \
+        --expect-created-at "$expected_created_at" \
+        --expect-deployment-id "$deployment_id" \
+        --expect-database-name "$database_name" \
+        --expect-postgres-major "$postgres_major_expected" \
+        --expect-key-id "$backup_key_id_expected" \
+        --expect-component recordings \
+        --expect-recording-epoch-id "$recording_epoch_id" \
+        --expect-recording-inventory-digest "$recording_inventory_digest" \
+    <"$recording_envelope_temporary" \
+    | "${compose[@]}" run --rm --no-deps -T management python manage.py recording_backup restore \
+        --backup-id "$expected_backup_id" \
+        --epoch-id "$recording_epoch_id" \
+        --inventory-digest "$recording_inventory_digest"
+set +o pipefail
 "${compose[@]}" run --rm --no-deps -T database-probe
 
 printf 'restored %s\n' "$backup_path"

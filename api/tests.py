@@ -21,7 +21,7 @@ from nacl.secret import SecretBox
 from nacl.signing import SigningKey
 from openpyxl import load_workbook
 
-from api import recording_crypto
+from api import ingestion_governance, recording_crypto
 from api.encrypted_fields import FIELD_PREFIX, encrypt_text, key_canary, key_fingerprint
 from api.formatting import format_bytes
 from api.models import (
@@ -908,7 +908,8 @@ class ApiContractTests(ApiTestMixin, TestCase):
                 "recording_active_expired": 0,
                 "recording_finalized_purged": 0,
                 "recording_aborted_purged": 0,
-                "recording_orphan_tombs_purged": 0,
+                "recording_orphans_quarantined": 0,
+                "recording_quarantine_purged": 0,
                 "audit_connections_purged": 0,
                 "legacy_file_audits_purged": 0,
                 "legacy_alarm_audits_purged": 0,
@@ -2300,20 +2301,25 @@ class OperationalEndpointTests(TestCase):
 class DataEncryptionRotationTests(TestCase):
     def test_rotation_rewraps_recording_data_keys_before_retiring_the_old_kek(self):
         encoded_data_key = recording_crypto.encode_data_key(b"d" * recording_crypto.DATA_KEY_BYTES)
+        storage_object_id = uuid.uuid4()
+        old_key_id = project_settings.DATA_ENCRYPTION_PRIMARY_KEY_ID
         upload = RecordingUpload.objects.create(
             create_id=uuid.uuid4(),
             device_id=None,
             device_id_at_create=1,
             owner_id_at_create=1,
             deployment_generation=0,
-            storage_namespace="d" * 64,
+            device_rid_at_create="rotation-device",
+            device_uuid_at_create="rotation-device-uuid",
+            storage_object_id=storage_object_id,
+            storage_namespace=ingestion_governance.recording_namespace(storage_object_id),
             filename="rotation-recording.webm",
             encryption_version=recording_crypto.FORMAT_VERSION,
+            data_key_kek_id=old_key_id,
             encrypted_data_key=encoded_data_key,
             storage_offset=recording_crypto.HEADER_SIZE,
         )
         database_upload_id = RecordingUpload._meta.pk.get_db_prep_value(upload.pk, connection)
-        old_key_id = project_settings.DATA_ENCRYPTION_PRIMARY_KEY_ID
         old_key = project_settings.DATA_ENCRYPTION_KEYS[old_key_id]
         new_key_id = "recording-rotation"
         new_key = b"n" * 32
@@ -2337,6 +2343,7 @@ class DataEncryptionRotationTests(TestCase):
             self.assertEqual(json.loads(output.getvalue())["rewritten"], 1)
             upload.refresh_from_db()
             self.assertEqual(upload.encrypted_data_key, encoded_data_key)
+            self.assertEqual(upload.data_key_kek_id, new_key_id)
             with connection.cursor() as cursor:
                 cursor.execute(
                     "SELECT encrypted_data_key FROM api_recordingupload WHERE upload_id = %s",
