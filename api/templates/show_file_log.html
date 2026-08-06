@@ -22,7 +22,9 @@
             <th>{{ "用户ID" | translate }}</th>
             <th>{{ "用户别名" | translate }}</th>
             <th>{{ "用户IP" | translate }}</th>
-            <th>{{ "文件大小" | translate }}</th>
+            <th>Planned</th>
+            <th>Actual</th>
+            <th>State</th>
             <th>{{ "发送/接受" | translate }}</th>
             <th>{{ "记录于" | translate }}</th>
           </tr>
@@ -36,7 +38,12 @@
             <td>{{ one.user_id }}</td>
             <td>{{ one.user_alias }}</td>
             <td>{{ one.user_ip }}</td>
-            <td>{{ one.filesize_display }}</td>
+            <td>{{ one.planned_bytes_display }}</td>
+            <td>{{ one.transferred_bytes_display }}</td>
+            <td>
+              <span class="status-pill">{{ one.transfer_state }}</span>
+              {% if one.terminal_reason %}<div>{{ one.terminal_reason }}</div>{% endif %}
+            </td>
             <td>
               {% if one.direction == 0 %}
                 <span class="status-pill is-online">{{ "接收" | translate }}</span>

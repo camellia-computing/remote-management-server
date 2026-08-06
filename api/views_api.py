@@ -6,6 +6,7 @@ import hashlib
 import ipaddress
 import json
 import logging
+import math
 import re
 import secrets
 import uuid
@@ -28,7 +29,7 @@ from joserfc import jwt
 from joserfc.jwk import KeySet
 from joserfc.jwt import JWTClaimsRegistry
 
-from api import ingestion_governance, recording_uploads
+from api import audit_lifecycle, ingestion_governance, recording_uploads
 
 # from django.forms.models import model_to_dict
 from api.address_book_authorization import (
@@ -64,6 +65,7 @@ from api.models import (
     DeviceProofChallenge,
     DeviceRecoveryApproval,
     FileLog,
+    FileTransferAuditEvent,
     OidcIdentity,
     OidcPendingAuth,
     RemoteDevice,
@@ -94,7 +96,9 @@ MAX_DEVICE_UUID_TEXT_LEN = 344
 MAX_AUDIT_INFO_BYTES = 16 * 1024
 MAX_AUDIT_NOTE_BYTES = 16 * 1024
 MAX_AUDIT_FILES = 10
-AUDIT_PROTOCOL_VERSION = 2
+AUDIT_PROTOCOL_VERSION = 3
+FILE_AUDIT_PROTOCOL_VERSION = 4
+MAX_AUDIT_INTEGER = 9_223_372_036_854_775_807
 MAX_AB_PEERS = 10_000
 MAX_AB_TAGS = 256
 MAX_AB_TAGS_PER_PEER = 32
@@ -1997,6 +2001,41 @@ def devices_deploy(request):
 
     try:
         with transaction.atomic():
+            # Identity mutations use one lock order: user authority first,
+            # then devices by primary key, followed by proofs and tokens.
+            # In particular, a full device save and personal-profile
+            # finalization can both require PostgreSQL to validate an owner
+            # FK. Locking a device first would therefore deadlock with account
+            # deletion, which holds the user row before locking its devices.
+            locked_user = UserProfile.objects.select_for_update().filter(pk=user.pk, is_active=True).first()
+            if not locked_user:
+                _log_event(
+                    request,
+                    "api_devices_deploy_denied",
+                    level="warning",
+                    username=user.username,
+                    rid=rid,
+                    reason="inactive_user",
+                )
+                return JsonResponse({"error": "Invalid token"}, status=401)
+            token_is_current = RemoteToken.objects.filter(
+                pk=token.pk,
+                device_id=token.device_id,
+                subject_user=locked_user,
+                credential_hash=locked_user.get_session_auth_hash(),
+                expires_at__gt=timezone.now(),
+            ).exists()
+            if not token_is_current:
+                _log_event(
+                    request,
+                    "api_devices_deploy_denied",
+                    level="warning",
+                    username=locked_user.username,
+                    rid=rid,
+                    reason="stale_token",
+                )
+                return JsonResponse({"error": "Invalid token"}, status=401)
+            user = locked_user
             matches = list(
                 RemoteDevice.objects.select_for_update().filter(Q(rid=rid) | Q(uuid=uuid_value)).order_by("pk")
             )
@@ -3204,6 +3243,12 @@ def _audit_connection_id(value):
     return value if 1 <= value <= 2_147_483_647 else None
 
 
+def _audit_revision(value):
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value if 1 <= value <= 9_223_372_036_854_775_807 else None
+
+
 def _audit_session_id(value):
     if isinstance(value, bool) or not isinstance(value, (str, int)):
         return None
@@ -3254,24 +3299,77 @@ def _audit_version_is_current(value):
     return isinstance(value, str) and value == str(AUDIT_PROTOCOL_VERSION)
 
 
-def _audit_upgrade_required():
+def _audit_upgrade_required(required_version=AUDIT_PROTOCOL_VERSION):
     return JsonResponse(
         {
             "error": "Unsupported audit protocol version",
-            "required_version": AUDIT_PROTOCOL_VERSION,
+            "required_version": required_version,
         },
         status=426,
     )
 
 
-def _audit_success(connection_log, *, status=200):
+def _file_audit_version_is_current(value):
+    if isinstance(value, bool):
+        return False
+    if isinstance(value, int):
+        return value == FILE_AUDIT_PROTOCOL_VERSION
+    return isinstance(value, str) and value == str(FILE_AUDIT_PROTOCOL_VERSION)
+
+
+def _audit_nonnegative_integer(value):
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value if 0 <= value <= MAX_AUDIT_INTEGER else None
+
+
+def _audit_success(connection_log, event_id, *, status=200):
+    now = audit_lifecycle.database_now()
+    lease_remaining = 0
+    if connection_log.state in ConnLog.OPEN_STATES and connection_log.lease_expires_at is not None:
+        lease_remaining = max(0, math.ceil((connection_log.lease_expires_at - now).total_seconds()))
     return JsonResponse(
         {
             "version": AUDIT_PROTOCOL_VERSION,
             "audit_session_id": str(connection_log.guid),
-            "revision": connection_log.event_revision,
+            "acknowledged_event_id": str(event_id),
+            "event_revision": connection_log.event_revision,
+            "state": connection_log.state,
+            "state_revision": connection_log.state_revision,
+            "heartbeat_revision": connection_log.heartbeat_revision,
+            "lease_remaining_seconds": lease_remaining,
+            "terminal_reason": connection_log.terminal_reason,
+            "terminal_source": connection_log.terminal_source,
         },
         status=status,
+    )
+
+
+def _file_audit_success(connection_log, transfer_event):
+    return JsonResponse(
+        {
+            "version": FILE_AUDIT_PROTOCOL_VERSION,
+            "audit_session_id": str(connection_log.guid),
+            "acknowledged_event_id": str(transfer_event.connection_event.event_id),
+            "transfer_id": str(transfer_event.transfer.transfer_id),
+            "transfer_revision": transfer_event.revision,
+            "transfer_state": transfer_event.state,
+            "transferred_bytes": transfer_event.transferred_bytes,
+        }
+    )
+
+
+def _audit_terminal_conflict(connection_log):
+    return JsonResponse(
+        {
+            "error": "Connection is not active",
+            "version": AUDIT_PROTOCOL_VERSION,
+            "state": connection_log.state,
+            "state_revision": connection_log.state_revision,
+            "terminal_reason": connection_log.terminal_reason,
+            "terminal_source": connection_log.terminal_source,
+        },
+        status=409,
     )
 
 
@@ -3352,8 +3450,11 @@ def _locked_host_audit_session(token, user, audit_session_id, *, active=True, re
         controller_device = locked_devices.get(connection_log.controller_device_id)
         if not _audit_controller_authority_is_current(connection_log, controller_device):
             return device, None, JsonResponse({"error": "Controller is not bound"}, status=403)
-    if active and connection_log.conn_end is not None:
-        return device, None, JsonResponse({"error": "Connection is closed"}, status=409)
+    if active:
+        now = audit_lifecycle.database_now()
+        audit_lifecycle.expire_locked_connection(connection_log, now, source="request_reconciler")
+        if connection_log.state not in ConnLog.OPEN_STATES:
+            return device, None, _audit_terminal_conflict(connection_log)
     return device, connection_log, None
 
 
@@ -3383,7 +3484,12 @@ def _append_audit_event(connection_log, event_id, kind, actor, reporter_device_u
         connection_log.owner_id_at_create,
         connection_log.host_device_id_at_create,
         connection_log.event_revision,
-        closes_connection=kind == ConnectionAuditEvent.KIND_CLOSED,
+        closes_connection=kind
+        in (
+            ConnectionAuditEvent.KIND_CLOSED,
+            ConnectionAuditEvent.KIND_ABORTED,
+            ConnectionAuditEvent.KIND_EXPIRED,
+        ),
     )
     sequence = connection_log.event_revision + 1
     event = ConnectionAuditEvent.objects.create(
@@ -3392,7 +3498,7 @@ def _append_audit_event(connection_log, event_id, kind, actor, reporter_device_u
         sequence=sequence,
         kind=kind,
         actor=actor,
-        actor_id_at_event=actor.id,
+        actor_id_at_event=actor.id if actor else connection_log.owner_id_at_create,
         reporter_device_uuid=reporter_device_uuid,
         details=details,
     )
@@ -3431,6 +3537,7 @@ def _audit_conn_active(request):
                     session_id=session_id,
                     from_id=controller_rid,
                 )
+                .order_by("-conn_start", "-pk")
                 .values_list("host_device_id", flat=True)
                 .first()
             )
@@ -3455,6 +3562,7 @@ def _audit_conn_active(request):
                     session_id=session_id,
                     from_id=controller_device.rid if controller_device else "",
                 )
+                .order_by("-conn_start", "-pk")
                 .first()
             )
             if not connection_log or not host_device or not controller_device:
@@ -3469,6 +3577,12 @@ def _audit_conn_active(request):
                 return JsonResponse("", safe=False, status=409)
             if connection_log.actor_id and connection_log.actor_id != user.id:
                 return JsonResponse("", safe=False, status=403)
+            now = audit_lifecycle.database_now()
+            audit_lifecycle.expire_locked_connection(connection_log, now, source="controller_query")
+            if connection_log.state != ConnLog.STATE_ACTIVE:
+                if connection_log.state == ConnLog.STATE_STARTING:
+                    return JsonResponse("", safe=False)
+                return _audit_terminal_conflict(connection_log)
             details = {
                 "controller_device_id": controller_device.rid,
                 "controller_device_pk": controller_device.id,
@@ -3488,9 +3602,7 @@ def _audit_conn_active(request):
                     details,
                 ):
                     return _audit_event_conflict()
-                return _audit_success(connection_log)
-            if connection_log.conn_end is not None:
-                return JsonResponse("", safe=False, status=409)
+                return _audit_success(connection_log, event_id)
             if connection_log.actor_id is None:
                 if connection_log.controller_device_id is not None:
                     return JsonResponse("", safe=False, status=409)
@@ -3530,7 +3642,7 @@ def _audit_conn_active(request):
         session_id=session_id,
         conn_type=conn_type,
     )
-    return _audit_success(connection_log)
+    return _audit_success(connection_log, event_id)
 
 
 def _audit_controller_note(request, postdata):
@@ -3601,9 +3713,11 @@ def _audit_controller_note_by_capability(request, postdata):
                     or existing.details.get("note") != note
                 ):
                     return _audit_event_conflict()
-                return _audit_success(connection_log)
-            if connection_log.conn_end is not None:
-                return JsonResponse({"error": "Connection is closed"}, status=409)
+                return _audit_success(connection_log, event_id)
+            observed_at = audit_lifecycle.database_now()
+            audit_lifecycle.expire_locked_connection(connection_log, observed_at, source="controller_note")
+            if connection_log.state != ConnLog.STATE_ACTIVE:
+                return _audit_terminal_conflict(connection_log)
             details = {"previous_note": connection_log.note, "note": note}
             _append_audit_event(
                 connection_log,
@@ -3618,7 +3732,7 @@ def _audit_controller_note_by_capability(request, postdata):
     except IntegrityError:
         return _audit_event_conflict()
     _log_event(request, "api_audit_note_update", username=user.username, guid=connection_log.guid)
-    return _audit_success(connection_log)
+    return _audit_success(connection_log, event_id)
 
 
 def _audit_conn(request):
@@ -3653,6 +3767,7 @@ def _audit_conn(request):
                 device = _locked_audit_device(token, user)
                 if not device:
                     return JsonResponse({"error": "Device is not active"}, status=403)
+                observed_at = audit_lifecycle.database_now()
                 connection_log = (
                     ConnLog.objects.select_for_update()
                     .filter(
@@ -3685,10 +3800,15 @@ def _audit_conn(request):
                         host_device_generation=device.deployment_generation,
                         owner_id_at_create=user.id,
                         event_revision=1,
+                        state=ConnLog.STATE_STARTING,
+                        state_revision=1,
+                        last_seen_at=observed_at,
+                        lease_expires_at=audit_lifecycle.lease_deadline(observed_at),
                         conn_id=conn_id,
                         from_ip=source_ip,
                         from_id="",
                         rid=device.rid,
+                        conn_start=observed_at,
                         session_id=session_id,
                         uuid=device.uuid,
                         conn_type=conn_type,
@@ -3714,6 +3834,9 @@ def _audit_conn(request):
                             "session_id": session_id,
                             "conn_type": conn_type,
                             "audit_ref": audit_ref,
+                            "state": ConnLog.STATE_STARTING,
+                            "state_revision": 1,
+                            "lease_seconds": settings.AUDIT_CONNECTION_LEASE_SECONDS,
                         },
                     )
                     created = True
@@ -3729,7 +3852,50 @@ def _audit_conn(request):
             session_id=session_id,
             conn_type=conn_type,
         )
-        return _audit_success(connection_log, status=201 if created else 200)
+        return _audit_success(connection_log, event_id, status=201 if created else 200)
+    elif action == "heartbeat":
+        audit_session_id = _audit_uuid4(postdata.get("audit_session_id"))
+        heartbeat_revision = _audit_revision(postdata.get("heartbeat_revision"))
+        if audit_session_id is None or heartbeat_revision is None:
+            return JsonResponse({"error": "Invalid audit heartbeat"}, status=400)
+        with transaction.atomic():
+            device, connection_log, authority_error = _locked_host_audit_session(
+                token,
+                user,
+                audit_session_id,
+            )
+            if authority_error:
+                return authority_error
+            if connection_log.conn_id != conn_id or connection_log.session_id != session_id:
+                return JsonResponse({"error": "Connection not found"}, status=404)
+            if heartbeat_revision < connection_log.heartbeat_revision:
+                return JsonResponse({"error": "Stale audit heartbeat"}, status=409)
+            if heartbeat_revision == connection_log.heartbeat_revision:
+                if connection_log.last_heartbeat_id != event_id:
+                    return JsonResponse({"error": "Audit heartbeat identity conflict"}, status=409)
+                return _audit_success(connection_log, event_id)
+            observed_at = audit_lifecycle.database_now()
+            connection_log.heartbeat_revision = heartbeat_revision
+            connection_log.last_heartbeat_id = event_id
+            audit_lifecycle.refresh_host_lease(connection_log, observed_at)
+            connection_log.save(
+                update_fields=(
+                    "heartbeat_revision",
+                    "last_heartbeat_id",
+                    "last_seen_at",
+                    "lease_expires_at",
+                )
+            )
+        _log_event(
+            request,
+            "api_audit_conn_heartbeat",
+            level="debug",
+            username=user.username,
+            conn_id=conn_id,
+            session_id=session_id,
+            heartbeat_revision=heartbeat_revision,
+        )
+        return _audit_success(connection_log, event_id)
     elif action == "close":
         audit_session_id = _audit_uuid4(postdata.get("audit_session_id"))
         if audit_session_id is None:
@@ -3750,24 +3916,66 @@ def _audit_conn(request):
                 if existing:
                     if (
                         existing.connection_id != connection_log.id
-                        or existing.kind != ConnectionAuditEvent.KIND_CLOSED
+                        or existing.kind not in (ConnectionAuditEvent.KIND_CLOSED, ConnectionAuditEvent.KIND_ABORTED)
                         or existing.actor_id != user.id
                         or existing.reporter_device_uuid != device.uuid
                     ):
                         return _audit_event_conflict()
-                    return _audit_success(connection_log)
-                if connection_log.conn_end is None:
-                    closed_at = timezone.now()
-                    _append_audit_event(
-                        connection_log,
-                        event_id,
-                        ConnectionAuditEvent.KIND_CLOSED,
-                        user,
-                        device.uuid,
-                        {"closed_at": closed_at.isoformat()},
+                    return _audit_success(connection_log, event_id)
+                terminal_at = audit_lifecycle.database_now()
+                audit_lifecycle.expire_locked_connection(connection_log, terminal_at, source="close_reconciler")
+                if connection_log.state not in ConnLog.OPEN_STATES:
+                    return _audit_terminal_conflict(connection_log)
+                event_kind = (
+                    ConnectionAuditEvent.KIND_CLOSED
+                    if connection_log.state == ConnLog.STATE_ACTIVE
+                    else ConnectionAuditEvent.KIND_ABORTED
+                )
+                terminal_state = (
+                    ConnLog.STATE_CLOSED if connection_log.state == ConnLog.STATE_ACTIVE else ConnLog.STATE_ABORTED
+                )
+                terminal_reason = "host_close" if terminal_state == ConnLog.STATE_CLOSED else "ended_before_active"
+                terminal_event, _created = _append_audit_event(
+                    connection_log,
+                    event_id,
+                    event_kind,
+                    user,
+                    device.uuid,
+                    {
+                        "terminal_at": terminal_at.isoformat(),
+                        "terminal_state": terminal_state,
+                        "reason": terminal_reason,
+                        "source": "host",
+                    },
+                )
+                if connection_log.state_revision >= 9_223_372_036_854_775_807:
+                    raise IntegrityError("Audit state revision exhausted")
+                connection_log.state = terminal_state
+                connection_log.state_revision += 1
+                connection_log.last_seen_at = terminal_at
+                connection_log.lease_expires_at = terminal_at
+                connection_log.terminal_at = terminal_at
+                connection_log.terminal_reason = terminal_reason
+                connection_log.terminal_source = "host"
+                connection_log.conn_end = terminal_at
+                connection_log.save(
+                    update_fields=(
+                        "state",
+                        "state_revision",
+                        "last_seen_at",
+                        "lease_expires_at",
+                        "terminal_at",
+                        "terminal_reason",
+                        "terminal_source",
+                        "conn_end",
                     )
-                    connection_log.conn_end = closed_at
-                    connection_log.save(update_fields=["conn_end"])
+                )
+                audit_lifecycle.reconcile_open_file_transfers(
+                    connection_log,
+                    terminal_event,
+                    terminal_at,
+                    reason=terminal_reason,
+                )
         except IntegrityError:
             return _audit_event_conflict()
         _log_event(
@@ -3779,7 +3987,7 @@ def _audit_conn(request):
             peer_id=connection_log.rid,
             session_id=session_id,
         )
-        return _audit_success(connection_log)
+        return _audit_success(connection_log, event_id)
     else:
         if action not in ("", "update"):
             return JsonResponse({"error": "Invalid action"}, status=400)
@@ -3823,7 +4031,6 @@ def _audit_conn(request):
                     token,
                     user,
                     audit_session_id,
-                    active=False,
                 )
                 if authority_error:
                     return authority_error
@@ -3840,9 +4047,7 @@ def _audit_conn(request):
                         submitted,
                     ):
                         return _audit_event_conflict()
-                    return _audit_success(connection_log)
-                if connection_log.conn_end is not None:
-                    return JsonResponse({"error": "Connection is closed"}, status=409)
+                    return _audit_success(connection_log, event_id)
                 update_fields = []
                 for field, value in submitted.items():
                     previous = getattr(connection_log, field)
@@ -3852,8 +4057,20 @@ def _audit_conn(request):
                         update_fields.append(field)
                     elif previous != value:
                         return JsonResponse({"error": "Connection fact is immutable"}, status=409)
-                if update_fields:
-                    connection_log.save(update_fields=update_fields)
+                if (
+                    connection_log.state == ConnLog.STATE_STARTING
+                    and connection_log.from_id
+                    and connection_log.conn_type is not None
+                ):
+                    if connection_log.state_revision >= 9_223_372_036_854_775_807:
+                        raise IntegrityError("Audit state revision exhausted")
+                    connection_log.state = ConnLog.STATE_ACTIVE
+                    connection_log.state_revision += 1
+                    update_fields.extend(("state", "state_revision"))
+                observed_at = audit_lifecycle.database_now()
+                audit_lifecycle.refresh_host_lease(connection_log, observed_at)
+                update_fields.extend(("last_seen_at", "lease_expires_at"))
+                connection_log.save(update_fields=tuple(dict.fromkeys(update_fields)))
                 _append_audit_event(
                     connection_log,
                     event_id,
@@ -3873,7 +4090,7 @@ def _audit_conn(request):
             peer_id=connection_log.rid,
             session_id=session_id,
         )
-        return _audit_success(connection_log)
+        return _audit_success(connection_log, event_id)
 
 
 def _audit_file(request):
@@ -3881,53 +4098,88 @@ def _audit_file(request):
     token, user, error = _audit_device_context(request, postdata)
     if error:
         return error
-    if not _audit_version_is_current(postdata.get("version")):
-        return _audit_upgrade_required()
+    if not _file_audit_version_is_current(postdata.get("version")):
+        return _audit_upgrade_required(FILE_AUDIT_PROTOCOL_VERSION)
     audit_session_id = _audit_uuid4(postdata.get("audit_session_id"))
     event_id = _audit_uuid4(postdata.get("event_id"))
+    transfer_id = _audit_uuid4(postdata.get("transfer_id"))
+    transfer_revision = _audit_revision(postdata.get("transfer_revision"))
     conn_id = _audit_connection_id(postdata.get("conn_id"))
-    if audit_session_id is None or event_id is None or conn_id is None:
+    if (
+        audit_session_id is None
+        or event_id is None
+        or transfer_id is None
+        or transfer_revision is None
+        or conn_id is None
+    ):
         return JsonResponse({"error": "Invalid connection identity"}, status=400)
     if not isinstance(postdata.get("is_file"), bool):
         return JsonResponse({"error": "Invalid file audit"}, status=400)
-    info = postdata.get("info", "{}")
-    if isinstance(info, str) and len(info.encode()) > MAX_AUDIT_INFO_BYTES:
-        return JsonResponse({"error": "Audit information is too large"}, status=413)
-    try:
-        info_obj = json.loads(info) if isinstance(info, str) else info
-    except (TypeError, ValueError, json.JSONDecodeError):
-        return JsonResponse({"error": "Invalid audit information"}, status=400)
-    if not isinstance(info_obj, dict):
-        return JsonResponse({"error": "Invalid audit information"}, status=400)
-    files = info_obj.get("files", [])
-    total_size = 0
-    if files:
-        if not isinstance(files, list) or len(files) > MAX_AUDIT_FILES:
-            return JsonResponse({"error": "Invalid audit files"}, status=400)
-        for item in files:
-            if not isinstance(item, (list, tuple)) or len(item) < 2:
-                return JsonResponse({"error": "Invalid audit files"}, status=400)
-            try:
-                size = int(item[1])
-            except (TypeError, ValueError):
-                return JsonResponse({"error": "Invalid audit files"}, status=400)
-            if size < 0 or size > settings.RECORD_UPLOAD_MAX_FILE_BYTES:
-                return JsonResponse({"error": "Invalid audit files"}, status=400)
-            total_size += size
+
+    state = postdata.get("state")
+    if state not in dict(FileLog.STATES):
+        return JsonResponse({"error": "Invalid file transfer state"}, status=400)
     path = _bounded_audit_text(postdata.get("path", ""), 500)
-    user_ip = _audit_ip(info_obj.get("ip", ""))
     remote_id = _audit_rid(postdata.get("peer_id", ""))
-    direction = _audit_enum(postdata.get("type", 0), (0, 1))
-    if path is None or user_ip is None or remote_id is None or direction is None:
+    direction = _audit_enum(postdata.get("direction"), (0, 1))
+    planned_file_count = _audit_nonnegative_integer(postdata.get("planned_file_count"))
+    planned_bytes = _audit_nonnegative_integer(postdata.get("planned_bytes"))
+    transferred_bytes = _audit_nonnegative_integer(postdata.get("transferred_bytes"))
+    source_kind = postdata.get("source_kind")
+    terminal_reason = _bounded_audit_text(postdata.get("terminal_reason", ""), 256)
+    if (
+        path is None
+        or remote_id is None
+        or direction is None
+        or planned_file_count is None
+        or planned_bytes is None
+        or transferred_bytes is None
+        or source_kind not in dict(FileLog.SOURCE_KINDS)
+        or terminal_reason is None
+    ):
         return JsonResponse({"error": "Invalid file audit"}, status=400)
+    if transferred_bytes > planned_bytes:
+        return JsonResponse({"error": "Invalid transferred bytes"}, status=400)
+    if state in (FileLog.STATE_STARTED, FileLog.STATE_PROGRESS, FileLog.STATE_COMPLETED):
+        if terminal_reason:
+            return JsonResponse({"error": "Invalid terminal reason"}, status=400)
+    elif not terminal_reason:
+        return JsonResponse({"error": "Terminal reason is required"}, status=400)
+
+    sample_files = postdata.get("sample_files")
+    if not isinstance(sample_files, list) or len(sample_files) > MAX_AUDIT_FILES:
+        return JsonResponse({"error": "Invalid audit files"}, status=400)
+    normalized_samples = []
+    sample_bytes = 0
+    for item in sample_files:
+        if not isinstance(item, dict) or set(item) != {"path", "size"}:
+            return JsonResponse({"error": "Invalid audit files"}, status=400)
+        sample_path = _bounded_audit_text(item.get("path"), 500)
+        sample_size = _audit_nonnegative_integer(item.get("size"))
+        if sample_path is None or sample_size is None:
+            return JsonResponse({"error": "Invalid audit files"}, status=400)
+        if sample_bytes > MAX_AUDIT_INTEGER - sample_size:
+            return JsonResponse({"error": "Invalid audit files"}, status=400)
+        sample_bytes += sample_size
+        normalized_samples.append({"path": sample_path, "size": sample_size})
+    if len(normalized_samples) > planned_file_count or sample_bytes > planned_bytes:
+        return JsonResponse({"error": "Invalid file plan"}, status=400)
+
     details = {
+        "transfer_id": str(transfer_id),
+        "transfer_revision": transfer_revision,
+        "state": state,
         "conn_id": conn_id,
         "path": path,
         "peer_id": remote_id,
         "direction": direction,
         "is_file": postdata["is_file"],
-        "filesize": total_size,
-        "info": info_obj,
+        "planned_file_count": planned_file_count,
+        "planned_bytes": planned_bytes,
+        "transferred_bytes": transferred_bytes,
+        "sample_files": normalized_samples,
+        "source_kind": source_kind,
+        "terminal_reason": terminal_reason,
     }
     try:
         with transaction.atomic():
@@ -3944,8 +4196,6 @@ def _audit_file(request):
                 return JsonResponse({"error": "Connection not found"}, status=404)
             if not connection_log.from_id or connection_log.from_id != remote_id:
                 return JsonResponse({"error": "Invalid file audit participant"}, status=403)
-            if connection_log.from_ip != user_ip:
-                return JsonResponse({"error": "Invalid file audit source"}, status=403)
             existing = _existing_audit_event(event_id)
             if existing:
                 if not _matching_audit_event(
@@ -3957,12 +4207,66 @@ def _audit_file(request):
                     details,
                 ):
                     return _audit_event_conflict()
-                if not FileLog.objects.filter(event=existing, connection=connection_log).exists():
-                    raise IntegrityError("File audit receipt is missing")
-                return _audit_success(connection_log)
-            if connection_log.conn_end is not None:
-                return JsonResponse({"error": "Connection is closed"}, status=409)
-            event, created = _append_audit_event(
+                transfer_event = (
+                    FileTransferAuditEvent.objects.select_related("transfer", "connection_event")
+                    .filter(
+                        connection_event=existing,
+                        transfer__connection=connection_log,
+                        transfer__transfer_id=transfer_id,
+                        revision=transfer_revision,
+                    )
+                    .first()
+                )
+                if transfer_event is None:
+                    raise IntegrityError("File transfer audit receipt is missing")
+                return _file_audit_success(connection_log, transfer_event)
+
+            observed_at = audit_lifecycle.database_now()
+            audit_lifecycle.expire_locked_connection(connection_log, observed_at, source="file_event")
+            if connection_log.state != ConnLog.STATE_ACTIVE:
+                return _audit_terminal_conflict(connection_log)
+
+            transfer = FileLog.objects.select_for_update().filter(transfer_id=transfer_id).first()
+            if transfer is None:
+                if transfer_revision != 1 or state != FileLog.STATE_STARTED or transferred_bytes != 0:
+                    return JsonResponse({"error": "File transfer must start at revision one"}, status=409)
+            else:
+                immutable_plan = (
+                    transfer.audit_version == FILE_AUDIT_PROTOCOL_VERSION
+                    and transfer.connection_id == connection_log.id
+                    and transfer.file == path
+                    and transfer.remote_id == device.rid
+                    and transfer.user_id == remote_id
+                    and str(transfer.user_ip) == connection_log.from_ip
+                    and transfer.direction == direction
+                    and transfer.is_file == postdata["is_file"]
+                    and transfer.planned_file_count == planned_file_count
+                    and transfer.planned_bytes == planned_bytes
+                    and transfer.sample_files == normalized_samples
+                    and transfer.source_kind == source_kind
+                    and transfer.reporter_id == user.id
+                    and transfer.reporter_device_uuid == device.uuid
+                )
+                if not immutable_plan:
+                    return JsonResponse({"error": "File transfer plan is immutable"}, status=409)
+                if transfer.state in FileLog.TERMINAL_STATES:
+                    return JsonResponse({"error": "File transfer is terminal"}, status=409)
+                if transfer_revision != transfer.transfer_revision + 1:
+                    return JsonResponse({"error": "File transfer revision is out of order"}, status=409)
+                if state not in (
+                    FileLog.STATE_PROGRESS,
+                    FileLog.STATE_COMPLETED,
+                    FileLog.STATE_FAILED,
+                    FileLog.STATE_CANCELLED,
+                    FileLog.STATE_UNKNOWN,
+                ):
+                    return JsonResponse({"error": "Invalid file transfer transition"}, status=409)
+                if transferred_bytes < transfer.transferred_bytes:
+                    return JsonResponse({"error": "Transferred bytes cannot decrease"}, status=409)
+
+            audit_lifecycle.refresh_host_lease(connection_log, observed_at)
+            connection_log.save(update_fields=("last_seen_at", "lease_expires_at"))
+            event, _created = _append_audit_event(
                 connection_log,
                 event_id,
                 ConnectionAuditEvent.KIND_FILE,
@@ -3970,24 +4274,60 @@ def _audit_file(request):
                 device.uuid,
                 details,
             )
-            if created:
-                FileLog.objects.create(
-                    audit_version=AUDIT_PROTOCOL_VERSION,
+            terminal_at = observed_at if state in FileLog.TERMINAL_STATES else None
+            if transfer is None:
+                transfer = FileLog.objects.create(
+                    audit_version=FILE_AUDIT_PROTOCOL_VERSION,
                     connection=connection_log,
                     event=event,
+                    transfer_id=transfer_id,
+                    transfer_revision=transfer_revision,
+                    state=state,
                     file=path,
                     user_id=remote_id,
-                    user_ip=user_ip,
+                    user_ip=connection_log.from_ip,
                     remote_id=device.rid,
-                    filesize=total_size,
+                    filesize=planned_bytes,
                     direction=direction,
-                    logged_at=timezone.now(),
-                    details=info_obj,
+                    is_file=postdata["is_file"],
+                    planned_file_count=planned_file_count,
+                    planned_bytes=planned_bytes,
+                    transferred_bytes=transferred_bytes,
+                    sample_files=normalized_samples,
+                    source_kind=source_kind,
+                    started_at=observed_at,
+                    terminal_at=terminal_at,
+                    terminal_reason=terminal_reason,
+                    logged_at=observed_at,
+                    details={"sample_files": normalized_samples},
                     reporter=user,
                     reporter_device_uuid=device.uuid,
                 )
-            elif not FileLog.objects.filter(event=event, connection=connection_log).exists():
-                raise IntegrityError("File audit receipt is missing")
+            else:
+                transfer.transfer_revision = transfer_revision
+                transfer.state = state
+                transfer.transferred_bytes = transferred_bytes
+                transfer.terminal_at = terminal_at
+                transfer.terminal_reason = terminal_reason
+                transfer.save(
+                    update_fields=(
+                        "transfer_revision",
+                        "state",
+                        "transferred_bytes",
+                        "terminal_at",
+                        "terminal_reason",
+                    )
+                )
+            transfer_event = FileTransferAuditEvent.objects.create(
+                transfer=transfer,
+                connection_event=event,
+                revision=transfer_revision,
+                state=state,
+                transferred_bytes=transferred_bytes,
+                terminal_reason=terminal_reason,
+                source_kind=source_kind,
+                created_at=observed_at,
+            )
     except IntegrityError:
         return _audit_event_conflict()
     _log_event(
@@ -3998,9 +4338,13 @@ def _audit_file(request):
         peer_id=remote_id,
         remote_id=connection_log.rid,
         direction=direction,
-        filesize=total_size,
+        transfer_id=transfer_id,
+        transfer_revision=transfer_revision,
+        state=state,
+        planned_bytes=planned_bytes,
+        transferred_bytes=transferred_bytes,
     )
-    return _audit_success(connection_log)
+    return _file_audit_success(connection_log, transfer_event)
 
 
 def _audit_alarm(request):
@@ -4066,9 +4410,13 @@ def _audit_alarm(request):
                     return _audit_event_conflict()
                 if not AlarmLog.objects.filter(event=existing, connection=connection_log).exists():
                     raise IntegrityError("Alarm audit receipt is missing")
-                return _audit_success(connection_log)
-            if connection_log.conn_end is not None:
-                return JsonResponse({"error": "Connection is closed"}, status=409)
+                return _audit_success(connection_log, event_id)
+            observed_at = audit_lifecycle.database_now()
+            audit_lifecycle.expire_locked_connection(connection_log, observed_at, source="alarm_event")
+            if connection_log.state != ConnLog.STATE_ACTIVE:
+                return _audit_terminal_conflict(connection_log)
+            audit_lifecycle.refresh_host_lease(connection_log, observed_at)
+            connection_log.save(update_fields=("last_seen_at", "lease_expires_at"))
             event, created = _append_audit_event(
                 connection_log,
                 event_id,
@@ -4095,7 +4443,7 @@ def _audit_alarm(request):
     except IntegrityError:
         return _audit_event_conflict()
     _log_event(request, "api_audit_alarm", level="warning", username=user.username, typ=typ)
-    return _audit_success(connection_log)
+    return _audit_success(connection_log, event_id)
 
 
 def audit(request):

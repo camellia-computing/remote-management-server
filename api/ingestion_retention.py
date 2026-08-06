@@ -7,7 +7,7 @@ import uuid
 from django.conf import settings
 from django.db import transaction
 
-from api import ingestion_governance, recording_inventory, recording_uploads
+from api import audit_lifecycle, ingestion_governance, recording_inventory, recording_uploads
 from api.models import AlarmLog, ConnLog, FileLog, RecordingUpload
 
 logger = logging.getLogger(__name__)
@@ -323,11 +323,11 @@ def _purge_connection(connection_id, cutoff):
         if (
             connection is None
             or connection.retention_hold
-            or connection.conn_end is None
-            or connection.conn_end >= cutoff
+            or connection.terminal_at is None
+            or connection.terminal_at >= cutoff
         ):
             return False
-        if connection.audit_version == 2:
+        if connection.audit_version in (2, 3):
             event_count = connection.events.count()
             if event_count != connection.event_revision:
                 raise RuntimeError("Connection audit event ledger is inconsistent")
@@ -342,11 +342,28 @@ def _purge_connection(connection_id, cutoff):
     return True
 
 
+def _expire_connection(connection_id, now):
+    with transaction.atomic():
+        connection = ConnLog.objects.select_for_update().filter(pk=connection_id).first()
+        if connection is None:
+            return False
+        return audit_lifecycle.expire_locked_connection(connection, now, source="cleanup_reconciler")
+
+
 def purge_audit_retention(now, *, batch_size, dry_run=False):
     cutoff = now - datetime.timedelta(days=settings.AUDIT_RETENTION_DAYS)
+    lease_now = audit_lifecycle.database_now()
+    stale_connection_ids = list(
+        ConnLog.objects.filter(
+            state__in=ConnLog.OPEN_STATES,
+            lease_expires_at__lte=lease_now,
+        )
+        .order_by("lease_expires_at", "pk")
+        .values_list("pk", flat=True)[:batch_size]
+    )
     connection_ids = list(
-        ConnLog.objects.filter(retention_hold=False, conn_end__lt=cutoff)
-        .order_by("conn_end", "pk")
+        ConnLog.objects.filter(retention_hold=False, terminal_at__lt=cutoff)
+        .order_by("terminal_at", "pk")
         .values_list("pk", flat=True)[:batch_size]
     )
     legacy_file_ids = list(
@@ -361,11 +378,15 @@ def purge_audit_retention(now, *, batch_size, dry_run=False):
     )
     if dry_run:
         return {
+            "audit_connections_expired": len(stale_connection_ids),
             "audit_connections_purged": len(connection_ids),
             "legacy_file_audits_purged": len(legacy_file_ids),
             "legacy_alarm_audits_purged": len(legacy_alarm_ids),
         }
     return {
+        "audit_connections_expired": sum(
+            _expire_connection(identifier, lease_now) for identifier in stale_connection_ids
+        ),
         "audit_connections_purged": sum(_purge_connection(identifier, cutoff) for identifier in connection_ids),
         "legacy_file_audits_purged": FileLog.objects.filter(pk__in=legacy_file_ids).delete()[0],
         "legacy_alarm_audits_purged": AlarmLog.objects.filter(pk__in=legacy_alarm_ids).delete()[0],

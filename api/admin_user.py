@@ -329,6 +329,7 @@ admin.site.register(models.ShareLink, models.ShareLinkAdmin)
 admin.site.register(models.ConnLog, models.ConnLogAdmin)
 admin.site.register(models.ConnectionAuditEvent, models.ConnectionAuditEventAdmin)
 admin.site.register(models.FileLog, models.FileLogAdmin)
+admin.site.register(models.FileTransferAuditEvent, models.FileTransferAuditEventAdmin)
 
 
 class StrategyProfileAdmin(admin.ModelAdmin):

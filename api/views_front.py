@@ -2989,7 +2989,16 @@ def file_log(request):
         item = model_to_dict(log)
         item["remote_alias"] = aliases.get(log.remote_id, _("UNKNOWN"))
         item["user_alias"] = aliases.get(log.user_id, _("UNKNOWN"))
-        item["filesize_display"] = format_bytes(log.filesize)
+        if log.audit_version == 4:
+            item["planned_bytes_display"] = format_bytes(log.planned_bytes)
+            item["transferred_bytes_display"] = format_bytes(log.transferred_bytes)
+            item["transfer_state"] = log.state
+            item["terminal_reason"] = log.terminal_reason
+        else:
+            item["planned_bytes_display"] = "-"
+            item["transferred_bytes_display"] = "-"
+            item["transfer_state"] = "legacy_plan_snapshot"
+            item["terminal_reason"] = ""
         entries.append(item)
     page_obj.object_list = entries
     _log_event(request, "front_file_log_view", username=request.user.username, page=page_number)

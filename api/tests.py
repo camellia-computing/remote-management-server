@@ -911,6 +911,7 @@ class ApiContractTests(ApiTestMixin, TestCase):
                 "recording_orphans_quarantined": 0,
                 "recording_quarantine_purged": 0,
                 "audit_connections_purged": 0,
+                "audit_connections_expired": 0,
                 "legacy_file_audits_purged": 0,
                 "legacy_alarm_audits_purged": 0,
             },
@@ -2014,7 +2015,7 @@ class SensitiveIngestionTests(ApiTestMixin, TestCase):
             uuid=outsider_uuid,
         )
         new_event = {
-            "version": 2,
+            "version": 3,
             "event_id": str(uuid.uuid4()),
             "action": "new",
             "id": "111111111",
@@ -2035,7 +2036,7 @@ class SensitiveIngestionTests(ApiTestMixin, TestCase):
         updated = self._post_json(
             "/api/audit/conn",
             {
-                "version": 2,
+                "version": 3,
                 "event_id": str(uuid.uuid4()),
                 "audit_session_id": audit_session_id,
                 "id": "111111111",
@@ -2056,7 +2057,7 @@ class SensitiveIngestionTests(ApiTestMixin, TestCase):
         self.assertEqual(connection_log.two_factor, 1)
 
         active = self.client.get(
-            f"/api/audit/conn/active?version=2&event_id={uuid.uuid4()}&id=111111111&session_id=99&conn_type=0",
+            f"/api/audit/conn/active?version=3&event_id={uuid.uuid4()}&id=111111111&session_id=99&conn_type=0",
             **self._auth_headers(controller_token),
         )
         self.assertEqual(active.status_code, 200, active.content)
@@ -2069,7 +2070,7 @@ class SensitiveIngestionTests(ApiTestMixin, TestCase):
         direct_note = self._post_json(
             "/api/audit/conn",
             {
-                "version": 2,
+                "version": 3,
                 "event_id": str(uuid.uuid4()),
                 "audit_session_id": audit_session_id,
                 "note": "during session",
@@ -2080,7 +2081,7 @@ class SensitiveIngestionTests(ApiTestMixin, TestCase):
         denied = self._put_json(
             "/api/audit",
             {
-                "version": 2,
+                "version": 3,
                 "event_id": str(uuid.uuid4()),
                 "audit_session_id": audit_session_id,
                 "note": "tampered",
@@ -2091,7 +2092,7 @@ class SensitiveIngestionTests(ApiTestMixin, TestCase):
         allowed = self._put_json(
             "/api/audit",
             {
-                "version": 2,
+                "version": 3,
                 "event_id": str(uuid.uuid4()),
                 "audit_session_id": audit_session_id,
                 "note": "approved",
@@ -2103,7 +2104,7 @@ class SensitiveIngestionTests(ApiTestMixin, TestCase):
         self.assertEqual(connection_log.note, "approved")
 
         close_event = {
-            "version": 2,
+            "version": 3,
             "event_id": str(uuid.uuid4()),
             "audit_session_id": audit_session_id,
             "action": "close",
@@ -2136,7 +2137,7 @@ class SensitiveIngestionTests(ApiTestMixin, TestCase):
         restarted_update = self._post_json(
             "/api/audit/conn",
             {
-                "version": 2,
+                "version": 3,
                 "event_id": str(uuid.uuid4()),
                 "audit_session_id": restarted_audit_session_id,
                 "action": "update",
@@ -2153,7 +2154,7 @@ class SensitiveIngestionTests(ApiTestMixin, TestCase):
         )
         self.assertEqual(restarted_update.status_code, 200, restarted_update.content)
         restarted_active = self.client.get(
-            f"/api/audit/conn/active?version=2&event_id={uuid.uuid4()}&id=111111111&session_id=100&conn_type=0",
+            f"/api/audit/conn/active?version=3&event_id={uuid.uuid4()}&id=111111111&session_id=100&conn_type=0",
             **self._auth_headers(controller_token),
         )
         self.assertEqual(restarted_active.status_code, 200, restarted_active.content)
@@ -2161,23 +2162,25 @@ class SensitiveIngestionTests(ApiTestMixin, TestCase):
         self.assertEqual(ConnLog.objects.count(), 2)
 
         file_event = {
-            "version": 2,
+            "version": 4,
             "event_id": str(uuid.uuid4()),
             "audit_session_id": restarted_audit_session_id,
+            "transfer_id": str(uuid.uuid4()),
+            "transfer_revision": 1,
+            "state": "started",
             "id": "111111111",
             "uuid": host_uuid,
             "peer_id": "222222222",
             "conn_id": 7,
-            "type": 0,
+            "direction": 0,
             "path": "/documents",
             "is_file": False,
-            "info": json.dumps(
-                {
-                    "ip": "192.0.2.10",
-                    "name": "bob",
-                    "files": [["report.pdf", 4096]],
-                }
-            ),
+            "planned_file_count": 1,
+            "planned_bytes": 4096,
+            "transferred_bytes": 0,
+            "sample_files": [{"path": "report.pdf", "size": 4096}],
+            "source_kind": "file_transfer",
+            "terminal_reason": "",
         }
         self.assertEqual(
             self._post_json("/api/audit/file", file_event, token=host_token).status_code,
@@ -2185,10 +2188,11 @@ class SensitiveIngestionTests(ApiTestMixin, TestCase):
         )
         file_log = FileLog.objects.get()
         self.assertEqual(file_log.filesize, 4096)
-        self.assertEqual(file_log.details["files"], [["report.pdf", 4096]])
+        self.assertEqual(file_log.planned_bytes, 4096)
+        self.assertEqual(file_log.sample_files, [{"path": "report.pdf", "size": 4096}])
 
         alarm_event = {
-            "version": 2,
+            "version": 3,
             "event_id": str(uuid.uuid4()),
             "audit_session_id": restarted_audit_session_id,
             "id": "111111111",
