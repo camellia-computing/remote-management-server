@@ -1998,6 +1998,41 @@ def devices_deploy(request):
 
     try:
         with transaction.atomic():
+            # Identity mutations use one lock order: user authority first,
+            # then devices by primary key, followed by proofs and tokens.
+            # In particular, a full device save and personal-profile
+            # finalization can both require PostgreSQL to validate an owner
+            # FK. Locking a device first would therefore deadlock with account
+            # deletion, which holds the user row before locking its devices.
+            locked_user = UserProfile.objects.select_for_update().filter(pk=user.pk, is_active=True).first()
+            if not locked_user:
+                _log_event(
+                    request,
+                    "api_devices_deploy_denied",
+                    level="warning",
+                    username=user.username,
+                    rid=rid,
+                    reason="inactive_user",
+                )
+                return JsonResponse({"error": "Invalid token"}, status=401)
+            token_is_current = RemoteToken.objects.filter(
+                pk=token.pk,
+                device_id=token.device_id,
+                subject_user=locked_user,
+                credential_hash=locked_user.get_session_auth_hash(),
+                expires_at__gt=timezone.now(),
+            ).exists()
+            if not token_is_current:
+                _log_event(
+                    request,
+                    "api_devices_deploy_denied",
+                    level="warning",
+                    username=locked_user.username,
+                    rid=rid,
+                    reason="stale_token",
+                )
+                return JsonResponse({"error": "Invalid token"}, status=401)
+            user = locked_user
             matches = list(
                 RemoteDevice.objects.select_for_update().filter(Q(rid=rid) | Q(uuid=uuid_value)).order_by("pk")
             )

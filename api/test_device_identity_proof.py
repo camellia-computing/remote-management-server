@@ -1016,7 +1016,11 @@ class PostgreSQLDeviceIdentityProofTests(TransactionTestCase):
 
         statuses = self.run_concurrently(payloads, token=bearer)
 
-        self.assertEqual(sorted(statuses), [200, 403])
+        # The winning key rotation revokes the bearer. The request that was
+        # authenticated concurrently must revalidate it after acquiring the
+        # user authority lock and fail as unauthenticated, not continue with a
+        # stale token until proof validation.
+        self.assertEqual(sorted(statuses), [200, 401])
         self.device.refresh_from_db()
         self.assertEqual(self.device.deployment_generation, 1)
         self.assertEqual(
@@ -1052,7 +1056,9 @@ class PostgreSQLDeviceIdentityProofTests(TransactionTestCase):
 
         statuses = self.run_concurrently(payloads, token=bearer)
 
-        self.assertEqual(sorted(statuses), [200, 403])
+        # The winning recovery revokes the bearer before the waiting request
+        # acquires the user authority lock.
+        self.assertEqual(sorted(statuses), [200, 401])
         approval.refresh_from_db()
         self.assertIsNotNone(approval.consumed_at)
         self.device.refresh_from_db()
