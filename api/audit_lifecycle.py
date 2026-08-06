@@ -6,7 +6,7 @@ from django.db import connection
 from django.utils import timezone
 
 from api import ingestion_governance
-from api.models import ConnectionAuditEvent, ConnLog
+from api.models import ConnectionAuditEvent, ConnLog, FileLog, FileTransferAuditEvent
 
 
 def database_now():
@@ -28,6 +28,47 @@ def refresh_host_lease(connection_log, now):
     connection_log.lease_expires_at = lease_deadline(now)
 
 
+def reconcile_open_file_transfers(connection_log, connection_event, terminal_at, *, reason):
+    """Append an unknown terminal fact for every transfer lacking a trusted result."""
+
+    transfers = list(
+        FileLog.objects.select_for_update()
+        .filter(
+            connection=connection_log,
+            audit_version=4,
+            state__in=FileLog.OPEN_STATES,
+        )
+        .order_by("pk")
+    )
+    for transfer in transfers:
+        if transfer.transfer_revision >= 9_223_372_036_854_775_807:
+            raise RuntimeError("File transfer revision exhausted")
+        revision = transfer.transfer_revision + 1
+        terminal_reason = f"connection_{reason}"
+        FileTransferAuditEvent.objects.create(
+            transfer=transfer,
+            connection_event=connection_event,
+            revision=revision,
+            state=FileLog.STATE_UNKNOWN,
+            transferred_bytes=transfer.transferred_bytes,
+            terminal_reason=terminal_reason,
+            source_kind=transfer.source_kind,
+            created_at=terminal_at,
+        )
+        transfer.transfer_revision = revision
+        transfer.state = FileLog.STATE_UNKNOWN
+        transfer.terminal_at = terminal_at
+        transfer.terminal_reason = terminal_reason
+        transfer.save(
+            update_fields=(
+                "transfer_revision",
+                "state",
+                "terminal_at",
+                "terminal_reason",
+            )
+        )
+
+
 def expire_locked_connection(connection_log, now, *, source):
     """Move one row-locked, stale open session to the telemetry-lost terminal state."""
 
@@ -44,7 +85,7 @@ def expire_locked_connection(connection_log, now, *, source):
         closes_connection=True,
     )
     sequence = connection_log.event_revision + 1
-    ConnectionAuditEvent.objects.create(
+    terminal_event = ConnectionAuditEvent.objects.create(
         event_id=uuid.uuid4(),
         connection=connection_log,
         sequence=sequence,
@@ -75,5 +116,11 @@ def expire_locked_connection(connection_log, now, *, source):
             "terminal_reason",
             "terminal_source",
         )
+    )
+    reconcile_open_file_transfers(
+        connection_log,
+        terminal_event,
+        now,
+        reason="telemetry_lost",
     )
     return True

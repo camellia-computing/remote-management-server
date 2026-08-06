@@ -65,6 +65,7 @@ from api.models import (
     DeviceProofChallenge,
     DeviceRecoveryApproval,
     FileLog,
+    FileTransferAuditEvent,
     OidcIdentity,
     OidcPendingAuth,
     RemoteDevice,
@@ -96,6 +97,8 @@ MAX_AUDIT_INFO_BYTES = 16 * 1024
 MAX_AUDIT_NOTE_BYTES = 16 * 1024
 MAX_AUDIT_FILES = 10
 AUDIT_PROTOCOL_VERSION = 3
+FILE_AUDIT_PROTOCOL_VERSION = 4
+MAX_AUDIT_INTEGER = 9_223_372_036_854_775_807
 MAX_AB_PEERS = 10_000
 MAX_AB_TAGS = 256
 MAX_AB_TAGS_PER_PEER = 32
@@ -3296,14 +3299,28 @@ def _audit_version_is_current(value):
     return isinstance(value, str) and value == str(AUDIT_PROTOCOL_VERSION)
 
 
-def _audit_upgrade_required():
+def _audit_upgrade_required(required_version=AUDIT_PROTOCOL_VERSION):
     return JsonResponse(
         {
             "error": "Unsupported audit protocol version",
-            "required_version": AUDIT_PROTOCOL_VERSION,
+            "required_version": required_version,
         },
         status=426,
     )
+
+
+def _file_audit_version_is_current(value):
+    if isinstance(value, bool):
+        return False
+    if isinstance(value, int):
+        return value == FILE_AUDIT_PROTOCOL_VERSION
+    return isinstance(value, str) and value == str(FILE_AUDIT_PROTOCOL_VERSION)
+
+
+def _audit_nonnegative_integer(value):
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value if 0 <= value <= MAX_AUDIT_INTEGER else None
 
 
 def _audit_success(connection_log, event_id, *, status=200):
@@ -3325,6 +3342,20 @@ def _audit_success(connection_log, event_id, *, status=200):
             "terminal_source": connection_log.terminal_source,
         },
         status=status,
+    )
+
+
+def _file_audit_success(connection_log, transfer_event):
+    return JsonResponse(
+        {
+            "version": FILE_AUDIT_PROTOCOL_VERSION,
+            "audit_session_id": str(connection_log.guid),
+            "acknowledged_event_id": str(transfer_event.connection_event.event_id),
+            "transfer_id": str(transfer_event.transfer.transfer_id),
+            "transfer_revision": transfer_event.revision,
+            "transfer_state": transfer_event.state,
+            "transferred_bytes": transfer_event.transferred_bytes,
+        }
     )
 
 
@@ -3904,7 +3935,7 @@ def _audit_conn(request):
                     ConnLog.STATE_CLOSED if connection_log.state == ConnLog.STATE_ACTIVE else ConnLog.STATE_ABORTED
                 )
                 terminal_reason = "host_close" if terminal_state == ConnLog.STATE_CLOSED else "ended_before_active"
-                _append_audit_event(
+                terminal_event, _created = _append_audit_event(
                     connection_log,
                     event_id,
                     event_kind,
@@ -3938,6 +3969,12 @@ def _audit_conn(request):
                         "terminal_source",
                         "conn_end",
                     )
+                )
+                audit_lifecycle.reconcile_open_file_transfers(
+                    connection_log,
+                    terminal_event,
+                    terminal_at,
+                    reason=terminal_reason,
                 )
         except IntegrityError:
             return _audit_event_conflict()
@@ -4061,53 +4098,88 @@ def _audit_file(request):
     token, user, error = _audit_device_context(request, postdata)
     if error:
         return error
-    if not _audit_version_is_current(postdata.get("version")):
-        return _audit_upgrade_required()
+    if not _file_audit_version_is_current(postdata.get("version")):
+        return _audit_upgrade_required(FILE_AUDIT_PROTOCOL_VERSION)
     audit_session_id = _audit_uuid4(postdata.get("audit_session_id"))
     event_id = _audit_uuid4(postdata.get("event_id"))
+    transfer_id = _audit_uuid4(postdata.get("transfer_id"))
+    transfer_revision = _audit_revision(postdata.get("transfer_revision"))
     conn_id = _audit_connection_id(postdata.get("conn_id"))
-    if audit_session_id is None or event_id is None or conn_id is None:
+    if (
+        audit_session_id is None
+        or event_id is None
+        or transfer_id is None
+        or transfer_revision is None
+        or conn_id is None
+    ):
         return JsonResponse({"error": "Invalid connection identity"}, status=400)
     if not isinstance(postdata.get("is_file"), bool):
         return JsonResponse({"error": "Invalid file audit"}, status=400)
-    info = postdata.get("info", "{}")
-    if isinstance(info, str) and len(info.encode()) > MAX_AUDIT_INFO_BYTES:
-        return JsonResponse({"error": "Audit information is too large"}, status=413)
-    try:
-        info_obj = json.loads(info) if isinstance(info, str) else info
-    except (TypeError, ValueError, json.JSONDecodeError):
-        return JsonResponse({"error": "Invalid audit information"}, status=400)
-    if not isinstance(info_obj, dict):
-        return JsonResponse({"error": "Invalid audit information"}, status=400)
-    files = info_obj.get("files", [])
-    total_size = 0
-    if files:
-        if not isinstance(files, list) or len(files) > MAX_AUDIT_FILES:
-            return JsonResponse({"error": "Invalid audit files"}, status=400)
-        for item in files:
-            if not isinstance(item, (list, tuple)) or len(item) < 2:
-                return JsonResponse({"error": "Invalid audit files"}, status=400)
-            try:
-                size = int(item[1])
-            except (TypeError, ValueError):
-                return JsonResponse({"error": "Invalid audit files"}, status=400)
-            if size < 0 or size > settings.RECORD_UPLOAD_MAX_FILE_BYTES:
-                return JsonResponse({"error": "Invalid audit files"}, status=400)
-            total_size += size
+
+    state = postdata.get("state")
+    if state not in dict(FileLog.STATES):
+        return JsonResponse({"error": "Invalid file transfer state"}, status=400)
     path = _bounded_audit_text(postdata.get("path", ""), 500)
-    user_ip = _audit_ip(info_obj.get("ip", ""))
     remote_id = _audit_rid(postdata.get("peer_id", ""))
-    direction = _audit_enum(postdata.get("type", 0), (0, 1))
-    if path is None or user_ip is None or remote_id is None or direction is None:
+    direction = _audit_enum(postdata.get("direction"), (0, 1))
+    planned_file_count = _audit_nonnegative_integer(postdata.get("planned_file_count"))
+    planned_bytes = _audit_nonnegative_integer(postdata.get("planned_bytes"))
+    transferred_bytes = _audit_nonnegative_integer(postdata.get("transferred_bytes"))
+    source_kind = postdata.get("source_kind")
+    terminal_reason = _bounded_audit_text(postdata.get("terminal_reason", ""), 256)
+    if (
+        path is None
+        or remote_id is None
+        or direction is None
+        or planned_file_count is None
+        or planned_bytes is None
+        or transferred_bytes is None
+        or source_kind not in dict(FileLog.SOURCE_KINDS)
+        or terminal_reason is None
+    ):
         return JsonResponse({"error": "Invalid file audit"}, status=400)
+    if transferred_bytes > planned_bytes:
+        return JsonResponse({"error": "Invalid transferred bytes"}, status=400)
+    if state in (FileLog.STATE_STARTED, FileLog.STATE_PROGRESS, FileLog.STATE_COMPLETED):
+        if terminal_reason:
+            return JsonResponse({"error": "Invalid terminal reason"}, status=400)
+    elif not terminal_reason:
+        return JsonResponse({"error": "Terminal reason is required"}, status=400)
+
+    sample_files = postdata.get("sample_files")
+    if not isinstance(sample_files, list) or len(sample_files) > MAX_AUDIT_FILES:
+        return JsonResponse({"error": "Invalid audit files"}, status=400)
+    normalized_samples = []
+    sample_bytes = 0
+    for item in sample_files:
+        if not isinstance(item, dict) or set(item) != {"path", "size"}:
+            return JsonResponse({"error": "Invalid audit files"}, status=400)
+        sample_path = _bounded_audit_text(item.get("path"), 500)
+        sample_size = _audit_nonnegative_integer(item.get("size"))
+        if sample_path is None or sample_size is None:
+            return JsonResponse({"error": "Invalid audit files"}, status=400)
+        if sample_bytes > MAX_AUDIT_INTEGER - sample_size:
+            return JsonResponse({"error": "Invalid audit files"}, status=400)
+        sample_bytes += sample_size
+        normalized_samples.append({"path": sample_path, "size": sample_size})
+    if len(normalized_samples) > planned_file_count or sample_bytes > planned_bytes:
+        return JsonResponse({"error": "Invalid file plan"}, status=400)
+
     details = {
+        "transfer_id": str(transfer_id),
+        "transfer_revision": transfer_revision,
+        "state": state,
         "conn_id": conn_id,
         "path": path,
         "peer_id": remote_id,
         "direction": direction,
         "is_file": postdata["is_file"],
-        "filesize": total_size,
-        "info": info_obj,
+        "planned_file_count": planned_file_count,
+        "planned_bytes": planned_bytes,
+        "transferred_bytes": transferred_bytes,
+        "sample_files": normalized_samples,
+        "source_kind": source_kind,
+        "terminal_reason": terminal_reason,
     }
     try:
         with transaction.atomic():
@@ -4124,8 +4196,6 @@ def _audit_file(request):
                 return JsonResponse({"error": "Connection not found"}, status=404)
             if not connection_log.from_id or connection_log.from_id != remote_id:
                 return JsonResponse({"error": "Invalid file audit participant"}, status=403)
-            if connection_log.from_ip != user_ip:
-                return JsonResponse({"error": "Invalid file audit source"}, status=403)
             existing = _existing_audit_event(event_id)
             if existing:
                 if not _matching_audit_event(
@@ -4137,16 +4207,66 @@ def _audit_file(request):
                     details,
                 ):
                     return _audit_event_conflict()
-                if not FileLog.objects.filter(event=existing, connection=connection_log).exists():
-                    raise IntegrityError("File audit receipt is missing")
-                return _audit_success(connection_log, event_id)
+                transfer_event = (
+                    FileTransferAuditEvent.objects.select_related("transfer", "connection_event")
+                    .filter(
+                        connection_event=existing,
+                        transfer__connection=connection_log,
+                        transfer__transfer_id=transfer_id,
+                        revision=transfer_revision,
+                    )
+                    .first()
+                )
+                if transfer_event is None:
+                    raise IntegrityError("File transfer audit receipt is missing")
+                return _file_audit_success(connection_log, transfer_event)
+
             observed_at = audit_lifecycle.database_now()
             audit_lifecycle.expire_locked_connection(connection_log, observed_at, source="file_event")
             if connection_log.state != ConnLog.STATE_ACTIVE:
                 return _audit_terminal_conflict(connection_log)
+
+            transfer = FileLog.objects.select_for_update().filter(transfer_id=transfer_id).first()
+            if transfer is None:
+                if transfer_revision != 1 or state != FileLog.STATE_STARTED or transferred_bytes != 0:
+                    return JsonResponse({"error": "File transfer must start at revision one"}, status=409)
+            else:
+                immutable_plan = (
+                    transfer.audit_version == FILE_AUDIT_PROTOCOL_VERSION
+                    and transfer.connection_id == connection_log.id
+                    and transfer.file == path
+                    and transfer.remote_id == device.rid
+                    and transfer.user_id == remote_id
+                    and str(transfer.user_ip) == connection_log.from_ip
+                    and transfer.direction == direction
+                    and transfer.is_file == postdata["is_file"]
+                    and transfer.planned_file_count == planned_file_count
+                    and transfer.planned_bytes == planned_bytes
+                    and transfer.sample_files == normalized_samples
+                    and transfer.source_kind == source_kind
+                    and transfer.reporter_id == user.id
+                    and transfer.reporter_device_uuid == device.uuid
+                )
+                if not immutable_plan:
+                    return JsonResponse({"error": "File transfer plan is immutable"}, status=409)
+                if transfer.state in FileLog.TERMINAL_STATES:
+                    return JsonResponse({"error": "File transfer is terminal"}, status=409)
+                if transfer_revision != transfer.transfer_revision + 1:
+                    return JsonResponse({"error": "File transfer revision is out of order"}, status=409)
+                if state not in (
+                    FileLog.STATE_PROGRESS,
+                    FileLog.STATE_COMPLETED,
+                    FileLog.STATE_FAILED,
+                    FileLog.STATE_CANCELLED,
+                    FileLog.STATE_UNKNOWN,
+                ):
+                    return JsonResponse({"error": "Invalid file transfer transition"}, status=409)
+                if transferred_bytes < transfer.transferred_bytes:
+                    return JsonResponse({"error": "Transferred bytes cannot decrease"}, status=409)
+
             audit_lifecycle.refresh_host_lease(connection_log, observed_at)
             connection_log.save(update_fields=("last_seen_at", "lease_expires_at"))
-            event, created = _append_audit_event(
+            event, _created = _append_audit_event(
                 connection_log,
                 event_id,
                 ConnectionAuditEvent.KIND_FILE,
@@ -4154,24 +4274,60 @@ def _audit_file(request):
                 device.uuid,
                 details,
             )
-            if created:
-                FileLog.objects.create(
-                    audit_version=AUDIT_PROTOCOL_VERSION,
+            terminal_at = observed_at if state in FileLog.TERMINAL_STATES else None
+            if transfer is None:
+                transfer = FileLog.objects.create(
+                    audit_version=FILE_AUDIT_PROTOCOL_VERSION,
                     connection=connection_log,
                     event=event,
+                    transfer_id=transfer_id,
+                    transfer_revision=transfer_revision,
+                    state=state,
                     file=path,
                     user_id=remote_id,
-                    user_ip=user_ip,
+                    user_ip=connection_log.from_ip,
                     remote_id=device.rid,
-                    filesize=total_size,
+                    filesize=planned_bytes,
                     direction=direction,
-                    logged_at=timezone.now(),
-                    details=info_obj,
+                    is_file=postdata["is_file"],
+                    planned_file_count=planned_file_count,
+                    planned_bytes=planned_bytes,
+                    transferred_bytes=transferred_bytes,
+                    sample_files=normalized_samples,
+                    source_kind=source_kind,
+                    started_at=observed_at,
+                    terminal_at=terminal_at,
+                    terminal_reason=terminal_reason,
+                    logged_at=observed_at,
+                    details={"sample_files": normalized_samples},
                     reporter=user,
                     reporter_device_uuid=device.uuid,
                 )
-            elif not FileLog.objects.filter(event=event, connection=connection_log).exists():
-                raise IntegrityError("File audit receipt is missing")
+            else:
+                transfer.transfer_revision = transfer_revision
+                transfer.state = state
+                transfer.transferred_bytes = transferred_bytes
+                transfer.terminal_at = terminal_at
+                transfer.terminal_reason = terminal_reason
+                transfer.save(
+                    update_fields=(
+                        "transfer_revision",
+                        "state",
+                        "transferred_bytes",
+                        "terminal_at",
+                        "terminal_reason",
+                    )
+                )
+            transfer_event = FileTransferAuditEvent.objects.create(
+                transfer=transfer,
+                connection_event=event,
+                revision=transfer_revision,
+                state=state,
+                transferred_bytes=transferred_bytes,
+                terminal_reason=terminal_reason,
+                source_kind=source_kind,
+                created_at=observed_at,
+            )
     except IntegrityError:
         return _audit_event_conflict()
     _log_event(
@@ -4182,9 +4338,13 @@ def _audit_file(request):
         peer_id=remote_id,
         remote_id=connection_log.rid,
         direction=direction,
-        filesize=total_size,
+        transfer_id=transfer_id,
+        transfer_revision=transfer_revision,
+        state=state,
+        planned_bytes=planned_bytes,
+        transferred_bytes=transferred_bytes,
     )
-    return _audit_success(connection_log, event_id)
+    return _file_audit_success(connection_log, transfer_event)
 
 
 def _audit_alarm(request):

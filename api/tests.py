@@ -2162,23 +2162,25 @@ class SensitiveIngestionTests(ApiTestMixin, TestCase):
         self.assertEqual(ConnLog.objects.count(), 2)
 
         file_event = {
-            "version": 3,
+            "version": 4,
             "event_id": str(uuid.uuid4()),
             "audit_session_id": restarted_audit_session_id,
+            "transfer_id": str(uuid.uuid4()),
+            "transfer_revision": 1,
+            "state": "started",
             "id": "111111111",
             "uuid": host_uuid,
             "peer_id": "222222222",
             "conn_id": 7,
-            "type": 0,
+            "direction": 0,
             "path": "/documents",
             "is_file": False,
-            "info": json.dumps(
-                {
-                    "ip": "192.0.2.10",
-                    "name": "bob",
-                    "files": [["report.pdf", 4096]],
-                }
-            ),
+            "planned_file_count": 1,
+            "planned_bytes": 4096,
+            "transferred_bytes": 0,
+            "sample_files": [{"path": "report.pdf", "size": 4096}],
+            "source_kind": "file_transfer",
+            "terminal_reason": "",
         }
         self.assertEqual(
             self._post_json("/api/audit/file", file_event, token=host_token).status_code,
@@ -2186,7 +2188,8 @@ class SensitiveIngestionTests(ApiTestMixin, TestCase):
         )
         file_log = FileLog.objects.get()
         self.assertEqual(file_log.filesize, 4096)
-        self.assertEqual(file_log.details["files"], [["report.pdf", 4096]])
+        self.assertEqual(file_log.planned_bytes, 4096)
+        self.assertEqual(file_log.sample_files, [{"path": "report.pdf", "size": 4096}])
 
         alarm_event = {
             "version": 3,

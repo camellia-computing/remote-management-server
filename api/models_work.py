@@ -819,6 +819,32 @@ class ConnectionAuditEventAdmin(admin.ModelAdmin):
 
 
 class FileLog(models.Model):
+    STATE_STARTED = "started"
+    STATE_PROGRESS = "progress"
+    STATE_COMPLETED = "completed"
+    STATE_FAILED = "failed"
+    STATE_CANCELLED = "cancelled"
+    STATE_UNKNOWN = "unknown"
+    STATES = (
+        (STATE_STARTED, "Started"),
+        (STATE_PROGRESS, "Progress"),
+        (STATE_COMPLETED, "Completed"),
+        (STATE_FAILED, "Failed"),
+        (STATE_CANCELLED, "Cancelled"),
+        (STATE_UNKNOWN, "Unknown"),
+    )
+    OPEN_STATES = (STATE_STARTED, STATE_PROGRESS)
+    TERMINAL_STATES = (STATE_COMPLETED, STATE_FAILED, STATE_CANCELLED, STATE_UNKNOWN)
+
+    SOURCE_FILE_TRANSFER = "file_transfer"
+    SOURCE_CLIPBOARD = "clipboard"
+    SOURCE_PRINTER = "printer"
+    SOURCE_KINDS = (
+        (SOURCE_FILE_TRANSFER, "File transfer"),
+        (SOURCE_CLIPBOARD, "Clipboard"),
+        (SOURCE_PRINTER, "Printer"),
+    )
+
     id = models.AutoField(verbose_name="ID", primary_key=True)
     file = models.CharField(verbose_name="Path", max_length=500)
     remote_id = models.CharField(verbose_name="Remote ID", max_length=16, default="0")
@@ -862,6 +888,28 @@ class FileLog(models.Model):
         on_delete=models.PROTECT,
         related_name="file_log",
     )
+    transfer_id = models.UUIDField(null=True, blank=True, editable=False, unique=True)
+    transfer_revision = models.PositiveBigIntegerField(default=0, editable=False)
+    state = models.CharField(
+        max_length=12,
+        choices=STATES,
+        default=STATE_UNKNOWN,
+        editable=False,
+    )
+    is_file = models.BooleanField(default=False, editable=False)
+    planned_file_count = models.PositiveBigIntegerField(default=0, editable=False)
+    planned_bytes = models.PositiveBigIntegerField(default=0, editable=False)
+    transferred_bytes = models.PositiveBigIntegerField(default=0, editable=False)
+    sample_files = models.JSONField(blank=True, default=list, editable=False)
+    source_kind = models.CharField(
+        max_length=16,
+        choices=SOURCE_KINDS,
+        default=SOURCE_FILE_TRANSFER,
+        editable=False,
+    )
+    started_at = models.DateTimeField(null=True, blank=True, editable=False)
+    terminal_at = models.DateTimeField(null=True, blank=True, editable=False)
+    terminal_reason = models.CharField(max_length=256, blank=True, default="", editable=False)
 
     class Meta:
         ordering = ("-logged_at",)
@@ -874,15 +922,47 @@ class FileLog(models.Model):
             ),
             models.CheckConstraint(
                 condition=models.Q(audit_version=1)
-                | models.Q(audit_version__in=(2, 3), connection__isnull=False, event__isnull=False),
+                | models.Q(audit_version__in=(2, 3), connection__isnull=False, event__isnull=False)
+                | models.Q(
+                    audit_version=4,
+                    connection__isnull=False,
+                    event__isnull=False,
+                    transfer_id__isnull=False,
+                    transfer_revision__gte=1,
+                    started_at__isnull=False,
+                    transferred_bytes__lte=models.F("planned_bytes"),
+                ),
                 name="valid_file_audit_binding",
+            ),
+            models.CheckConstraint(
+                condition=~models.Q(audit_version=4)
+                | models.Q(
+                    state__in=("started", "progress"),
+                    terminal_at__isnull=True,
+                    terminal_reason="",
+                )
+                | models.Q(
+                    state="completed",
+                    terminal_at__isnull=False,
+                    terminal_reason="",
+                )
+                | models.Q(
+                    state__in=("failed", "cancelled", "unknown"),
+                    terminal_at__isnull=False,
+                    terminal_reason__gt="",
+                ),
+                name="valid_file_transfer_lifecycle",
             ),
         ]
         indexes = [
             models.Index(
                 fields=["connection", "logged_at"],
                 name="file_legacy_retention_idx",
-            )
+            ),
+            models.Index(
+                fields=["connection", "state"],
+                name="file_transfer_state_idx",
+            ),
         ]
 
 
@@ -894,11 +974,87 @@ class FileLogAdmin(admin.ModelAdmin):
         "user_id",
         "user_ip",
         "filesize",
+        "planned_bytes",
+        "transferred_bytes",
+        "state",
         "direction",
         "logged_at",
     )
-    search_fields = ("file", "remote_id", "user_id", "user_ip")
-    list_filter = ("direction", "logged_at")
+    search_fields = ("transfer_id", "file", "remote_id", "user_id", "user_ip")
+    list_filter = ("state", "source_kind", "direction", "logged_at")
+
+    def has_add_permission(self, request):
+        return False
+
+    def has_change_permission(self, request, obj=None):
+        return False
+
+    def has_delete_permission(self, request, obj=None):
+        return False
+
+
+class FileTransferAuditEvent(models.Model):
+    id = models.AutoField(verbose_name="ID", primary_key=True)
+    transfer = models.ForeignKey(
+        FileLog,
+        editable=False,
+        on_delete=models.CASCADE,
+        related_name="transfer_events",
+    )
+    connection_event = models.ForeignKey(
+        ConnectionAuditEvent,
+        editable=False,
+        on_delete=models.PROTECT,
+        related_name="file_transfer_events",
+    )
+    revision = models.PositiveBigIntegerField(editable=False)
+    state = models.CharField(max_length=12, choices=FileLog.STATES, editable=False)
+    transferred_bytes = models.PositiveBigIntegerField(default=0, editable=False)
+    terminal_reason = models.CharField(max_length=256, blank=True, default="", editable=False)
+    source_kind = models.CharField(
+        max_length=16,
+        choices=FileLog.SOURCE_KINDS,
+        default=FileLog.SOURCE_FILE_TRANSFER,
+        editable=False,
+    )
+    created_at = models.DateTimeField(default=timezone.now, editable=False)
+
+    class Meta:
+        ordering = ("transfer_id", "revision")
+        constraints = [
+            models.UniqueConstraint(
+                fields=["transfer", "revision"],
+                name="unique_file_transfer_revision",
+            ),
+            models.CheckConstraint(
+                condition=models.Q(revision__gte=1),
+                name="positive_file_transfer_revision",
+            ),
+            models.CheckConstraint(
+                condition=models.Q(
+                    state__in=(FileLog.STATE_STARTED, FileLog.STATE_PROGRESS, FileLog.STATE_COMPLETED),
+                    terminal_reason="",
+                )
+                | models.Q(
+                    state__in=(FileLog.STATE_FAILED, FileLog.STATE_CANCELLED, FileLog.STATE_UNKNOWN),
+                    terminal_reason__gt="",
+                ),
+                name="valid_file_transfer_event_state",
+            ),
+        ]
+
+
+class FileTransferAuditEventAdmin(admin.ModelAdmin):
+    list_display = (
+        "transfer",
+        "revision",
+        "state",
+        "transferred_bytes",
+        "source_kind",
+        "created_at",
+    )
+    search_fields = ("transfer__transfer_id", "connection_event__event_id")
+    list_filter = ("state", "source_kind", "created_at")
 
     def has_add_permission(self, request):
         return False

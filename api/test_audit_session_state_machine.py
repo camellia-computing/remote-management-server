@@ -19,6 +19,7 @@ from api.models import (
     ConnectionAuditEvent,
     ConnLog,
     FileLog,
+    FileTransferAuditEvent,
     PersistentIngestionUsage,
     RemoteDevice,
     UserProfile,
@@ -70,6 +71,31 @@ class AuditSessionStateMachineTests(ApiTestMixin, TestCase):
         )
         self.assertEqual(updated.status_code, 200, updated.content)
         return ConnLog.objects.get(), audit_session_id
+
+    def _file_payload(self, audit_session_id, **overrides):
+        payload = {
+            "version": 4,
+            "event_id": str(uuid.uuid4()),
+            "audit_session_id": audit_session_id,
+            "transfer_id": str(uuid.uuid4()),
+            "transfer_revision": 1,
+            "state": "started",
+            "id": "111111111",
+            "uuid": self.host_uuid,
+            "peer_id": "222222222",
+            "conn_id": 7,
+            "direction": 0,
+            "path": "/documents",
+            "is_file": False,
+            "planned_file_count": 1,
+            "planned_bytes": 4096,
+            "transferred_bytes": 0,
+            "sample_files": [{"path": "report.pdf", "size": 4096}],
+            "source_kind": "file_transfer",
+            "terminal_reason": "",
+        }
+        payload.update(overrides)
+        return payload
 
     @override_settings(
         AUDIT_MAX_EVENTS_PER_CONNECTION=3,
@@ -371,24 +397,7 @@ class AuditSessionStateMachineTests(ApiTestMixin, TestCase):
         nonexistent_session_id = str(uuid.uuid4())
         file_response = self._post_json(
             "/api/audit/file",
-            {
-                "version": 3,
-                "event_id": str(uuid.uuid4()),
-                "audit_session_id": nonexistent_session_id,
-                "id": "111111111",
-                "uuid": self.host_uuid,
-                "peer_id": "222222222",
-                "conn_id": 2_147_483_647,
-                "type": 0,
-                "path": "/documents",
-                "is_file": False,
-                "info": json.dumps(
-                    {
-                        "ip": "192.0.2.10",
-                        "files": [["report.pdf", 4096]],
-                    }
-                ),
-            },
+            self._file_payload(nonexistent_session_id, conn_id=2_147_483_647),
             token=self.host_token,
         )
         alarm_response = self._post_json(
@@ -414,19 +423,7 @@ class AuditSessionStateMachineTests(ApiTestMixin, TestCase):
         _connection, unbound_session_id = self._open_connection()
         unbound_file = self._post_json(
             "/api/audit/file",
-            {
-                "version": 3,
-                "event_id": str(uuid.uuid4()),
-                "audit_session_id": unbound_session_id,
-                "id": "111111111",
-                "uuid": self.host_uuid,
-                "peer_id": "222222222",
-                "conn_id": 7,
-                "type": 0,
-                "path": "/documents",
-                "is_file": False,
-                "info": json.dumps({"ip": "192.0.2.10", "files": [["report.pdf", 4096]]}),
-            },
+            self._file_payload(unbound_session_id),
             token=self.host_token,
         )
         unbound_alarm = self._post_json(
@@ -496,6 +493,7 @@ class AuditSessionStateMachineTests(ApiTestMixin, TestCase):
             admin.site._registry[ConnLog],
             admin.site._registry[ConnectionAuditEvent],
             admin.site._registry[FileLog],
+            admin.site._registry[FileTransferAuditEvent],
             admin.site._registry[AlarmLog],
         )
 
@@ -560,24 +558,7 @@ class AuditSessionStateMachineTests(ApiTestMixin, TestCase):
         self.assertEqual(revised_note.status_code, 200, revised_note.content)
 
         file_event_id = str(uuid.uuid4())
-        file_payload = {
-            "version": 3,
-            "event_id": file_event_id,
-            "audit_session_id": audit_session_id,
-            "id": "111111111",
-            "uuid": self.host_uuid,
-            "peer_id": "222222222",
-            "conn_id": 7,
-            "type": 0,
-            "path": "/documents",
-            "is_file": False,
-            "info": json.dumps(
-                {
-                    "ip": "192.0.2.10",
-                    "files": [["report.pdf", 4096]],
-                }
-            ),
-        }
+        file_payload = self._file_payload(audit_session_id, event_id=file_event_id)
         file_response = self._post_json("/api/audit/file", file_payload, token=self.host_token)
         self.assertEqual(file_response.status_code, 200, file_response.content)
         alarm_event_id = str(uuid.uuid4())
@@ -738,24 +719,11 @@ class AuditSessionStateMachineTests(ApiTestMixin, TestCase):
         )
         rejected = self._post_json(
             "/api/audit/file",
-            {
-                "version": 3,
-                "event_id": str(uuid.uuid4()),
-                "audit_session_id": audit_session_id,
-                "id": "111111111",
-                "uuid": self.host_uuid,
-                "peer_id": "222222222",
-                "conn_id": 7,
-                "type": 0,
-                "path": "/documents",
-                "is_file": False,
-                "info": json.dumps(
-                    {
-                        "ip": "192.0.2.10",
-                        "files": [["after-owner-delete.txt", 42]],
-                    }
-                ),
-            },
+            self._file_payload(
+                audit_session_id,
+                planned_bytes=42,
+                sample_files=[{"path": "after-owner-delete.txt", "size": 42}],
+            ),
             token=self.host_token,
         )
         self.assertEqual(rejected.status_code, 403, rejected.content)
@@ -918,22 +886,25 @@ class AuditSessionConcurrencyTests(ApiTestMixin, TransactionTestCase):
 
     def _file_payload(self, event_id):
         return {
-            "version": 3,
+            "version": 4,
             "event_id": event_id,
             "audit_session_id": self.audit_session_id,
+            "transfer_id": event_id,
+            "transfer_revision": 1,
+            "state": "started",
             "id": "111111111",
             "uuid": self.host_uuid,
             "peer_id": "222222222",
             "conn_id": 7,
-            "type": 0,
+            "direction": 0,
             "path": "/documents",
             "is_file": False,
-            "info": json.dumps(
-                {
-                    "ip": "192.0.2.10",
-                    "files": [["concurrent.txt", 42]],
-                }
-            ),
+            "planned_file_count": 1,
+            "planned_bytes": 42,
+            "transferred_bytes": 0,
+            "sample_files": [{"path": "concurrent.txt", "size": 42}],
+            "source_kind": "file_transfer",
+            "terminal_reason": "",
         }
 
     def _alarm_payload(self, event_id):
