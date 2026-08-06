@@ -5,6 +5,7 @@ from django.core.exceptions import ValidationError
 from django.core.management.base import BaseCommand, CommandError
 from django.db import connection, transaction
 
+from api import recording_inventory
 from api.encrypted_fields import (
     FIELD_PREFIX,
     LEGACY_FIELD_PREFIX,
@@ -23,6 +24,7 @@ ENCRYPTED_COLUMNS = (
     ("api_remotedevice", "id", "address_book_password"),
     ("api_oidcpendingauth", "state", "nonce"),
     ("api_oidcpendingauth", "state", "code_verifier"),
+    ("api_recordingupload", "upload_id", "encrypted_data_key"),
 )
 MAX_REPORTED_ERRORS = 20
 
@@ -150,6 +152,11 @@ class Command(BaseCommand):
         primary_prefix = f"{FIELD_PREFIX}{settings.DATA_ENCRYPTION_PRIMARY_KEY_ID}:"
         while max_batches is None or result["batches"] < max_batches:
             with transaction.atomic():
+                if table == "api_recordingupload":
+                    try:
+                        recording_inventory.lock_recording_mutation()
+                    except recording_inventory.RecordingBackupInProgress as error:
+                        raise CommandError(str(error)) from error
                 where = f"{field_name} IS NOT NULL AND {field_name} <> %s AND SUBSTR({field_name}, 1, %s) <> %s"
                 params = ["", len(primary_prefix), primary_prefix]
                 if last_pk is not None:
@@ -186,11 +193,23 @@ class Command(BaseCommand):
                 if not result["dry_run"]:
                     with connection.cursor() as cursor:
                         for row_pk, old_envelope, new_envelope in changes:
-                            cursor.execute(
-                                f"UPDATE {table_name} SET {field_name} = %s "  # noqa: S608 - fixed allowlist
-                                f"WHERE {pk_name} = %s AND {field_name} = %s",
-                                [new_envelope, row_pk, old_envelope],
-                            )
+                            if table == "api_recordingupload":
+                                cursor.execute(
+                                    f"UPDATE {table_name} SET {field_name} = %s, "  # noqa: S608 - fixed allowlist
+                                    f"data_key_kek_id = %s WHERE {pk_name} = %s AND {field_name} = %s",
+                                    [
+                                        new_envelope,
+                                        settings.DATA_ENCRYPTION_PRIMARY_KEY_ID,
+                                        row_pk,
+                                        old_envelope,
+                                    ],
+                                )
+                            else:
+                                cursor.execute(
+                                    f"UPDATE {table_name} SET {field_name} = %s "  # noqa: S608 - fixed allowlist
+                                    f"WHERE {pk_name} = %s AND {field_name} = %s",
+                                    [new_envelope, row_pk, old_envelope],
+                                )
                             if cursor.rowcount != 1:
                                 raise CommandError(
                                     f"Concurrent update detected for {table}.{encrypted_column}[{row_pk!r}]"

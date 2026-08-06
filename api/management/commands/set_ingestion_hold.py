@@ -5,6 +5,7 @@ from django.core.management.base import BaseCommand, CommandError
 from django.db import transaction
 from django.utils import timezone
 
+from api import recording_inventory
 from api.models import ConnLog, RecordingUpload, UserProfile
 
 
@@ -43,7 +44,12 @@ class Command(BaseCommand):
         model = RecordingUpload if options["kind"] == "recording" else ConnLog
         lookup = {"pk": resource_id} if model is RecordingUpload else {"guid": resource_id}
         with transaction.atomic():
-            resource = model.objects.select_for_update().filter(**lookup).first()
+            if model is RecordingUpload:
+                recording_inventory.lock_recording_mutation()
+            resources = model.objects.select_for_update()
+            if model is RecordingUpload:
+                resources = resources.defer("encrypted_data_key")
+            resource = resources.filter(**lookup).first()
             if resource is None:
                 raise CommandError("retention resource does not exist")
             resource.retention_hold = bool(options["hold"])

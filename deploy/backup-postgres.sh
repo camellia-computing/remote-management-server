@@ -55,11 +55,29 @@ fi
 
 timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
 backup_id="$(python3 "$envelope_helper" new-id)"
+compose=(docker compose --env-file "$env_file" -f "$project_dir/docker-compose.yaml")
 temporary="$backup_dir/.postgres-$timestamp-$backup_id.dump.age.tmp"
 destination="$backup_dir/postgres-$timestamp-$backup_id.dump.age"
-trap 'rm -f -- "$temporary"' EXIT HUP INT TERM
+recording_temporary="$backup_dir/.recordings-$timestamp-$backup_id.bundle.age.tmp"
+recording_destination="$backup_dir/recordings-$timestamp-$backup_id.bundle.age"
+checkpoint_started=0
+checkpoint_json=""
 
-compose=(docker compose --env-file "$env_file" -f "$project_dir/docker-compose.yaml")
+cleanup() {
+    status=$?
+    trap - EXIT HUP INT TERM
+    rm -f -- "$temporary" "$recording_temporary"
+    if (( status != 0 )); then
+        rm -f -- "$destination" "$recording_destination"
+        if (( checkpoint_started == 1 )); then
+            "${compose[@]}" exec -T management python manage.py recording_backup abort \
+                --backup-id "$backup_id" --ignore-missing >/dev/null 2>&1 || true
+        fi
+    fi
+    exit "$status"
+}
+trap cleanup EXIT HUP INT TERM
+
 server_version_num="$("${compose[@]}" run --rm --no-deps -T database-backup \
     psql --no-psqlrc --tuples-only --no-align --command 'SHOW server_version_num' \
     | tr -d '[:space:]')"
@@ -67,8 +85,27 @@ server_version_num="$("${compose[@]}" run --rm --no-deps -T database-backup \
 postgres_major="$((server_version_num / 10000))"
 (( postgres_major > 0 )) || die "PostgreSQL major version is invalid"
 
+checkpoint_json="$("${compose[@]}" exec -T management python manage.py recording_backup begin \
+    --backup-id "$backup_id" --requested-at "$timestamp")" || die "cannot begin a consistent recording checkpoint"
+checkpoint_started=1
+checkpoint_values="$(CAMELLIA_REMOTE_CHECKPOINT_JSON="$checkpoint_json" CAMELLIA_REMOTE_BACKUP_ID="$backup_id" python3 -c '
+import json, os
+value = json.loads(os.environ["CAMELLIA_REMOTE_CHECKPOINT_JSON"])
+epoch = value.get("epoch_id", "")
+digest = value.get("inventory_digest", "")
+if set(value) != {"backup_id", "epoch_id", "inventory_count", "inventory_digest", "manifest_version", "object_count", "requested_at", "state"}:
+    raise SystemExit(1)
+if value["backup_id"] != os.environ["CAMELLIA_REMOTE_BACKUP_ID"] or value["state"] != "ready":
+    raise SystemExit(1)
+print(epoch, digest)
+')" || die "recording checkpoint metadata is invalid"
+read -r recording_epoch_id recording_inventory_digest <<<"$checkpoint_values"
+[[ "$recording_epoch_id" =~ ^[0-9a-f-]{36}$ ]] || die "recording checkpoint epoch is invalid"
+[[ "$recording_inventory_digest" =~ ^[0-9a-f]{64}$ ]] || die "recording checkpoint digest is invalid"
+
 # pg_dump is never written to disk in plaintext. The metadata frame is also
-# encrypted by age, so restore can authenticate deployment/database context.
+# encrypted by age, so restore can authenticate deployment/database context
+# and the exact frozen recording inventory epoch.
 set -o pipefail
 "${compose[@]}" run --rm --no-deps -T database-backup \
     pg_dump --format=custom --compress=9 --no-owner --no-acl \
@@ -79,14 +116,56 @@ set -o pipefail
         --database-name "$database_name" \
         --postgres-major "$postgres_major" \
         --key-id "$backup_key_id" \
+        --component database \
+        --recording-epoch-id "$recording_epoch_id" \
+        --recording-inventory-digest "$recording_inventory_digest" \
     | "$age_binary" --encrypt --recipient "$recipient" --output "$temporary"
+
+"${compose[@]}" exec -T management python manage.py recording_backup export --backup-id "$backup_id" \
+    | python3 "$envelope_helper" pack \
+        --backup-id "$backup_id" \
+        --created-at "$timestamp" \
+        --deployment-id "$deployment_id" \
+        --database-name "$database_name" \
+        --postgres-major "$postgres_major" \
+        --key-id "$backup_key_id" \
+        --component recordings \
+        --recording-epoch-id "$recording_epoch_id" \
+        --recording-inventory-digest "$recording_inventory_digest" \
+    | "$age_binary" --encrypt --recipient "$recipient" --output "$recording_temporary"
 set +o pipefail
 
 test -s "$temporary" || die "encrypted backup is empty"
+test -s "$recording_temporary" || die "encrypted recording backup is empty"
+mv -- "$recording_temporary" "$recording_destination"
 mv -- "$temporary" "$destination"
+CAMELLIA_REMOTE_BACKUP_FSYNC_DIR="$backup_dir" python3 -c '
+import os
+fd = os.open(os.environ["CAMELLIA_REMOTE_BACKUP_FSYNC_DIR"], os.O_RDONLY | os.O_DIRECTORY)
+try:
+    os.fsync(fd)
+finally:
+    os.close(fd)
+'
+"${compose[@]}" exec -T management python manage.py recording_backup finish --backup-id "$backup_id" >/dev/null
+checkpoint_started=0
 trap - EXIT HUP INT TERM
 
-find "$backup_dir" -maxdepth 1 -type f -name 'postgres-*.dump.age' \
-    -mmin "+$((retention_hours * 60))" -delete
+while IFS= read -r -d '' expired_database; do
+    expired_name="${expired_database##*/}"
+    if [[ ! "$expired_name" =~ ^postgres-([0-9]{8}T[0-9]{6}Z)-([0-9a-f]{32})\.dump\.age$ ]]; then
+        continue
+    fi
+    expired_recordings="$backup_dir/recordings-${BASH_REMATCH[1]}-${BASH_REMATCH[2]}.bundle.age"
+    [[ -f "$expired_recordings" && ! -L "$expired_recordings" ]] || continue
+    if [[ -z "$(find "$expired_recordings" -maxdepth 0 -type f \
+        -mmin "+$((retention_hours * 60))" -print -quit)" ]]; then
+        continue
+    fi
+    rm -f -- "$expired_database" "$expired_recordings"
+done < <(
+    find "$backup_dir" -maxdepth 1 -type f -name 'postgres-*.dump.age' \
+        -mmin "+$((retention_hours * 60))" -print0
+)
 
 printf 'created %s\n' "$destination"

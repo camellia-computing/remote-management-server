@@ -21,6 +21,7 @@ from nacl.secret import SecretBox
 from nacl.signing import SigningKey
 from openpyxl import load_workbook
 
+from api import ingestion_governance, recording_crypto
 from api.encrypted_fields import FIELD_PREFIX, encrypt_text, key_canary, key_fingerprint
 from api.formatting import format_bytes
 from api.models import (
@@ -34,6 +35,7 @@ from api.models import (
     LoginAdmissionLock,
     LoginAttempt,
     OidcPendingAuth,
+    RecordingUpload,
     RemoteDevice,
     RemotePeer,
     RemoteTag,
@@ -906,7 +908,8 @@ class ApiContractTests(ApiTestMixin, TestCase):
                 "recording_active_expired": 0,
                 "recording_finalized_purged": 0,
                 "recording_aborted_purged": 0,
-                "recording_orphan_tombs_purged": 0,
+                "recording_orphans_quarantined": 0,
+                "recording_quarantine_purged": 0,
                 "audit_connections_purged": 0,
                 "legacy_file_audits_purged": 0,
                 "legacy_alarm_audits_purged": 0,
@@ -1948,7 +1951,7 @@ class SensitiveIngestionTests(ApiTestMixin, TestCase):
 
                 staging = next(Path(upload_root).glob("*/.uploads/*.part"))
                 base_dir = staging.parent.parent
-                with _record_file_lock(base_dir, state["upload_id"]):
+                with _record_file_lock(base_dir):
                     busy = self._raw_record(
                         "version=2&type=part"
                         f"&upload_id={state['upload_id']}&offset=0&revision=0&length=4"
@@ -1978,7 +1981,8 @@ class SensitiveIngestionTests(ApiTestMixin, TestCase):
                 )
                 self.assertEqual(conflict.status_code, 409)
 
-                self.assertEqual(staging.read_bytes(), b"data")
+                self.assertNotIn(b"data", staging.read_bytes())
+                self.assertGreater(staging.stat().st_size, len(b"data"))
                 self.assertEqual(list(Path(upload_root).glob("*/session.webm")), [])
 
     def test_audit_ingestion_and_notes_are_scoped_to_authenticated_participants(self):
@@ -2295,6 +2299,66 @@ class OperationalEndpointTests(TestCase):
 
 
 class DataEncryptionRotationTests(TestCase):
+    def test_rotation_rewraps_recording_data_keys_before_retiring_the_old_kek(self):
+        encoded_data_key = recording_crypto.encode_data_key(b"d" * recording_crypto.DATA_KEY_BYTES)
+        storage_object_id = uuid.uuid4()
+        old_key_id = project_settings.DATA_ENCRYPTION_PRIMARY_KEY_ID
+        upload = RecordingUpload.objects.create(
+            create_id=uuid.uuid4(),
+            device_id=None,
+            device_id_at_create=1,
+            owner_id_at_create=1,
+            deployment_generation=0,
+            device_rid_at_create="rotation-device",
+            device_uuid_at_create="rotation-device-uuid",
+            storage_object_id=storage_object_id,
+            storage_namespace=ingestion_governance.recording_namespace(storage_object_id),
+            filename="rotation-recording.webm",
+            encryption_version=recording_crypto.FORMAT_VERSION,
+            data_key_kek_id=old_key_id,
+            encrypted_data_key=encoded_data_key,
+            storage_offset=recording_crypto.HEADER_SIZE,
+        )
+        database_upload_id = RecordingUpload._meta.pk.get_db_prep_value(upload.pk, connection)
+        old_key = project_settings.DATA_ENCRYPTION_KEYS[old_key_id]
+        new_key_id = "recording-rotation"
+        new_key = b"n" * 32
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT encrypted_data_key FROM api_recordingupload WHERE upload_id = %s",
+                [database_upload_id],
+            )
+            old_envelope = cursor.fetchone()[0]
+        self.assertTrue(old_envelope.startswith(f"{FIELD_PREFIX}{old_key_id}:"))
+        self.assertNotIn(encoded_data_key, old_envelope)
+
+        with override_settings(
+            DATA_ENCRYPTION_KEY_BYTES=new_key,
+            DATA_ENCRYPTION_KEYS={old_key_id: old_key, new_key_id: new_key},
+            DATA_ENCRYPTION_PRIMARY_KEY_ID=new_key_id,
+            DATA_ENCRYPTION_V1_KEY_ID=old_key_id,
+        ):
+            output = StringIO()
+            call_command("rotate_data_encryption", stdout=output)
+            self.assertEqual(json.loads(output.getvalue())["rewritten"], 1)
+            upload.refresh_from_db()
+            self.assertEqual(upload.encrypted_data_key, encoded_data_key)
+            self.assertEqual(upload.data_key_kek_id, new_key_id)
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    "SELECT encrypted_data_key FROM api_recordingupload WHERE upload_id = %s",
+                    [database_upload_id],
+                )
+                new_envelope = cursor.fetchone()[0]
+            self.assertTrue(new_envelope.startswith(f"{FIELD_PREFIX}{new_key_id}:"))
+            self.assertNotIn(encoded_data_key, new_envelope)
+            call_command(
+                "rotate_data_encryption",
+                retire_key_id=old_key_id,
+                stdout=StringIO(),
+            )
+            self.assertFalse(DataEncryptionKeyState.objects.filter(key_id=old_key_id).exists())
+
     def test_rotation_is_resumable_and_legacy_key_retirement_is_explicit(self):
         recording_root = self.enterContext(tempfile.TemporaryDirectory())
         old_key_id = project_settings.DATA_ENCRYPTION_PRIMARY_KEY_ID

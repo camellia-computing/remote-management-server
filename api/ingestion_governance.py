@@ -194,10 +194,12 @@ def release_audit_connection(owner_id, device_id, event_count):
     _apply(rows, items=-1, events=-int(event_count))
 
 
-def recording_namespace(owner_id, rid, device_uuid):
+def recording_namespace(storage_object_id):
     import hashlib
 
-    return hashlib.sha256(f"{owner_id}\0{rid}\0{device_uuid}".encode()).hexdigest()
+    if not isinstance(storage_object_id, uuid.UUID) or storage_object_id.version != 4:
+        raise ValueError("recording storage object ID must be a version 4 UUID")
+    return hashlib.sha256(b"camellia-recording-object-v2\0" + storage_object_id.bytes).hexdigest()
 
 
 def _decode_mount_path(value):

@@ -2,12 +2,15 @@ import datetime
 import hashlib
 import json
 import os
+import select
+import subprocess
+import sys
 import tempfile
 import uuid
 from concurrent.futures import ThreadPoolExecutor
-from io import StringIO
+from io import BytesIO, StringIO
 from pathlib import Path
-from threading import Barrier
+from threading import Barrier, Event
 from types import SimpleNamespace
 from unittest.mock import PropertyMock, patch
 from urllib.parse import urlencode
@@ -15,13 +18,16 @@ from urllib.parse import urlencode
 from django.core.handlers.wsgi import WSGIRequest
 from django.core.management import call_command
 from django.core.management.base import CommandError
-from django.db import DatabaseError, close_old_connections, connection, connections
-from django.test import Client, TestCase, TransactionTestCase, override_settings
+from django.db import DatabaseError, close_old_connections, connection, connections, transaction
+from django.test import Client, SimpleTestCase, TestCase, TransactionTestCase, override_settings
 from django.utils import timezone
 
-from api import ingestion_governance
+from api import ingestion_governance, recording_crypto, recording_inventory, recording_uploads
 from api.models import (
     PersistentIngestionUsage,
+    RecordingBackupControl,
+    RecordingBackupEpoch,
+    RecordingBackupObject,
     RecordingUpload,
     RecordingUploadChunk,
     RemoteDevice,
@@ -30,6 +36,73 @@ from api.models import (
 )
 
 PROTOCOL_VERSION = "2"
+
+
+class RecordingFileLockTests(SimpleTestCase):
+    def setUp(self):
+        self.root = tempfile.TemporaryDirectory()
+        self.base_dir = Path(self.root.name) / "recording-namespace"
+        self.base_dir.mkdir(mode=0o700)
+
+    def tearDown(self):
+        self.root.cleanup()
+
+    def test_wall_clock_age_never_steals_a_live_namespace_lock(self):
+        with recording_uploads._record_file_lock(self.base_dir):
+            locked_stat = self.base_dir.stat()
+            os.utime(self.base_dir, (1, 1))
+            self.assertFalse((self.base_dir / ".locks").exists())
+            with self.assertRaises(BlockingIOError):
+                with recording_uploads._record_file_lock(self.base_dir):
+                    self.fail("a second holder entered the same recording lock")
+
+        released_stat = self.base_dir.stat()
+        self.assertEqual((released_stat.st_dev, released_stat.st_ino), (locked_stat.st_dev, locked_stat.st_ino))
+        with recording_uploads._record_file_lock(self.base_dir):
+            reacquired_stat = self.base_dir.stat()
+            self.assertEqual(
+                (reacquired_stat.st_dev, reacquired_stat.st_ino),
+                (locked_stat.st_dev, locked_stat.st_ino),
+            )
+
+    def test_process_exit_releases_the_persistent_lock_without_stale_recovery(self):
+        child_code = (
+            "import django, sys\n"
+            "django.setup()\n"
+            "from api import recording_uploads\n"
+            "with recording_uploads._record_file_lock(sys.argv[1]):\n"
+            "    print('locked', flush=True)\n"
+            "    sys.stdin.buffer.read(1)\n"
+        )
+        holder = subprocess.Popen(  # noqa: S603 - fixed interpreter and isolated test child
+            [sys.executable, "-u", "-c", child_code, os.fspath(self.base_dir)],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            readable, _writable, _exceptional = select.select([holder.stdout], [], [], 5)
+            self.assertTrue(readable, "child process did not report recording lock acquisition")
+            self.assertEqual(holder.stdout.readline(), "locked\n")
+            os.utime(self.base_dir, (1, 1))
+            with self.assertRaises(BlockingIOError):
+                with recording_uploads._record_file_lock(self.base_dir):
+                    self.fail("parent entered a recording lock held by a child process")
+            holder.kill()
+            holder.wait(5)
+            with recording_uploads._record_file_lock(self.base_dir):
+                self.assertTrue(self.base_dir.is_dir())
+        finally:
+            if holder.poll() is None:
+                holder.terminate()
+                try:
+                    holder.wait(5)
+                except subprocess.TimeoutExpired:
+                    holder.kill()
+                    holder.wait(5)
+            for stream in (holder.stdin, holder.stdout, holder.stderr):
+                stream.close()
 
 
 class RecordingUploadStateMachineTests(TestCase):
@@ -112,6 +185,32 @@ class RecordingUploadStateMachineTests(TestCase):
         }
         return self._request("part", body=data, **params)
 
+    def _assert_authenticated_recording(self, upload_id, path, expected):
+        upload = RecordingUpload.objects.get(upload_id=upload_id)
+        fd = os.open(path, os.O_RDONLY)
+        try:
+            actual_size, actual_digest = recording_crypto.verify_recording_fd(
+                fd,
+                upload_id=upload.upload_id,
+                data_key=recording_crypto.decode_data_key(upload.encrypted_data_key),
+                receipts=upload.chunks.order_by("revision"),
+                expected_revision=upload.revision,
+                expected_storage_offset=upload.storage_offset,
+                max_chunk_bytes=1024,
+            )
+        finally:
+            os.close(fd)
+        self.assertEqual(actual_size, len(expected))
+        self.assertEqual(actual_digest, hashlib.sha256(expected).hexdigest())
+
+    def _object_paths(self, upload_id):
+        upload = RecordingUpload.objects.get(upload_id=upload_id)
+        base = Path(self.upload_root.name) / upload.storage_namespace
+        return (
+            base / ".uploads" / f"{upload.storage_object_id}.part",
+            base / f"{upload.storage_object_id}.recording",
+        )
+
     @override_settings(
         RECORD_UPLOAD_MAX_ACTIVE_PER_DEVICE=1,
         RECORD_UPLOAD_MAX_ACTIVE_PER_OWNER=1,
@@ -175,6 +274,377 @@ class RecordingUploadStateMachineTests(TestCase):
         self.assertEqual(response.json()["code"], "recording_storage_unavailable")
         request_body.assert_not_called()
 
+    def test_published_recording_is_authenticated_ciphertext_at_rest(self):
+        canary = b"FULL-SESSION-PLAINTEXT-CANARY"
+        state = self._create(filename="encrypted.webm")
+        committed = self._part(state, canary).json()
+
+        finalized = self._request(
+            "finalize",
+            upload_id=state["upload_id"],
+            revision=committed["revision"],
+            final_size=len(canary),
+            final_digest=hashlib.sha256(canary).hexdigest(),
+        )
+
+        self.assertEqual(finalized.status_code, 200, finalized.content)
+        _staging, published = self._object_paths(state["upload_id"])
+        self.assertTrue(published.is_file())
+        stored = published.read_bytes()
+        self.assertNotIn(canary, stored)
+        self.assertNotEqual(stored, canary)
+
+    def test_deleted_device_identity_cannot_reenter_an_old_recording_object_namespace(self):
+        old_state = self._create(filename="generation-isolated.webm")
+        old_committed = self._part(old_state, b"old-generation").json()
+        old_finalized = self._request(
+            "finalize",
+            upload_id=old_state["upload_id"],
+            revision=old_committed["revision"],
+            final_size=len(b"old-generation"),
+            final_digest=hashlib.sha256(b"old-generation").hexdigest(),
+        )
+        self.assertEqual(old_finalized.status_code, 200, old_finalized.content)
+        old_upload = RecordingUpload.objects.get(pk=old_state["upload_id"])
+        old_namespace = old_upload.storage_namespace
+        old_object = (
+            Path(self.upload_root.name) / old_upload.storage_namespace / f"{old_upload.storage_object_id}.recording"
+        )
+
+        self.device.delete()
+        replacement = RemoteDevice.objects.create(
+            rid="123456789",
+            cpu="-",
+            hostname="replacement-recorder",
+            memory="-",
+            os="linux",
+            uuid="recording-device-uuid",
+            public_key_hash=hashlib.sha256(b"replacement-recording-public-key").hexdigest(),
+            username="recorder",
+            version="test",
+            owner=self.user,
+        )
+        RemoteToken.objects.create(
+            device=replacement,
+            subject_user=self.user,
+            access_token=hashlib.sha256(self.raw_token.encode()).hexdigest(),
+            credential_hash=self.user.get_session_auth_hash(),
+            expires_at=timezone.now() + datetime.timedelta(hours=1),
+        )
+
+        new_state = self._create(
+            create_id="99999999-9999-4999-8999-999999999999",
+            filename="generation-isolated.webm",
+        )
+        new_upload = RecordingUpload.objects.get(pk=new_state["upload_id"])
+
+        self.assertNotEqual(new_upload.storage_namespace, old_namespace)
+        self.assertNotEqual(new_upload.storage_object_id, old_upload.storage_object_id)
+        self.assertTrue(old_object.exists())
+        new_committed = self._part(new_state, b"new-generation").json()
+        new_finalized = self._request(
+            "finalize",
+            upload_id=new_state["upload_id"],
+            revision=new_committed["revision"],
+            final_size=len(b"new-generation"),
+            final_digest=hashlib.sha256(b"new-generation").hexdigest(),
+        )
+        self.assertEqual(new_finalized.status_code, 200, new_finalized.content)
+        self.assertTrue(old_object.exists())
+
+    def test_backup_epoch_blocks_mutation_and_round_trips_authoritative_ciphertext_inventory(self):
+        plaintext = b"backup-recording-ciphertext"
+        state = self._create(filename="backup.webm")
+        committed = self._part(state, plaintext).json()
+        finalized = self._request(
+            "finalize",
+            upload_id=state["upload_id"],
+            revision=committed["revision"],
+            final_size=len(plaintext),
+            final_digest=hashlib.sha256(plaintext).hexdigest(),
+        )
+        self.assertEqual(finalized.status_code, 200, finalized.content)
+        _staging, published = self._object_paths(state["upload_id"])
+
+        epoch = recording_inventory.begin_backup(
+            "0123456789abcdef0123456789abcdef",
+            "20260806T001500Z",
+        )
+
+        self.assertEqual((epoch.inventory_count, epoch.object_count), (1, 1))
+        snapshot = RecordingBackupObject.objects.get(epoch=epoch)
+        upload = RecordingUpload.objects.get(pk=state["upload_id"])
+        self.assertEqual(snapshot.storage_object_id, upload.storage_object_id)
+        self.assertEqual(snapshot.deployment_generation, upload.deployment_generation)
+        self.assertEqual(snapshot.ciphertext_digest, upload.ciphertext_digest)
+        self.assertEqual(snapshot.plaintext_digest, hashlib.sha256(plaintext).hexdigest())
+        blocked = self._request("status", upload_id=state["upload_id"])
+        self.assertEqual(blocked.status_code, 503, blocked.content)
+        self.assertEqual(blocked.json()["code"], "recording_backup_in_progress")
+
+        bundle = BytesIO()
+        recording_inventory.export_backup(epoch.backup_id, bundle)
+        published.unlink()
+        recording_uploads_dir = published.parent
+        recording_inventory.restore_backup(
+            epoch.backup_id,
+            str(epoch.epoch_id),
+            epoch.inventory_digest,
+            BytesIO(bundle.getvalue()),
+        )
+
+        self.assertTrue(published.is_file())
+        self._assert_authenticated_recording(state["upload_id"], published, plaintext)
+        self.assertIsNone(RecordingBackupControl.objects.get(singleton=1).active_epoch_id)
+        self.assertEqual(recording_uploads_dir.stat().st_mode & 0o077, 0)
+
+    def test_backup_epoch_rejects_missing_extra_and_corrupt_recording_objects(self):
+        scenarios = ("missing", "extra", "corrupt")
+        for index, scenario in enumerate(scenarios, start=1):
+            with self.subTest(scenario=scenario):
+                state = self._create(
+                    create_id=str(uuid.uuid4()),
+                    filename=f"{scenario}.webm",
+                )
+                committed = self._part(state, scenario.encode(), chunk_id=str(uuid.uuid4())).json()
+                finalized = self._request(
+                    "finalize",
+                    upload_id=state["upload_id"],
+                    revision=committed["revision"],
+                    final_size=len(scenario),
+                    final_digest=hashlib.sha256(scenario.encode()).hexdigest(),
+                )
+                self.assertEqual(finalized.status_code, 200, finalized.content)
+                _staging, published = self._object_paths(state["upload_id"])
+                if scenario == "missing":
+                    published.unlink()
+                elif scenario == "extra":
+                    namespace = Path(self.upload_root.name) / ("f" * 64)
+                    namespace.mkdir()
+                    (namespace / f"{uuid.uuid4()}.recording").write_bytes(b"extra")
+                else:
+                    corrupted = bytearray(published.read_bytes())
+                    corrupted[-1] ^= 1
+                    published.write_bytes(corrupted)
+
+                with self.assertRaises(recording_inventory.RecordingInventoryError):
+                    recording_inventory.begin_backup(
+                        f"{index:032x}",
+                        f"20260806T00150{index}Z",
+                    )
+                self.assertIsNone(RecordingBackupControl.objects.get(singleton=1).active_epoch_id)
+
+                RecordingUpload.objects.all().delete()
+                for child in Path(self.upload_root.name).iterdir():
+                    if child.is_dir():
+                        for path in sorted(child.rglob("*"), reverse=True):
+                            if path.is_file() or path.is_symlink():
+                                path.unlink()
+                            elif path.is_dir():
+                                path.rmdir()
+                        child.rmdir()
+
+    def test_zero_byte_recording_has_an_authenticated_nonempty_header(self):
+        state = self._create(filename="empty-encrypted.webm")
+        staging = next(Path(self.upload_root.name).glob("*/.uploads/*.part"))
+        self.assertEqual(staging.stat().st_size, recording_crypto.HEADER_SIZE)
+        self.assertNotEqual(staging.read_bytes(), b"")
+        digest = hashlib.sha256(b"").hexdigest()
+
+        finalized = self._request(
+            "finalize",
+            upload_id=state["upload_id"],
+            revision=0,
+            final_size=0,
+            final_digest=digest,
+        )
+
+        self.assertEqual(finalized.status_code, 200, finalized.content)
+        _staging, published = self._object_paths(state["upload_id"])
+        self._assert_authenticated_recording(state["upload_id"], published, b"")
+        corrupted = bytearray(published.read_bytes())
+        corrupted[-1] ^= 1
+        published.write_bytes(corrupted)
+        replay = self._request(
+            "finalize",
+            upload_id=state["upload_id"],
+            revision=0,
+            final_size=0,
+            final_digest=digest,
+        )
+        self.assertEqual(replay.status_code, 500, replay.content)
+        self.assertEqual(replay.json()["code"], "storage_failed")
+
+    def test_multi_chunk_recording_is_streamed_as_authenticated_ciphertext(self):
+        first_canary = b"FIRST-RECORDING-CHUNK-CANARY"
+        second_canary = b"SECOND-RECORDING-CHUNK-CANARY"
+        plaintext = first_canary + second_canary
+        state = self._create(filename="multi-encrypted.webm")
+        first = self._part(state, first_canary).json()
+        second = self._part(
+            first,
+            second_canary,
+            chunk_id="33333333-3333-4333-8333-333333333333",
+        ).json()
+        staging = next(Path(self.upload_root.name).glob("*/.uploads/*.part"))
+        ciphertext = staging.read_bytes()
+        self.assertNotIn(first_canary, ciphertext)
+        self.assertNotIn(second_canary, ciphertext)
+        upload = RecordingUpload.objects.get(pk=state["upload_id"])
+        self.assertEqual(
+            upload.storage_offset,
+            recording_crypto.HEADER_SIZE
+            + recording_crypto.chunk_record_size(len(first_canary))
+            + recording_crypto.chunk_record_size(len(second_canary)),
+        )
+
+        finalized = self._request(
+            "finalize",
+            upload_id=state["upload_id"],
+            revision=second["revision"],
+            final_size=len(plaintext),
+            final_digest=hashlib.sha256(plaintext).hexdigest(),
+        )
+
+        self.assertEqual(finalized.status_code, 200, finalized.content)
+        _staging, published = self._object_paths(state["upload_id"])
+        self._assert_authenticated_recording(state["upload_id"], published, plaintext)
+
+    def test_chunk_bit_flip_fails_closed_without_publishing_plaintext(self):
+        plaintext = b"AUTHENTICATED-CHUNK-BIT-FLIP-CANARY"
+        state = self._create(filename="bit-flip.webm")
+        committed = self._part(state, plaintext).json()
+        staging = next(Path(self.upload_root.name).glob("*/.uploads/*.part"))
+        corrupted = bytearray(staging.read_bytes())
+        corrupted[-1] ^= 1
+        staging.write_bytes(corrupted)
+
+        rejected = self._request(
+            "finalize",
+            upload_id=state["upload_id"],
+            revision=committed["revision"],
+            final_size=len(plaintext),
+            final_digest=hashlib.sha256(plaintext).hexdigest(),
+        )
+
+        self.assertEqual(rejected.status_code, 500, rejected.content)
+        self.assertEqual(rejected.json()["code"], "storage_failed")
+        self.assertTrue(staging.exists())
+        self.assertFalse(self._object_paths(state["upload_id"])[1].exists())
+        self.assertEqual(
+            RecordingUpload.objects.get(pk=state["upload_id"]).state,
+            RecordingUpload.STATE_ACTIVE,
+        )
+
+    def test_wrong_data_key_and_unavailable_wrapping_key_id_fail_closed(self):
+        plaintext = b"WRONG-KEY-CANARY"
+        state = self._create(filename="wrong-data-key.webm")
+        committed = self._part(state, plaintext).json()
+        RecordingUpload.objects.filter(pk=state["upload_id"]).update(
+            encrypted_data_key=recording_crypto.encode_data_key(recording_crypto.generate_data_key())
+        )
+
+        wrong_data_key = self._request(
+            "finalize",
+            upload_id=state["upload_id"],
+            revision=committed["revision"],
+            final_size=len(plaintext),
+            final_digest=hashlib.sha256(plaintext).hexdigest(),
+        )
+        self.assertEqual(wrong_data_key.status_code, 500, wrong_data_key.content)
+        self.assertEqual(wrong_data_key.json()["code"], "storage_failed")
+
+        other = self._create(
+            create_id="99999999-9999-4999-8999-999999999999",
+            filename="missing-wrapping-key.webm",
+        )
+        database_upload_id = RecordingUpload._meta.pk.get_db_prep_value(
+            uuid.UUID(other["upload_id"]),
+            connection,
+        )
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT encrypted_data_key FROM api_recordingupload WHERE upload_id = %s",
+                [database_upload_id],
+            )
+            envelope = cursor.fetchone()[0]
+            encoded = envelope.rsplit(":", 1)[1]
+            cursor.execute(
+                "UPDATE api_recordingupload SET encrypted_data_key = %s WHERE upload_id = %s",
+                [f"secretbox:v2:missing-key:{encoded}", database_upload_id],
+            )
+
+        missing_key = self._request("status", upload_id=other["upload_id"])
+        self.assertEqual(missing_key.status_code, 500, missing_key.content)
+        self.assertEqual(missing_key.json()["code"], "storage_failed")
+
+    def test_truncated_header_record_and_tag_fail_closed(self):
+        empty = self._create(filename="truncated-header.webm")
+        empty_staging = next(Path(self.upload_root.name).glob("*/.uploads/*.part"))
+        empty_staging.write_bytes(empty_staging.read_bytes()[:-1])
+        header_rejected = self._request("status", upload_id=empty["upload_id"])
+        self.assertEqual(header_rejected.status_code, 500, header_rejected.content)
+
+        state = self._create(
+            create_id="77777777-7777-4777-8777-777777777777",
+            filename="truncated-record.webm",
+        )
+        plaintext = b"TRUNCATED-RECORD-CANARY"
+        committed = self._part(state, plaintext).json()
+        staging = next(path for path in Path(self.upload_root.name).glob("*/.uploads/*.part") if path != empty_staging)
+        staging.write_bytes(staging.read_bytes()[:-1])
+        record_rejected = self._request(
+            "finalize",
+            upload_id=state["upload_id"],
+            revision=committed["revision"],
+            final_size=len(plaintext),
+            final_digest=hashlib.sha256(plaintext).hexdigest(),
+        )
+        self.assertEqual(record_rejected.status_code, 500, record_rejected.content)
+        self.assertFalse(self._object_paths(state["upload_id"])[1].exists())
+
+    def test_reordered_and_duplicated_chunk_records_fail_closed(self):
+        def corrupt_two_chunk_recording(create_id, filename, mutation):
+            first_plaintext = b"FIRST-EQUAL-SIZE-CHUNK"
+            second_plaintext = b"OTHER-EQUAL-SIZE-CHUNK"
+            self.assertEqual(len(first_plaintext), len(second_plaintext))
+            state = self._create(create_id=create_id, filename=filename)
+            first = self._part(state, first_plaintext).json()
+            second = self._part(
+                first,
+                second_plaintext,
+                chunk_id=str(uuid.uuid4()),
+            ).json()
+            staging, published = self._object_paths(state["upload_id"])
+            raw = staging.read_bytes()
+            record_size = recording_crypto.chunk_record_size(len(first_plaintext))
+            header = raw[: recording_crypto.HEADER_SIZE]
+            first_record = raw[recording_crypto.HEADER_SIZE : recording_crypto.HEADER_SIZE + record_size]
+            second_record = raw[recording_crypto.HEADER_SIZE + record_size :]
+            self.assertEqual(len(first_record), len(second_record))
+            staging.write_bytes(header + mutation(first_record, second_record))
+            plaintext = first_plaintext + second_plaintext
+            rejected = self._request(
+                "finalize",
+                upload_id=state["upload_id"],
+                revision=second["revision"],
+                final_size=len(plaintext),
+                final_digest=hashlib.sha256(plaintext).hexdigest(),
+            )
+            self.assertEqual(rejected.status_code, 500, rejected.content)
+            self.assertFalse(published.exists())
+
+        corrupt_two_chunk_recording(
+            "44444444-4444-4444-8444-444444444444",
+            "reordered.webm",
+            lambda first, second: second + first,
+        )
+        corrupt_two_chunk_recording(
+            "55555555-5555-4555-8555-555555555555",
+            "duplicated.webm",
+            lambda first, _second: first + first,
+        )
+
     @override_settings(
         RECORD_UPLOAD_RETENTION_DAYS=1,
         RECORD_UPLOAD_ABORTED_RETENTION_DAYS=1,
@@ -201,13 +671,20 @@ class RecordingUploadStateMachineTests(TestCase):
 
         call_command("purge_expired_state", batch_size=10, stdout=StringIO())
         self.assertTrue(RecordingUpload.objects.filter(pk=upload.pk).exists())
-        self.assertTrue(list(Path(self.upload_root.name).glob("*/retained.webm")))
+        published = self._object_paths(state["upload_id"])[1]
+        self.assertTrue(published.exists())
 
         RecordingUpload.objects.filter(pk=upload.pk).update(retention_hold=False)
-        call_command("purge_expired_state", batch_size=10, stdout=StringIO())
+        with override_settings(
+            DATA_ENCRYPTION_KEY_BYTES=b"x" * 32,
+            DATA_ENCRYPTION_KEYS={"unavailable-test-key": b"x" * 32},
+            DATA_ENCRYPTION_PRIMARY_KEY_ID="unavailable-test-key",
+            DATA_ENCRYPTION_V1_KEY_ID="unavailable-test-key",
+        ):
+            call_command("purge_expired_state", batch_size=10, stdout=StringIO())
 
         self.assertFalse(RecordingUpload.objects.filter(pk=upload.pk).exists())
-        self.assertFalse(list(Path(self.upload_root.name).glob("*/retained.webm")))
+        self.assertFalse(published.exists())
         recording_usage = PersistentIngestionUsage.objects.filter(kind="recording")
         self.assertTrue(recording_usage.exists())
         for usage in recording_usage:
@@ -266,15 +743,21 @@ class RecordingUploadStateMachineTests(TestCase):
         self.user.save(update_fields=("is_admin",))
         output = StringIO()
 
-        call_command(
-            "set_ingestion_hold",
-            "recording",
-            state["upload_id"],
-            actor=self.user.username,
-            reason="litigation request 42",
-            hold=True,
-            stdout=output,
-        )
+        with override_settings(
+            DATA_ENCRYPTION_KEY_BYTES=b"x" * 32,
+            DATA_ENCRYPTION_KEYS={"unavailable-test-key": b"x" * 32},
+            DATA_ENCRYPTION_PRIMARY_KEY_ID="unavailable-test-key",
+            DATA_ENCRYPTION_V1_KEY_ID="unavailable-test-key",
+        ):
+            call_command(
+                "set_ingestion_hold",
+                "recording",
+                state["upload_id"],
+                actor=self.user.username,
+                reason="litigation request 42",
+                hold=True,
+                stdout=output,
+            )
 
         upload = RecordingUpload.objects.get(pk=state["upload_id"])
         self.assertTrue(upload.retention_hold)
@@ -292,7 +775,24 @@ class RecordingUploadStateMachineTests(TestCase):
                 stdout=StringIO(),
             )
 
-    @override_settings(RECORD_UPLOAD_ACTIVE_TIMEOUT_MINUTES=5)
+    def test_abort_moves_and_deletes_ciphertext_without_unwrapping_its_data_key(self):
+        state = self._create(filename="abort-without-key.webm")
+        self.assertEqual(self._part(state, b"opaque-abort").status_code, 200)
+
+        with override_settings(
+            DATA_ENCRYPTION_KEY_BYTES=b"x" * 32,
+            DATA_ENCRYPTION_KEYS={"unavailable-test-key": b"x" * 32},
+            DATA_ENCRYPTION_PRIMARY_KEY_ID="unavailable-test-key",
+            DATA_ENCRYPTION_V1_KEY_ID="unavailable-test-key",
+        ):
+            aborted = self._request("abort", upload_id=state["upload_id"])
+
+        self.assertEqual(aborted.status_code, 200, aborted.content)
+        self.assertEqual(aborted.json()["state"], "aborted")
+        self.assertFalse(list(Path(self.upload_root.name).rglob("*.part")))
+        self.assertFalse(list(Path(self.upload_root.name).rglob("*.aborted")))
+
+    @override_settings(RECORD_UPLOAD_ACTIVE_TIMEOUT_MINUTES=5, RECORD_UPLOAD_ORPHAN_QUARANTINE_DAYS=1)
     def test_orphan_tomb_cleanup_is_dry_run_safe_and_bounded(self):
         upload_dir = Path(self.upload_root.name) / ("a" * 64) / ".uploads"
         upload_dir.mkdir(parents=True)
@@ -306,18 +806,35 @@ class RecordingUploadStateMachineTests(TestCase):
 
         output = StringIO()
         call_command("purge_expired_state", dry_run=True, batch_size=2, stdout=output)
-        self.assertEqual(json.loads(output.getvalue())["recording_orphan_tombs_purged"], 2)
+        self.assertEqual(json.loads(output.getvalue())["recording_orphans_quarantined"], 2)
         self.assertEqual(sum(path.exists() for path in paths), 3)
 
         output = StringIO()
         call_command("purge_expired_state", batch_size=2, stdout=output)
-        self.assertEqual(json.loads(output.getvalue())["recording_orphan_tombs_purged"], 2)
+        self.assertEqual(json.loads(output.getvalue())["recording_orphans_quarantined"], 2)
         self.assertEqual(sum(path.exists() for path in paths), 1)
+        quarantine = Path(self.upload_root.name) / ".quarantine"
+        self.assertEqual(len(list(quarantine.glob("*.quarantined"))), 2)
 
         output = StringIO()
         call_command("purge_expired_state", batch_size=2, stdout=output)
-        self.assertEqual(json.loads(output.getvalue())["recording_orphan_tombs_purged"], 1)
+        self.assertEqual(json.loads(output.getvalue())["recording_orphans_quarantined"], 1)
         self.assertFalse(any(path.exists() for path in paths))
+        quarantined = list(quarantine.glob("*.quarantined"))
+        self.assertEqual(len(quarantined), 3)
+
+        expired = (timezone.now() - datetime.timedelta(days=2)).timestamp()
+        for path in quarantined:
+            os.utime(path, (expired, expired))
+        output = StringIO()
+        call_command("purge_expired_state", batch_size=2, stdout=output)
+        self.assertEqual(json.loads(output.getvalue())["recording_quarantine_purged"], 2)
+        self.assertEqual(len(list(quarantine.glob("*.quarantined"))), 1)
+
+        output = StringIO()
+        call_command("purge_expired_state", batch_size=2, stdout=output)
+        self.assertEqual(json.loads(output.getvalue())["recording_quarantine_purged"], 1)
+        self.assertFalse(list(quarantine.glob("*.quarantined")))
 
     def test_orphan_cleanup_rejects_a_symlinked_staging_directory(self):
         namespace = Path(self.upload_root.name) / ("b" * 64)
@@ -439,7 +956,7 @@ class RecordingUploadStateMachineTests(TestCase):
             final_digest=digest,
         )
         self.assertEqual(finalized_response.status_code, 200, finalized_response.content)
-        self.assertTrue((staging.parent.parent / "empty-finalize-recovery.webm").exists())
+        self.assertTrue(self._object_paths(finalized["upload_id"])[1].exists())
 
         aborted = self._create(
             create_id="66666666-6666-4666-8666-666666666666",
@@ -455,7 +972,7 @@ class RecordingUploadStateMachineTests(TestCase):
         state = self._create(filename="partial.webm")
 
         def fail_after_partial_write(fd, data):
-            self.assertEqual(data, b"durable")
+            self.assertTrue(data.startswith(recording_crypto.RECORD_MAGIC))
             self.assertEqual(os.write(fd, data[:2]), 2)
             raise OSError("injected short filesystem write")
 
@@ -469,7 +986,10 @@ class RecordingUploadStateMachineTests(TestCase):
         self.assertEqual(status.json()["revision"], 0)
         partials = list(Path(self.upload_root.name).rglob("*.part"))
         self.assertEqual(len(partials), 1)
-        self.assertEqual(partials[0].read_bytes(), b"")
+        upload = RecordingUpload.objects.get(upload_id=state["upload_id"])
+        self.assertEqual(partials[0].stat().st_size, recording_crypto.HEADER_SIZE)
+        self.assertEqual(upload.storage_offset, recording_crypto.HEADER_SIZE)
+        self._assert_authenticated_recording(state["upload_id"], partials[0], b"")
 
         retried = self._part(state, b"durable")
         self.assertEqual(retried.status_code, 200, retried.content)
@@ -492,10 +1012,12 @@ class RecordingUploadStateMachineTests(TestCase):
         self.assertEqual(upload.revision, 0)
         self.assertFalse(RecordingUploadChunk.objects.filter(upload=upload).exists())
         staging = next(Path(self.upload_root.name).glob("*/.uploads/*.part"))
-        self.assertEqual(staging.read_bytes(), b"rollback")
+        self.assertGreater(staging.stat().st_size, upload.storage_offset)
+        self.assertNotIn(b"rollback", staging.read_bytes())
         reconciled = self._request("status", upload_id=state["upload_id"])
         self.assertEqual(reconciled.status_code, 200, reconciled.content)
-        self.assertEqual(staging.read_bytes(), b"")
+        self.assertEqual(staging.stat().st_size, recording_crypto.HEADER_SIZE)
+        self._assert_authenticated_recording(state["upload_id"], staging, b"")
 
         committed = self._part(state, b"rollback")
         self.assertEqual(committed.status_code, 200, committed.content)
@@ -518,9 +1040,10 @@ class RecordingUploadStateMachineTests(TestCase):
         self.assertEqual(failed_finalize.status_code, 500, failed_finalize.content)
         upload.refresh_from_db()
         self.assertEqual(upload.state, RecordingUpload.STATE_ACTIVE)
-        published = staging.parent.parent / "database-rollback.webm"
+        _expected_staging, published = self._object_paths(state["upload_id"])
         self.assertFalse(staging.exists())
-        self.assertEqual(published.read_bytes(), b"rollback")
+        self.assertNotIn(b"rollback", published.read_bytes())
+        self._assert_authenticated_recording(state["upload_id"], published, b"rollback")
 
         finalized = self._request(
             "finalize",
@@ -558,7 +1081,7 @@ class RecordingUploadStateMachineTests(TestCase):
             final_digest="0" * 64,
         )
         self.assertEqual(wrong_digest.status_code, 409, wrong_digest.content)
-        self.assertEqual(list(Path(self.upload_root.name).rglob("finished.webm")), [])
+        self.assertFalse(self._object_paths(state["upload_id"])[1].exists())
 
         finalized = self._request(
             "finalize",
@@ -573,9 +1096,10 @@ class RecordingUploadStateMachineTests(TestCase):
         self.assertTrue(final_state["finalized"])
         self.assertEqual(final_state["final_size"], len(b"complete-recording"))
         self.assertEqual(final_state["final_digest"], digest)
-        published = list(Path(self.upload_root.name).glob("*/finished.webm"))
-        self.assertEqual(len(published), 1)
-        self.assertEqual(published[0].read_bytes(), b"complete-recording")
+        _staging, published = self._object_paths(state["upload_id"])
+        self.assertTrue(published.is_file())
+        self.assertNotIn(b"complete-recording", published.read_bytes())
+        self._assert_authenticated_recording(state["upload_id"], published, b"complete-recording")
         self.assertEqual(list(Path(self.upload_root.name).rglob("*.part")), [])
 
         replayed_finalize = self._request(
@@ -594,14 +1118,14 @@ class RecordingUploadStateMachineTests(TestCase):
             chunk_id="33333333-3333-4333-8333-333333333333",
         )
         self.assertEqual(post_finalize_part.status_code, 409, post_finalize_part.content)
-        self.assertEqual(published[0].read_bytes(), b"complete-recording")
+        self._assert_authenticated_recording(state["upload_id"], published, b"complete-recording")
 
     def test_finalize_recovers_rename_that_preceded_database_commit(self):
         state = self._create(filename="rename-recovery.webm")
         committed = self._part(state, b"rename-recovery").json()
         digest = hashlib.sha256(b"rename-recovery").hexdigest()
         staging = next(Path(self.upload_root.name).glob("*/.uploads/*.part"))
-        published = staging.parent.parent / "rename-recovery.webm"
+        _expected_staging, published = self._object_paths(state["upload_id"])
         staging.rename(published)
 
         recovered = self._request(
@@ -614,7 +1138,7 @@ class RecordingUploadStateMachineTests(TestCase):
 
         self.assertEqual(recovered.status_code, 200, recovered.content)
         self.assertEqual(recovered.json()["state"], "finalized")
-        self.assertEqual(published.read_bytes(), b"rename-recovery")
+        self._assert_authenticated_recording(state["upload_id"], published, b"rename-recovery")
 
     def test_abort_recovers_tomb_that_preceded_database_commit(self):
         state = self._create(filename="abort-recovery.webm")
@@ -682,7 +1206,7 @@ class RecordingUploadStateMachineTests(TestCase):
         self.assertEqual(response.status_code, 200, response.content)
         rejected = self._request("abort", upload_id=finalized["upload_id"])
         self.assertEqual(rejected.status_code, 409, rejected.content)
-        self.assertEqual(len(list(Path(self.upload_root.name).glob("*/retained.webm"))), 1)
+        self.assertTrue(self._object_paths(finalized["upload_id"])[1].is_file())
 
 
 class RecordingStorageCapabilityTests(TestCase):
@@ -924,6 +1448,46 @@ class RecordingUploadConcurrencyTests(TransactionTestCase):
         with ThreadPoolExecutor(max_workers=len(states)) as executor:
             return list(executor.map(send, enumerate(states)))
 
+    def test_backup_checkpoint_waits_for_an_inflight_recording_mutation_lock(self):
+        mutation_locked = Event()
+        release_mutation = Event()
+        backup_attempted = Event()
+
+        def hold_mutation_lock():
+            close_old_connections()
+            try:
+                with transaction.atomic():
+                    recording_inventory.lock_recording_mutation()
+                    mutation_locked.set()
+                    if not release_mutation.wait(10):
+                        raise TimeoutError("recording mutation release timed out")
+            finally:
+                close_old_connections()
+
+        def begin_checkpoint():
+            close_old_connections()
+            backup_attempted.set()
+            try:
+                return recording_inventory.begin_backup(
+                    "abcdef0123456789abcdef0123456789",
+                    "20260806T004500Z",
+                )
+            finally:
+                close_old_connections()
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            mutation = executor.submit(hold_mutation_lock)
+            self.assertTrue(mutation_locked.wait(10), "recording mutation did not acquire backup control")
+            checkpoint = executor.submit(begin_checkpoint)
+            self.assertTrue(backup_attempted.wait(10), "backup checkpoint did not start")
+            self.assertFalse(checkpoint.done(), "backup checkpoint bypassed an in-flight mutation lock")
+            release_mutation.set()
+            mutation.result(timeout=10)
+            epoch = checkpoint.result(timeout=10)
+
+        self.assertEqual(epoch.state, RecordingBackupEpoch.STATE_READY)
+        recording_inventory.abort_backup(epoch.backup_id)
+
     @override_settings(
         RECORD_UPLOAD_MAX_ACTIVE_PER_DEVICE=1,
         RECORD_UPLOAD_MAX_ACTIVE_PER_OWNER=1,
@@ -1027,7 +1591,8 @@ class RecordingUploadConcurrencyTests(TransactionTestCase):
         self.assertEqual(responses[0][1], responses[1][1])
         self.assertEqual(RecordingUploadChunk.objects.count(), 1)
         staging = next(Path(self.upload_root.name).glob("*/.uploads/*.part"))
-        self.assertEqual(staging.read_bytes(), b"concurrent")
+        self.assertNotIn(b"concurrent", staging.read_bytes())
+        self.assertEqual(staging.stat().st_size, RecordingUpload.objects.get().storage_offset)
 
     def test_concurrent_distinct_chunk_ids_allow_only_one_revision_winner(self):
         state = self._create("concurrent-conflict.webm")
@@ -1043,4 +1608,5 @@ class RecordingUploadConcurrencyTests(TransactionTestCase):
         self.assertEqual(sorted(status for status, _payload in responses), [200, 409])
         self.assertEqual(RecordingUploadChunk.objects.count(), 1)
         staging = next(Path(self.upload_root.name).glob("*/.uploads/*.part"))
-        self.assertEqual(staging.read_bytes(), b"concurrent")
+        self.assertNotIn(b"concurrent", staging.read_bytes())
+        self.assertEqual(staging.stat().st_size, RecordingUpload.objects.get().storage_offset)
