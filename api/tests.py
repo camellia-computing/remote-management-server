@@ -790,9 +790,13 @@ class ApiContractTests(ApiTestMixin, TestCase):
         self.assertEqual(response.headers.get("Content-Disposition"), "attachment; filename=DeviceInfo-v1.xlsx")
 
         log_output = "\n".join(export_logs.output)
-        self.assertIn('"event": "front_export_xlsx"', log_output)
-        self.assertIn('"schema": "device-inventory-v1"', log_output)
-        self.assertIn('"count": 1', log_output)
+        export_payload = next(
+            payload
+            for payload in (json.loads(record.getMessage()) for record in export_logs.records)
+            if payload.get("event") == "front_export_xlsx"
+        )
+        self.assertEqual(export_payload["attributes"]["schema"], "device-inventory-v1")
+        self.assertEqual(export_payload["attributes"]["count"], 1)
         for canary in (credential_canary, uuid_canary, public_key_hash_canary):
             with self.subTest(log_canary=canary):
                 self.assertNotIn(canary, log_output)

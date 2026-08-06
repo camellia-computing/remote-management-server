@@ -863,6 +863,9 @@ LOGGING = {
             "style": "{",
             "datefmt": "%Y-%m-%d %H:%M:%S",
         },
+        "structured_event": {
+            "()": "camellia_remote_management.observability.StructuredEventFormatter",
+        },
     },
     "filters": {
         "safe_django_request": {
@@ -876,6 +879,12 @@ LOGGING = {
             "filters": ["safe_django_request"],
             "level": LOG_LEVEL,
         },
+        "structured_console": {
+            "class": "logging.StreamHandler",
+            "formatter": "structured_event",
+            "filters": ["safe_django_request"],
+            "level": LOG_LEVEL,
+        },
     },
     "root": {
         "handlers": ["console"],
@@ -883,7 +892,7 @@ LOGGING = {
     },
     "loggers": {
         "django": {"handlers": ["console"], "level": LOG_LEVEL, "propagate": False},
-        "api": {"handlers": ["console"], "level": LOG_LEVEL, "propagate": False},
+        "api": {"handlers": ["structured_console"], "level": LOG_LEVEL, "propagate": False},
     },
 }
 STATIC_URL = "/static/"

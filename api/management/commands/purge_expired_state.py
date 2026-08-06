@@ -19,6 +19,7 @@ from api.models import (
     RequestRateLease,
     ShareLink,
 )
+from camellia_remote_management.observability import background_operation
 
 
 class Command(BaseCommand):
@@ -38,6 +39,10 @@ class Command(BaseCommand):
         )
 
     def handle(self, *args, **options):
+        with background_operation("purge_expired_state"):
+            return self._handle(*args, **options)
+
+    def _handle(self, *args, **options):
         now = timezone.now()
         batch_size = options["batch_size"]
         if not 1 <= batch_size <= 1000:

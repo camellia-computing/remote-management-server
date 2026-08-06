@@ -46,7 +46,7 @@ from api.request_utils import client_ip
 from api.response_security import protect_credential_response
 from api.tag_colors import normalize_tag_color, tag_color_css
 from api.xlsx import safe_csv_writer, xlsx_response
-from camellia_remote_management.access_logging import normalized_route
+from camellia_remote_management.observability import log_structured_event
 
 logger = logging.getLogger(__name__)
 MAX_AB_PEERS = 10_000
@@ -77,17 +77,12 @@ def _client_ip(request):
 def _log_event(request, event, level="info", **extra):
     user = getattr(request, "user", None)
     username = user.username if user and getattr(user, "is_authenticated", False) else "anonymous"
-    payload = {
-        "event": event,
+    attributes = {
         "user": username,
         "ip": _client_ip(request),
-        "route": normalized_route(getattr(request, "resolver_match", None)),
-        "method": getattr(request, "method", ""),
     }
-    payload.update({k: v for k, v in extra.items() if v is not None})
-    details = json.dumps(payload, ensure_ascii=False, default=str)
-    log_fn = getattr(logger, level, logger.info)
-    log_fn("event=%s details=%s", event, details)
+    attributes.update({k: v for k, v in extra.items() if v is not None})
+    log_structured_event(logger, request, event, level=level, attributes=attributes)
 
 
 def model_to_dict2(instance, fields=None, exclude=None, replace=None, default=None):

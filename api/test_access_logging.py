@@ -1,3 +1,4 @@
+import json
 import logging
 from datetime import timedelta
 from pathlib import Path
@@ -13,9 +14,12 @@ from api import views_api, views_front
 from api.middleware import SafeAccessLogMiddleware
 from camellia_remote_management.access_logging import (
     ACCESS_ROUTE_ENV,
+    EVENT_ID_ENV,
     REQUEST_ID_ENV,
     REQUEST_ID_HEADER,
     SAFE_ACCESS_LOG_FORMAT,
+    SPAN_ID_ENV,
+    TRACE_ID_ENV,
     SafeAccessLogger,
     SafeDjangoRequestFilter,
 )
@@ -83,11 +87,24 @@ class SafeAccessLoggingTests(SimpleTestCase):
                 response, atoms, line = self._access_line(request)
                 self.assertEqual(
                     set(atoms),
-                    {"m", "route", "s", "B", "D", "request_id"},
+                    {
+                        "m",
+                        "route",
+                        "s",
+                        "B",
+                        "D",
+                        "request_id",
+                        "trace_id",
+                        "span_id",
+                        "event_id",
+                    },
                 )
                 self.assertEqual(atoms["route"], expected_route)
                 self.assertRegex(atoms["request_id"], r"\A[0-9a-f]{32}\Z")
                 self.assertEqual(response[REQUEST_ID_HEADER], atoms["request_id"])
+                self.assertRegex(atoms["trace_id"], r"\A(?!0{32})[0-9a-f]{32}\Z")
+                self.assertRegex(atoms["span_id"], r"\A(?!0{16})[0-9a-f]{16}\Z")
+                self.assertEqual(atoms["event_id"], "-")
                 self.assertIn(f"route={expected_route}", line)
                 self.assertIn("duration_us=2500", line)
                 self.assertNotIn("LOG008_", line)
@@ -114,6 +131,9 @@ class SafeAccessLoggingTests(SimpleTestCase):
         self.assertEqual(atoms["m"], "INVALID")
         self.assertEqual(atoms["route"], "<unmatched>")
         self.assertEqual(atoms["request_id"], "<missing>")
+        self.assertEqual(atoms["trace_id"], "<missing>")
+        self.assertEqual(atoms["span_id"], "<missing>")
+        self.assertEqual(atoms["event_id"], "-")
         self.assertEqual(atoms["s"], "000")
         self.assertEqual(atoms["B"], 0)
         self.assertEqual(atoms["D"], 0)
@@ -128,6 +148,9 @@ class SafeAccessLoggingTests(SimpleTestCase):
         )
         request.resolver_match = resolve(request.path_info)
         request.META[REQUEST_ID_ENV] = "a" * 32
+        request.META[TRACE_ID_ENV] = "b" * 32
+        request.META[SPAN_ID_ENV] = "c" * 16
+        request.META[EVENT_ID_ENV] = "11111111-1111-4111-8111-111111111111"
         record = logging.LogRecord(
             "django.request",
             logging.WARNING,
@@ -144,7 +167,10 @@ class SafeAccessLoggingTests(SimpleTestCase):
         rendered = record.getMessage()
         self.assertEqual(
             rendered,
-            f"request status=404 route=/api/share/(?P<share_token>[A-Za-z0-9_-]{{32,128}}) request_id={'a' * 32}",
+            "request status=404 "
+            "route=/api/share/(?P<share_token>[A-Za-z0-9_-]{32,128}) "
+            f"request_id={'a' * 32} trace_id={'b' * 32} span_id={'c' * 16} "
+            "event_id=11111111-1111-4111-8111-111111111111",
         )
         self.assertNotIn("LOG008_", rendered)
 
@@ -158,8 +184,10 @@ class SafeAccessLoggingTests(SimpleTestCase):
             with self.subTest(module=module.__name__), patch.object(module.logger, "info") as log_info:
                 module._log_event(request, "log008_canary_event")
                 args = log_info.call_args.args
-                rendered = args[0] % args[1:]
-                self.assertIn('"route": "/api/share/(?P<share_token>[A-Za-z0-9_-]{32,128})"', rendered)
+                self.assertEqual(len(args), 1)
+                rendered = args[0]
+                payload = json.loads(rendered)
+                self.assertEqual(payload["route"], "/api/share/(?P<share_token>[A-Za-z0-9_-]{32,128})")
                 self.assertNotIn("LOG008_", rendered)
 
     def test_production_entrypoint_selects_safe_logger_and_format(self):

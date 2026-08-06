@@ -5,13 +5,23 @@ from gunicorn.glogging import Logger
 
 ACCESS_ROUTE_ENV = "camellia.access_route"
 REQUEST_ID_ENV = "camellia.request_id"
+TRACE_ID_ENV = "camellia.trace_id"
+SPAN_ID_ENV = "camellia.span_id"
+EVENT_ID_ENV = "camellia.event_id"
 REQUEST_ID_HEADER = "X-Request-ID"
 SAFE_ACCESS_LOG_FORMAT = (
-    "method=%(m)s route=%(route)s status=%(s)s bytes=%(B)s duration_us=%(D)s request_id=%(request_id)s"
+    "method=%(m)s route=%(route)s status=%(s)s bytes=%(B)s duration_us=%(D)s "
+    "request_id=%(request_id)s trace_id=%(trace_id)s span_id=%(span_id)s event_id=%(event_id)s"
 )
 
 _METHOD_RE = re.compile(r"[A-Z]{1,16}\Z", re.ASCII)
 _REQUEST_ID_RE = re.compile(r"[0-9a-f]{32}\Z", re.ASCII)
+_TRACE_ID_RE = re.compile(r"[0-9a-f]{32}\Z", re.ASCII)
+_SPAN_ID_RE = re.compile(r"[0-9a-f]{16}\Z", re.ASCII)
+_EVENT_ID_RE = re.compile(
+    r"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\Z",
+    re.ASCII,
+)
 _ROUTE_RE = re.compile(r"[!-~]{1,256}\Z", re.ASCII)
 _STATUS_RE = re.compile(r"[1-5][0-9]{2}\Z", re.ASCII)
 
@@ -49,6 +59,13 @@ def safe_request_id(environ):
     return "<missing>"
 
 
+def _safe_correlation(environ, key, pattern, *, allow_missing=False):
+    value = environ.get(key)
+    if isinstance(value, str) and pattern.fullmatch(value) and value.strip("0"):
+        return value
+    return "-" if allow_missing else "<missing>"
+
+
 def _safe_status(resp):
     status = str(getattr(resp, "status", "")).split(None, 1)[0]
     return status if _STATUS_RE.fullmatch(status) else "000"
@@ -81,6 +98,9 @@ class SafeAccessLogger(Logger):
             "B": _safe_bytes(resp),
             "D": _duration_microseconds(request_time),
             "request_id": safe_request_id(environ),
+            "trace_id": _safe_correlation(environ, TRACE_ID_ENV, _TRACE_ID_RE),
+            "span_id": _safe_correlation(environ, SPAN_ID_ENV, _SPAN_ID_RE),
+            "event_id": _safe_correlation(environ, EVENT_ID_ENV, _EVENT_ID_RE, allow_missing=True),
         }
 
 
@@ -94,10 +114,14 @@ class SafeDjangoRequestFilter(Filter):
         status = str(getattr(record, "status_code", ""))
         if not _STATUS_RE.fullmatch(status):
             status = "000"
-        record.msg = "request status=%s route=%s request_id=%s"
+        environ = getattr(request, "META", {})
+        record.msg = "request status=%s route=%s request_id=%s trace_id=%s span_id=%s event_id=%s"
         record.args = (
             status,
             normalized_route(getattr(request, "resolver_match", None)),
-            safe_request_id(getattr(request, "META", {})),
+            safe_request_id(environ),
+            _safe_correlation(environ, TRACE_ID_ENV, _TRACE_ID_RE),
+            _safe_correlation(environ, SPAN_ID_ENV, _SPAN_ID_RE),
+            _safe_correlation(environ, EVENT_ID_ENV, _EVENT_ID_RE, allow_missing=True),
         )
         return True

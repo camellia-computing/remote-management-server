@@ -83,7 +83,7 @@ from api.policy_generation import (
 from api.rate_limits import enforce_authenticated_rate_limit
 from api.request_utils import client_ip, load_json_body, load_json_object
 from api.tag_colors import normalize_tag_color
-from camellia_remote_management.access_logging import normalized_route
+from camellia_remote_management.observability import log_structured_event
 
 logger = logging.getLogger(__name__)
 EFFECTIVE_SECONDS = 7200
@@ -734,17 +734,12 @@ def _log_event(request, event, level="info", **extra):
     username = (
         user.username if user and getattr(user, "is_authenticated", False) else extra.pop("username", "anonymous")
     )
-    payload = {
-        "event": event,
+    attributes = {
         "user": username,
         "ip": get_client_ip(request),
-        "route": normalized_route(getattr(request, "resolver_match", None)),
-        "method": getattr(request, "method", ""),
     }
-    payload.update({k: v for k, v in extra.items() if v is not None})
-    details = json.dumps(payload, ensure_ascii=False, default=str)
-    log_fn = getattr(logger, level, logger.info)
-    log_fn("event=%s details=%s", event, details)
+    attributes.update({k: v for k, v in extra.items() if v is not None})
+    log_structured_event(logger, request, event, level=level, attributes=attributes)
 
 
 _record_file_lock = recording_uploads._record_file_lock
