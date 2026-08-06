@@ -11,7 +11,7 @@ from api import recording_crypto
 class RecordingEncryptionMigrationTests(TransactionTestCase):
     migrate_from = ("api", "0015_persistent_ingestion_governance")
     migrate_to = ("api", "0016_recording_encryption")
-    migrate_latest = ("api", "0017_recording_inventory_backup")
+    migrate_latest = ("api", "0018_connection_audit_lease")
 
     def test_empty_recording_inventory_migrates_to_required_encryption_fields(self):
         executor = MigrationExecutor(connection)
@@ -62,6 +62,7 @@ class RecordingEncryptionMigrationTests(TransactionTestCase):
 class RecordingInventoryMigrationTests(TransactionTestCase):
     migrate_from = ("api", "0016_recording_encryption")
     migrate_to = ("api", "0017_recording_inventory_backup")
+    migrate_latest = ("api", "0018_connection_audit_lease")
 
     def test_empty_encrypted_inventory_adds_required_object_and_backup_authority(self):
         executor = MigrationExecutor(connection)
@@ -84,7 +85,7 @@ class RecordingInventoryMigrationTests(TransactionTestCase):
             control = apps.get_model("api", "RecordingBackupControl").objects.get(singleton=1)
             self.assertIsNone(control.active_epoch_id)
         finally:
-            MigrationExecutor(connection).migrate([self.migrate_to])
+            MigrationExecutor(connection).migrate([self.migrate_latest])
 
     def test_pre_inventory_encrypted_rows_block_storage_layout_cutover(self):
         executor = MigrationExecutor(connection)
@@ -113,4 +114,4 @@ class RecordingInventoryMigrationTests(TransactionTestCase):
         finally:
             if old_upload_model is not None:
                 old_upload_model.objects.all().delete()
-            MigrationExecutor(connection).migrate([self.migrate_to])
+            MigrationExecutor(connection).migrate([self.migrate_latest])

@@ -496,6 +496,21 @@ class RemoteDeviceAdmin(admin.ModelAdmin):
 
 
 class ConnLog(models.Model):
+    STATE_STARTING = "starting"
+    STATE_ACTIVE = "active"
+    STATE_CLOSED = "closed"
+    STATE_ABORTED = "aborted"
+    STATE_EXPIRED = "expired"
+    OPEN_STATES = (STATE_STARTING, STATE_ACTIVE)
+    TERMINAL_STATES = (STATE_CLOSED, STATE_ABORTED, STATE_EXPIRED)
+    STATES = (
+        (STATE_STARTING, "Starting"),
+        (STATE_ACTIVE, "Active"),
+        (STATE_CLOSED, "Closed"),
+        (STATE_ABORTED, "Aborted"),
+        (STATE_EXPIRED, "Expired"),
+    )
+
     id = models.AutoField(verbose_name="ID", primary_key=True)
     guid = models.UUIDField(
         verbose_name="GUID",
@@ -528,6 +543,15 @@ class ConnLog(models.Model):
     controller_device_generation = models.PositiveBigIntegerField(null=True, blank=True, editable=False)
     controller_owner_id_at_bind = models.PositiveBigIntegerField(null=True, blank=True, editable=False)
     event_revision = models.PositiveBigIntegerField(default=0, editable=False)
+    state = models.CharField(max_length=12, choices=STATES, default=STATE_EXPIRED, editable=False)
+    state_revision = models.PositiveBigIntegerField(default=0, editable=False)
+    last_seen_at = models.DateTimeField(null=True, blank=True, editable=False)
+    lease_expires_at = models.DateTimeField(null=True, blank=True, editable=False)
+    heartbeat_revision = models.PositiveBigIntegerField(default=0, editable=False)
+    last_heartbeat_id = models.UUIDField(null=True, blank=True, editable=False)
+    terminal_at = models.DateTimeField(null=True, blank=True, editable=False)
+    terminal_reason = models.CharField(max_length=64, blank=True, default="", editable=False)
+    terminal_source = models.CharField(max_length=32, blank=True, default="", editable=False)
     retention_hold = models.BooleanField(default=False, db_index=True, editable=False)
     retention_hold_reason = models.CharField(max_length=512, blank=True, default="", editable=False)
     retention_hold_at = models.DateTimeField(null=True, blank=True, editable=False)
@@ -611,19 +635,61 @@ class ConnLog(models.Model):
             ),
             models.UniqueConstraint(
                 fields=["host_device", "create_id"],
-                condition=models.Q(audit_version=2),
+                condition=models.Q(audit_version__in=(2, 3)),
                 name="unique_connection_audit_create",
             ),
             models.CheckConstraint(
                 condition=models.Q(audit_version=1)
                 | models.Q(
-                    audit_version=2,
+                    audit_version__in=(2, 3),
                     create_id__isnull=False,
                     host_device_id_at_create__isnull=False,
                     owner_id_at_create__isnull=False,
                     event_revision__gte=1,
                 ),
                 name="valid_connection_audit_authority",
+            ),
+            models.CheckConstraint(
+                condition=(
+                    models.Q(
+                        state__in=("starting", "active"),
+                        state_revision__gte=1,
+                        last_seen_at__isnull=False,
+                        lease_expires_at__isnull=False,
+                        terminal_at__isnull=True,
+                        terminal_reason="",
+                        terminal_source="",
+                        conn_end__isnull=True,
+                    )
+                    | models.Q(
+                        state__in=("closed", "aborted"),
+                        state_revision__gte=1,
+                        last_seen_at__isnull=False,
+                        lease_expires_at__isnull=False,
+                        terminal_at__isnull=False,
+                        terminal_reason__gt="",
+                        terminal_source__gt="",
+                        conn_end__isnull=False,
+                    )
+                    | models.Q(
+                        state="expired",
+                        state_revision__gte=1,
+                        last_seen_at__isnull=False,
+                        lease_expires_at__isnull=False,
+                        terminal_at__isnull=False,
+                        terminal_reason__gt="",
+                        terminal_source__gt="",
+                        conn_end__isnull=True,
+                    )
+                ),
+                name="valid_connection_audit_lifecycle",
+            ),
+            models.CheckConstraint(
+                condition=(
+                    models.Q(heartbeat_revision=0, last_heartbeat_id__isnull=True)
+                    | models.Q(heartbeat_revision__gte=1, last_heartbeat_id__isnull=False)
+                ),
+                name="valid_connection_heartbeat_identity",
             ),
         ]
         indexes = [
@@ -636,8 +702,12 @@ class ConnLog(models.Model):
                 name="connection_started_lookup",
             ),
             models.Index(
-                fields=["retention_hold", "conn_end"],
-                name="connection_retention_idx",
+                fields=["state", "lease_expires_at"],
+                name="connection_lease_idx",
+            ),
+            models.Index(
+                fields=["retention_hold", "terminal_at"],
+                name="connection_terminal_idx",
             ),
         ]
 
@@ -650,6 +720,8 @@ class ConnectionAuditEvent(models.Model):
     KIND_FILE = "file"
     KIND_ALARM = "alarm"
     KIND_CLOSED = "closed"
+    KIND_ABORTED = "aborted"
+    KIND_EXPIRED = "expired"
     KINDS = (
         (KIND_OPENED, "Opened"),
         (KIND_AUTHORIZED, "Authorized"),
@@ -658,6 +730,8 @@ class ConnectionAuditEvent(models.Model):
         (KIND_FILE, "File"),
         (KIND_ALARM, "Alarm"),
         (KIND_CLOSED, "Closed"),
+        (KIND_ABORTED, "Aborted"),
+        (KIND_EXPIRED, "Expired"),
     )
 
     id = models.AutoField(verbose_name="ID", primary_key=True)
@@ -710,11 +784,14 @@ class ConnLogAdmin(admin.ModelAdmin):
         "two_factor",
         "host_device",
         "controller_device",
+        "state",
+        "last_seen_at",
+        "terminal_at",
         "conn_start",
         "conn_end",
     )
     search_fields = ("guid", "from_ip", "from_id", "rid", "session_id", "audit_ref")
-    list_filter = ("conn_type", "primary_auth", "two_factor", "conn_start", "conn_end")
+    list_filter = ("state", "conn_type", "primary_auth", "two_factor", "conn_start", "terminal_at")
 
     def has_add_permission(self, request):
         return False
@@ -797,7 +874,7 @@ class FileLog(models.Model):
             ),
             models.CheckConstraint(
                 condition=models.Q(audit_version=1)
-                | models.Q(audit_version=2, connection__isnull=False, event__isnull=False),
+                | models.Q(audit_version__in=(2, 3), connection__isnull=False, event__isnull=False),
                 name="valid_file_audit_binding",
             ),
         ]
@@ -1347,7 +1424,7 @@ class AlarmLog(models.Model):
             ),
             models.CheckConstraint(
                 condition=models.Q(audit_version=1)
-                | models.Q(audit_version=2, connection__isnull=False, event__isnull=False),
+                | models.Q(audit_version__in=(2, 3), connection__isnull=False, event__isnull=False),
                 name="valid_alarm_audit_binding",
             ),
         ]

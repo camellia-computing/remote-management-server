@@ -40,7 +40,7 @@ class AuditSessionStateMachineTests(ApiTestMixin, TestCase):
 
     def _connection_event(self, action, **overrides):
         payload = {
-            "version": 2,
+            "version": 3,
             "event_id": str(uuid.uuid4()),
             "action": action,
             "id": "111111111",
@@ -115,6 +115,9 @@ class AuditSessionStateMachineTests(ApiTestMixin, TestCase):
         ConnLog.objects.filter(pk=connection.pk).update(
             conn_start=old - datetime.timedelta(hours=1),
             conn_end=old,
+            last_seen_at=old,
+            lease_expires_at=old,
+            terminal_at=old,
             retention_hold=True,
             retention_hold_reason="test hold",
             retention_hold_at=timezone.now(),
@@ -142,6 +145,7 @@ class AuditSessionStateMachineTests(ApiTestMixin, TestCase):
         response = self._post_json(
             "/api/audit/conn",
             {
+                "version": 2,
                 "action": "new",
                 "id": "111111111",
                 "uuid": self.host_uuid,
@@ -154,6 +158,7 @@ class AuditSessionStateMachineTests(ApiTestMixin, TestCase):
         )
 
         self.assertEqual(response.status_code, 426, response.content)
+        self.assertEqual(response.json()["required_version"], 3)
 
     def test_closed_connection_facts_cannot_be_rewritten(self):
         connection, audit_session_id = self._open_connection()
@@ -180,7 +185,8 @@ class AuditSessionStateMachineTests(ApiTestMixin, TestCase):
             two_factor=1,
         )
         self.assertEqual(replayed_open.status_code, 200, replayed_open.content)
-        self.assertEqual(replayed_authorization.status_code, 200, replayed_authorization.content)
+        self.assertEqual(replayed_open.json()["state"], ConnLog.STATE_CLOSED)
+        self.assertEqual(replayed_authorization.status_code, 409, replayed_authorization.content)
 
         rewritten = self._connection_event(
             "update",
@@ -201,12 +207,172 @@ class AuditSessionStateMachineTests(ApiTestMixin, TestCase):
         self.assertEqual(connection.audit_ref, "initial-ref")
         self.assertEqual(connection.note, "")
 
+    @override_settings(AUDIT_CONNECTION_LEASE_SECONDS=60)
+    def test_heartbeat_is_monotonic_idempotent_and_cannot_revive_an_expired_session(self):
+        connection, audit_session_id = self._open_connection()
+        heartbeat_id = str(uuid.uuid4())
+        payload = {
+            "event_id": heartbeat_id,
+            "heartbeat_revision": 1,
+            "audit_session_id": audit_session_id,
+        }
+        heartbeat = self._connection_event("heartbeat", **payload)
+        self.assertEqual(heartbeat.status_code, 200, heartbeat.content)
+        self.assertEqual(heartbeat.json()["heartbeat_revision"], 1)
+        self.assertEqual(heartbeat.json()["state"], ConnLog.STATE_ACTIVE)
+        connection.refresh_from_db()
+        first_deadline = connection.lease_expires_at
+
+        replay = self._connection_event("heartbeat", **payload)
+        conflict = self._connection_event(
+            "heartbeat",
+            event_id=str(uuid.uuid4()),
+            heartbeat_revision=1,
+            audit_session_id=audit_session_id,
+        )
+        self.assertEqual(replay.status_code, 200, replay.content)
+        self.assertEqual(conflict.status_code, 409, conflict.content)
+        connection.refresh_from_db()
+        self.assertEqual(connection.lease_expires_at, first_deadline)
+        self.assertEqual(connection.event_revision, 2)
+
+        stale = timezone.now() - datetime.timedelta(seconds=1)
+        ConnLog.objects.filter(pk=connection.pk).update(
+            last_seen_at=stale - datetime.timedelta(seconds=60),
+            lease_expires_at=stale,
+        )
+        late = self._connection_event(
+            "heartbeat",
+            event_id=str(uuid.uuid4()),
+            heartbeat_revision=2,
+            audit_session_id=audit_session_id,
+        )
+        self.assertEqual(late.status_code, 409, late.content)
+        connection.refresh_from_db()
+        self.assertEqual(connection.state, ConnLog.STATE_EXPIRED)
+        self.assertIsNone(connection.conn_end)
+        self.assertEqual(connection.terminal_reason, "telemetry_lost")
+        self.assertEqual(connection.events.order_by("sequence").last().kind, ConnectionAuditEvent.KIND_EXPIRED)
+
+    @override_settings(AUDIT_CONNECTION_LEASE_SECONDS=60, AUDIT_RETENTION_DAYS=1)
+    def test_cleanup_reconciles_a_crashed_host_without_forging_a_normal_close(self):
+        opened = self._connection_event(
+            "new",
+            ip="192.0.2.10",
+            type=0,
+            conn_audit_ref="crash-ref",
+        )
+        self.assertEqual(opened.status_code, 201, opened.content)
+        connection = ConnLog.objects.get()
+        stale = timezone.now() - datetime.timedelta(seconds=1)
+        ConnLog.objects.filter(pk=connection.pk).update(
+            last_seen_at=stale - datetime.timedelta(seconds=60),
+            lease_expires_at=stale,
+        )
+
+        output = StringIO()
+        with (
+            tempfile.TemporaryDirectory() as recording_root,
+            override_settings(RECORD_UPLOAD_ROOT=Path(recording_root), RECORD_UPLOAD_REQUIRE_MOUNT=False),
+        ):
+            call_command("purge_expired_state", batch_size=10, stdout=output)
+
+        result = json.loads(output.getvalue())
+        self.assertEqual(result["audit_connections_expired"], 1)
+        connection.refresh_from_db()
+        self.assertEqual(connection.state, ConnLog.STATE_EXPIRED)
+        self.assertEqual(connection.terminal_source, "cleanup_reconciler")
+        self.assertIsNone(connection.conn_end)
+        self.assertEqual(connection.events.count(), 2)
+        usage = PersistentIngestionUsage.objects.get(kind="audit", scope="global")
+        self.assertEqual((usage.items, usage.events), (1, 2))
+
+        old_terminal = timezone.now() - datetime.timedelta(days=2)
+        ConnLog.objects.filter(pk=connection.pk).update(terminal_at=old_terminal)
+        with (
+            tempfile.TemporaryDirectory() as recording_root,
+            override_settings(RECORD_UPLOAD_ROOT=Path(recording_root), RECORD_UPLOAD_REQUIRE_MOUNT=False),
+        ):
+            call_command("purge_expired_state", batch_size=10, stdout=StringIO())
+
+        self.assertFalse(ConnLog.objects.filter(pk=connection.pk).exists())
+        self.assertEqual(ConnectionAuditEvent.objects.count(), 0)
+        for usage in PersistentIngestionUsage.objects.filter(kind="audit"):
+            self.assertEqual((usage.items, usage.events), (0, 0))
+
+    def test_close_distinguishes_normal_and_pre_authorization_terminal_states(self):
+        opened = self._connection_event("new", ip="192.0.2.10", type=0)
+        self.assertEqual(opened.status_code, 201, opened.content)
+        aborted = self._connection_event("close", audit_session_id=opened.json()["audit_session_id"])
+        self.assertEqual(aborted.status_code, 200, aborted.content)
+        self.assertEqual(aborted.json()["state"], ConnLog.STATE_ABORTED)
+        connection = ConnLog.objects.get()
+        self.assertEqual(connection.events.order_by("sequence").last().kind, ConnectionAuditEvent.KIND_ABORTED)
+        self.assertIsNotNone(connection.conn_end)
+
+    def test_heartbeat_then_close_is_terminal_and_rejects_a_late_heartbeat(self):
+        connection, audit_session_id = self._open_connection()
+        heartbeat = self._connection_event(
+            "heartbeat",
+            heartbeat_revision=1,
+            audit_session_id=audit_session_id,
+        )
+        self.assertEqual(heartbeat.status_code, 200, heartbeat.content)
+
+        closed = self._connection_event("close", audit_session_id=audit_session_id)
+        self.assertEqual(closed.status_code, 200, closed.content)
+        self.assertEqual(closed.json()["state"], ConnLog.STATE_CLOSED)
+        self.assertEqual(closed.json()["heartbeat_revision"], 1)
+        self.assertEqual(closed.json()["lease_remaining_seconds"], 0)
+
+        late_heartbeat = self._connection_event(
+            "heartbeat",
+            heartbeat_revision=2,
+            audit_session_id=audit_session_id,
+        )
+        self.assertEqual(late_heartbeat.status_code, 409, late_heartbeat.content)
+        self.assertEqual(late_heartbeat.json()["state"], ConnLog.STATE_CLOSED)
+        connection.refresh_from_db()
+        self.assertEqual(connection.state, ConnLog.STATE_CLOSED)
+        self.assertEqual(connection.heartbeat_revision, 1)
+        self.assertEqual(connection.events.order_by("sequence").last().kind, ConnectionAuditEvent.KIND_CLOSED)
+
+    def test_controller_cannot_bind_a_session_after_its_host_lease_expires(self):
+        connection, _audit_session_id = self._open_connection()
+        stale = timezone.now() - datetime.timedelta(seconds=1)
+        ConnLog.objects.filter(pk=connection.pk).update(
+            last_seen_at=stale - datetime.timedelta(seconds=90),
+            lease_expires_at=stale,
+        )
+        controller_password = uuid.uuid4().hex
+        controller = UserProfile.objects.create_user(username="expired-controller", password=controller_password)
+        controller_uuid = device_uuid("audit-expired-controller")
+        self._device(owner=controller, rid="222222222", uuid=controller_uuid)
+        controller_token = self._login(
+            "expired-controller",
+            controller_password,
+            rid="222222222",
+            uuid=controller_uuid,
+        )
+
+        active = self.client.get(
+            f"/api/audit/conn/active?version=3&event_id={uuid.uuid4()}&id=111111111&session_id=99&conn_type=0",
+            **self._auth_headers(controller_token),
+        )
+
+        self.assertEqual(active.status_code, 409, active.content)
+        self.assertEqual(active.json()["state"], ConnLog.STATE_EXPIRED)
+        connection.refresh_from_db()
+        self.assertEqual(connection.state, ConnLog.STATE_EXPIRED)
+        self.assertIsNone(connection.actor_id)
+        self.assertIsNone(connection.conn_end)
+
     def test_file_and_alarm_require_an_existing_active_connection(self):
         nonexistent_session_id = str(uuid.uuid4())
         file_response = self._post_json(
             "/api/audit/file",
             {
-                "version": 2,
+                "version": 3,
                 "event_id": str(uuid.uuid4()),
                 "audit_session_id": nonexistent_session_id,
                 "id": "111111111",
@@ -228,7 +394,7 @@ class AuditSessionStateMachineTests(ApiTestMixin, TestCase):
         alarm_response = self._post_json(
             "/api/audit/alarm",
             {
-                "version": 2,
+                "version": 3,
                 "event_id": str(uuid.uuid4()),
                 "audit_session_id": nonexistent_session_id,
                 "id": "111111111",
@@ -249,7 +415,7 @@ class AuditSessionStateMachineTests(ApiTestMixin, TestCase):
         unbound_file = self._post_json(
             "/api/audit/file",
             {
-                "version": 2,
+                "version": 3,
                 "event_id": str(uuid.uuid4()),
                 "audit_session_id": unbound_session_id,
                 "id": "111111111",
@@ -266,7 +432,7 @@ class AuditSessionStateMachineTests(ApiTestMixin, TestCase):
         unbound_alarm = self._post_json(
             "/api/audit/alarm",
             {
-                "version": 2,
+                "version": 3,
                 "event_id": str(uuid.uuid4()),
                 "audit_session_id": unbound_session_id,
                 "id": "111111111",
@@ -303,13 +469,13 @@ class AuditSessionStateMachineTests(ApiTestMixin, TestCase):
         )
 
         active = self.client.get(
-            f"/api/audit/conn/active?version=2&event_id={uuid.uuid4()}&id=111111111&session_id=99&conn_type=0",
+            f"/api/audit/conn/active?version=3&event_id={uuid.uuid4()}&id=111111111&session_id=99&conn_type=0",
             **self._auth_headers(controller_token),
         )
         note = self._post_json(
             "/api/audit/conn",
             {
-                "version": 2,
+                "version": 3,
                 "event_id": str(uuid.uuid4()),
                 "audit_session_id": audit_session_id,
                 "note": "after close",
@@ -356,15 +522,19 @@ class AuditSessionStateMachineTests(ApiTestMixin, TestCase):
         )
         bind_event_id = str(uuid.uuid4())
         active = self.client.get(
-            f"/api/audit/conn/active?version=2&event_id={bind_event_id}&id=111111111&session_id=99&conn_type=0",
+            f"/api/audit/conn/active?version=3&event_id={bind_event_id}&id=111111111&session_id=99&conn_type=0",
             **self._auth_headers(controller_token),
         )
         self.assertEqual(active.status_code, 200, active.content)
         self.assertEqual(active.json()["audit_session_id"], audit_session_id)
+        self.assertEqual(active.json()["acknowledged_event_id"], bind_event_id)
+        self.assertEqual(active.json()["version"], 3)
+        self.assertEqual(active.json()["state"], ConnLog.STATE_ACTIVE)
+        self.assertGreater(active.json()["lease_remaining_seconds"], 0)
 
         note_event_id = str(uuid.uuid4())
         note_payload = {
-            "version": 2,
+            "version": 3,
             "event_id": note_event_id,
             "audit_session_id": audit_session_id,
             "note": "approved",
@@ -373,11 +543,14 @@ class AuditSessionStateMachineTests(ApiTestMixin, TestCase):
         replayed_note = self._post_json("/api/audit/conn", note_payload, token=controller_token)
         self.assertEqual(note.status_code, 200, note.content)
         self.assertEqual(replayed_note.status_code, 200, replayed_note.content)
-        self.assertEqual(note.json()["revision"], replayed_note.json()["revision"])
+        self.assertEqual(note.json()["acknowledged_event_id"], note_event_id)
+        self.assertEqual(note.json()["state"], ConnLog.STATE_ACTIVE)
+        self.assertGreater(note.json()["lease_remaining_seconds"], 0)
+        self.assertEqual(note.json()["event_revision"], replayed_note.json()["event_revision"])
         revised_note = self._post_json(
             "/api/audit/conn",
             {
-                "version": 2,
+                "version": 3,
                 "event_id": str(uuid.uuid4()),
                 "audit_session_id": audit_session_id,
                 "note": "revised",
@@ -388,7 +561,7 @@ class AuditSessionStateMachineTests(ApiTestMixin, TestCase):
 
         file_event_id = str(uuid.uuid4())
         file_payload = {
-            "version": 2,
+            "version": 3,
             "event_id": file_event_id,
             "audit_session_id": audit_session_id,
             "id": "111111111",
@@ -409,7 +582,7 @@ class AuditSessionStateMachineTests(ApiTestMixin, TestCase):
         self.assertEqual(file_response.status_code, 200, file_response.content)
         alarm_event_id = str(uuid.uuid4())
         alarm_payload = {
-            "version": 2,
+            "version": 3,
             "event_id": alarm_event_id,
             "audit_session_id": audit_session_id,
             "id": "111111111",
@@ -425,7 +598,7 @@ class AuditSessionStateMachineTests(ApiTestMixin, TestCase):
         self.assertEqual(closed.status_code, 200, closed.content)
 
         replayed_bind = self.client.get(
-            f"/api/audit/conn/active?version=2&event_id={bind_event_id}&id=111111111&session_id=99&conn_type=0",
+            f"/api/audit/conn/active?version=3&event_id={bind_event_id}&id=111111111&session_id=99&conn_type=0",
             **self._auth_headers(controller_token),
         )
         replayed_note_after_close = self._post_json(
@@ -443,12 +616,8 @@ class AuditSessionStateMachineTests(ApiTestMixin, TestCase):
             alarm_payload,
             token=self.host_token,
         )
-        for replayed in (
-            replayed_bind,
-            replayed_note_after_close,
-            replayed_file_after_close,
-            replayed_alarm_after_close,
-        ):
+        self.assertEqual(replayed_bind.status_code, 409, replayed_bind.content)
+        for replayed in (replayed_note_after_close, replayed_file_after_close, replayed_alarm_after_close):
             self.assertEqual(replayed.status_code, 200, replayed.content)
 
         connection.refresh_from_db()
@@ -487,7 +656,7 @@ class AuditSessionStateMachineTests(ApiTestMixin, TestCase):
         after_close = self._post_json(
             "/api/audit/alarm",
             {
-                "version": 2,
+                "version": 3,
                 "event_id": str(uuid.uuid4()),
                 "audit_session_id": audit_session_id,
                 "id": "111111111",
@@ -507,7 +676,7 @@ class AuditSessionStateMachineTests(ApiTestMixin, TestCase):
         conflict = self._post_json(
             "/api/audit/conn",
             {
-                "version": 2,
+                "version": 3,
                 "event_id": str(authorized_event.event_id),
                 "audit_session_id": audit_session_id,
                 "action": "update",
@@ -551,7 +720,7 @@ class AuditSessionStateMachineTests(ApiTestMixin, TestCase):
             uuid=controller_uuid,
         )
         active = self.client.get(
-            f"/api/audit/conn/active?version=2&event_id={uuid.uuid4()}&id=111111111&session_id=99&conn_type=0",
+            f"/api/audit/conn/active?version=3&event_id={uuid.uuid4()}&id=111111111&session_id=99&conn_type=0",
             **self._auth_headers(controller_token),
         )
         self.assertEqual(active.status_code, 200, active.content)
@@ -570,7 +739,7 @@ class AuditSessionStateMachineTests(ApiTestMixin, TestCase):
         rejected = self._post_json(
             "/api/audit/file",
             {
-                "version": 2,
+                "version": 3,
                 "event_id": str(uuid.uuid4()),
                 "audit_session_id": audit_session_id,
                 "id": "111111111",
@@ -612,7 +781,7 @@ class AuditSessionStateMachineTests(ApiTestMixin, TestCase):
             uuid=controller_uuid,
         )
         active = self.client.get(
-            f"/api/audit/conn/active?version=2&event_id={uuid.uuid4()}&id=111111111&session_id=99&conn_type=0",
+            f"/api/audit/conn/active?version=3&event_id={uuid.uuid4()}&id=111111111&session_id=99&conn_type=0",
             **self._auth_headers(controller_token),
         )
         self.assertEqual(active.status_code, 200, active.content)
@@ -636,16 +805,16 @@ class AuditSessionStateMachineTests(ApiTestMixin, TestCase):
         )
         self.assertEqual(rejected.status_code, 401, rejected.content)
 
-    def test_database_rejects_unbound_v2_children_and_duplicate_sequences(self):
+    def test_database_rejects_unbound_v3_children_and_duplicate_sequences(self):
         connection, _audit_session_id = self._open_connection()
         for create in (
             lambda: FileLog.objects.create(
-                audit_version=2,
+                audit_version=3,
                 file="/forged",
                 user_ip="192.0.2.10",
             ),
             lambda: AlarmLog.objects.create(
-                audit_version=2,
+                audit_version=3,
                 typ=AlarmLog.TYPE_SESSION_SCOPE_VIOLATION,
                 reporter_device_id="111111111",
             ),
@@ -685,7 +854,7 @@ class AuditSessionConcurrencyTests(ApiTestMixin, TransactionTestCase):
 
     def _host_event(self, action, **overrides):
         payload = {
-            "version": 2,
+            "version": 3,
             "event_id": str(uuid.uuid4()),
             "action": action,
             "id": "111111111",
@@ -720,7 +889,7 @@ class AuditSessionConcurrencyTests(ApiTestMixin, TransactionTestCase):
             uuid=controller_uuid,
         )
         active = self.client.get(
-            f"/api/audit/conn/active?version=2&event_id={uuid.uuid4()}&id=111111111&session_id=99&conn_type=0",
+            f"/api/audit/conn/active?version=3&event_id={uuid.uuid4()}&id=111111111&session_id=99&conn_type=0",
             **self._auth_headers(controller_token),
         )
         self.assertEqual(active.status_code, 200, active.content)
@@ -749,7 +918,7 @@ class AuditSessionConcurrencyTests(ApiTestMixin, TransactionTestCase):
 
     def _file_payload(self, event_id):
         return {
-            "version": 2,
+            "version": 3,
             "event_id": event_id,
             "audit_session_id": self.audit_session_id,
             "id": "111111111",
@@ -769,7 +938,7 @@ class AuditSessionConcurrencyTests(ApiTestMixin, TransactionTestCase):
 
     def _alarm_payload(self, event_id):
         return {
-            "version": 2,
+            "version": 3,
             "event_id": event_id,
             "audit_session_id": self.audit_session_id,
             "id": "111111111",
@@ -818,6 +987,67 @@ class AuditSessionConcurrencyTests(ApiTestMixin, TransactionTestCase):
         self.assertEqual(FileLog.objects.count(), 1)
         self.assertEqual(AlarmLog.objects.count(), 1)
 
+    def test_concurrent_heartbeat_and_close_have_only_valid_serializations(self):
+        self._authorize_and_bind_controller()
+        heartbeat_event_id = str(uuid.uuid4())
+        close_event_id = str(uuid.uuid4())
+        responses = self._post_concurrently(
+            [
+                (
+                    "/api/audit/conn",
+                    {
+                        "version": 3,
+                        "event_id": heartbeat_event_id,
+                        "action": "heartbeat",
+                        "heartbeat_revision": 1,
+                        "audit_session_id": self.audit_session_id,
+                        "id": "111111111",
+                        "uuid": self.host_uuid,
+                        "conn_id": 7,
+                        "session_id": 99,
+                    },
+                ),
+                (
+                    "/api/audit/conn",
+                    {
+                        "version": 3,
+                        "event_id": close_event_id,
+                        "action": "close",
+                        "audit_session_id": self.audit_session_id,
+                        "id": "111111111",
+                        "uuid": self.host_uuid,
+                        "conn_id": 7,
+                        "session_id": 99,
+                    },
+                ),
+            ]
+        )
+
+        heartbeat_status, heartbeat_body = responses[0]
+        close_status, close_body = responses[1]
+        self.assertEqual(close_status, 200, close_body)
+        self.assertIn(heartbeat_status, (200, 409), heartbeat_body)
+        self.assertEqual(close_body["state"], ConnLog.STATE_CLOSED)
+        self.assertEqual(close_body["lease_remaining_seconds"], 0)
+
+        connection_log = ConnLog.objects.get()
+        self.assertEqual(connection_log.state, ConnLog.STATE_CLOSED)
+        self.assertEqual(connection_log.event_revision, 4)
+        self.assertEqual(connection_log.events.filter(kind=ConnectionAuditEvent.KIND_CLOSED).count(), 1)
+        self.assertEqual(connection_log.heartbeat_revision, 1 if heartbeat_status == 200 else 0)
+        if heartbeat_status == 409:
+            self.assertEqual(heartbeat_body["state"], ConnLog.STATE_CLOSED)
+
+        late = self._host_event(
+            "heartbeat",
+            heartbeat_revision=connection_log.heartbeat_revision + 1,
+            audit_session_id=self.audit_session_id,
+        )
+        self.assertEqual(late.status_code, 409, late.content)
+        connection_log.refresh_from_db()
+        self.assertEqual(connection_log.state, ConnLog.STATE_CLOSED)
+        self.assertEqual(connection_log.event_revision, 4)
+
     @override_settings(
         AUDIT_MAX_EVENTS_PER_CONNECTION=10,
         AUDIT_MAX_EVENTS_PER_DEVICE=5,
@@ -838,7 +1068,7 @@ class AuditSessionConcurrencyTests(ApiTestMixin, TransactionTestCase):
 
         def update_payload(audit_session_id, conn_id, session_id, primary_auth):
             return {
-                "version": 2,
+                "version": 3,
                 "event_id": str(uuid.uuid4()),
                 "action": "update",
                 "audit_session_id": audit_session_id,
@@ -875,7 +1105,7 @@ class AuditSessionConcurrencyTests(ApiTestMixin, TransactionTestCase):
                 (
                     "/api/audit/conn",
                     {
-                        "version": 2,
+                        "version": 3,
                         "event_id": str(uuid.uuid4()),
                         "action": "update",
                         "audit_session_id": self.audit_session_id,

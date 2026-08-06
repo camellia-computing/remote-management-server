@@ -6,6 +6,7 @@ import hashlib
 import ipaddress
 import json
 import logging
+import math
 import re
 import secrets
 import uuid
@@ -28,7 +29,7 @@ from joserfc import jwt
 from joserfc.jwk import KeySet
 from joserfc.jwt import JWTClaimsRegistry
 
-from api import ingestion_governance, recording_uploads
+from api import audit_lifecycle, ingestion_governance, recording_uploads
 
 # from django.forms.models import model_to_dict
 from api.address_book_authorization import (
@@ -94,7 +95,7 @@ MAX_DEVICE_UUID_TEXT_LEN = 344
 MAX_AUDIT_INFO_BYTES = 16 * 1024
 MAX_AUDIT_NOTE_BYTES = 16 * 1024
 MAX_AUDIT_FILES = 10
-AUDIT_PROTOCOL_VERSION = 2
+AUDIT_PROTOCOL_VERSION = 3
 MAX_AB_PEERS = 10_000
 MAX_AB_TAGS = 256
 MAX_AB_TAGS_PER_PEER = 32
@@ -3204,6 +3205,12 @@ def _audit_connection_id(value):
     return value if 1 <= value <= 2_147_483_647 else None
 
 
+def _audit_revision(value):
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value if 1 <= value <= 9_223_372_036_854_775_807 else None
+
+
 def _audit_session_id(value):
     if isinstance(value, bool) or not isinstance(value, (str, int)):
         return None
@@ -3264,14 +3271,39 @@ def _audit_upgrade_required():
     )
 
 
-def _audit_success(connection_log, *, status=200):
+def _audit_success(connection_log, event_id, *, status=200):
+    now = audit_lifecycle.database_now()
+    lease_remaining = 0
+    if connection_log.state in ConnLog.OPEN_STATES and connection_log.lease_expires_at is not None:
+        lease_remaining = max(0, math.ceil((connection_log.lease_expires_at - now).total_seconds()))
     return JsonResponse(
         {
             "version": AUDIT_PROTOCOL_VERSION,
             "audit_session_id": str(connection_log.guid),
-            "revision": connection_log.event_revision,
+            "acknowledged_event_id": str(event_id),
+            "event_revision": connection_log.event_revision,
+            "state": connection_log.state,
+            "state_revision": connection_log.state_revision,
+            "heartbeat_revision": connection_log.heartbeat_revision,
+            "lease_remaining_seconds": lease_remaining,
+            "terminal_reason": connection_log.terminal_reason,
+            "terminal_source": connection_log.terminal_source,
         },
         status=status,
+    )
+
+
+def _audit_terminal_conflict(connection_log):
+    return JsonResponse(
+        {
+            "error": "Connection is not active",
+            "version": AUDIT_PROTOCOL_VERSION,
+            "state": connection_log.state,
+            "state_revision": connection_log.state_revision,
+            "terminal_reason": connection_log.terminal_reason,
+            "terminal_source": connection_log.terminal_source,
+        },
+        status=409,
     )
 
 
@@ -3352,8 +3384,11 @@ def _locked_host_audit_session(token, user, audit_session_id, *, active=True, re
         controller_device = locked_devices.get(connection_log.controller_device_id)
         if not _audit_controller_authority_is_current(connection_log, controller_device):
             return device, None, JsonResponse({"error": "Controller is not bound"}, status=403)
-    if active and connection_log.conn_end is not None:
-        return device, None, JsonResponse({"error": "Connection is closed"}, status=409)
+    if active:
+        now = audit_lifecycle.database_now()
+        audit_lifecycle.expire_locked_connection(connection_log, now, source="request_reconciler")
+        if connection_log.state not in ConnLog.OPEN_STATES:
+            return device, None, _audit_terminal_conflict(connection_log)
     return device, connection_log, None
 
 
@@ -3383,7 +3418,12 @@ def _append_audit_event(connection_log, event_id, kind, actor, reporter_device_u
         connection_log.owner_id_at_create,
         connection_log.host_device_id_at_create,
         connection_log.event_revision,
-        closes_connection=kind == ConnectionAuditEvent.KIND_CLOSED,
+        closes_connection=kind
+        in (
+            ConnectionAuditEvent.KIND_CLOSED,
+            ConnectionAuditEvent.KIND_ABORTED,
+            ConnectionAuditEvent.KIND_EXPIRED,
+        ),
     )
     sequence = connection_log.event_revision + 1
     event = ConnectionAuditEvent.objects.create(
@@ -3392,7 +3432,7 @@ def _append_audit_event(connection_log, event_id, kind, actor, reporter_device_u
         sequence=sequence,
         kind=kind,
         actor=actor,
-        actor_id_at_event=actor.id,
+        actor_id_at_event=actor.id if actor else connection_log.owner_id_at_create,
         reporter_device_uuid=reporter_device_uuid,
         details=details,
     )
@@ -3431,6 +3471,7 @@ def _audit_conn_active(request):
                     session_id=session_id,
                     from_id=controller_rid,
                 )
+                .order_by("-conn_start", "-pk")
                 .values_list("host_device_id", flat=True)
                 .first()
             )
@@ -3455,6 +3496,7 @@ def _audit_conn_active(request):
                     session_id=session_id,
                     from_id=controller_device.rid if controller_device else "",
                 )
+                .order_by("-conn_start", "-pk")
                 .first()
             )
             if not connection_log or not host_device or not controller_device:
@@ -3469,6 +3511,12 @@ def _audit_conn_active(request):
                 return JsonResponse("", safe=False, status=409)
             if connection_log.actor_id and connection_log.actor_id != user.id:
                 return JsonResponse("", safe=False, status=403)
+            now = audit_lifecycle.database_now()
+            audit_lifecycle.expire_locked_connection(connection_log, now, source="controller_query")
+            if connection_log.state != ConnLog.STATE_ACTIVE:
+                if connection_log.state == ConnLog.STATE_STARTING:
+                    return JsonResponse("", safe=False)
+                return _audit_terminal_conflict(connection_log)
             details = {
                 "controller_device_id": controller_device.rid,
                 "controller_device_pk": controller_device.id,
@@ -3488,9 +3536,7 @@ def _audit_conn_active(request):
                     details,
                 ):
                     return _audit_event_conflict()
-                return _audit_success(connection_log)
-            if connection_log.conn_end is not None:
-                return JsonResponse("", safe=False, status=409)
+                return _audit_success(connection_log, event_id)
             if connection_log.actor_id is None:
                 if connection_log.controller_device_id is not None:
                     return JsonResponse("", safe=False, status=409)
@@ -3530,7 +3576,7 @@ def _audit_conn_active(request):
         session_id=session_id,
         conn_type=conn_type,
     )
-    return _audit_success(connection_log)
+    return _audit_success(connection_log, event_id)
 
 
 def _audit_controller_note(request, postdata):
@@ -3601,9 +3647,11 @@ def _audit_controller_note_by_capability(request, postdata):
                     or existing.details.get("note") != note
                 ):
                     return _audit_event_conflict()
-                return _audit_success(connection_log)
-            if connection_log.conn_end is not None:
-                return JsonResponse({"error": "Connection is closed"}, status=409)
+                return _audit_success(connection_log, event_id)
+            observed_at = audit_lifecycle.database_now()
+            audit_lifecycle.expire_locked_connection(connection_log, observed_at, source="controller_note")
+            if connection_log.state != ConnLog.STATE_ACTIVE:
+                return _audit_terminal_conflict(connection_log)
             details = {"previous_note": connection_log.note, "note": note}
             _append_audit_event(
                 connection_log,
@@ -3618,7 +3666,7 @@ def _audit_controller_note_by_capability(request, postdata):
     except IntegrityError:
         return _audit_event_conflict()
     _log_event(request, "api_audit_note_update", username=user.username, guid=connection_log.guid)
-    return _audit_success(connection_log)
+    return _audit_success(connection_log, event_id)
 
 
 def _audit_conn(request):
@@ -3653,6 +3701,7 @@ def _audit_conn(request):
                 device = _locked_audit_device(token, user)
                 if not device:
                     return JsonResponse({"error": "Device is not active"}, status=403)
+                observed_at = audit_lifecycle.database_now()
                 connection_log = (
                     ConnLog.objects.select_for_update()
                     .filter(
@@ -3685,10 +3734,15 @@ def _audit_conn(request):
                         host_device_generation=device.deployment_generation,
                         owner_id_at_create=user.id,
                         event_revision=1,
+                        state=ConnLog.STATE_STARTING,
+                        state_revision=1,
+                        last_seen_at=observed_at,
+                        lease_expires_at=audit_lifecycle.lease_deadline(observed_at),
                         conn_id=conn_id,
                         from_ip=source_ip,
                         from_id="",
                         rid=device.rid,
+                        conn_start=observed_at,
                         session_id=session_id,
                         uuid=device.uuid,
                         conn_type=conn_type,
@@ -3714,6 +3768,9 @@ def _audit_conn(request):
                             "session_id": session_id,
                             "conn_type": conn_type,
                             "audit_ref": audit_ref,
+                            "state": ConnLog.STATE_STARTING,
+                            "state_revision": 1,
+                            "lease_seconds": settings.AUDIT_CONNECTION_LEASE_SECONDS,
                         },
                     )
                     created = True
@@ -3729,7 +3786,50 @@ def _audit_conn(request):
             session_id=session_id,
             conn_type=conn_type,
         )
-        return _audit_success(connection_log, status=201 if created else 200)
+        return _audit_success(connection_log, event_id, status=201 if created else 200)
+    elif action == "heartbeat":
+        audit_session_id = _audit_uuid4(postdata.get("audit_session_id"))
+        heartbeat_revision = _audit_revision(postdata.get("heartbeat_revision"))
+        if audit_session_id is None or heartbeat_revision is None:
+            return JsonResponse({"error": "Invalid audit heartbeat"}, status=400)
+        with transaction.atomic():
+            device, connection_log, authority_error = _locked_host_audit_session(
+                token,
+                user,
+                audit_session_id,
+            )
+            if authority_error:
+                return authority_error
+            if connection_log.conn_id != conn_id or connection_log.session_id != session_id:
+                return JsonResponse({"error": "Connection not found"}, status=404)
+            if heartbeat_revision < connection_log.heartbeat_revision:
+                return JsonResponse({"error": "Stale audit heartbeat"}, status=409)
+            if heartbeat_revision == connection_log.heartbeat_revision:
+                if connection_log.last_heartbeat_id != event_id:
+                    return JsonResponse({"error": "Audit heartbeat identity conflict"}, status=409)
+                return _audit_success(connection_log, event_id)
+            observed_at = audit_lifecycle.database_now()
+            connection_log.heartbeat_revision = heartbeat_revision
+            connection_log.last_heartbeat_id = event_id
+            audit_lifecycle.refresh_host_lease(connection_log, observed_at)
+            connection_log.save(
+                update_fields=(
+                    "heartbeat_revision",
+                    "last_heartbeat_id",
+                    "last_seen_at",
+                    "lease_expires_at",
+                )
+            )
+        _log_event(
+            request,
+            "api_audit_conn_heartbeat",
+            level="debug",
+            username=user.username,
+            conn_id=conn_id,
+            session_id=session_id,
+            heartbeat_revision=heartbeat_revision,
+        )
+        return _audit_success(connection_log, event_id)
     elif action == "close":
         audit_session_id = _audit_uuid4(postdata.get("audit_session_id"))
         if audit_session_id is None:
@@ -3750,24 +3850,60 @@ def _audit_conn(request):
                 if existing:
                     if (
                         existing.connection_id != connection_log.id
-                        or existing.kind != ConnectionAuditEvent.KIND_CLOSED
+                        or existing.kind not in (ConnectionAuditEvent.KIND_CLOSED, ConnectionAuditEvent.KIND_ABORTED)
                         or existing.actor_id != user.id
                         or existing.reporter_device_uuid != device.uuid
                     ):
                         return _audit_event_conflict()
-                    return _audit_success(connection_log)
-                if connection_log.conn_end is None:
-                    closed_at = timezone.now()
-                    _append_audit_event(
-                        connection_log,
-                        event_id,
-                        ConnectionAuditEvent.KIND_CLOSED,
-                        user,
-                        device.uuid,
-                        {"closed_at": closed_at.isoformat()},
+                    return _audit_success(connection_log, event_id)
+                terminal_at = audit_lifecycle.database_now()
+                audit_lifecycle.expire_locked_connection(connection_log, terminal_at, source="close_reconciler")
+                if connection_log.state not in ConnLog.OPEN_STATES:
+                    return _audit_terminal_conflict(connection_log)
+                event_kind = (
+                    ConnectionAuditEvent.KIND_CLOSED
+                    if connection_log.state == ConnLog.STATE_ACTIVE
+                    else ConnectionAuditEvent.KIND_ABORTED
+                )
+                terminal_state = (
+                    ConnLog.STATE_CLOSED if connection_log.state == ConnLog.STATE_ACTIVE else ConnLog.STATE_ABORTED
+                )
+                terminal_reason = "host_close" if terminal_state == ConnLog.STATE_CLOSED else "ended_before_active"
+                _append_audit_event(
+                    connection_log,
+                    event_id,
+                    event_kind,
+                    user,
+                    device.uuid,
+                    {
+                        "terminal_at": terminal_at.isoformat(),
+                        "terminal_state": terminal_state,
+                        "reason": terminal_reason,
+                        "source": "host",
+                    },
+                )
+                if connection_log.state_revision >= 9_223_372_036_854_775_807:
+                    raise IntegrityError("Audit state revision exhausted")
+                connection_log.state = terminal_state
+                connection_log.state_revision += 1
+                connection_log.last_seen_at = terminal_at
+                connection_log.lease_expires_at = terminal_at
+                connection_log.terminal_at = terminal_at
+                connection_log.terminal_reason = terminal_reason
+                connection_log.terminal_source = "host"
+                connection_log.conn_end = terminal_at
+                connection_log.save(
+                    update_fields=(
+                        "state",
+                        "state_revision",
+                        "last_seen_at",
+                        "lease_expires_at",
+                        "terminal_at",
+                        "terminal_reason",
+                        "terminal_source",
+                        "conn_end",
                     )
-                    connection_log.conn_end = closed_at
-                    connection_log.save(update_fields=["conn_end"])
+                )
         except IntegrityError:
             return _audit_event_conflict()
         _log_event(
@@ -3779,7 +3915,7 @@ def _audit_conn(request):
             peer_id=connection_log.rid,
             session_id=session_id,
         )
-        return _audit_success(connection_log)
+        return _audit_success(connection_log, event_id)
     else:
         if action not in ("", "update"):
             return JsonResponse({"error": "Invalid action"}, status=400)
@@ -3823,7 +3959,6 @@ def _audit_conn(request):
                     token,
                     user,
                     audit_session_id,
-                    active=False,
                 )
                 if authority_error:
                     return authority_error
@@ -3840,9 +3975,7 @@ def _audit_conn(request):
                         submitted,
                     ):
                         return _audit_event_conflict()
-                    return _audit_success(connection_log)
-                if connection_log.conn_end is not None:
-                    return JsonResponse({"error": "Connection is closed"}, status=409)
+                    return _audit_success(connection_log, event_id)
                 update_fields = []
                 for field, value in submitted.items():
                     previous = getattr(connection_log, field)
@@ -3852,8 +3985,20 @@ def _audit_conn(request):
                         update_fields.append(field)
                     elif previous != value:
                         return JsonResponse({"error": "Connection fact is immutable"}, status=409)
-                if update_fields:
-                    connection_log.save(update_fields=update_fields)
+                if (
+                    connection_log.state == ConnLog.STATE_STARTING
+                    and connection_log.from_id
+                    and connection_log.conn_type is not None
+                ):
+                    if connection_log.state_revision >= 9_223_372_036_854_775_807:
+                        raise IntegrityError("Audit state revision exhausted")
+                    connection_log.state = ConnLog.STATE_ACTIVE
+                    connection_log.state_revision += 1
+                    update_fields.extend(("state", "state_revision"))
+                observed_at = audit_lifecycle.database_now()
+                audit_lifecycle.refresh_host_lease(connection_log, observed_at)
+                update_fields.extend(("last_seen_at", "lease_expires_at"))
+                connection_log.save(update_fields=tuple(dict.fromkeys(update_fields)))
                 _append_audit_event(
                     connection_log,
                     event_id,
@@ -3873,7 +4018,7 @@ def _audit_conn(request):
             peer_id=connection_log.rid,
             session_id=session_id,
         )
-        return _audit_success(connection_log)
+        return _audit_success(connection_log, event_id)
 
 
 def _audit_file(request):
@@ -3959,9 +4104,13 @@ def _audit_file(request):
                     return _audit_event_conflict()
                 if not FileLog.objects.filter(event=existing, connection=connection_log).exists():
                     raise IntegrityError("File audit receipt is missing")
-                return _audit_success(connection_log)
-            if connection_log.conn_end is not None:
-                return JsonResponse({"error": "Connection is closed"}, status=409)
+                return _audit_success(connection_log, event_id)
+            observed_at = audit_lifecycle.database_now()
+            audit_lifecycle.expire_locked_connection(connection_log, observed_at, source="file_event")
+            if connection_log.state != ConnLog.STATE_ACTIVE:
+                return _audit_terminal_conflict(connection_log)
+            audit_lifecycle.refresh_host_lease(connection_log, observed_at)
+            connection_log.save(update_fields=("last_seen_at", "lease_expires_at"))
             event, created = _append_audit_event(
                 connection_log,
                 event_id,
@@ -4000,7 +4149,7 @@ def _audit_file(request):
         direction=direction,
         filesize=total_size,
     )
-    return _audit_success(connection_log)
+    return _audit_success(connection_log, event_id)
 
 
 def _audit_alarm(request):
@@ -4066,9 +4215,13 @@ def _audit_alarm(request):
                     return _audit_event_conflict()
                 if not AlarmLog.objects.filter(event=existing, connection=connection_log).exists():
                     raise IntegrityError("Alarm audit receipt is missing")
-                return _audit_success(connection_log)
-            if connection_log.conn_end is not None:
-                return JsonResponse({"error": "Connection is closed"}, status=409)
+                return _audit_success(connection_log, event_id)
+            observed_at = audit_lifecycle.database_now()
+            audit_lifecycle.expire_locked_connection(connection_log, observed_at, source="alarm_event")
+            if connection_log.state != ConnLog.STATE_ACTIVE:
+                return _audit_terminal_conflict(connection_log)
+            audit_lifecycle.refresh_host_lease(connection_log, observed_at)
+            connection_log.save(update_fields=("last_seen_at", "lease_expires_at"))
             event, created = _append_audit_event(
                 connection_log,
                 event_id,
@@ -4095,7 +4248,7 @@ def _audit_alarm(request):
     except IntegrityError:
         return _audit_event_conflict()
     _log_event(request, "api_audit_alarm", level="warning", username=user.username, typ=typ)
-    return _audit_success(connection_log)
+    return _audit_success(connection_log, event_id)
 
 
 def audit(request):
