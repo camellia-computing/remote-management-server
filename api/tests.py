@@ -738,8 +738,13 @@ class ApiContractTests(ApiTestMixin, TestCase):
         ):
             response = self.client.get("/api/down_peers")
 
-        self.assertEqual(response.status_code, 200, response.content)
-        workbook = load_workbook(BytesIO(response.content), read_only=True, data_only=False)
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.streaming)
+        response_body = b"".join(response.streaming_content)
+        for closer in response._resource_closers:
+            closer()
+        response._resource_closers.clear()
+        workbook = load_workbook(BytesIO(response_body), read_only=True, data_only=False)
         try:
             worksheet = workbook.active
             exported_rows = list(worksheet.iter_rows(values_only=True))
@@ -787,7 +792,7 @@ class ApiContractTests(ApiTestMixin, TestCase):
         self.assertEqual(response.headers.get("Cache-Control"), "no-store, private")
         self.assertEqual(response.headers.get("Pragma"), "no-cache")
         self.assertEqual(response.headers.get("X-Camellia-Export-Schema"), "device-inventory-v1")
-        self.assertEqual(response.headers.get("Content-Disposition"), "attachment; filename=DeviceInfo-v1.xlsx")
+        self.assertEqual(response.headers.get("Content-Disposition"), 'attachment; filename="DeviceInfo-v1.xlsx"')
 
         log_output = "\n".join(export_logs.output)
         export_payload = next(

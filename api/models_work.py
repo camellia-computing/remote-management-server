@@ -420,6 +420,15 @@ class RemoteDevice(models.Model):
         ordering = ("-rid",)
         verbose_name = _("设备")
         verbose_name_plural = _("设备列表")
+        indexes = [
+            models.Index(fields=("owner", "rid"), name="device_owner_rid_idx"),
+            models.Index(fields=("owner", "is_active", "rid"), name="device_owner_active_rid_idx"),
+            models.Index(fields=("is_active", "rid"), name="device_active_rid_idx"),
+            models.Index(
+                fields=("owner", "-update_time", "rid"),
+                name="device_owner_updated_rid_idx",
+            ),
+        ]
 
     def effective_strategy(self):
         if self.strategy_id:

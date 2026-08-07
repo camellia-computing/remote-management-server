@@ -50,6 +50,12 @@ from api.device_identity import (
     deployment_assertion,
     issue_proof_challenge,
 )
+from api.device_inventory import (
+    DeviceInventory,
+    InvalidInventoryCursor,
+    dump_inventory_cursor,
+    load_inventory_cursor,
+)
 from api.encrypted_fields import verify_key_canary
 from api.login_admission import complete_login_success, reserve_login_attempt
 from api.models import (
@@ -4990,80 +4996,38 @@ def peers(request):
     if not user:
         _log_event(request, "api_peers_unauthorized", level="warning")
         return JsonResponse({"error": "Invalid token"}, status=401)
-    current, page_size, _start, _end = _pagination(request)
-    if user.is_admin:
-        device_qs = RemoteDevice.objects.select_related(
-            "owner__strategy",
-            "device_group__strategy",
-            "strategy",
-        ).order_by("rid")
-        peer_qs = RemotePeer.objects.filter(
-            profile__guid__startswith="personal-",
-        ).select_related("profile__owner")
-    else:
-        peer_qs = RemotePeer.objects.filter(
-            profile__owner=user,
-            profile__guid=_personal_guid(user),
-        ).select_related("profile__owner")
-        device_qs = RemoteDevice.objects.filter(
-            owner=user,
-        ).select_related(
-            "owner__strategy",
-            "device_group__strategy",
-            "strategy",
-        )
-        device_qs = device_qs.order_by("rid")
-    devices = {x.rid: x for x in device_qs}
-    if user.is_admin:
-        peers_by_owner_and_rid = {(peer.profile.owner_id, peer.rid): peer for peer in peer_qs}
-        peers_by_rid = {rid: peers_by_owner_and_rid.get((device.owner_id, rid)) for rid, device in devices.items()}
-        device_ids = sorted(devices)
-    else:
-        peers_by_rid = {peer.rid: peer for peer in peer_qs}
-        device_ids = sorted(set(devices) | set(peers_by_rid))
     status_filter = request.GET.get("status", "")
-    if status_filter in ("0", "1"):
-        target = 1 if status_filter == "1" else 0
-        device_ids = [
-            rid for rid in device_ids if (devices[rid].is_active if rid in devices else True) == (target == 1)
-        ]
-    total = len(device_ids)
-    start = (current - 1) * page_size
-    end = start + page_size
-    data = []
-    for rid in device_ids[start:end]:
-        device = devices.get(rid)
-        peer = peers_by_rid.get(rid)
-        username = device.username if device and device.username else (peer.username if peer else "")
-        owner = ""
-        if device and device.owner:
-            owner = device.owner.username
-        elif peer:
-            owner = peer.profile.owner.username
-        status = 1 if not device or device.is_active else 0
-        data.append(
-            {
-                "id": rid,
-                "info": {
-                    "username": username,
-                    "os": (device.os if device else (peer.platform if peer else "")),
-                    "device_name": (device.hostname if device else (peer.hostname if peer else "")),
-                },
-                "status": status,
-                "user": owner,
-                "user_name": owner,
-                "device_group_name": (
-                    device.device_group.name
-                    if device and device.device_group_id
-                    else (peer.device_group_name if peer else "")
-                ),
-                "note": device.note if device else (peer.note if peer else ""),
-            }
-        )
+    if status_filter not in ("0", "1"):
+        status_filter = ""
+    current, page_size, start, _end = _pagination(request)
+    inventory = DeviceInventory(user)
+    cursor_value = str(request.GET.get("cursor", "") or "").strip()
+    rid_after = ""
+    if cursor_value:
+        try:
+            rid_after = load_inventory_cursor(cursor_value, user, status_filter)
+        except InvalidInventoryCursor:
+            return JsonResponse({"error": "Invalid inventory cursor"}, status=400)
+        start = 0
+
+    total = inventory.count(status_filter=status_filter)
+    rows = inventory.rows(
+        offset=start,
+        limit=page_size + 1 if cursor_value else page_size,
+        status_filter=status_filter,
+        rid_after=rid_after,
+    )
+    next_cursor = ""
+    has_more = len(rows) > page_size if cursor_value else bool(rows) and start + len(rows) < total
+    if cursor_value and has_more:
+        rows = rows[:page_size]
+    if has_more:
+        next_cursor = dump_inventory_cursor(rows[-1], user, status_filter)
+    data = [row.as_api_dict() for row in rows]
     _log_event(
         request, "api_peers", level="debug", username=user.username, total=total, page=current, page_size=page_size
     )
-    return JsonResponse({"total": total, "data": data})
+    return JsonResponse({"total": total, "data": data, "nextCursor": next_cursor})
 
 
 def device_group_accessible(request):

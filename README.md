@@ -69,6 +69,8 @@ Management为每个upload生成独立32-byte data key，只把其规范Base64值
 
 地址簿和待处理OIDC中的secret使用带key ID的`secretbox:v2` envelope认证加密；数据库key inventory保存不含业务明文的canary和fingerprint，readiness会拒绝错误key或replica配置分裂。shared profile的默认连接密码不再存入通用`info` JSON，而是迁移到显式加密字段；profile列表永不加载或返回该字段，Client仅在目标RID已存在且当前地址簿权限有效时调用目标绑定的即时credential API。连接凭据只通过已认证且通过地址簿权限校验的运行时 API 返回。Django 管理表单将其作为只写字段，CSV/Excel 导出不包含连接凭据。
 
+设备API和Web工作台使用显式的窄字段inventory projection：管理员只查询全局device，普通用户只合并本人device与本人精确`personal-<owner-id>` profile中的peer，并以`source/owner/rid`标识数据来源；数据库在构造Python对象前完成权限过滤、稳定排序和分页。`/api/peers`保留页码参数并额外返回绑定viewer、权限范围和status filter的一小时签名`nextCursor`，新调用方应使用cursor避免并发插入/删除造成重复页。首页用独立聚合和top-6查询。`DeviceInfo-v1.xlsx`只读取版本化allowlist，通过数据库iterator、write-only workbook、受限memory spool和`FileResponse`交付；行数、压缩输出字节与生成deadline任一超过`.env.example`预算时拒绝导出，不允许通过增加worker内存绕过。
+
 地址簿ACL审计与对应权限变更在同一事务提交。审计行保存profile GUID、名称和owner的不可变快照；删除profile会先写入tombstone，再把历史行的业务外键置空，因此API、Web、Admin或owner级联删除都不会抹除已有ACL历史。Django Admin只允许查看这些审计行，不允许新增、修改或删除。
 
 Alarm与地址簿ACL审计都按`created_at DESC, id DESC`稳定排序，并在PostgreSQL使用与该顺序匹配的B-tree索引。其本表文本搜索字段和`UserProfile.username`使用`pg_trgm`表达式GIN索引；执行人/报告人username先以最多1,000个匹配ID的独立索引查询解析，不能把跨表username join混入审计大表的OR条件。每个搜索词限制为3–344个字符，过短、过长或匹配用户过宽时页面明确拒绝并要求收窄。地址簿ACL页面使用绑定当前搜索条件的签名`(created_at,id)`keyset cursor，只提供较新/较早方向且不执行全表count或尾页offset；ACL历史不由连接审计的90天retention误删。Alarm Django Admin关闭完整总数，并把任一筛选下可浏览窗口硬限制为最新10,000条，更早记录必须先用时间或字段筛选定位。新增索引由非原子migration以`CREATE INDEX CONCURRENTLY`构建；生产migration角色必须保持数据库/`public` schema owner以安装trusted `pg_trgm`，runtime角色不获得扩展或DDL权限。

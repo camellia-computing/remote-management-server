@@ -5,7 +5,6 @@ import secrets
 import uuid
 from datetime import datetime
 from io import StringIO
-from itertools import chain
 from urllib.parse import urlencode
 
 from django.conf import settings
@@ -17,8 +16,7 @@ from django.core import signing
 from django.core.exceptions import ValidationError
 from django.core.paginator import Paginator
 from django.db import IntegrityError, transaction
-from django.db.models import Count, Model, Prefetch, Q
-from django.db.models.fields import CharField, DateField, DateTimeField, TextField
+from django.db.models import Count, Prefetch, Q
 from django.forms.models import model_to_dict
 from django.http import HttpResponse, HttpResponseRedirect, JsonResponse
 from django.shortcuts import render
@@ -31,6 +29,7 @@ from api.address_book_authorization import (
 )
 from api.audit_expressions import audit_cursor_boundary
 from api.audit_queries import AUDIT_SEARCH_MAX_LENGTH, AUDIT_SEARCH_MIN_LENGTH, filter_address_book_audits
+from api.device_inventory import DeviceInventory, InventoryPageSource
 from api.formatting import format_bytes
 from api.login_admission import REGISTER_SCOPE, complete_login_success, reserve_login_attempt
 from api.models import (
@@ -49,7 +48,7 @@ from api.models import (
 from api.request_utils import client_ip
 from api.response_security import protect_credential_response
 from api.tag_colors import normalize_tag_color, tag_color_css
-from api.xlsx import safe_csv_writer, xlsx_response
+from api.xlsx import SpreadsheetBudgetExceeded, bounded_xlsx_file_response, safe_csv_writer, xlsx_response
 from camellia_remote_management.observability import log_structured_event
 
 logger = logging.getLogger(__name__)
@@ -147,101 +146,6 @@ def _ab_audit_page(audits, cursor):
         has_newer = True
     candidates = list(page_query.order_by("-created_at", "-id")[: AUDIT_PAGE_SIZE + 1])
     return candidates[:AUDIT_PAGE_SIZE], has_newer, len(candidates) > AUDIT_PAGE_SIZE
-
-
-def model_to_dict2(instance, fields=None, exclude=None, replace=None, default=None):
-    """
-    :params instance: 模型对象，不能是queryset数据集
-    :params fields: 指定要展示的字段数据，('字段1','字段2')
-    :params exclude: 指定排除掉的字段数据,('字段1','字段2')
-    :params replace: 将字段名字修改成需要的名字，{'数据库字段名':'前端展示名'}
-    :params default: 新增不存在的字段数据，{'字段':'数据'}
-    """
-    # 对传递进来的模型对象校验
-    if not isinstance(instance, Model):
-        raise Exception(_("model_to_dict接收的参数必须是模型对象"))
-    # 对替换数据库字段名字校验
-    if replace and type(replace) == dict:  # noqa
-        for replace_field in replace.values():
-            if hasattr(instance, replace_field):
-                raise Exception(_(f"model_to_dict,要替换成{replace_field}字段已经存在了"))
-    # 对要新增的默认值进行校验
-    if default and type(default) == dict:  # noqa
-        for default_key in default.keys():
-            if hasattr(instance, default_key):
-                raise Exception(_(f"model_to_dict,要新增默认值，但字段{default_key}已经存在了"))  # noqa
-    opts = instance._meta
-    data = {}
-    for f in chain(opts.concrete_fields, opts.private_fields, opts.many_to_many):
-        # 源码下：这块代码会将时间字段剔除掉，我加上一层判断，让其不再剔除时间字段
-        if not getattr(f, "editable", False):
-            if type(f) == DateField or type(f) == DateTimeField:  # noqa
-                pass
-            else:
-                continue
-        # 如果fields参数传递了，要进行判断
-        if fields is not None and f.name not in fields:
-            continue
-        # 如果exclude 传递了，要进行判断
-        if exclude and f.name in exclude:
-            continue
-
-        key = f.name
-        # 获取字段对应的数据
-        if type(f) == DateTimeField:  # noqa
-            # 字段类型是，DateTimeFiled 使用自己的方式操作
-            value = getattr(instance, key)
-            value = timezone.localtime(value).strftime("%Y-%m-%d %H:%M") if value else ""
-        elif type(f) == DateField:  # noqa
-            # 字段类型是，DateFiled 使用自己的方式操作
-            value = getattr(instance, key)
-            value = value.strftime("%Y-%m-%d") if value else ""
-        elif type(f) == CharField or type(f) == TextField:  # noqa
-            value = getattr(instance, key)
-        else:  # 其他类型的字段
-            # value = getattr(instance, key)
-            key = f.name
-            value = f.value_from_object(instance)
-            # data[f.name] = f.value_from_object(instance)
-        # 1、替换字段名字
-        if replace and key in replace.keys():
-            key = replace.get(key)
-        data[key] = value
-    # 2、新增默认的字段数据
-    if default:
-        data.update(default)
-    return data
-
-
-DEVICE_DEFAULTS = {
-    "rid": "",
-    "alias": "",
-    "device_group_name": "",
-    "note": "",
-    "version": "",
-    "username": "",
-    "hostname": "",
-    "platform": "",
-    "os": "",
-    "cpu": "",
-    "memory": "",
-    "ip_address": "",
-    "create_time": "",
-    "update_time": "",
-    "status": "",
-    "owner_name": "",
-    "rust_user": "",
-    "strategy_name": "",
-    "has_rhash": "",
-}
-
-
-def _normalize_device_item(item):
-    for key, value in DEVICE_DEFAULTS.items():
-        if key not in item:
-            item[key] = value
-    item["rid"] = str(item.get("rid") or "")
-    return item
 
 
 def index(request):
@@ -386,94 +290,6 @@ def user_logout(request):
     return HttpResponseRedirect("/api/user_action?action=login")
 
 
-def get_single_info(uid):
-    user = UserProfile.objects.filter(Q(id=uid)).first()
-    personal_guid = _personal_guid(user) if user else ""
-    address_book_peers = {
-        peer.rid: model_to_dict(peer, exclude=("tags",))
-        for peer in RemotePeer.objects.filter(
-            profile__owner_id=uid,
-            profile__guid=personal_guid,
-        )
-    }
-    # A saved RID is address-book metadata, not authority to read another
-    # owner's inventory. Non-owned peers stay in address_book_peers and are
-    # normalized below with unknown status and empty inventory fields.
-    devices = RemoteDevice.objects.filter(owner_id=uid).select_related(
-        "owner__strategy",
-        "device_group__strategy",
-        "strategy",
-    )
-    now = timezone.now()
-    items = {}
-    for device in devices:
-        item = model_to_dict2(device)
-        item["owner_name"] = device.owner.username if device.owner else ""
-        item["device_group_name"] = device.device_group.name if device.device_group_id else ""
-        effective_strategy = device.effective_strategy()
-        item["strategy_name"] = effective_strategy.name if effective_strategy else ""
-        address_book_peer = address_book_peers.pop(device.rid, None)
-        if address_book_peer:
-            for key in ("alias", "platform", "rhash", "password"):
-                if address_book_peer.get(key):
-                    item[key] = address_book_peer[key]
-            if not item.get("device_group_name"):
-                item["device_group_name"] = address_book_peer.get("device_group_name", "")
-            if not item.get("note"):
-                item["note"] = address_book_peer.get("note", "")
-        item["rust_user"] = item["owner_name"] or (user.username if user else "")
-        item["status"] = _("在线") if (now - device.update_time).total_seconds() <= 120 else _("离线")
-        rhash_value = item.get("rhash") or ""
-        item["has_rhash"] = _("是") if len(rhash_value) > 1 else _("否")
-        items[device.rid] = _normalize_device_item(item)
-
-    # Address-book-only peers remain actionable even before a device heartbeat
-    # creates the corresponding inventory record.
-    for rid, item in address_book_peers.items():
-        rhash_value = item.get("rhash") or ""
-        item["has_rhash"] = _("是") if len(rhash_value) > 1 else _("否")
-        item["rust_user"] = user.username if user else ""
-        item["status"] = _("未知状态")
-        items[rid] = _normalize_device_item(item)
-
-    return list(items.values())
-
-
-def get_all_info():
-    device_objects = RemoteDevice.objects.select_related(
-        "owner__strategy",
-        "device_group__strategy",
-        "strategy",
-    )
-    peers = RemotePeer.objects.filter(
-        profile__guid__startswith="personal-",
-    ).select_related("profile__owner")
-    now = timezone.now()
-    devices = {}
-    for device in device_objects:
-        item = model_to_dict2(device)
-        item["owner_name"] = device.owner.username if device.owner else ""
-        item["device_group_name"] = device.device_group.name if device.device_group_id else ""
-        effective_strategy = device.effective_strategy()
-        item["strategy_name"] = effective_strategy.name if effective_strategy else ""
-        item["status"] = _("在线") if (now - device.update_time).total_seconds() <= 120 else _("离线")
-        devices[device.rid] = item
-    for peer in peers:
-        user = peer.profile.owner
-        device = devices.get(peer.rid, None)
-        if device and user:
-            devices[peer.rid]["rust_user"] = user.username
-            devices[peer.rid]["alias"] = peer.alias
-
-    for rid in devices.keys():
-        if not devices[rid].get("rust_user", ""):
-            devices[rid]["rust_user"] = _("未登录")
-        if "alias" not in devices[rid]:
-            devices[rid]["alias"] = ""
-        _normalize_device_item(devices[rid])
-    return [v for k, v in devices.items()]
-
-
 def _get_current_user(request):
     user = getattr(request, "user", None)
     if not user or not getattr(user, "is_authenticated", False):
@@ -513,11 +329,8 @@ def work(request):
         _log_event(request, "front_work_view", username=u.username, show_type=request.GET.get("show_type", ""))
         show_type = request.GET.get("show_type", "")
         show_all = True if show_type == "admin" and u.is_admin else False
-        paginator = (
-            Paginator(get_all_info(), 15)
-            if show_type == "admin" and u.is_admin
-            else Paginator(get_single_info(u.id), 15)
-        )
+        inventory = DeviceInventory(u, admin_scope=show_all)
+        paginator = Paginator(InventoryPageSource(inventory), 15)
         page_number = request.GET.get("page")
         page_obj = paginator.get_page(page_number)
         nav_active = "work_admin" if show_all else "work"
@@ -539,27 +352,6 @@ def work(request):
             },
             status=500,
         )
-
-
-def _summarize_devices(items):
-    total = len(items)
-    online = 0
-    offline = 0
-    unknown = 0
-    for item in items:
-        status = item.get("status", "")
-        if status == _("在线"):
-            online += 1
-        elif status == _("离线"):
-            offline += 1
-        else:
-            unknown += 1
-    return {
-        "total": total,
-        "online": online,
-        "offline": offline,
-        "unknown": unknown,
-    }
 
 
 def _is_personal_guid(guid):
@@ -1127,9 +919,9 @@ def home(request):
     if not u:
         return HttpResponseRedirect("/api/user_action?action=login")
     try:
-        items = get_all_info() if u.is_admin else get_single_info(u.id)
-        summary = _summarize_devices(items)
-        recent = sorted(items, key=lambda x: x.get("update_time", ""), reverse=True)[:6]
+        inventory = DeviceInventory(u)
+        summary = inventory.summary()
+        recent = inventory.recent(limit=6)
         _log_event(request, "front_home_view", username=u.username, total=summary["total"])
         return render(
             request,
@@ -1167,9 +959,20 @@ def down_peers(request):
         _log_event(request, "front_export_denied", level="warning", username=u.username)
         return HttpResponseRedirect("/api/work")
 
+    row_count = RemoteDevice.objects.count()
+    if row_count > settings.DEVICE_INVENTORY_EXPORT_MAX_ROWS:
+        _log_event(
+            request,
+            "front_export_rejected",
+            level="warning",
+            username=u.username,
+            reason="row_budget",
+            count=row_count,
+        )
+        return JsonResponse({"error": _("设备数量超过导出上限，请缩小范围。")}, status=413)
+
     now = timezone.now()
-    rows = []
-    device_inventory = RemoteDevice.objects.values(
+    device_inventory = RemoteDevice.objects.order_by("rid").values(
         "rid",
         "owner__username",
         "owner__strategy__name",
@@ -1181,13 +984,17 @@ def down_peers(request):
         "is_active",
         "update_time",
     )
-    for device in device_inventory:
-        update_time = device["update_time"]
-        strategy_name = (
-            device["strategy__name"] or device["device_group__strategy__name"] or device["owner__strategy__name"] or ""
-        )
-        rows.append(
-            [
+
+    def export_rows():
+        for device in device_inventory.iterator(chunk_size=settings.DEVICE_INVENTORY_EXPORT_CHUNK_SIZE):
+            update_time = device["update_time"]
+            strategy_name = (
+                device["strategy__name"]
+                or device["device_group__strategy__name"]
+                or device["owner__strategy__name"]
+                or ""
+            )
+            yield (
                 device["rid"],
                 device["owner__username"] or "",
                 device["device_group__name"] or "",
@@ -1197,23 +1004,39 @@ def down_peers(request):
                 device["is_active"],
                 _("在线") if (now - update_time).total_seconds() <= 120 else _("离线"),
                 timezone.localtime(update_time).strftime("%Y-%m-%d %H:%M"),
-            ]
-        )
+            )
 
-    response = xlsx_response(
-        "DeviceInfo-v1.xlsx",
-        _("设备信息表"),
-        DEVICE_INVENTORY_EXPORT_HEADERS,
-        rows,
-    )
+    try:
+        response, exported_count, response_bytes = bounded_xlsx_file_response(
+            "DeviceInfo-v1.xlsx",
+            _("设备信息表"),
+            DEVICE_INVENTORY_EXPORT_HEADERS,
+            export_rows(),
+            max_rows=settings.DEVICE_INVENTORY_EXPORT_MAX_ROWS,
+            max_bytes=settings.DEVICE_INVENTORY_EXPORT_MAX_BYTES,
+            deadline_seconds=settings.DEVICE_INVENTORY_EXPORT_DEADLINE_SECONDS,
+            spool_memory_bytes=settings.DEVICE_INVENTORY_EXPORT_SPOOL_MEMORY_BYTES,
+        )
+    except SpreadsheetBudgetExceeded as exc:
+        _log_event(
+            request,
+            "front_export_rejected",
+            level="warning",
+            username=u.username,
+            reason=type(exc).__name__,
+            count=row_count,
+        )
+        return JsonResponse({"error": _("设备导出超过资源预算，请缩小范围后重试。")}, status=413)
     response["X-Camellia-Export-Schema"] = DEVICE_INVENTORY_EXPORT_SCHEMA
+    response["X-Camellia-Export-Rows"] = str(exported_count)
     protect_credential_response(response)
     _log_event(
         request,
         "front_export_xlsx",
         username=u.username,
         schema=DEVICE_INVENTORY_EXPORT_SCHEMA,
-        count=len(rows),
+        count=exported_count,
+        response_bytes=response_bytes,
     )
     return response
 
