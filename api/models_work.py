@@ -768,6 +768,11 @@ class ConnectionAuditEvent(models.Model):
     )
     actor_id_at_event = models.PositiveBigIntegerField(editable=False)
     reporter_device_uuid = models.CharField(max_length=344, blank=True, default="", editable=False)
+    reporter_device_id_at_event = models.PositiveBigIntegerField(null=True, blank=True, editable=False)
+    reporter_device_generation = models.PositiveBigIntegerField(null=True, blank=True, editable=False)
+    reporter_sequence = models.PositiveBigIntegerField(null=True, blank=True, editable=False)
+    payload_digest = models.CharField(max_length=64, blank=True, default="", editable=False)
+    acknowledgement = models.JSONField(blank=True, default=dict, editable=False)
     details = models.JSONField(blank=True, default=dict, editable=False)
     created_at = models.DateTimeField(default=timezone.now, editable=False)
 
@@ -781,6 +786,15 @@ class ConnectionAuditEvent(models.Model):
             models.CheckConstraint(
                 condition=models.Q(sequence__gte=1),
                 name="positive_connection_audit_sequence",
+            ),
+            models.CheckConstraint(
+                condition=models.Q(reporter_sequence__isnull=True) | models.Q(reporter_sequence__gte=1),
+                name="positive_audit_reporter_sequence",
+            ),
+            models.UniqueConstraint(
+                fields=["connection", "reporter_sequence"],
+                condition=models.Q(reporter_sequence__isnull=False),
+                name="unique_audit_reporter_sequence",
             ),
         ]
 
@@ -820,8 +834,18 @@ class ConnLogAdmin(admin.ModelAdmin):
 
 
 class ConnectionAuditEventAdmin(admin.ModelAdmin):
-    list_display = ("connection", "sequence", "kind", "actor_id_at_event", "actor", "created_at")
-    search_fields = ("event_id", "connection__guid", "actor__username")
+    list_display = (
+        "connection",
+        "sequence",
+        "reporter_sequence",
+        "kind",
+        "actor_id_at_event",
+        "reporter_device_id_at_event",
+        "reporter_device_generation",
+        "actor",
+        "created_at",
+    )
+    search_fields = ("event_id", "payload_digest", "connection__guid", "actor__username")
     list_filter = ("kind", "created_at")
 
     def has_add_permission(self, request):

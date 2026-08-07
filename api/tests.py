@@ -2172,7 +2172,9 @@ class SensitiveIngestionTests(ApiTestMixin, TestCase):
 
         file_event = {
             "version": 4,
+            "receipt_version": 1,
             "event_id": str(uuid.uuid4()),
+            "reporter_sequence": ConnLog.objects.get(guid=restarted_audit_session_id).event_revision + 1,
             "audit_session_id": restarted_audit_session_id,
             "transfer_id": str(uuid.uuid4()),
             "transfer_revision": 1,
@@ -2202,7 +2204,9 @@ class SensitiveIngestionTests(ApiTestMixin, TestCase):
 
         alarm_event = {
             "version": 3,
+            "receipt_version": 1,
             "event_id": str(uuid.uuid4()),
+            "reporter_sequence": ConnLog.objects.get(guid=restarted_audit_session_id).event_revision + 1,
             "audit_session_id": restarted_audit_session_id,
             "id": "111111111",
             "uuid": host_uuid,

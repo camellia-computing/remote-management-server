@@ -1,12 +1,13 @@
 import datetime
 import uuid
+from unittest.mock import patch
 
 from django.db import IntegrityError, transaction
 from django.test import TestCase, override_settings
 from django.utils import timezone
 
 from api import ingestion_retention
-from api.models import ConnectionAuditEvent, ConnLog, FileLog, UserProfile
+from api.models import AlarmLog, ConnectionAuditEvent, ConnLog, FileLog, UserProfile
 from api.tests import ApiTestMixin, device_uuid
 
 TEST_STORAGES = {
@@ -79,6 +80,7 @@ class FileAuditLifecycleTests(ApiTestMixin, TestCase):
         revision,
         state,
         event_id=None,
+        reporter_sequence=None,
         transferred_bytes=0,
         terminal_reason="",
         planned_file_count=100,
@@ -87,9 +89,13 @@ class FileAuditLifecycleTests(ApiTestMixin, TestCase):
     ):
         if sample_files is None:
             sample_files = [{"path": f"sample-{index}.bin", "size": 1} for index in range(10)]
+        if reporter_sequence is None:
+            reporter_sequence = ConnLog.objects.get(guid=self.audit_session_id).event_revision + 1
         return {
             "version": 4,
+            "receipt_version": 1,
             "event_id": event_id or str(uuid.uuid4()),
+            "reporter_sequence": reporter_sequence,
             "audit_session_id": self.audit_session_id,
             "transfer_id": transfer_id,
             "transfer_revision": revision,
@@ -152,8 +158,11 @@ class FileAuditLifecycleTests(ApiTestMixin, TestCase):
             started.json(),
             {
                 "version": 4,
+                "receipt_version": 1,
                 "audit_session_id": self.audit_session_id,
                 "acknowledged_event_id": started.json()["acknowledged_event_id"],
+                "reporter_sequence": started.json()["reporter_sequence"],
+                "payload_digest": started.json()["payload_digest"],
                 "transfer_id": transfer_id,
                 "transfer_revision": 1,
                 "transfer_state": "started",
@@ -214,15 +223,24 @@ class FileAuditLifecycleTests(ApiTestMixin, TestCase):
         self.assertEqual(replayed.status_code, 200, replayed.content)
         self.assertEqual(started.json(), replayed.json())
 
-        conflicting_event = self._post_file(
-            self._file_payload(
-                transfer_id=transfer_id,
-                revision=1,
-                state="started",
-                event_id=event_id,
-                planned_bytes=101,
+        with patch("api.views_api._log_event") as conflict_log:
+            conflicting_event = self._post_file(
+                self._file_payload(
+                    transfer_id=transfer_id,
+                    revision=1,
+                    state="started",
+                    event_id=event_id,
+                    planned_bytes=101,
+                )
             )
-        )
+        conflict_calls = [
+            call
+            for call in conflict_log.call_args_list
+            if len(call.args) > 1 and call.args[1] == "api_audit_event_identity_conflict"
+        ]
+        self.assertEqual(len(conflict_calls), 1)
+        self.assertEqual(conflict_calls[0].kwargs["level"], "warning")
+        self.assertEqual(conflict_calls[0].kwargs["kind"], ConnectionAuditEvent.KIND_FILE)
         duplicate_revision = self._post_file(
             self._file_payload(
                 transfer_id=transfer_id,
@@ -278,6 +296,132 @@ class FileAuditLifecycleTests(ApiTestMixin, TestCase):
         self.assertEqual(completed.status_code, 200, completed.content)
         self.assertEqual(resurrected.status_code, 409, resurrected.content)
         self.assertEqual(FileLog.objects.get().transfer_events.count(), 3)
+
+    def test_receipt_binds_canonical_payload_generation_session_and_reporter_sequence(self):
+        transfer_id = str(uuid.uuid4())
+        event_id = str(uuid.uuid4())
+        reporter_sequence = ConnLog.objects.get(guid=self.audit_session_id).event_revision + 1
+        payload = self._file_payload(
+            transfer_id=transfer_id,
+            revision=1,
+            state="started",
+            event_id=event_id,
+            reporter_sequence=reporter_sequence,
+        )
+
+        accepted = self._post_file(payload)
+        replayed = self._post_file(payload)
+
+        self.assertEqual(accepted.status_code, 200, accepted.content)
+        self.assertEqual(replayed.status_code, 200, replayed.content)
+        self.assertEqual(accepted.json(), replayed.json())
+        self.assertEqual(accepted.json()["receipt_version"], 1)
+        self.assertEqual(accepted.json()["reporter_sequence"], reporter_sequence)
+        self.assertRegex(accepted.json()["payload_digest"], r"^[0-9a-f]{64}$")
+        event = ConnectionAuditEvent.objects.get(event_id=event_id)
+        connection = ConnLog.objects.get(guid=self.audit_session_id)
+        self.assertEqual(event.reporter_sequence, reporter_sequence)
+        self.assertEqual(event.reporter_device_id_at_event, connection.host_device_id_at_create)
+        self.assertEqual(event.reporter_device_generation, connection.host_device_generation)
+        self.assertEqual(event.payload_digest, accepted.json()["payload_digest"])
+        self.assertEqual(event.acknowledgement, accepted.json())
+
+    def test_legacy_event_without_receipt_cannot_be_mistaken_for_a_durable_replay(self):
+        connection = ConnLog.objects.get(guid=self.audit_session_id)
+        legacy_event_id = uuid.uuid4()
+        legacy_sequence = connection.event_revision + 1
+        ConnectionAuditEvent.objects.create(
+            event_id=legacy_event_id,
+            connection=connection,
+            sequence=legacy_sequence,
+            kind=ConnectionAuditEvent.KIND_FILE,
+            actor=self.user,
+            actor_id_at_event=self.user.pk,
+            reporter_device_uuid=self.host_uuid,
+            details={},
+        )
+        connection.event_revision = legacy_sequence
+        connection.save(update_fields=("event_revision",))
+        payload = self._file_payload(
+            transfer_id=str(uuid.uuid4()),
+            revision=1,
+            state="started",
+            event_id=str(legacy_event_id),
+            reporter_sequence=1,
+        )
+
+        rejected = self._post_file(payload)
+
+        self.assertEqual(rejected.status_code, 409, rejected.content)
+        self.assertEqual(rejected.json()["error"], "Audit event identity conflict")
+        self.assertEqual(FileLog.objects.count(), 0)
+        legacy = ConnectionAuditEvent.objects.get(event_id=legacy_event_id)
+        self.assertIsNone(legacy.reporter_sequence)
+        self.assertEqual(legacy.payload_digest, "")
+        self.assertEqual(legacy.acknowledgement, {})
+
+    def test_reused_reporter_sequence_is_rejected_without_partial_evidence(self):
+        reporter_sequence = ConnLog.objects.get(guid=self.audit_session_id).event_revision + 1
+        accepted = self._post_file(
+            self._file_payload(
+                transfer_id=str(uuid.uuid4()),
+                revision=1,
+                state="started",
+                reporter_sequence=reporter_sequence,
+            )
+        )
+        self.assertEqual(accepted.status_code, 200, accepted.content)
+        before_events = ConnectionAuditEvent.objects.count()
+        before_files = FileLog.objects.count()
+        conflicting = self._file_payload(
+            transfer_id=str(uuid.uuid4()),
+            revision=1,
+            state="started",
+            reporter_sequence=reporter_sequence,
+        )
+
+        rejected = self._post_file(conflicting)
+
+        self.assertEqual(rejected.status_code, 409, rejected.content)
+        self.assertEqual(rejected.json()["reporter_sequence"], reporter_sequence)
+        self.assertEqual(FileLog.objects.count(), before_files)
+        self.assertEqual(ConnectionAuditEvent.objects.count(), before_events)
+
+    def test_alarm_replay_returns_original_receipt_after_later_evidence(self):
+        connection = ConnLog.objects.get(guid=self.audit_session_id)
+        alarm_event_id = str(uuid.uuid4())
+        alarm_payload = {
+            "version": 3,
+            "receipt_version": 1,
+            "event_id": alarm_event_id,
+            "reporter_sequence": connection.event_revision + 1,
+            "audit_session_id": self.audit_session_id,
+            "id": "111111111",
+            "uuid": self.host_uuid,
+            "typ": 9,
+            "conn_id": 7,
+            "info": {"nested": {"b": 2, "a": 1}, "message": "scope mismatch"},
+        }
+        accepted = self._post_json("/api/audit/alarm", alarm_payload, token=self.host_token)
+        self.assertEqual(accepted.status_code, 200, accepted.content)
+
+        connection.refresh_from_db()
+        file_response = self._post_file(
+            self._file_payload(
+                transfer_id=str(uuid.uuid4()),
+                revision=1,
+                state="started",
+                reporter_sequence=connection.event_revision + 1,
+            )
+        )
+        self.assertEqual(file_response.status_code, 200, file_response.content)
+        replay_payload = dict(alarm_payload)
+        replay_payload["info"] = {"message": "scope mismatch", "nested": {"a": 1, "b": 2}}
+        replayed = self._post_json("/api/audit/alarm", replay_payload, token=self.host_token)
+
+        self.assertEqual(replayed.status_code, 200, replayed.content)
+        self.assertEqual(replayed.json(), accepted.json())
+        self.assertEqual(AlarmLog.objects.count(), 1)
 
     def test_failed_cancelled_and_unknown_are_distinct_terminal_states(self):
         for index, terminal_state in enumerate(("failed", "cancelled", "unknown"), start=1):

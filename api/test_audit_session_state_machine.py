@@ -81,9 +81,12 @@ class AuditSessionStateMachineTests(ApiTestMixin, TestCase):
         return ConnLog.objects.get(), audit_session_id
 
     def _file_payload(self, audit_session_id, **overrides):
+        event_revision = ConnLog.objects.filter(guid=audit_session_id).values_list("event_revision", flat=True).first()
         payload = {
             "version": 4,
+            "receipt_version": 1,
             "event_id": str(uuid.uuid4()),
+            "reporter_sequence": (event_revision + 1) if event_revision is not None else 1,
             "audit_session_id": audit_session_id,
             "transfer_id": str(uuid.uuid4()),
             "transfer_revision": 1,
@@ -537,7 +540,9 @@ class AuditSessionStateMachineTests(ApiTestMixin, TestCase):
             "/api/audit/alarm",
             {
                 "version": 3,
+                "receipt_version": 1,
                 "event_id": str(uuid.uuid4()),
+                "reporter_sequence": 1,
                 "audit_session_id": nonexistent_session_id,
                 "id": "111111111",
                 "uuid": self.host_uuid,
@@ -563,7 +568,9 @@ class AuditSessionStateMachineTests(ApiTestMixin, TestCase):
             "/api/audit/alarm",
             {
                 "version": 3,
+                "receipt_version": 1,
                 "event_id": str(uuid.uuid4()),
+                "reporter_sequence": 3,
                 "audit_session_id": unbound_session_id,
                 "id": "111111111",
                 "uuid": self.host_uuid,
@@ -697,7 +704,9 @@ class AuditSessionStateMachineTests(ApiTestMixin, TestCase):
         alarm_event_id = str(uuid.uuid4())
         alarm_payload = {
             "version": 3,
+            "receipt_version": 1,
             "event_id": alarm_event_id,
+            "reporter_sequence": ConnLog.objects.get(guid=audit_session_id).event_revision + 1,
             "audit_session_id": audit_session_id,
             "id": "111111111",
             "uuid": self.host_uuid,
@@ -771,7 +780,9 @@ class AuditSessionStateMachineTests(ApiTestMixin, TestCase):
             "/api/audit/alarm",
             {
                 "version": 3,
+                "receipt_version": 1,
                 "event_id": str(uuid.uuid4()),
+                "reporter_sequence": ConnLog.objects.get(guid=audit_session_id).event_revision + 1,
                 "audit_session_id": audit_session_id,
                 "id": "111111111",
                 "uuid": self.host_uuid,
@@ -931,6 +942,10 @@ class AuditSessionStateMachineTests(ApiTestMixin, TestCase):
                 create()
 
 
+@override_settings(
+    REQUEST_RATE_LIMIT_CREDENTIAL_CONCURRENCY=64,
+    REQUEST_RATE_LIMIT_SOURCE_CONCURRENCY=64,
+)
 class AuditSessionConcurrencyTests(ApiTestMixin, TransactionTestCase):
     def setUp(self):
         if connection.vendor != "postgresql":
@@ -1017,10 +1032,14 @@ class AuditSessionConcurrencyTests(ApiTestMixin, TransactionTestCase):
             futures = [executor.submit(send, path, payload) for path, payload in requests]
             return [future.result(timeout=20) for future in futures]
 
-    def _file_payload(self, event_id):
+    def _file_payload(self, event_id, reporter_sequence=None):
+        if reporter_sequence is None:
+            reporter_sequence = ConnLog.objects.get(guid=self.audit_session_id).event_revision + 1
         return {
             "version": 4,
+            "receipt_version": 1,
             "event_id": event_id,
+            "reporter_sequence": reporter_sequence,
             "audit_session_id": self.audit_session_id,
             "transfer_id": event_id,
             "transfer_revision": 1,
@@ -1040,10 +1059,14 @@ class AuditSessionConcurrencyTests(ApiTestMixin, TransactionTestCase):
             "terminal_reason": "",
         }
 
-    def _alarm_payload(self, event_id):
+    def _alarm_payload(self, event_id, reporter_sequence=None):
+        if reporter_sequence is None:
+            reporter_sequence = ConnLog.objects.get(guid=self.audit_session_id).event_revision + 1
         return {
             "version": 3,
+            "receipt_version": 1,
             "event_id": event_id,
+            "reporter_sequence": reporter_sequence,
             "audit_session_id": self.audit_session_id,
             "id": "111111111",
             "uuid": self.host_uuid,
@@ -1056,27 +1079,25 @@ class AuditSessionConcurrencyTests(ApiTestMixin, TransactionTestCase):
     def test_duplicate_file_event_is_acknowledged_once_without_duplicate_evidence(self):
         self._authorize_and_bind_controller()
         event_id = str(uuid.uuid4())
-        responses = self._post_concurrently(
-            [
-                ("/api/audit/file", self._file_payload(event_id)),
-                ("/api/audit/file", self._file_payload(event_id)),
-            ]
-        )
+        responses = self._post_concurrently([("/api/audit/file", self._file_payload(event_id)) for _index in range(32)])
 
-        self.assertEqual([status for status, _payload in responses], [200, 200])
-        self.assertEqual(responses[0][1], responses[1][1])
+        self.assertEqual([status for status, _payload in responses], [200] * 32)
+        self.assertTrue(all(payload == responses[0][1] for _status, payload in responses))
         self.assertEqual(FileLog.objects.count(), 1)
         self.assertEqual(
             ConnectionAuditEvent.objects.filter(kind=ConnectionAuditEvent.KIND_FILE).count(),
             1,
         )
 
-    def test_concurrent_file_and_alarm_have_unique_contiguous_sequences(self):
+    def test_concurrent_file_and_alarm_accept_distinct_out_of_order_reporter_sequences(self):
         self._authorize_and_bind_controller()
+        next_sequence = ConnLog.objects.get(guid=self.audit_session_id).event_revision + 1
+        file_payload = self._file_payload(str(uuid.uuid4()), next_sequence)
+        alarm_payload = self._alarm_payload(str(uuid.uuid4()), next_sequence + 1)
         responses = self._post_concurrently(
             [
-                ("/api/audit/file", self._file_payload(str(uuid.uuid4()))),
-                ("/api/audit/alarm", self._alarm_payload(str(uuid.uuid4()))),
+                ("/api/audit/file", file_payload),
+                ("/api/audit/alarm", alarm_payload),
             ]
         )
 
@@ -1087,6 +1108,10 @@ class AuditSessionConcurrencyTests(ApiTestMixin, TransactionTestCase):
         self.assertEqual(
             {event.kind for event in events[-2:]},
             {ConnectionAuditEvent.KIND_FILE, ConnectionAuditEvent.KIND_ALARM},
+        )
+        self.assertEqual(
+            {event.reporter_sequence for event in events[-2:]},
+            {next_sequence, next_sequence + 1},
         )
         self.assertEqual(FileLog.objects.count(), 1)
         self.assertEqual(AlarmLog.objects.count(), 1)
