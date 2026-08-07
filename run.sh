@@ -19,7 +19,7 @@ MAX_REQUESTS="${CAMELLIA_REMOTE_GUNICORN_MAX_REQUESTS:-1000}"
 MAX_REQUESTS_JITTER="${CAMELLIA_REMOTE_GUNICORN_MAX_REQUESTS_JITTER:-100}"
 FORWARDED_ALLOW_IPS="${CAMELLIA_REMOTE_GUNICORN_FORWARDED_ALLOW_IPS:-127.0.0.1}"
 RECORD_DIR="${CAMELLIA_REMOTE_RECORD_UPLOAD_ROOT:-$APP_DIR/records}"
-ACCESS_LOG_FORMAT='method=%(m)s route=%(route)s status=%(s)s bytes=%(B)s duration_us=%(D)s request_id=%(request_id)s'
+ACCESS_LOG_FORMAT='method=%(m)s route=%(route)s status=%(s)s bytes=%(B)s duration_us=%(D)s request_id=%(request_id)s trace_id=%(trace_id)s span_id=%(span_id)s event_id=%(event_id)s'
 
 require_integer_range() {
     variable_name="$1"

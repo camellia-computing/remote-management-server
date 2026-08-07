@@ -50,6 +50,12 @@ from api.device_identity import (
     deployment_assertion,
     issue_proof_challenge,
 )
+from api.device_inventory import (
+    DeviceInventory,
+    InvalidInventoryCursor,
+    dump_inventory_cursor,
+    load_inventory_cursor,
+)
 from api.encrypted_fields import verify_key_canary
 from api.login_admission import complete_login_success, reserve_login_attempt
 from api.models import (
@@ -83,7 +89,7 @@ from api.policy_generation import (
 from api.rate_limits import enforce_authenticated_rate_limit
 from api.request_utils import client_ip, load_json_body, load_json_object
 from api.tag_colors import normalize_tag_color
-from camellia_remote_management.access_logging import normalized_route
+from camellia_remote_management.observability import log_structured_event
 
 logger = logging.getLogger(__name__)
 EFFECTIVE_SECONDS = 7200
@@ -98,6 +104,7 @@ MAX_AUDIT_NOTE_BYTES = 16 * 1024
 MAX_AUDIT_FILES = 10
 AUDIT_PROTOCOL_VERSION = 3
 FILE_AUDIT_PROTOCOL_VERSION = 4
+AUDIT_EVIDENCE_RECEIPT_VERSION = 1
 MAX_AUDIT_INTEGER = 9_223_372_036_854_775_807
 MAX_AB_PEERS = 10_000
 MAX_AB_TAGS = 256
@@ -734,17 +741,12 @@ def _log_event(request, event, level="info", **extra):
     username = (
         user.username if user and getattr(user, "is_authenticated", False) else extra.pop("username", "anonymous")
     )
-    payload = {
-        "event": event,
+    attributes = {
         "user": username,
         "ip": get_client_ip(request),
-        "route": normalized_route(getattr(request, "resolver_match", None)),
-        "method": getattr(request, "method", ""),
     }
-    payload.update({k: v for k, v in extra.items() if v is not None})
-    details = json.dumps(payload, ensure_ascii=False, default=str)
-    log_fn = getattr(logger, level, logger.info)
-    log_fn("event=%s details=%s", event, details)
+    attributes.update({k: v for k, v in extra.items() if v is not None})
+    log_structured_event(logger, request, event, level=level, attributes=attributes)
 
 
 _record_file_lock = recording_uploads._record_file_lock
@@ -3309,6 +3311,17 @@ def _audit_upgrade_required(required_version=AUDIT_PROTOCOL_VERSION):
     )
 
 
+def _audit_evidence_upgrade_required(protocol_version):
+    return JsonResponse(
+        {
+            "error": "Unsupported audit evidence receipt version",
+            "required_version": protocol_version,
+            "required_receipt_version": AUDIT_EVIDENCE_RECEIPT_VERSION,
+        },
+        status=426,
+    )
+
+
 def _file_audit_version_is_current(value):
     if isinstance(value, bool):
         return False
@@ -3317,35 +3330,122 @@ def _file_audit_version_is_current(value):
     return isinstance(value, str) and value == str(FILE_AUDIT_PROTOCOL_VERSION)
 
 
+def _audit_evidence_receipt_version_is_current(value):
+    if isinstance(value, bool):
+        return False
+    if isinstance(value, int):
+        return value == AUDIT_EVIDENCE_RECEIPT_VERSION
+    return isinstance(value, str) and value == str(AUDIT_EVIDENCE_RECEIPT_VERSION)
+
+
 def _audit_nonnegative_integer(value):
     if isinstance(value, bool) or not isinstance(value, int):
         return None
     return value if 0 <= value <= MAX_AUDIT_INTEGER else None
 
 
-def _audit_success(connection_log, event_id, *, status=200):
+def _audit_reporter_sequence(value):
+    parsed = _audit_nonnegative_integer(value)
+    return parsed if parsed is not None and parsed >= 1 else None
+
+
+def _audit_evidence_digest(
+    *,
+    event_id,
+    connection_log,
+    kind,
+    actor,
+    reporter_device,
+    reporter_sequence,
+    details,
+):
+    canonical = json.dumps(
+        {
+            "schema": "audit-evidence-receipt-v1",
+            "event_id": str(event_id),
+            "audit_session_id": str(connection_log.guid),
+            "kind": kind,
+            "actor_id": actor.id,
+            "reporter_device_id": reporter_device.id,
+            "reporter_device_generation": connection_log.host_device_generation,
+            "reporter_device_uuid": reporter_device.uuid,
+            "reporter_sequence": reporter_sequence,
+            "details": details,
+        },
+        ensure_ascii=False,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
+
+
+def _matching_evidence_event(
+    existing,
+    connection_log,
+    kind,
+    actor,
+    reporter_device,
+    reporter_sequence,
+    payload_digest,
+):
+    return (
+        existing.connection_id == connection_log.id
+        and existing.kind == kind
+        and existing.actor_id == actor.id
+        and existing.reporter_device_uuid == reporter_device.uuid
+        and existing.reporter_device_id_at_event == reporter_device.id
+        and existing.reporter_device_generation == connection_log.host_device_generation
+        and existing.reporter_sequence == reporter_sequence
+        and len(existing.payload_digest) == 64
+        and secrets.compare_digest(existing.payload_digest, payload_digest)
+        and isinstance(existing.acknowledgement, dict)
+        and bool(existing.acknowledgement)
+    )
+
+
+def _reporter_sequence_conflict(reporter_sequence):
+    return JsonResponse(
+        {
+            "error": "Audit reporter sequence is already bound",
+            "reporter_sequence": reporter_sequence,
+        },
+        status=409,
+    )
+
+
+def _store_evidence_acknowledgement(event, acknowledgement):
+    event.acknowledgement = acknowledgement
+    event.save(update_fields=("acknowledgement",))
+
+
+def _audit_success_payload(connection_log, event_id):
     now = audit_lifecycle.database_now()
     lease_remaining = 0
     if connection_log.state in ConnLog.OPEN_STATES and connection_log.lease_expires_at is not None:
         lease_remaining = max(0, math.ceil((connection_log.lease_expires_at - now).total_seconds()))
-    return JsonResponse(
-        {
-            "version": AUDIT_PROTOCOL_VERSION,
-            "audit_session_id": str(connection_log.guid),
-            "acknowledged_event_id": str(event_id),
-            "event_revision": connection_log.event_revision,
-            "state": connection_log.state,
-            "state_revision": connection_log.state_revision,
-            "heartbeat_revision": connection_log.heartbeat_revision,
-            "lease_remaining_seconds": lease_remaining,
-            "terminal_reason": connection_log.terminal_reason,
-            "terminal_source": connection_log.terminal_source,
-        },
-        status=status,
-    )
+    return {
+        "version": AUDIT_PROTOCOL_VERSION,
+        "audit_session_id": str(connection_log.guid),
+        "acknowledged_event_id": str(event_id),
+        "event_revision": connection_log.event_revision,
+        "state": connection_log.state,
+        "state_revision": connection_log.state_revision,
+        "heartbeat_revision": connection_log.heartbeat_revision,
+        "lease_remaining_seconds": lease_remaining,
+        "terminal_reason": connection_log.terminal_reason,
+        "terminal_source": connection_log.terminal_source,
+    }
+
+
+def _audit_success(connection_log, event_id, *, status=200):
+    return JsonResponse(_audit_success_payload(connection_log, event_id), status=status)
 
 
 def _file_audit_success(connection_log, transfer_event):
+    acknowledgement = transfer_event.connection_event.acknowledgement
+    if acknowledgement:
+        return JsonResponse(acknowledgement)
     return JsonResponse(
         {
             "version": FILE_AUDIT_PROTOCOL_VERSION,
@@ -3472,7 +3572,18 @@ def _matching_audit_event(existing, connection_log, kind, actor, reporter_device
     )
 
 
-def _append_audit_event(connection_log, event_id, kind, actor, reporter_device_uuid, details):
+def _append_audit_event(
+    connection_log,
+    event_id,
+    kind,
+    actor,
+    reporter_device_uuid,
+    details,
+    *,
+    reporter_device=None,
+    reporter_sequence=None,
+    payload_digest="",
+):
     existing = _existing_audit_event(event_id)
     if existing:
         if not _matching_audit_event(existing, connection_log, kind, actor, reporter_device_uuid, details):
@@ -3500,6 +3611,10 @@ def _append_audit_event(connection_log, event_id, kind, actor, reporter_device_u
         actor=actor,
         actor_id_at_event=actor.id if actor else connection_log.owner_id_at_create,
         reporter_device_uuid=reporter_device_uuid,
+        reporter_device_id_at_event=(reporter_device.id if reporter_device else None),
+        reporter_device_generation=(connection_log.host_device_generation if reporter_device else None),
+        reporter_sequence=reporter_sequence,
+        payload_digest=payload_digest,
         details=details,
     )
     connection_log.event_revision = sequence
@@ -3507,7 +3622,14 @@ def _append_audit_event(connection_log, event_id, kind, actor, reporter_device_u
     return event, True
 
 
-def _audit_event_conflict():
+def _audit_event_conflict(request=None, *, kind="unknown"):
+    if request is not None:
+        _log_event(
+            request,
+            "api_audit_event_identity_conflict",
+            level="warning",
+            kind=kind,
+        )
     return JsonResponse({"error": "Audit event identity conflict"}, status=409)
 
 
@@ -3618,6 +3740,7 @@ def _audit_conn_active(request):
                 connection_log.controller_device = controller_device
                 connection_log.controller_device_id_at_bind = controller_device.id
                 connection_log.controller_device_generation = controller_device.deployment_generation
+                connection_log.controller_device_name_at_bind = controller_device.hostname
                 connection_log.controller_owner_id_at_bind = user.id
                 connection_log.save(
                     update_fields=[
@@ -3625,6 +3748,7 @@ def _audit_conn_active(request):
                         "controller_device",
                         "controller_device_id_at_bind",
                         "controller_device_generation",
+                        "controller_device_name_at_bind",
                         "controller_owner_id_at_bind",
                     ]
                 )
@@ -3798,6 +3922,7 @@ def _audit_conn(request):
                         host_device=device,
                         host_device_id_at_create=device.id,
                         host_device_generation=device.deployment_generation,
+                        host_device_name_at_create=device.hostname,
                         owner_id_at_create=user.id,
                         event_revision=1,
                         state=ConnLog.STATE_STARTING,
@@ -4100,14 +4225,18 @@ def _audit_file(request):
         return error
     if not _file_audit_version_is_current(postdata.get("version")):
         return _audit_upgrade_required(FILE_AUDIT_PROTOCOL_VERSION)
+    if not _audit_evidence_receipt_version_is_current(postdata.get("receipt_version")):
+        return _audit_evidence_upgrade_required(FILE_AUDIT_PROTOCOL_VERSION)
     audit_session_id = _audit_uuid4(postdata.get("audit_session_id"))
     event_id = _audit_uuid4(postdata.get("event_id"))
+    reporter_sequence = _audit_reporter_sequence(postdata.get("reporter_sequence"))
     transfer_id = _audit_uuid4(postdata.get("transfer_id"))
     transfer_revision = _audit_revision(postdata.get("transfer_revision"))
     conn_id = _audit_connection_id(postdata.get("conn_id"))
     if (
         audit_session_id is None
         or event_id is None
+        or reporter_sequence is None
         or transfer_id is None
         or transfer_revision is None
         or conn_id is None
@@ -4196,17 +4325,30 @@ def _audit_file(request):
                 return JsonResponse({"error": "Connection not found"}, status=404)
             if not connection_log.from_id or connection_log.from_id != remote_id:
                 return JsonResponse({"error": "Invalid file audit participant"}, status=403)
+            try:
+                payload_digest = _audit_evidence_digest(
+                    event_id=event_id,
+                    connection_log=connection_log,
+                    kind=ConnectionAuditEvent.KIND_FILE,
+                    actor=user,
+                    reporter_device=device,
+                    reporter_sequence=reporter_sequence,
+                    details=details,
+                )
+            except (TypeError, ValueError):
+                return JsonResponse({"error": "Invalid file audit"}, status=400)
             existing = _existing_audit_event(event_id)
             if existing:
-                if not _matching_audit_event(
+                if not _matching_evidence_event(
                     existing,
                     connection_log,
                     ConnectionAuditEvent.KIND_FILE,
                     user,
-                    device.uuid,
-                    details,
+                    device,
+                    reporter_sequence,
+                    payload_digest,
                 ):
-                    return _audit_event_conflict()
+                    return _audit_event_conflict(request, kind=ConnectionAuditEvent.KIND_FILE)
                 transfer_event = (
                     FileTransferAuditEvent.objects.select_related("transfer", "connection_event")
                     .filter(
@@ -4220,6 +4362,12 @@ def _audit_file(request):
                 if transfer_event is None:
                     raise IntegrityError("File transfer audit receipt is missing")
                 return _file_audit_success(connection_log, transfer_event)
+
+            if ConnectionAuditEvent.objects.filter(
+                connection=connection_log,
+                reporter_sequence=reporter_sequence,
+            ).exists():
+                return _reporter_sequence_conflict(reporter_sequence)
 
             observed_at = audit_lifecycle.database_now()
             audit_lifecycle.expire_locked_connection(connection_log, observed_at, source="file_event")
@@ -4273,6 +4421,9 @@ def _audit_file(request):
                 user,
                 device.uuid,
                 details,
+                reporter_device=device,
+                reporter_sequence=reporter_sequence,
+                payload_digest=payload_digest,
             )
             terminal_at = observed_at if state in FileLog.TERMINAL_STATES else None
             if transfer is None:
@@ -4328,8 +4479,21 @@ def _audit_file(request):
                 source_kind=source_kind,
                 created_at=observed_at,
             )
+            acknowledgement = {
+                "version": FILE_AUDIT_PROTOCOL_VERSION,
+                "receipt_version": AUDIT_EVIDENCE_RECEIPT_VERSION,
+                "audit_session_id": str(connection_log.guid),
+                "acknowledged_event_id": str(event.event_id),
+                "reporter_sequence": reporter_sequence,
+                "payload_digest": payload_digest,
+                "transfer_id": str(transfer.transfer_id),
+                "transfer_revision": transfer_event.revision,
+                "transfer_state": transfer_event.state,
+                "transferred_bytes": transfer_event.transferred_bytes,
+            }
+            _store_evidence_acknowledgement(event, acknowledgement)
     except IntegrityError:
-        return _audit_event_conflict()
+        return _audit_event_conflict(request, kind=ConnectionAuditEvent.KIND_FILE)
     _log_event(
         request,
         "api_audit_file",
@@ -4354,10 +4518,13 @@ def _audit_alarm(request):
         return error
     if not _audit_version_is_current(postdata.get("version")):
         return _audit_upgrade_required()
+    if not _audit_evidence_receipt_version_is_current(postdata.get("receipt_version")):
+        return _audit_evidence_upgrade_required(AUDIT_PROTOCOL_VERSION)
     audit_session_id = _audit_uuid4(postdata.get("audit_session_id"))
     event_id = _audit_uuid4(postdata.get("event_id"))
+    reporter_sequence = _audit_reporter_sequence(postdata.get("reporter_sequence"))
     conn_id = _audit_connection_id(postdata.get("conn_id"))
-    if audit_session_id is None or event_id is None or conn_id is None:
+    if audit_session_id is None or event_id is None or reporter_sequence is None or conn_id is None:
         return JsonResponse({"error": "Invalid connection identity"}, status=400)
     typ = _audit_enum(postdata.get("typ", 0), AlarmLog.TYPES)
     if typ is None:
@@ -4397,20 +4564,38 @@ def _audit_alarm(request):
                 return JsonResponse({"error": "Connection not found"}, status=404)
             if audit_ref and audit_ref != connection_log.audit_ref:
                 return JsonResponse({"error": "Invalid audit reference"}, status=409)
+            try:
+                payload_digest = _audit_evidence_digest(
+                    event_id=event_id,
+                    connection_log=connection_log,
+                    kind=ConnectionAuditEvent.KIND_ALARM,
+                    actor=user,
+                    reporter_device=device,
+                    reporter_sequence=reporter_sequence,
+                    details=details,
+                )
+            except (TypeError, ValueError):
+                return JsonResponse({"error": "Invalid alarm information"}, status=400)
             existing = _existing_audit_event(event_id)
             if existing:
-                if not _matching_audit_event(
+                if not _matching_evidence_event(
                     existing,
                     connection_log,
                     ConnectionAuditEvent.KIND_ALARM,
                     user,
-                    device.uuid,
-                    details,
+                    device,
+                    reporter_sequence,
+                    payload_digest,
                 ):
-                    return _audit_event_conflict()
+                    return _audit_event_conflict(request, kind=ConnectionAuditEvent.KIND_ALARM)
                 if not AlarmLog.objects.filter(event=existing, connection=connection_log).exists():
                     raise IntegrityError("Alarm audit receipt is missing")
-                return _audit_success(connection_log, event_id)
+                return JsonResponse(existing.acknowledgement)
+            if ConnectionAuditEvent.objects.filter(
+                connection=connection_log,
+                reporter_sequence=reporter_sequence,
+            ).exists():
+                return _reporter_sequence_conflict(reporter_sequence)
             observed_at = audit_lifecycle.database_now()
             audit_lifecycle.expire_locked_connection(connection_log, observed_at, source="alarm_event")
             if connection_log.state != ConnLog.STATE_ACTIVE:
@@ -4424,6 +4609,9 @@ def _audit_alarm(request):
                 user,
                 device.uuid,
                 details,
+                reporter_device=device,
+                reporter_sequence=reporter_sequence,
+                payload_digest=payload_digest,
             )
             if created:
                 AlarmLog.objects.create(
@@ -4438,12 +4626,21 @@ def _audit_alarm(request):
                     conn_id=conn_id,
                     audit_ref=connection_log.audit_ref,
                 )
+                acknowledgement = _audit_success_payload(connection_log, event_id)
+                acknowledgement.update(
+                    {
+                        "receipt_version": AUDIT_EVIDENCE_RECEIPT_VERSION,
+                        "reporter_sequence": reporter_sequence,
+                        "payload_digest": payload_digest,
+                    }
+                )
+                _store_evidence_acknowledgement(event, acknowledgement)
             elif not AlarmLog.objects.filter(event=event, connection=connection_log).exists():
                 raise IntegrityError("Alarm audit receipt is missing")
     except IntegrityError:
-        return _audit_event_conflict()
+        return _audit_event_conflict(request, kind=ConnectionAuditEvent.KIND_ALARM)
     _log_event(request, "api_audit_alarm", level="warning", username=user.username, typ=typ)
-    return _audit_success(connection_log, event_id)
+    return JsonResponse(acknowledgement)
 
 
 def audit(request):
@@ -4992,80 +5189,38 @@ def peers(request):
     if not user:
         _log_event(request, "api_peers_unauthorized", level="warning")
         return JsonResponse({"error": "Invalid token"}, status=401)
-    current, page_size, _start, _end = _pagination(request)
-    if user.is_admin:
-        device_qs = RemoteDevice.objects.select_related(
-            "owner__strategy",
-            "device_group__strategy",
-            "strategy",
-        ).order_by("rid")
-        peer_qs = RemotePeer.objects.filter(
-            profile__guid__startswith="personal-",
-        ).select_related("profile__owner")
-    else:
-        peer_qs = RemotePeer.objects.filter(
-            profile__owner=user,
-            profile__guid=_personal_guid(user),
-        ).select_related("profile__owner")
-        device_qs = RemoteDevice.objects.filter(
-            owner=user,
-        ).select_related(
-            "owner__strategy",
-            "device_group__strategy",
-            "strategy",
-        )
-        device_qs = device_qs.order_by("rid")
-    devices = {x.rid: x for x in device_qs}
-    if user.is_admin:
-        peers_by_owner_and_rid = {(peer.profile.owner_id, peer.rid): peer for peer in peer_qs}
-        peers_by_rid = {rid: peers_by_owner_and_rid.get((device.owner_id, rid)) for rid, device in devices.items()}
-        device_ids = sorted(devices)
-    else:
-        peers_by_rid = {peer.rid: peer for peer in peer_qs}
-        device_ids = sorted(set(devices) | set(peers_by_rid))
     status_filter = request.GET.get("status", "")
-    if status_filter in ("0", "1"):
-        target = 1 if status_filter == "1" else 0
-        device_ids = [
-            rid for rid in device_ids if (devices[rid].is_active if rid in devices else True) == (target == 1)
-        ]
-    total = len(device_ids)
-    start = (current - 1) * page_size
-    end = start + page_size
-    data = []
-    for rid in device_ids[start:end]:
-        device = devices.get(rid)
-        peer = peers_by_rid.get(rid)
-        username = device.username if device and device.username else (peer.username if peer else "")
-        owner = ""
-        if device and device.owner:
-            owner = device.owner.username
-        elif peer:
-            owner = peer.profile.owner.username
-        status = 1 if not device or device.is_active else 0
-        data.append(
-            {
-                "id": rid,
-                "info": {
-                    "username": username,
-                    "os": (device.os if device else (peer.platform if peer else "")),
-                    "device_name": (device.hostname if device else (peer.hostname if peer else "")),
-                },
-                "status": status,
-                "user": owner,
-                "user_name": owner,
-                "device_group_name": (
-                    device.device_group.name
-                    if device and device.device_group_id
-                    else (peer.device_group_name if peer else "")
-                ),
-                "note": device.note if device else (peer.note if peer else ""),
-            }
-        )
+    if status_filter not in ("0", "1"):
+        status_filter = ""
+    current, page_size, start, _end = _pagination(request)
+    inventory = DeviceInventory(user)
+    cursor_value = str(request.GET.get("cursor", "") or "").strip()
+    rid_after = ""
+    if cursor_value:
+        try:
+            rid_after = load_inventory_cursor(cursor_value, user, status_filter)
+        except InvalidInventoryCursor:
+            return JsonResponse({"error": "Invalid inventory cursor"}, status=400)
+        start = 0
+
+    total = inventory.count(status_filter=status_filter)
+    rows = inventory.rows(
+        offset=start,
+        limit=page_size + 1 if cursor_value else page_size,
+        status_filter=status_filter,
+        rid_after=rid_after,
+    )
+    next_cursor = ""
+    has_more = len(rows) > page_size if cursor_value else bool(rows) and start + len(rows) < total
+    if cursor_value and has_more:
+        rows = rows[:page_size]
+    if has_more:
+        next_cursor = dump_inventory_cursor(rows[-1], user, status_filter)
+    data = [row.as_api_dict() for row in rows]
     _log_event(
         request, "api_peers", level="debug", username=user.username, total=total, page=current, page_size=page_size
     )
-    return JsonResponse({"total": total, "data": data})
+    return JsonResponse({"total": total, "data": data, "nextCursor": next_cursor})
 
 
 def device_group_accessible(request):

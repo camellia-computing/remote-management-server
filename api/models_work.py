@@ -4,14 +4,17 @@ import uuid
 from django.conf import settings
 from django.contrib import admin
 from django.contrib.auth.models import Group
+from django.contrib.postgres.indexes import GinIndex, OpClass
 from django.core.exceptions import ValidationError
 from django.db import models, router, transaction
+from django.db.models.functions import Cast, Upper
 from django.db.models.signals import m2m_changed, pre_delete
 from django.dispatch import receiver
 from django.utils import timezone
 from django.utils.translation import gettext_lazy as _
 
 from .address_book_errors import AuthorizationGenerationExhausted
+from .audit_expressions import audit_search_document
 from .encrypted_fields import EncryptedTextField
 from .recording_crypto import FORMAT_VERSION as RECORDING_ENCRYPTION_VERSION
 from .recording_crypto import HEADER_SIZE as RECORDING_HEADER_SIZE
@@ -417,6 +420,15 @@ class RemoteDevice(models.Model):
         ordering = ("-rid",)
         verbose_name = _("设备")
         verbose_name_plural = _("设备列表")
+        indexes = [
+            models.Index(fields=("owner", "rid"), name="device_owner_rid_idx"),
+            models.Index(fields=("owner", "is_active", "rid"), name="device_owner_active_rid_idx"),
+            models.Index(fields=("is_active", "rid"), name="device_active_rid_idx"),
+            models.Index(
+                fields=("owner", "-update_time", "rid"),
+                name="device_owner_updated_rid_idx",
+            ),
+        ]
 
     def effective_strategy(self):
         if self.strategy_id:
@@ -530,6 +542,7 @@ class ConnLog(models.Model):
     )
     host_device_id_at_create = models.PositiveBigIntegerField(null=True, blank=True, editable=False)
     host_device_generation = models.PositiveBigIntegerField(default=0, editable=False)
+    host_device_name_at_create = models.CharField(max_length=100, blank=True, default="", editable=False)
     owner_id_at_create = models.PositiveBigIntegerField(null=True, blank=True, editable=False)
     controller_device = models.ForeignKey(
         "RemoteDevice",
@@ -541,6 +554,7 @@ class ConnLog(models.Model):
     )
     controller_device_id_at_bind = models.PositiveBigIntegerField(null=True, blank=True, editable=False)
     controller_device_generation = models.PositiveBigIntegerField(null=True, blank=True, editable=False)
+    controller_device_name_at_bind = models.CharField(max_length=100, blank=True, default="", editable=False)
     controller_owner_id_at_bind = models.PositiveBigIntegerField(null=True, blank=True, editable=False)
     event_revision = models.PositiveBigIntegerField(default=0, editable=False)
     state = models.CharField(max_length=12, choices=STATES, default=STATE_EXPIRED, editable=False)
@@ -754,6 +768,11 @@ class ConnectionAuditEvent(models.Model):
     )
     actor_id_at_event = models.PositiveBigIntegerField(editable=False)
     reporter_device_uuid = models.CharField(max_length=344, blank=True, default="", editable=False)
+    reporter_device_id_at_event = models.PositiveBigIntegerField(null=True, blank=True, editable=False)
+    reporter_device_generation = models.PositiveBigIntegerField(null=True, blank=True, editable=False)
+    reporter_sequence = models.PositiveBigIntegerField(null=True, blank=True, editable=False)
+    payload_digest = models.CharField(max_length=64, blank=True, default="", editable=False)
+    acknowledgement = models.JSONField(blank=True, default=dict, editable=False)
     details = models.JSONField(blank=True, default=dict, editable=False)
     created_at = models.DateTimeField(default=timezone.now, editable=False)
 
@@ -767,6 +786,15 @@ class ConnectionAuditEvent(models.Model):
             models.CheckConstraint(
                 condition=models.Q(sequence__gte=1),
                 name="positive_connection_audit_sequence",
+            ),
+            models.CheckConstraint(
+                condition=models.Q(reporter_sequence__isnull=True) | models.Q(reporter_sequence__gte=1),
+                name="positive_audit_reporter_sequence",
+            ),
+            models.UniqueConstraint(
+                fields=["connection", "reporter_sequence"],
+                condition=models.Q(reporter_sequence__isnull=False),
+                name="unique_audit_reporter_sequence",
             ),
         ]
 
@@ -783,7 +811,9 @@ class ConnLogAdmin(admin.ModelAdmin):
         "primary_auth",
         "two_factor",
         "host_device",
+        "host_device_name_at_create",
         "controller_device",
+        "controller_device_name_at_bind",
         "state",
         "last_seen_at",
         "terminal_at",
@@ -804,8 +834,18 @@ class ConnLogAdmin(admin.ModelAdmin):
 
 
 class ConnectionAuditEventAdmin(admin.ModelAdmin):
-    list_display = ("connection", "sequence", "kind", "actor_id_at_event", "actor", "created_at")
-    search_fields = ("event_id", "connection__guid", "actor__username")
+    list_display = (
+        "connection",
+        "sequence",
+        "reporter_sequence",
+        "kind",
+        "actor_id_at_event",
+        "reporter_device_id_at_event",
+        "reporter_device_generation",
+        "actor",
+        "created_at",
+    )
+    search_fields = ("event_id", "payload_digest", "connection__guid", "actor__username")
     list_filter = ("kind", "created_at")
 
     def has_add_permission(self, request):
@@ -1483,9 +1523,33 @@ class AddressBookRuleAudit(models.Model):
     created_at = models.DateTimeField(verbose_name=_("创建时间"), default=timezone.now)
 
     class Meta:
-        ordering = ("-created_at",)
+        ordering = ("-created_at", "-id")
         verbose_name = _("地址簿规则审计")
         verbose_name_plural = _("地址簿规则审计列表")
+        indexes = [
+            models.Index(
+                fields=["-created_at", "-id"],
+                name="ab_audit_created_pk_idx",
+            ),
+            GinIndex(
+                OpClass(
+                    Upper(
+                        Cast(
+                            audit_search_document(
+                                "profile_name",
+                                "profile_guid",
+                                "profile_owner_name",
+                                "target_name",
+                                "action",
+                            ),
+                            models.TextField(),
+                        )
+                    ),
+                    name="gin_trgm_ops",
+                ),
+                name="ab_audit_search_trgm_idx",
+            ),
+        ]
         constraints = [
             models.CheckConstraint(
                 condition=models.Q(rule__gte=1, rule__lte=3),
@@ -1570,7 +1634,7 @@ class AlarmLog(models.Model):
     )
 
     class Meta:
-        ordering = ("-created_at",)
+        ordering = ("-created_at", "-id")
         verbose_name = _("告警日志")
         verbose_name_plural = _("告警日志列表")
         constraints = [
@@ -1586,9 +1650,33 @@ class AlarmLog(models.Model):
         ]
         indexes = [
             models.Index(
+                fields=["-created_at", "-id"],
+                name="alarm_created_pk_idx",
+            ),
+            models.Index(
+                fields=["typ", "-created_at", "-id"],
+                name="alarm_type_created_pk_idx",
+            ),
+            GinIndex(
+                OpClass(
+                    Upper(
+                        Cast(
+                            audit_search_document(
+                                "reporter_device_id",
+                                "reporter_device_uuid",
+                                "audit_ref",
+                            ),
+                            models.TextField(),
+                        )
+                    ),
+                    name="gin_trgm_ops",
+                ),
+                name="alarm_search_trgm_idx",
+            ),
+            models.Index(
                 fields=["connection", "created_at"],
                 name="alarm_legacy_ret_idx",
-            )
+            ),
         ]
 
     def __str__(self):

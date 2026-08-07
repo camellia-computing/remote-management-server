@@ -1,16 +1,90 @@
 from django import forms
-from django.contrib import admin
+from django.contrib import admin, messages
 from django.contrib.auth import password_validation
 from django.contrib.auth.admin import UserAdmin as BaseUserAdmin
 from django.contrib.auth.forms import ReadOnlyPasswordHashField
 from django.contrib.auth.models import Group
 from django.core.exceptions import ValidationError
+from django.core.paginator import Paginator
 from django.db import transaction
+from django.utils.functional import cached_property
+from django.utils.text import smart_split, unescape_string_literal
 from django.utils.translation import gettext as _
 
 from api import models
 from api.address_book_authorization import bump_locked_authorization_generation
+from api.audit_queries import (
+    AUDIT_SEARCH_MAX_LENGTH,
+    AUDIT_SEARCH_MIN_LENGTH,
+    filter_address_book_audits,
+    filter_alarm_logs,
+)
 from api.credential_sessions import revoke_device_credentials, revoke_user_credentials
+
+AUDIT_ADMIN_BROWSE_LIMIT = 10_000
+
+
+class AuditAdminPaginator(Paginator):
+    @cached_property
+    def count(self):
+        if not hasattr(self.object_list, "values_list"):
+            return min(super().count, AUDIT_ADMIN_BROWSE_LIMIT)
+        primary_keys = self.object_list.values_list("pk", flat=True)[: AUDIT_ADMIN_BROWSE_LIMIT + 1]
+        observed = sum(1 for _primary_key in primary_keys.iterator(chunk_size=1_000))
+        return min(observed, AUDIT_ADMIN_BROWSE_LIMIT)
+
+
+class BoundedAuditAdminMixin:
+    paginator = AuditAdminPaginator
+    show_full_result_count = False
+    list_max_show_all = 0
+    search_help_text = _(
+        "每个搜索词需要 3–344 个字符。为限制数据库工作量，列表最多浏览当前筛选条件下最新的 10,000 条记录；"
+        "更早记录请先按时间或字段缩小范围。"
+    )
+
+    def get_paginator(self, request, queryset, per_page, orphans=0, allow_empty_first_page=True):
+        if not getattr(request, "_camellia_audit_pagination_notice", False):
+            messages.info(
+                request,
+                _("审计列表最多浏览当前筛选条件下最新的 %(count)s 条记录；需要更早记录时请先使用时间或搜索筛选。")
+                % {"count": f"{AUDIT_ADMIN_BROWSE_LIMIT:,}"},
+            )
+            request._camellia_audit_pagination_notice = True
+        return super().get_paginator(request, queryset, per_page, orphans, allow_empty_first_page)
+
+
+def _admin_search_terms(search_term):
+    terms = []
+    for bit in smart_split(search_term):
+        if bit.startswith(('"', "'")) and bit[0] == bit[-1]:
+            bit = unescape_string_literal(bit)
+        terms.append(bit)
+    return terms
+
+
+def _audit_admin_search(request, queryset, search_term, filter_function):
+    terms = _admin_search_terms(search_term)
+    if not terms:
+        return queryset, False
+    if any(len(term) < AUDIT_SEARCH_MIN_LENGTH for term in terms):
+        messages.warning(
+            request,
+            _("审计搜索中的每个词都至少需要 %(count)s 个字符。") % {"count": AUDIT_SEARCH_MIN_LENGTH},
+        )
+        return queryset.none(), False
+    if any(len(term) > AUDIT_SEARCH_MAX_LENGTH for term in terms):
+        messages.warning(
+            request,
+            _("审计搜索中的每个词都不能超过 %(count)s 个字符。") % {"count": AUDIT_SEARCH_MAX_LENGTH},
+        )
+        return queryset.none(), False
+    for term in terms:
+        queryset, too_broad = filter_function(queryset, term)
+        if too_broad:
+            messages.warning(request, _("审计搜索匹配的用户过多，请输入更精确的搜索词。"))
+            return queryset.none(), False
+    return queryset, False
 
 
 class UserCreationForm(forms.ModelForm):
@@ -439,7 +513,7 @@ class AddressBookShareAdmin(admin.ModelAdmin):
                 bump_locked_authorization_generation(profile)
 
 
-class AlarmLogAdmin(admin.ModelAdmin):
+class AlarmLogAdmin(BoundedAuditAdminMixin, admin.ModelAdmin):
     list_display = (
         "typ",
         "reporter_device_id",
@@ -454,6 +528,9 @@ class AlarmLogAdmin(admin.ModelAdmin):
         "reporter__username",
     )
     list_filter = ("typ", "created_at")
+
+    def get_search_results(self, request, queryset, search_term):
+        return _audit_admin_search(request, queryset, search_term, filter_alarm_logs)
 
     def has_add_permission(self, request):
         return False
@@ -522,8 +599,17 @@ class AddressBookRuleAdmin(admin.ModelAdmin):
 
 class AddressBookRuleAuditAdmin(admin.ModelAdmin):
     list_display = ("profile_label", "action", "target_type", "target_name", "rule", "actor", "created_at")
-    search_fields = ("profile_name", "profile_guid", "profile_owner_name", "target_name", "actor__username")
+    search_fields = (
+        "profile_name",
+        "profile_guid",
+        "profile_owner_name",
+        "target_name",
+        "action",
+        "actor__username",
+    )
     list_filter = ("action", "target_type", "rule", "created_at")
+    search_help_text = _("审计搜索中的每个词需要 3–344 个字符。")
+    show_full_result_count = False
     readonly_fields = (
         "profile",
         "profile_guid",
@@ -537,6 +623,9 @@ class AddressBookRuleAuditAdmin(admin.ModelAdmin):
         "details",
         "created_at",
     )
+
+    def get_search_results(self, request, queryset, search_term):
+        return _audit_admin_search(request, queryset, search_term, filter_address_book_audits)
 
     @admin.display(description=_("地址簿"))
     def profile_label(self, obj):

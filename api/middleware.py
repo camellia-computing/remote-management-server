@@ -1,4 +1,5 @@
-import secrets
+import logging
+import time
 
 from django.http import JsonResponse
 
@@ -11,12 +12,17 @@ from api.rate_limits import (
 )
 from api.request_utils import InvalidJsonPayload
 from api.response_security import CREDENTIAL_RESPONSE_MARKER, protect_credential_response
-from camellia_remote_management.access_logging import (
-    ACCESS_ROUTE_ENV,
-    REQUEST_ID_ENV,
-    REQUEST_ID_HEADER,
-    normalized_route,
+from camellia_remote_management.access_logging import REQUEST_ID_HEADER
+from camellia_remote_management.observability import (
+    EVENT_ID_HEADER,
+    TRACEPARENT_HEADER,
+    begin_request_context,
+    finish_request_context,
+    log_structured_event,
+    reset_request_context,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class SafeAccessLogMiddleware:
@@ -26,18 +32,40 @@ class SafeAccessLogMiddleware:
         self.get_response = get_response
 
     def __call__(self, request):
-        request_id = secrets.token_hex(16)
-        request.META[REQUEST_ID_ENV] = request_id
-        request.META[ACCESS_ROUTE_ENV] = "<unmatched>"
+        context, token = begin_request_context(request)
+        started_ns = time.monotonic_ns()
         try:
             response = self.get_response(request)
+        except Exception as exc:
+            finish_request_context(request, context)
+            log_structured_event(
+                logger,
+                request,
+                "http_request_failed",
+                level="error",
+                duration_us=max((time.monotonic_ns() - started_ns) // 1_000, 0),
+                error_class=type(exc).__name__,
+            )
+            raise
+        else:
+            context = finish_request_context(request, context)
+            resolver_match = getattr(request, "resolver_match", None)
+            if resolver_match and getattr(resolver_match.func, CREDENTIAL_RESPONSE_MARKER, False):
+                protect_credential_response(response)
+            response[REQUEST_ID_HEADER] = context.request_id
+            response[TRACEPARENT_HEADER] = context.traceparent
+            if context.event_id:
+                response[EVENT_ID_HEADER] = context.event_id
+            log_structured_event(
+                logger,
+                request,
+                "http_request_completed",
+                status=getattr(response, "status_code", 0),
+                duration_us=max((time.monotonic_ns() - started_ns) // 1_000, 0),
+            )
+            return response
         finally:
-            request.META[ACCESS_ROUTE_ENV] = normalized_route(getattr(request, "resolver_match", None))
-        resolver_match = getattr(request, "resolver_match", None)
-        if resolver_match and getattr(resolver_match.func, CREDENTIAL_RESPONSE_MARKER, False):
-            protect_credential_response(response)
-        response[REQUEST_ID_HEADER] = request_id
-        return response
+            reset_request_context(token)
 
 
 class ApiExceptionMiddleware:

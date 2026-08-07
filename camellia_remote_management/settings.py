@@ -224,9 +224,7 @@ DATA_ENCRYPTION_PRIMARY_KEY_ID = data_encryption_key_id(
     _data_encryption_key_id,
     "CAMELLIA_REMOTE_DATA_ENCRYPTION_KEY_ID",
 )
-_data_encryption_keys = data_encryption_legacy_keys(
-    os.environ.get("CAMELLIA_REMOTE_DATA_ENCRYPTION_LEGACY_KEYS", "")
-)
+_data_encryption_keys = data_encryption_legacy_keys(os.environ.get("CAMELLIA_REMOTE_DATA_ENCRYPTION_LEGACY_KEYS", ""))
 if DATA_ENCRYPTION_PRIMARY_KEY_ID in _data_encryption_keys:
     raise ImproperlyConfigured("The primary data-encryption key ID must not also be a legacy key ID")
 if DATA_ENCRYPTION_KEY_BYTES in _data_encryption_keys.values():
@@ -565,6 +563,37 @@ RECORD_UPLOAD_VOLUME_RESERVE_INODES = env_int("CAMELLIA_REMOTE_RECORD_VOLUME_RES
 RECORD_UPLOAD_REQUIRE_MOUNT = env_bool("CAMELLIA_REMOTE_RECORD_REQUIRE_MOUNT", not DEBUG)
 RECORD_UPLOAD_CAPABILITY_CACHE_SECONDS = env_int("CAMELLIA_REMOTE_RECORD_CAPABILITY_CACHE_SECONDS", 2, 0, 60)
 
+DEVICE_INVENTORY_EXPORT_MAX_ROWS = env_int(
+    "CAMELLIA_REMOTE_DEVICE_INVENTORY_EXPORT_MAX_ROWS",
+    100_000,
+    1,
+    1_000_000,
+)
+DEVICE_INVENTORY_EXPORT_MAX_BYTES = env_int(
+    "CAMELLIA_REMOTE_DEVICE_INVENTORY_EXPORT_MAX_BYTES",
+    64 * 1024 * 1024,
+    64 * 1024,
+    1024 * 1024 * 1024,
+)
+DEVICE_INVENTORY_EXPORT_DEADLINE_SECONDS = env_int(
+    "CAMELLIA_REMOTE_DEVICE_INVENTORY_EXPORT_DEADLINE_SECONDS",
+    60,
+    1,
+    600,
+)
+DEVICE_INVENTORY_EXPORT_SPOOL_MEMORY_BYTES = env_int(
+    "CAMELLIA_REMOTE_DEVICE_INVENTORY_EXPORT_SPOOL_MEMORY_BYTES",
+    2 * 1024 * 1024,
+    64 * 1024,
+    64 * 1024 * 1024,
+)
+DEVICE_INVENTORY_EXPORT_CHUNK_SIZE = env_int(
+    "CAMELLIA_REMOTE_DEVICE_INVENTORY_EXPORT_CHUNK_SIZE",
+    1000,
+    1,
+    10_000,
+)
+
 AUDIT_MAX_CONNECTIONS_PER_DEVICE = env_int("CAMELLIA_REMOTE_AUDIT_MAX_CONNECTIONS_PER_DEVICE", 10_000, 1, 10_000_000)
 AUDIT_MAX_CONNECTIONS_PER_OWNER = env_int("CAMELLIA_REMOTE_AUDIT_MAX_CONNECTIONS_PER_OWNER", 100_000, 1, 100_000_000)
 AUDIT_MAX_CONNECTIONS_GLOBAL = env_int("CAMELLIA_REMOTE_AUDIT_MAX_CONNECTIONS_GLOBAL", 10_000_000, 1, 1_000_000_000)
@@ -605,6 +634,7 @@ INSTALLED_APPS = [
     "django.contrib.contenttypes",
     "django.contrib.sessions",
     "django.contrib.messages",
+    "django.contrib.postgres",
     "django.contrib.staticfiles",
     "api.apps.ApiConfig",
     "webui2.apps.Webui2Config",
@@ -863,6 +893,9 @@ LOGGING = {
             "style": "{",
             "datefmt": "%Y-%m-%d %H:%M:%S",
         },
+        "structured_event": {
+            "()": "camellia_remote_management.observability.StructuredEventFormatter",
+        },
     },
     "filters": {
         "safe_django_request": {
@@ -876,6 +909,12 @@ LOGGING = {
             "filters": ["safe_django_request"],
             "level": LOG_LEVEL,
         },
+        "structured_console": {
+            "class": "logging.StreamHandler",
+            "formatter": "structured_event",
+            "filters": ["safe_django_request"],
+            "level": LOG_LEVEL,
+        },
     },
     "root": {
         "handlers": ["console"],
@@ -883,7 +922,7 @@ LOGGING = {
     },
     "loggers": {
         "django": {"handlers": ["console"], "level": LOG_LEVEL, "propagate": False},
-        "api": {"handlers": ["console"], "level": LOG_LEVEL, "propagate": False},
+        "api": {"handlers": ["structured_console"], "level": LOG_LEVEL, "propagate": False},
     },
 }
 STATIC_URL = "/static/"

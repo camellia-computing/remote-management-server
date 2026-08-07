@@ -18,9 +18,9 @@
           <tr>
             <th>{{ "用户IP" | translate }}</th>
             <th>{{ "用户ID" | translate }}</th>
-            <th>{{ "用户别名" | translate }}</th>
+            <th>{{ "用户设备名（审计快照）" | translate }}</th>
             <th>{{ "远程ID" | translate }}</th>
-            <th>{{ "远程别名" | translate }}</th>
+            <th>{{ "远程设备名（审计快照）" | translate }}</th>
             <th>{{ "连接类型" | translate }}</th>
             <th>{{ "连接开始时间" | translate }}</th>
             <th>{{ "连接结束时间" | translate }}</th>
@@ -32,9 +32,9 @@
           <tr>
             <td>{{ one.from_ip }}</td>
             <td>{{ one.from_id }}</td>
-            <td>{{ one.from_alias }}</td>
+            <td>{{ one.controller_device_name }}</td>
             <td>{{ one.rid }}</td>
-            <td>{{ one.alias }}</td>
+            <td>{{ one.host_device_name }}</td>
             <td>{{ one.conn_type|default:"-" }}</td>
             <td>{{ one.conn_start }}</td>
             <td>{{ one.conn_end }}</td>

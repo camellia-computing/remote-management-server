@@ -4,8 +4,9 @@ from django.contrib.auth.models import (
     PermissionsMixin,
 )
 from django.contrib.auth.validators import UnicodeUsernameValidator
+from django.contrib.postgres.indexes import GinIndex, OpClass
 from django.db import models, router, transaction
-from django.db.models.functions import Lower
+from django.db.models.functions import Cast, Lower, Upper
 from django.utils.crypto import salted_hmac
 from django.utils.translation import gettext_lazy as _
 
@@ -176,6 +177,15 @@ class UserProfile(AbstractBaseUser, PermissionsMixin):
     class Meta:
         verbose_name = _("用户")
         verbose_name_plural = _("用户列表")
+        indexes = (
+            GinIndex(
+                OpClass(
+                    Upper(Cast("username", models.TextField())),
+                    name="gin_trgm_ops",
+                ),
+                name="user_name_search_trgm_idx",
+            ),
+        )
         constraints = (
             models.UniqueConstraint(
                 Lower("username"),

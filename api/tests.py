@@ -738,8 +738,13 @@ class ApiContractTests(ApiTestMixin, TestCase):
         ):
             response = self.client.get("/api/down_peers")
 
-        self.assertEqual(response.status_code, 200, response.content)
-        workbook = load_workbook(BytesIO(response.content), read_only=True, data_only=False)
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.streaming)
+        response_body = b"".join(response.streaming_content)
+        for closer in response._resource_closers:
+            closer()
+        response._resource_closers.clear()
+        workbook = load_workbook(BytesIO(response_body), read_only=True, data_only=False)
         try:
             worksheet = workbook.active
             exported_rows = list(worksheet.iter_rows(values_only=True))
@@ -787,12 +792,16 @@ class ApiContractTests(ApiTestMixin, TestCase):
         self.assertEqual(response.headers.get("Cache-Control"), "no-store, private")
         self.assertEqual(response.headers.get("Pragma"), "no-cache")
         self.assertEqual(response.headers.get("X-Camellia-Export-Schema"), "device-inventory-v1")
-        self.assertEqual(response.headers.get("Content-Disposition"), "attachment; filename=DeviceInfo-v1.xlsx")
+        self.assertEqual(response.headers.get("Content-Disposition"), 'attachment; filename="DeviceInfo-v1.xlsx"')
 
         log_output = "\n".join(export_logs.output)
-        self.assertIn('"event": "front_export_xlsx"', log_output)
-        self.assertIn('"schema": "device-inventory-v1"', log_output)
-        self.assertIn('"count": 1', log_output)
+        export_payload = next(
+            payload
+            for payload in (json.loads(record.getMessage()) for record in export_logs.records)
+            if payload.get("event") == "front_export_xlsx"
+        )
+        self.assertEqual(export_payload["attributes"]["schema"], "device-inventory-v1")
+        self.assertEqual(export_payload["attributes"]["count"], 1)
         for canary in (credential_canary, uuid_canary, public_key_hash_canary):
             with self.subTest(log_canary=canary):
                 self.assertNotIn(canary, log_output)
@@ -2163,7 +2172,9 @@ class SensitiveIngestionTests(ApiTestMixin, TestCase):
 
         file_event = {
             "version": 4,
+            "receipt_version": 1,
             "event_id": str(uuid.uuid4()),
+            "reporter_sequence": ConnLog.objects.get(guid=restarted_audit_session_id).event_revision + 1,
             "audit_session_id": restarted_audit_session_id,
             "transfer_id": str(uuid.uuid4()),
             "transfer_revision": 1,
@@ -2193,7 +2204,9 @@ class SensitiveIngestionTests(ApiTestMixin, TestCase):
 
         alarm_event = {
             "version": 3,
+            "receipt_version": 1,
             "event_id": str(uuid.uuid4()),
+            "reporter_sequence": ConnLog.objects.get(guid=restarted_audit_session_id).event_revision + 1,
             "audit_session_id": restarted_audit_session_id,
             "id": "111111111",
             "uuid": host_uuid,
