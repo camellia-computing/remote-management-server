@@ -3613,6 +3613,7 @@ def _audit_conn_active(request):
                 connection_log.controller_device = controller_device
                 connection_log.controller_device_id_at_bind = controller_device.id
                 connection_log.controller_device_generation = controller_device.deployment_generation
+                connection_log.controller_device_name_at_bind = controller_device.hostname
                 connection_log.controller_owner_id_at_bind = user.id
                 connection_log.save(
                     update_fields=[
@@ -3620,6 +3621,7 @@ def _audit_conn_active(request):
                         "controller_device",
                         "controller_device_id_at_bind",
                         "controller_device_generation",
+                        "controller_device_name_at_bind",
                         "controller_owner_id_at_bind",
                     ]
                 )
@@ -3793,6 +3795,7 @@ def _audit_conn(request):
                         host_device=device,
                         host_device_id_at_create=device.id,
                         host_device_generation=device.deployment_generation,
+                        host_device_name_at_create=device.hostname,
                         owner_id_at_create=user.id,
                         event_revision=1,
                         state=ConnLog.STATE_STARTING,

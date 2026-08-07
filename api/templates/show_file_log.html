@@ -18,9 +18,9 @@
           <tr>
             <th>{{ "文件" | translate }}</th>
             <th>{{ "远程ID" | translate }}</th>
-            <th>{{ "远程别名" | translate }}</th>
+            <th>{{ "远程设备名（审计快照）" | translate }}</th>
             <th>{{ "用户ID" | translate }}</th>
-            <th>{{ "用户别名" | translate }}</th>
+            <th>{{ "用户设备名（审计快照）" | translate }}</th>
             <th>{{ "用户IP" | translate }}</th>
             <th>Planned</th>
             <th>Actual</th>
@@ -34,9 +34,9 @@
           <tr>
             <td>{{ one.file }}</td>
             <td>{{ one.remote_id }}</td>
-            <td>{{ one.remote_alias }}</td>
+            <td>{{ one.host_device_name }}</td>
             <td>{{ one.user_id }}</td>
-            <td>{{ one.user_alias }}</td>
+            <td>{{ one.controller_device_name }}</td>
             <td>{{ one.user_ip }}</td>
             <td>{{ one.planned_bytes_display }}</td>
             <td>{{ one.transferred_bytes_display }}</td>

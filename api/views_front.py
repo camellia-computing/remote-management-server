@@ -2924,13 +2924,6 @@ def ab_audit(request):
     )
 
 
-def _peer_alias_map(peer_ids):
-    aliases = {}
-    for peer in RemotePeer.objects.filter(rid__in=peer_ids).order_by("pk"):
-        aliases.setdefault(peer.rid, peer.alias or _("UNKNOWN"))
-    return aliases
-
-
 @login_required(login_url="/api/user_action?action=login")
 def conn_log(request):
     if not request.user.is_admin:
@@ -2943,12 +2936,11 @@ def conn_log(request):
     page_number = request.GET.get("page")
     page_obj = paginator.get_page(page_number)
     logs = list(page_obj.object_list)
-    aliases = _peer_alias_map({peer_id for log in logs for peer_id in (log.rid, log.from_id) if peer_id})
     entries = []
     for log in logs:
         item = model_to_dict(log)
-        item["alias"] = aliases.get(log.rid, _("UNKNOWN"))
-        item["from_alias"] = aliases.get(log.from_id, _("UNKNOWN"))
+        item["host_device_name"] = log.host_device_name_at_create or _("UNKNOWN")
+        item["controller_device_name"] = log.controller_device_name_at_bind or _("UNKNOWN")
         if log.conn_start and log.conn_end:
             duration = max(0, round((log.conn_end - log.conn_start).total_seconds()))
             minutes, seconds = divmod(duration, 60)
@@ -2972,18 +2964,20 @@ def file_log(request):
         _log_event(request, "front_file_log_denied", level="warning", username=request.user.username)
         return HttpResponseRedirect("/api/home")
     paginator = Paginator(
-        FileLog.objects.select_related("reporter").order_by("-logged_at", "-id"),
+        FileLog.objects.select_related("reporter", "connection").order_by("-logged_at", "-id"),
         20,
     )
     page_number = request.GET.get("page")
     page_obj = paginator.get_page(page_number)
     logs = list(page_obj.object_list)
-    aliases = _peer_alias_map({peer_id for log in logs for peer_id in (log.remote_id, log.user_id) if peer_id})
     entries = []
     for log in logs:
         item = model_to_dict(log)
-        item["remote_alias"] = aliases.get(log.remote_id, _("UNKNOWN"))
-        item["user_alias"] = aliases.get(log.user_id, _("UNKNOWN"))
+        connection = log.connection if log.connection_id else None
+        item["host_device_name"] = (connection.host_device_name_at_create if connection else "") or _("UNKNOWN")
+        item["controller_device_name"] = (connection.controller_device_name_at_bind if connection else "") or _(
+            "UNKNOWN"
+        )
         if log.audit_version == 4:
             item["planned_bytes_display"] = format_bytes(log.planned_bytes)
             item["transferred_bytes_display"] = format_bytes(log.transferred_bytes)

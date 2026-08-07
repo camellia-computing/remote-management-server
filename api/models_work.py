@@ -530,6 +530,7 @@ class ConnLog(models.Model):
     )
     host_device_id_at_create = models.PositiveBigIntegerField(null=True, blank=True, editable=False)
     host_device_generation = models.PositiveBigIntegerField(default=0, editable=False)
+    host_device_name_at_create = models.CharField(max_length=100, blank=True, default="", editable=False)
     owner_id_at_create = models.PositiveBigIntegerField(null=True, blank=True, editable=False)
     controller_device = models.ForeignKey(
         "RemoteDevice",
@@ -541,6 +542,7 @@ class ConnLog(models.Model):
     )
     controller_device_id_at_bind = models.PositiveBigIntegerField(null=True, blank=True, editable=False)
     controller_device_generation = models.PositiveBigIntegerField(null=True, blank=True, editable=False)
+    controller_device_name_at_bind = models.CharField(max_length=100, blank=True, default="", editable=False)
     controller_owner_id_at_bind = models.PositiveBigIntegerField(null=True, blank=True, editable=False)
     event_revision = models.PositiveBigIntegerField(default=0, editable=False)
     state = models.CharField(max_length=12, choices=STATES, default=STATE_EXPIRED, editable=False)
@@ -783,7 +785,9 @@ class ConnLogAdmin(admin.ModelAdmin):
         "primary_auth",
         "two_factor",
         "host_device",
+        "host_device_name_at_create",
         "controller_device",
+        "controller_device_name_at_bind",
         "state",
         "last_seen_at",
         "terminal_at",

@@ -11,10 +11,12 @@ from django.contrib import admin
 from django.core.management import call_command
 from django.db import IntegrityError, close_old_connections, connection, connections, transaction
 from django.test import Client, TestCase, TransactionTestCase, override_settings
+from django.test.utils import CaptureQueriesContext
 from django.utils import timezone
 
 from api import admin_user  # noqa: F401 - importing registers the admin models
 from api.models import (
+    AddressBookProfile,
     AlarmLog,
     ConnectionAuditEvent,
     ConnLog,
@@ -22,9 +24,15 @@ from api.models import (
     FileTransferAuditEvent,
     PersistentIngestionUsage,
     RemoteDevice,
+    RemotePeer,
     UserProfile,
 )
 from api.tests import ApiTestMixin, device_uuid
+
+TEST_STORAGES = {
+    "default": {"BACKEND": "django.core.files.storage.FileSystemStorage"},
+    "staticfiles": {"BACKEND": "django.contrib.staticfiles.storage.StaticFilesStorage"},
+}
 
 
 class AuditSessionStateMachineTests(ApiTestMixin, TestCase):
@@ -335,6 +343,131 @@ class AuditSessionStateMachineTests(ApiTestMixin, TestCase):
         connection = ConnLog.objects.get()
         self.assertEqual(connection.events.order_by("sequence").last().kind, ConnectionAuditEvent.KIND_ABORTED)
         self.assertIsNotNone(connection.conn_end)
+
+    @override_settings(STORAGES=TEST_STORAGES)
+    def test_audit_pages_use_immutable_device_snapshots_not_address_book_aliases(self):
+        host_name = "HOST-SNAPSHOT-CANARY"
+        controller_name = "CONTROLLER-SNAPSHOT-CANARY"
+        RemoteDevice.objects.filter(pk=self.host_device.pk).update(hostname=host_name)
+
+        audit_connection, audit_session_id = self._open_connection()
+        controller_password = uuid.uuid4().hex
+        controller = UserProfile.objects.create_user(username="controller", password=controller_password)
+        controller_uuid = device_uuid("audit-display-controller")
+        controller_device = self._device(
+            owner=controller,
+            rid="222222222",
+            uuid=controller_uuid,
+        )
+        controller_token = self._login(
+            "controller",
+            controller_password,
+            rid="222222222",
+            uuid=controller_uuid,
+        )
+        RemoteDevice.objects.filter(pk=controller_device.pk).update(hostname=controller_name)
+        bind_event_id = uuid.uuid4()
+        bound = self.client.get(
+            f"/api/audit/conn/active?version=3&event_id={bind_event_id}&id=111111111&session_id=99&conn_type=0",
+            **self._auth_headers(controller_token),
+        )
+        self.assertEqual(bound.status_code, 200, bound.content)
+        audit_connection.refresh_from_db()
+        self.assertEqual(audit_connection.host_device_name_at_create, host_name)
+        self.assertEqual(audit_connection.controller_device_name_at_bind, controller_name)
+
+        file_response = self._post_json(
+            "/api/audit/file",
+            self._file_payload(audit_session_id),
+            token=self.host_token,
+        )
+        self.assertEqual(file_response.status_code, 200, file_response.content)
+
+        RemotePeer.objects.filter(rid__in=("111111111", "222222222")).delete()
+        unrelated_profile = AddressBookProfile.objects.create(
+            guid="audit-display-unrelated",
+            name="Unrelated audit aliases",
+            owner=self.admin,
+            rule=3,
+        )
+        second_profile = AddressBookProfile.objects.create(
+            guid="audit-display-second",
+            name="Second audit aliases",
+            owner=controller,
+            rule=3,
+        )
+        RemotePeer.objects.create(
+            profile=unrelated_profile,
+            rid="111111111",
+            alias="BORROWED-HOST-ALIAS",
+        )
+        RemotePeer.objects.create(
+            profile=second_profile,
+            rid="111111111",
+            alias="OWNER-HOST-ALIAS",
+        )
+        RemotePeer.objects.create(
+            profile=unrelated_profile,
+            rid="222222222",
+            alias="BORROWED-CONTROLLER-ALIAS",
+        )
+        RemotePeer.objects.create(
+            profile=second_profile,
+            rid="222222222",
+            alias="OWNER-CONTROLLER-ALIAS",
+        )
+
+        self.client.force_login(self.admin)
+        for path in ("/api/conn_log", "/api/file_log"):
+            with self.subTest(path=path, phase="initial"):
+                with CaptureQueriesContext(connection) as queries:
+                    page = self.client.get(path)
+                self.assertEqual(page.status_code, 200, page.content)
+                self.assertFalse(any("api_remotepeer" in query["sql"].lower() for query in queries))
+                self.assertContains(page, host_name)
+                self.assertContains(page, controller_name)
+                self.assertNotContains(page, "BORROWED-HOST-ALIAS")
+                self.assertNotContains(page, "BORROWED-CONTROLLER-ALIAS")
+                self.assertNotContains(page, "OWNER-HOST-ALIAS")
+                self.assertNotContains(page, "OWNER-CONTROLLER-ALIAS")
+
+        RemotePeer.objects.all().update(alias="RENAMED-ADDRESS-BOOK-ALIAS")
+        RemotePeer.objects.all().delete()
+        RemoteDevice.objects.filter(pk=self.host_device.pk).update(hostname="RENAMED-HOST")
+        RemoteDevice.objects.filter(pk=controller_device.pk).update(hostname="RENAMED-CONTROLLER")
+        replayed_open = self._connection_event(
+            "new",
+            event_id=str(audit_connection.create_id),
+            ip="192.0.2.10",
+            type=0,
+            conn_audit_ref="initial-ref",
+        )
+        replayed_bind = self.client.get(
+            f"/api/audit/conn/active?version=3&event_id={bind_event_id}&id=111111111&session_id=99&conn_type=0",
+            **self._auth_headers(controller_token),
+        )
+        self.assertEqual(replayed_open.status_code, 200, replayed_open.content)
+        self.assertEqual(replayed_bind.status_code, 200, replayed_bind.content)
+        audit_connection.refresh_from_db()
+        self.assertEqual(audit_connection.host_device_name_at_create, host_name)
+        self.assertEqual(audit_connection.controller_device_name_at_bind, controller_name)
+        controller_device.refresh_from_db()
+        controller_device.owner = self.admin
+        controller_device.save(update_fields=("owner",))
+        RemoteDevice.objects.filter(pk__in=(self.host_device.pk, controller_device.pk)).delete()
+        audit_connection.refresh_from_db()
+        self.assertIsNone(audit_connection.host_device_id)
+        self.assertIsNone(audit_connection.controller_device_id)
+
+        for path in ("/api/conn_log", "/api/file_log"):
+            with self.subTest(path=path, phase="after_rename_delete"):
+                page = self.client.get(path)
+                self.assertEqual(page.status_code, 200, page.content)
+                self.assertContains(page, host_name)
+                self.assertContains(page, controller_name)
+                self.assertNotContains(page, "RENAMED-ADDRESS-BOOK-ALIAS")
+                self.assertNotContains(page, "RENAMED-HOST")
+                self.assertNotContains(page, "RENAMED-CONTROLLER")
 
     def test_heartbeat_then_close_is_terminal_and_rejects_a_late_heartbeat(self):
         connection, audit_session_id = self._open_connection()
