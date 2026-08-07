@@ -3,7 +3,7 @@ from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.http import require_http_methods
 
 from api import views_api, views_front
-from api.response_security import credential_response
+from api.response_security import credential_response, sensitive_response
 
 
 def stateless_api(view, *methods):
@@ -13,7 +13,7 @@ def stateless_api(view, *methods):
 
 def browser_view(view, *methods):
     """Declare the method contract while retaining session and CSRF protection."""
-    return require_http_methods(methods)(view)
+    return sensitive_response(require_http_methods(methods)(view))
 
 
 def credential_stateless_api(view, *methods):
