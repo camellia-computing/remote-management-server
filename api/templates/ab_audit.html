@@ -9,22 +9,28 @@
 {% endblock %}
 
 {% block content %}
+{% if messages %}
+  {% for message in messages %}
+    <div class="notice {% if message.tags %}is-{{ message.tags }}{% endif %}">{{ message }}</div>
+  {% endfor %}
+{% endif %}
 <div class="card ab-hero">
   <div class="card-header">
     <div>
       <h2 class="card-title">{% trans "规则审计日志" %}</h2>
       <p class="card-subtitle">{% trans "查看权限变更与共享配置的历史记录。" %}</p>
     </div>
-    <span class="pill">{{ page_obj.paginator.count }} {% trans "条记录" %}</span>
+    <span class="pill">{% blocktrans %}本页 {{ page_count }} 条记录{% endblocktrans %}</span>
   </div>
   <div class="ab-hero-body">
     <form class="ab-filter" method="get" action="/api/ab_audit">
-      <input class="ab-input ab-input-wide" type="text" name="q" value="{{ filter_q }}" aria-label="{% trans "搜索地址簿、执行人或目标" %}" placeholder="{% trans "搜索地址簿、执行人或目标" %}">
+      <input class="ab-input ab-input-wide" type="text" name="q" value="{{ filter_q }}" maxlength="344" aria-label="{% trans "搜索地址簿、执行人或目标" %}" placeholder="{% trans "搜索地址簿、执行人或目标" %}">
       <button class="btn btn-secondary btn-xs" type="submit">{% trans "筛选" %}</button>
       {% if filter_q %}
         <a class="btn btn-ghost btn-xs" href="/api/ab_audit">{% trans "清除" %}</a>
       {% endif %}
     </form>
+    <p class="ab-row-meta">{% trans "搜索词需要 3–344 个字符；分页游标按稳定的时间与记录 ID 前后移动，不执行全表计数。" %}</p>
   </div>
 </div>
 
@@ -65,15 +71,11 @@
 </div>
 
 <div class="pagination">
-  {% if page_obj.has_previous %}
-    <a class="btn btn-ghost" href="?{% if filter_q %}q={{ filter_q|urlencode }}&{% endif %}page={{ page_obj.previous_page_number }}">{% trans "上一页" %}</a>
+  {% if has_newer %}
+    <a class="btn btn-ghost" href="?{% if filter_q %}q={{ filter_q|urlencode }}&{% endif %}cursor={{ newer_cursor|urlencode }}">{% trans "较新记录" %}</a>
   {% endif %}
-  {% if page_obj.paginator.num_pages > 1 %}
-    <span class="page-info">{% trans "页码" %} {{ page_obj.number }} / {{ page_obj.paginator.num_pages }}</span>
-  {% endif %}
-  {% if page_obj.has_next %}
-    <a class="btn btn-ghost" href="?{% if filter_q %}q={{ filter_q|urlencode }}&{% endif %}page={{ page_obj.next_page_number }}">{% trans "下一页" %}</a>
-    <a class="btn btn-ghost" href="?{% if filter_q %}q={{ filter_q|urlencode }}&{% endif %}page={{ page_obj.paginator.num_pages }}">{% trans "尾页" %} &raquo;</a>
+  {% if has_older %}
+    <a class="btn btn-ghost" href="?{% if filter_q %}q={{ filter_q|urlencode }}&{% endif %}cursor={{ older_cursor|urlencode }}">{% trans "较早记录" %}</a>
   {% endif %}
 </div>
 {% endblock %}

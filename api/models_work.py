@@ -4,14 +4,17 @@ import uuid
 from django.conf import settings
 from django.contrib import admin
 from django.contrib.auth.models import Group
+from django.contrib.postgres.indexes import GinIndex, OpClass
 from django.core.exceptions import ValidationError
 from django.db import models, router, transaction
+from django.db.models.functions import Cast, Upper
 from django.db.models.signals import m2m_changed, pre_delete
 from django.dispatch import receiver
 from django.utils import timezone
 from django.utils.translation import gettext_lazy as _
 
 from .address_book_errors import AuthorizationGenerationExhausted
+from .audit_expressions import audit_search_document
 from .encrypted_fields import EncryptedTextField
 from .recording_crypto import FORMAT_VERSION as RECORDING_ENCRYPTION_VERSION
 from .recording_crypto import HEADER_SIZE as RECORDING_HEADER_SIZE
@@ -1487,9 +1490,33 @@ class AddressBookRuleAudit(models.Model):
     created_at = models.DateTimeField(verbose_name=_("创建时间"), default=timezone.now)
 
     class Meta:
-        ordering = ("-created_at",)
+        ordering = ("-created_at", "-id")
         verbose_name = _("地址簿规则审计")
         verbose_name_plural = _("地址簿规则审计列表")
+        indexes = [
+            models.Index(
+                fields=["-created_at", "-id"],
+                name="ab_audit_created_pk_idx",
+            ),
+            GinIndex(
+                OpClass(
+                    Upper(
+                        Cast(
+                            audit_search_document(
+                                "profile_name",
+                                "profile_guid",
+                                "profile_owner_name",
+                                "target_name",
+                                "action",
+                            ),
+                            models.TextField(),
+                        )
+                    ),
+                    name="gin_trgm_ops",
+                ),
+                name="ab_audit_search_trgm_idx",
+            ),
+        ]
         constraints = [
             models.CheckConstraint(
                 condition=models.Q(rule__gte=1, rule__lte=3),
@@ -1574,7 +1601,7 @@ class AlarmLog(models.Model):
     )
 
     class Meta:
-        ordering = ("-created_at",)
+        ordering = ("-created_at", "-id")
         verbose_name = _("告警日志")
         verbose_name_plural = _("告警日志列表")
         constraints = [
@@ -1590,9 +1617,33 @@ class AlarmLog(models.Model):
         ]
         indexes = [
             models.Index(
+                fields=["-created_at", "-id"],
+                name="alarm_created_pk_idx",
+            ),
+            models.Index(
+                fields=["typ", "-created_at", "-id"],
+                name="alarm_type_created_pk_idx",
+            ),
+            GinIndex(
+                OpClass(
+                    Upper(
+                        Cast(
+                            audit_search_document(
+                                "reporter_device_id",
+                                "reporter_device_uuid",
+                                "audit_ref",
+                            ),
+                            models.TextField(),
+                        )
+                    ),
+                    name="gin_trgm_ops",
+                ),
+                name="alarm_search_trgm_idx",
+            ),
+            models.Index(
                 fields=["connection", "created_at"],
                 name="alarm_legacy_ret_idx",
-            )
+            ),
         ]
 
     def __str__(self):

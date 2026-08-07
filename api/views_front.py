@@ -3,6 +3,7 @@ import json
 import logging
 import secrets
 import uuid
+from datetime import datetime
 from io import StringIO
 from itertools import chain
 from urllib.parse import urlencode
@@ -12,6 +13,7 @@ from django.contrib import auth, messages
 from django.contrib.auth import password_validation
 from django.contrib.auth.decorators import login_required
 from django.contrib.auth.models import Group
+from django.core import signing
 from django.core.exceptions import ValidationError
 from django.core.paginator import Paginator
 from django.db import IntegrityError, transaction
@@ -27,6 +29,8 @@ from api.address_book_authorization import (
     bump_locked_authorization_generation,
     lock_profile_access,
 )
+from api.audit_expressions import audit_cursor_boundary
+from api.audit_queries import AUDIT_SEARCH_MAX_LENGTH, AUDIT_SEARCH_MIN_LENGTH, filter_address_book_audits
 from api.formatting import format_bytes
 from api.login_admission import REGISTER_SCOPE, complete_login_success, reserve_login_attempt
 from api.models import (
@@ -52,6 +56,8 @@ logger = logging.getLogger(__name__)
 MAX_AB_PEERS = 10_000
 MAX_AB_TAGS = 256
 MAX_AB_TAGS_PER_PEER = 32
+AUDIT_PAGE_SIZE = 20
+AB_AUDIT_CURSOR_SALT = "api.ab-audit.cursor.v1"
 DEVICE_INVENTORY_EXPORT_SCHEMA = "device-inventory-v1"
 DEVICE_INVENTORY_EXPORT_HEADERS = (
     "rid",
@@ -83,6 +89,64 @@ def _log_event(request, event, level="info", **extra):
     }
     attributes.update({k: v for k, v in extra.items() if v is not None})
     log_structured_event(logger, request, event, level=level, attributes=attributes)
+
+
+def _ab_audit_query_digest(search_term):
+    return hashlib.sha256(search_term.encode("utf-8")).hexdigest()
+
+
+def _dump_ab_audit_cursor(audit, direction, search_term):
+    return signing.dumps(
+        {
+            "v": 1,
+            "direction": direction,
+            "created_at": audit.created_at.isoformat(),
+            "id": audit.pk,
+            "query": _ab_audit_query_digest(search_term),
+        },
+        salt=AB_AUDIT_CURSOR_SALT,
+        compress=True,
+    )
+
+
+def _load_ab_audit_cursor(value, search_term):
+    if not value:
+        return None
+    try:
+        payload = signing.loads(value, salt=AB_AUDIT_CURSOR_SALT)
+        if payload.get("v") != 1 or payload.get("direction") not in ("older", "newer"):
+            raise ValueError("unsupported cursor")
+        if not secrets.compare_digest(str(payload.get("query", "")), _ab_audit_query_digest(search_term)):
+            raise ValueError("cursor does not belong to this search")
+        created_at = datetime.fromisoformat(str(payload["created_at"]))
+        audit_id = int(payload["id"])
+        if not timezone.is_aware(created_at) or audit_id < 1:
+            raise ValueError("invalid cursor boundary")
+    except (KeyError, TypeError, ValueError, signing.BadSignature):
+        return None
+    return payload["direction"], created_at, audit_id
+
+
+def _ab_audit_page(audits, cursor):
+    if cursor and cursor[0] == "newer":
+        _direction, created_at, audit_id = cursor
+        candidates = list(
+            audits.filter(audit_cursor_boundary(created_at, audit_id, direction="newer")).order_by("created_at", "id")[
+                : AUDIT_PAGE_SIZE + 1
+            ]
+        )
+        has_newer = len(candidates) > AUDIT_PAGE_SIZE
+        rows = list(reversed(candidates[:AUDIT_PAGE_SIZE]))
+        return rows, has_newer, bool(rows)
+
+    page_query = audits
+    has_newer = False
+    if cursor:
+        _direction, created_at, audit_id = cursor
+        page_query = page_query.filter(audit_cursor_boundary(created_at, audit_id, direction="older"))
+        has_newer = True
+    candidates = list(page_query.order_by("-created_at", "-id")[: AUDIT_PAGE_SIZE + 1])
+    return candidates[:AUDIT_PAGE_SIZE], has_newer, len(candidates) > AUDIT_PAGE_SIZE
 
 
 def model_to_dict2(instance, fields=None, exclude=None, replace=None, default=None):
@@ -2870,20 +2934,46 @@ def ab_audit(request):
         return HttpResponseRedirect("/api/home")
 
     filter_q = str(request.GET.get("q", "")).strip()
-    audits = AddressBookRuleAudit.objects.select_related("profile", "actor").order_by("-created_at")
-    if filter_q:
-        audits = audits.filter(
-            Q(profile_name__icontains=filter_q)
-            | Q(profile_guid__icontains=filter_q)
-            | Q(profile_owner_name__icontains=filter_q)
-            | Q(actor__username__icontains=filter_q)
-            | Q(target_name__icontains=filter_q)
-            | Q(action__icontains=filter_q)
+    audits = AddressBookRuleAudit.objects.select_related("profile", "actor")
+    search_rejected = False
+    if filter_q and len(filter_q) < AUDIT_SEARCH_MIN_LENGTH:
+        search_rejected = True
+        audits = audits.none()
+        messages.warning(
+            request,
+            _("审计搜索词至少需要 %(count)s 个字符。") % {"count": AUDIT_SEARCH_MIN_LENGTH},
         )
-    paginator = Paginator(audits, 20)
-    page_number = request.GET.get("page")
-    page_obj = paginator.get_page(page_number)
-    _log_event(request, "front_ab_audit_view", username=u.username, total=page_obj.paginator.count)
+    elif len(filter_q) > AUDIT_SEARCH_MAX_LENGTH:
+        search_rejected = True
+        audits = audits.none()
+        messages.warning(
+            request,
+            _("审计搜索词不能超过 %(count)s 个字符。") % {"count": AUDIT_SEARCH_MAX_LENGTH},
+        )
+    elif filter_q:
+        audits, search_rejected = filter_address_book_audits(audits, filter_q)
+        if search_rejected:
+            messages.warning(request, _("审计搜索匹配的用户过多，请输入更精确的搜索词。"))
+
+    cursor_value = str(request.GET.get("cursor", "")).strip()
+    cursor = _load_ab_audit_cursor(cursor_value, filter_q)
+    if cursor_value and cursor is None:
+        messages.warning(request, _("审计分页游标无效，已返回最新一页。"))
+    rows, has_newer, has_older = _ab_audit_page(audits, cursor)
+    if cursor is not None and not rows and not search_rejected:
+        messages.info(request, _("审计分页边界已过期，已返回最新一页。"))
+        cursor = None
+        rows, has_newer, has_older = _ab_audit_page(audits, None)
+    newer_cursor = _dump_ab_audit_cursor(rows[0], "newer", filter_q) if rows and has_newer else ""
+    older_cursor = _dump_ab_audit_cursor(rows[-1], "older", filter_q) if rows and has_older else ""
+    _log_event(
+        request,
+        "front_ab_audit_view",
+        username=u.username,
+        page_size=len(rows),
+        filtered=bool(filter_q),
+        search_rejected=search_rejected,
+    )
 
     action_labels = {
         "share_add": _("用户共享新增"),
@@ -2896,7 +2986,7 @@ def ab_audit(request):
     }
 
     entries = []
-    for audit in page_obj:
+    for audit in rows:
         entries.append(
             {
                 "created_at": audit.created_at,
@@ -2916,9 +3006,13 @@ def ab_audit(request):
         "ab_audit.html",
         {
             "u": u,
-            "page_obj": page_obj,
             "entries": entries,
             "filter_q": filter_q,
+            "has_newer": has_newer,
+            "has_older": has_older,
+            "newer_cursor": newer_cursor,
+            "older_cursor": older_cursor,
+            "page_count": len(entries),
             "nav_active": "ab_audit",
         },
     )
