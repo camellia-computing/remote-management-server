@@ -45,7 +45,7 @@ from api.models import (
     ShareLink,
     UserProfile,
 )
-from api.request_utils import client_ip
+from api.request_utils import STRICT_SHARE_JSON_ATTRIBUTE, client_ip, load_json_form_field
 from api.response_security import protect_credential_response
 from api.tag_colors import normalize_tag_color, tag_color_css
 from api.xlsx import SpreadsheetBudgetExceeded, bounded_xlsx_file_response, safe_csv_writer, xlsx_response
@@ -1283,18 +1283,15 @@ def share(request, share_token=None):
             {"peers": peers, "sharelinks": sharelinks, "u": request.user, "nav_active": "share", "is_admin": is_admin},
         )
     else:
-        data = request.POST.get("data", "[]")
-        try:
-            data = json.loads(data)
-        except (TypeError, json.JSONDecodeError):
-            _log_event(
+        if hasattr(request, STRICT_SHARE_JSON_ATTRIBUTE):
+            data = getattr(request, STRICT_SHARE_JSON_ATTRIBUTE)
+        else:
+            data = load_json_form_field(
                 request,
-                "front_share_create_failed",
-                level="warning",
-                username=request.user.username,
-                reason="invalid_json",
+                "data",
+                max_bytes=settings.JSON_SHARE_EMBEDDED_MAX_BYTES,
+                max_form_bytes=settings.JSON_SHARE_FORM_MAX_BODY_BYTES,
             )
-            return JsonResponse({"code": 0, "msg": _("数据解析失败。")})
         if not data:
             _log_event(
                 request,
@@ -1303,7 +1300,7 @@ def share(request, share_token=None):
                 username=request.user.username,
                 reason="empty_data",
             )
-            return JsonResponse({"code": 0, "msg": _("数据为空。")})
+            return JsonResponse({"code": 0, "msg": _("数据为空。")}, status=400)
         if not isinstance(data, list) or not 1 <= len(data) <= MAX_SHARE_PEERS:
             return JsonResponse({"code": 0, "msg": _("一次最多分享 20 台设备。")}, status=400)
         selected_keys = {str(item.get("value", "")).strip() for item in data if isinstance(item, dict)}

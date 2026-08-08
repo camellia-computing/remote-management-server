@@ -2,6 +2,7 @@ import base64
 import concurrent.futures
 import json
 import threading
+import uuid
 from unittest.mock import patch
 
 from django.contrib import admin
@@ -33,7 +34,10 @@ class CredentialRevocationTests(TestCase):
 
     @staticmethod
     def post_json(client, path, payload, token=None):
-        headers = {"HTTP_AUTHORIZATION": f"Bearer {token}"} if token else {}
+        headers = {
+            "HTTP_IDEMPOTENCY_KEY": str(uuid.uuid4()),
+            **({"HTTP_AUTHORIZATION": f"Bearer {token}"} if token else {}),
+        }
         return client.post(
             path,
             data=json.dumps(payload),
@@ -71,7 +75,7 @@ class CredentialRevocationTests(TestCase):
         response = self.post_json(
             Client(),
             "/api/users/force-logout",
-            {"user_guids": [str(self.target.pk), str(self.target.pk), "999999999"]},
+            {"user_guids": [str(self.target.pk)]},
             token=operator_token,
         )
 

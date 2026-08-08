@@ -58,9 +58,10 @@ def _parse_list(value, parser, *, max_items):
     seen = set()
     for item in value:
         parsed = parser(item)
-        if parsed not in seen:
-            seen.add(parsed)
-            result.append(parsed)
+        if parsed in seen:
+            raise InvalidIdentifier("Duplicate identifiers are not allowed")
+        seen.add(parsed)
+        result.append(parsed)
     return result
 
 

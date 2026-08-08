@@ -160,6 +160,39 @@ class RemoteToken(models.Model):
         verbose_name_plural = _("令牌列表")
 
 
+class ManagementBatchOperation(models.Model):
+    """Durable authority for one replay-safe management batch mutation."""
+
+    generation = models.BigAutoField(primary_key=True)
+    operation_id = models.UUIDField(unique=True, editable=False)
+    actor = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="management_batch_operations",
+        editable=False,
+    )
+    operation = models.CharField(max_length=64, editable=False)
+    request_digest = models.CharField(max_length=64, editable=False)
+    status_code = models.PositiveSmallIntegerField(editable=False)
+    response = models.JSONField(editable=False)
+    created_at = models.DateTimeField(auto_now_add=True, db_index=True)
+
+    class Meta:
+        ordering = ("-generation",)
+        indexes = [
+            models.Index(
+                fields=("actor", "created_at"),
+                name="mgmt_batch_actor_created_idx",
+            )
+        ]
+        constraints = [
+            models.CheckConstraint(
+                condition=models.Q(status_code__gte=200, status_code__lt=500),
+                name="valid_mgmt_batch_status",
+            )
+        ]
+
+
 class DeviceProofChallenge(models.Model):
     """Short-lived, one-use challenge for device key possession proofs."""
 
@@ -1687,6 +1720,7 @@ class OidcPendingAuth(models.Model):
     """Pending OIDC authorization state, shared across workers."""
 
     STATUS_PENDING = "pending"
+    STATUS_PROCESSING = "processing"
     STATUS_DONE = "done"
     STATUS_ERROR = "error"
 
@@ -1715,6 +1749,9 @@ class OidcPendingAuth(models.Model):
     code_verifier = EncryptedTextField(verbose_name="PKCE Code Verifier", max_length=128)
     status = models.CharField(verbose_name="Status", max_length=16, default=STATUS_PENDING, db_index=True)
     error_code = models.CharField(verbose_name="Error Code", max_length=64, blank=True, default="")
+    callback_claim_owner = models.UUIDField(null=True, blank=True, editable=False)
+    callback_claim_generation = models.PositiveBigIntegerField(default=0, editable=False)
+    callback_claim_expires_at = models.DateTimeField(null=True, blank=True, editable=False)
     authenticated_user = models.ForeignKey(
         settings.AUTH_USER_MODEL,
         null=True,
@@ -1733,11 +1770,28 @@ class OidcPendingAuth(models.Model):
                 condition=models.Q(
                     status__in=(
                         "pending",
+                        "processing",
                         "done",
                         "error",
                     ),
                 ),
                 name="valid_oidc_pending_status",
+            ),
+            models.CheckConstraint(
+                condition=(
+                    models.Q(
+                        status="processing",
+                        callback_claim_owner__isnull=False,
+                        callback_claim_generation__gte=1,
+                        callback_claim_expires_at__isnull=False,
+                    )
+                    | models.Q(
+                        ~models.Q(status="processing"),
+                        callback_claim_owner__isnull=True,
+                        callback_claim_expires_at__isnull=True,
+                    )
+                ),
+                name="valid_oidc_callback_claim",
             ),
         ]
 

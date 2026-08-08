@@ -1,6 +1,7 @@
 import logging
 import time
 
+from django.conf import settings
 from django.http import JsonResponse
 from django.urls import Resolver404, resolve
 
@@ -12,7 +13,13 @@ from api.rate_limits import (
     rate_limit_backend_response,
     rate_limit_response,
 )
-from api.request_utils import InvalidJsonPayload
+from api.request_utils import (
+    STRICT_SHARE_JSON_ATTRIBUTE,
+    InvalidJsonPayload,
+    JsonPayloadTooLarge,
+    UnsupportedJsonMediaType,
+    load_json_form_field,
+)
 from api.response_security import SENSITIVE_RESPONSE_MARKER, protect_sensitive_response
 from camellia_remote_management.access_logging import REQUEST_ID_HEADER
 from camellia_remote_management.observability import (
@@ -25,6 +32,14 @@ from camellia_remote_management.observability import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def json_envelope_error_response(exception):
+    if isinstance(exception, JsonPayloadTooLarge):
+        return JsonResponse({"error": "JSON payload too large"}, status=413)
+    if isinstance(exception, UnsupportedJsonMediaType):
+        return JsonResponse({"error": "Unsupported JSON media type"}, status=415)
+    return JsonResponse({"error": "Invalid JSON payload"}, status=400)
 
 
 def _is_sensitive_response_route(request):
@@ -79,6 +94,27 @@ class SafeAccessLogMiddleware:
             reset_request_context(token)
 
 
+class StrictShareJsonPreflightMiddleware:
+    """Bound and parse the only CSRF-protected embedded-JSON form before CSRF reads it."""
+
+    def __init__(self, get_response):
+        self.get_response = get_response
+
+    def __call__(self, request):
+        if request.method == "POST" and request.path_info == "/api/share":
+            try:
+                payload = load_json_form_field(
+                    request,
+                    "data",
+                    max_bytes=settings.JSON_SHARE_EMBEDDED_MAX_BYTES,
+                    max_form_bytes=settings.JSON_SHARE_FORM_MAX_BODY_BYTES,
+                )
+            except InvalidJsonPayload as exc:
+                return json_envelope_error_response(exc)
+            setattr(request, STRICT_SHARE_JSON_ATTRIBUTE, payload)
+        return self.get_response(request)
+
+
 class ApiExceptionMiddleware:
     """Translate bounded API parsing failures into stable client errors."""
 
@@ -90,7 +126,7 @@ class ApiExceptionMiddleware:
 
     def process_exception(self, request, exception):
         if isinstance(exception, InvalidJsonPayload):
-            return JsonResponse({"error": "Invalid JSON payload"}, status=400)
+            return json_envelope_error_response(exception)
         if isinstance(exception, InvalidIdentifier):
             return JsonResponse({"error": "Invalid identifier"}, status=400)
         if isinstance(exception, AuthorizationGenerationExhausted):

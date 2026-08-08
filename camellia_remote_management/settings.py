@@ -411,6 +411,16 @@ if not DEBUG and not DEVICE_VERIFICATION_TOKEN:
 
 OIDC_PROVIDERS = {}
 OIDC_HTTP_TIMEOUT_SECONDS = env_int("CAMELLIA_REMOTE_OIDC_HTTP_TIMEOUT_SECONDS", 10, 2, 60)
+OIDC_CALLBACK_CLAIM_LEASE_SECONDS = env_int(
+    "CAMELLIA_REMOTE_OIDC_CALLBACK_CLAIM_LEASE_SECONDS",
+    max(60, OIDC_HTTP_TIMEOUT_SECONDS * 3 + 15),
+    30,
+    600,
+)
+if OIDC_CALLBACK_CLAIM_LEASE_SECONDS < OIDC_HTTP_TIMEOUT_SECONDS * 3 + 15:
+    raise ImproperlyConfigured(
+        "CAMELLIA_REMOTE_OIDC_CALLBACK_CLAIM_LEASE_SECONDS must cover discovery, token, and JWKS deadlines"
+    )
 _oidc_name = os.environ.get("CAMELLIA_REMOTE_OIDC_NAME", "").strip()
 _oidc_issuer = os.environ.get("CAMELLIA_REMOTE_OIDC_ISSUER", "").strip()
 _oidc_client_id = os.environ.get("CAMELLIA_REMOTE_OIDC_CLIENT_ID", "").strip()
@@ -494,6 +504,12 @@ OIDC_PENDING_RETENTION_MINUTES = env_int(
 )
 SHARE_LINK_RETENTION_DAYS = env_int(
     "CAMELLIA_REMOTE_SHARE_LINK_RETENTION_DAYS",
+    30,
+    1,
+    365,
+)
+MANAGEMENT_OPERATION_RETENTION_DAYS = env_int(
+    "CAMELLIA_REMOTE_MANAGEMENT_OPERATION_RETENTION_DAYS",
     30,
     1,
     365,
@@ -609,7 +625,63 @@ if not (
 AUDIT_CONNECTION_LEASE_SECONDS = env_int("CAMELLIA_REMOTE_AUDIT_CONNECTION_LEASE_SECONDS", 90, 30, 600)
 AUDIT_RETENTION_DAYS = env_int("CAMELLIA_REMOTE_AUDIT_RETENTION_DAYS", 90, 1, 3650)
 INGESTION_CLEANUP_BATCH_SIZE = env_int("CAMELLIA_REMOTE_INGESTION_CLEANUP_BATCH_SIZE", 100, 1, 1000)
-DATA_UPLOAD_MAX_MEMORY_SIZE = RECORD_UPLOAD_MAX_CHUNK_BYTES
+
+# JSON endpoints reject oversized input before Django materializes or parses it.
+# These route budgets are deliberately independent from recording chunks: a
+# larger recording setting must never expand the login/control-plane contract.
+JSON_AUTH_MAX_BODY_BYTES = env_int(
+    "CAMELLIA_REMOTE_JSON_AUTH_MAX_BODY_BYTES",
+    32 * 1024,
+    4 * 1024,
+    1024 * 1024,
+)
+JSON_CONTROL_MAX_BODY_BYTES = env_int(
+    "CAMELLIA_REMOTE_JSON_CONTROL_MAX_BODY_BYTES",
+    64 * 1024,
+    JSON_AUTH_MAX_BODY_BYTES,
+    1024 * 1024,
+)
+JSON_AUDIT_MAX_BODY_BYTES = env_int(
+    "CAMELLIA_REMOTE_JSON_AUDIT_MAX_BODY_BYTES",
+    64 * 1024,
+    32 * 1024,
+    1024 * 1024,
+)
+JSON_MANAGEMENT_BATCH_MAX_BODY_BYTES = env_int(
+    "CAMELLIA_REMOTE_JSON_MANAGEMENT_BATCH_MAX_BODY_BYTES",
+    256 * 1024,
+    JSON_CONTROL_MAX_BODY_BYTES,
+    4 * 1024 * 1024,
+)
+JSON_ADDRESS_BOOK_BULK_MAX_BODY_BYTES = env_int(
+    "CAMELLIA_REMOTE_JSON_ADDRESS_BOOK_BULK_MAX_BODY_BYTES",
+    4 * 1024 * 1024,
+    JSON_MANAGEMENT_BATCH_MAX_BODY_BYTES,
+    16 * 1024 * 1024,
+)
+JSON_SHARE_EMBEDDED_MAX_BYTES = env_int(
+    "CAMELLIA_REMOTE_JSON_SHARE_EMBEDDED_MAX_BYTES",
+    16 * 1024,
+    1024,
+    64 * 1024,
+)
+JSON_SHARE_FORM_MAX_BODY_BYTES = env_int(
+    "CAMELLIA_REMOTE_JSON_SHARE_FORM_MAX_BODY_BYTES",
+    64 * 1024,
+    JSON_SHARE_EMBEDDED_MAX_BYTES,
+    1024 * 1024,
+)
+
+# Django still needs one operational materialization ceiling for request.body.
+# It is derived rather than operator-tuned and is not an endpoint contract:
+# recording and strict JSON helpers enforce their own smaller limits and exact
+# framing before parsing or mutation.
+_minimum_request_body_materialization_bytes = max(
+    RECORD_UPLOAD_MAX_CHUNK_BYTES,
+    JSON_ADDRESS_BOOK_BULK_MAX_BODY_BYTES,
+    JSON_SHARE_FORM_MAX_BODY_BYTES,
+)
+DATA_UPLOAD_MAX_MEMORY_SIZE = _minimum_request_body_materialization_bytes
 DATA_UPLOAD_MAX_NUMBER_FIELDS = env_int("CAMELLIA_REMOTE_DATA_UPLOAD_MAX_NUMBER_FIELDS", 1000, 100, 10000)
 DATA_UPLOAD_MAX_NUMBER_FILES = 0
 FILE_UPLOAD_PERMISSIONS = 0o600
@@ -650,6 +722,7 @@ MIDDLEWARE = [
     "django.middleware.common.CommonMiddleware",
     "django.contrib.auth.middleware.AuthenticationMiddleware",
     "api.rate_limits.RateLimitMiddleware",
+    "api.middleware.StrictShareJsonPreflightMiddleware",
     "django.middleware.csrf.CsrfViewMiddleware",
     "django.contrib.messages.middleware.MessageMiddleware",
     "api.middleware.ApiExceptionMiddleware",

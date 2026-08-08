@@ -10,6 +10,7 @@ import math
 import re
 import secrets
 import uuid
+from dataclasses import dataclass
 from urllib.parse import urlsplit
 
 import requests
@@ -42,6 +43,7 @@ from api.credential_sessions import (
     revoke_user_credentials,
 )
 from api.device_identity import (
+    MAX_DEPLOYMENT_GENERATION,
     DeviceProofError,
     DeviceRecoveryRequired,
     consume_deployment_proof,
@@ -65,6 +67,12 @@ from api.identifiers import (
     parse_uuid_list,
 )
 from api.login_admission import complete_login_success, reserve_login_attempt
+from api.management_operations import (
+    ManagementMutation,
+    ManagementOperationConflict,
+    execute_management_operation,
+    operation_id_from_request,
+)
 from api.models import (
     AddressBookProfile,
     AddressBookRule,
@@ -90,11 +98,13 @@ from api.models import (
 )
 from api.policy_generation import (
     InvalidManagedPolicy,
+    device_ids_affected_by_groups,
+    device_ids_affected_by_users,
     managed_policy_document,
     normalize_policy_options,
 )
 from api.rate_limits import enforce_authenticated_rate_limit
-from api.request_utils import client_ip, load_json_body, load_json_object
+from api.request_utils import client_ip, load_json_body, load_json_object, load_json_text
 from api.tag_colors import normalize_tag_color
 from camellia_remote_management.observability import log_structured_event
 
@@ -105,6 +115,7 @@ MAX_DEPLOY_KEY_LEN = 512
 OIDC_PENDING_MINUTES = settings.OIDC_PENDING_RETENTION_MINUTES
 OIDC_MAX_PENDING_PER_IP = 20
 OIDC_DOCUMENT_MAX_BYTES = 1024 * 1024
+MAX_OIDC_CALLBACK_CLAIM_GENERATION = (1 << 63) - 1
 MAX_DEVICE_UUID_TEXT_LEN = 344
 MAX_AUDIT_INFO_BYTES = 16 * 1024
 MAX_AUDIT_NOTE_BYTES = 16 * 1024
@@ -135,12 +146,26 @@ OIDC_SAFE_ID_TOKEN_ALGORITHMS = frozenset(
 )
 
 
-def _load_json(request):
-    return load_json_body(request)
+@dataclass(frozen=True)
+class _OidcCallbackClaim:
+    state: str
+    owner: uuid.UUID
+    generation: int
+    provider: str
+    nonce: str
+    code_verifier: str
 
 
-def _load_json_object(request):
-    return load_json_object(request)
+class _OidcCallbackClaimLost(RuntimeError):
+    pass
+
+
+def _load_json(request, *, max_bytes=None):
+    return load_json_body(request, max_bytes=max_bytes)
+
+
+def _load_json_object(request, *, max_bytes=None):
+    return load_json_object(request, max_bytes=max_bytes)
 
 
 def _get_bearer_token(request):
@@ -336,6 +361,12 @@ class _OidcPolicyRevocationRequired(Exception):
     def __init__(self, user_id):
         self.user_id = user_id
         super().__init__("OIDC policy revocation is required")
+
+
+class _OidcPolicyDenied(PermissionError):
+    def __init__(self, user_id):
+        self.user_id = user_id
+        super().__init__("OIDC auto-provision policy no longer permits this identity")
 
 
 def _device_by_identity(rid, device_uuid, *, for_update=False):
@@ -660,7 +691,7 @@ def _oidc_auto_provision_allowed(provider, claims):
     return True
 
 
-def _resolve_oidc_user(provider_name, issuer, claims):
+def _resolve_oidc_user(provider_name, issuer, claims, *, defer_policy_revocation=False):
     provider = getattr(settings, "OIDC_PROVIDERS", {}).get(provider_name)
     if not provider or str(provider.get("issuer") or "").rstrip("/") != issuer:
         raise ValueError("OIDC provider does not match the validated issuer")
@@ -722,14 +753,16 @@ def _resolve_oidc_user(provider_name, issuer, claims):
                     )
             break
         except _OidcPolicyRevocationRequired as exc:
-            revoke_user_credentials((exc.user_id,))
-            raise PermissionError("OIDC auto-provision policy no longer permits this identity") from None
+            if not defer_policy_revocation:
+                revoke_user_credentials((exc.user_id,))
+            raise _OidcPolicyDenied(exc.user_id) from None
         except (IntegrityError, ValidationError):
             identity = OidcIdentity.objects.select_related("user").filter(issuer=issuer, subject=subject).first()
             if identity:
                 if identity.is_auto_provisioned and not auto_provision_allowed:
-                    revoke_user_credentials((identity.user_id,))
-                    raise PermissionError("OIDC auto-provision policy no longer permits this identity") from None
+                    if not defer_policy_revocation:
+                        revoke_user_credentials((identity.user_id,))
+                    raise _OidcPolicyDenied(identity.user_id) from None
                 user = identity.user
                 break
     if user is None:
@@ -1044,13 +1077,28 @@ def _rid_list(value):
     result = []
     seen = set()
     for item in value:
-        item = str(item).strip()
-        if not item or len(item) > 64:
+        if not isinstance(item, str) or not item or len(item) > 64 or item != item.strip():
             return None
-        if item not in seen:
-            seen.add(item)
-            result.append(item)
+        if item in seen:
+            return None
+        seen.add(item)
+        result.append(item)
     return result
+
+
+def _operation_id_or_error(request):
+    try:
+        return operation_id_from_request(request), None
+    except InvalidIdentifier:
+        return None, JsonResponse({"error": "Valid Idempotency-Key required"}, status=400)
+
+
+def _execute_management_batch(**kwargs):
+    try:
+        result = execute_management_operation(**kwargs)
+    except ManagementOperationConflict:
+        return JsonResponse({"error": "Operation identifier conflict"}, status=409)
+    return JsonResponse(result.body, status=result.status_code)
 
 
 def _strict_bool(value):
@@ -1355,7 +1403,7 @@ def _finalize_personal_device_peer(user, device):
 
 def login(request):
     result = {}
-    data = _load_json_object(request)
+    data = _load_json_object(request, max_bytes=settings.JSON_AUTH_MAX_BODY_BYTES)
 
     username_value = data.get("username", "")
     username = username_value.strip() if isinstance(username_value, str) else ""
@@ -1634,7 +1682,7 @@ def login_options(request):
 
 
 def oidc_auth(request):
-    data = _load_json_object(request)
+    data = _load_json_object(request, max_bytes=settings.JSON_AUTH_MAX_BODY_BYTES)
     provider_name = _oidc_provider_name(data.get("op"))
     provider = getattr(settings, "OIDC_PROVIDERS", {}).get(provider_name)
     if not provider:
@@ -1707,7 +1755,7 @@ def oidc_auth(request):
 
 
 def oidc_auth_query(request):
-    data = _load_json_object(request)
+    data = _load_json_object(request, max_bytes=settings.JSON_AUTH_MAX_BODY_BYTES)
     poll_code = str(data.get("code", "")).strip()
     rid = data.get("id", "")
     device_uuid = data.get("uuid", "")
@@ -1758,34 +1806,197 @@ def oidc_auth_query(request):
     return JsonResponse(body)
 
 
+def _oidc_callback_deadline(session):
+    return session.created_at + datetime.timedelta(minutes=OIDC_PENDING_MINUTES)
+
+
+def _reject_pending_oidc_callback(state):
+    now = timezone.now()
+    with transaction.atomic():
+        session = OidcPendingAuth.objects.select_for_update(of=("self",)).filter(state=state).first()
+        if not session:
+            return HttpResponse("Invalid OIDC callback", status=400)
+        if now >= _oidc_callback_deadline(session):
+            session.delete()
+            return HttpResponse("OIDC authorization expired", status=408)
+        if session.status == OidcPendingAuth.STATUS_DONE:
+            return HttpResponse("OIDC authorization completed. You can close this window.")
+        if session.status == OidcPendingAuth.STATUS_PROCESSING:
+            return HttpResponse("OIDC authorization is already being processed.", status=409)
+        if session.status != OidcPendingAuth.STATUS_PENDING:
+            return HttpResponse("OIDC authorization was not completed.", status=400)
+        session.status = OidcPendingAuth.STATUS_ERROR
+        session.error_code = "provider_denied"
+        session.save(update_fields=["status", "error_code"])
+    return HttpResponse("OIDC authorization was not completed.", status=400)
+
+
+def _claim_oidc_callback(state):
+    now = timezone.now()
+    with transaction.atomic():
+        session = OidcPendingAuth.objects.select_for_update(of=("self",)).filter(state=state).first()
+        if not session:
+            return None, HttpResponse("Invalid OIDC callback", status=400)
+        deadline = _oidc_callback_deadline(session)
+        if now >= deadline:
+            session.delete()
+            return None, HttpResponse("OIDC authorization expired", status=408)
+        if session.status == OidcPendingAuth.STATUS_DONE:
+            return None, HttpResponse("OIDC authorization completed. You can close this window.")
+        if session.status == OidcPendingAuth.STATUS_ERROR:
+            return None, HttpResponse("OIDC authorization was not completed.", status=400)
+        if session.status == OidcPendingAuth.STATUS_PROCESSING:
+            if not session.callback_claim_expires_at or session.callback_claim_expires_at > now:
+                return None, HttpResponse("OIDC authorization is already being processed.", status=409)
+        elif session.status != OidcPendingAuth.STATUS_PENDING:
+            raise RuntimeError("OIDC callback state is invalid")
+        if session.callback_claim_generation >= MAX_OIDC_CALLBACK_CLAIM_GENERATION:
+            session.status = OidcPendingAuth.STATUS_ERROR
+            session.error_code = "claim_generation_exhausted"
+            session.callback_claim_owner = None
+            session.callback_claim_expires_at = None
+            session.save(
+                update_fields=[
+                    "status",
+                    "error_code",
+                    "callback_claim_owner",
+                    "callback_claim_expires_at",
+                ]
+            )
+            return None, HttpResponse("OIDC authorization failed", status=409)
+        owner = uuid.uuid4()
+        generation = session.callback_claim_generation + 1
+        expires_at = min(
+            now + datetime.timedelta(seconds=settings.OIDC_CALLBACK_CLAIM_LEASE_SECONDS),
+            deadline,
+        )
+        session.status = OidcPendingAuth.STATUS_PROCESSING
+        session.error_code = ""
+        session.callback_claim_owner = owner
+        session.callback_claim_generation = generation
+        session.callback_claim_expires_at = expires_at
+        session.save(
+            update_fields=[
+                "status",
+                "error_code",
+                "callback_claim_owner",
+                "callback_claim_generation",
+                "callback_claim_expires_at",
+            ]
+        )
+        claim = _OidcCallbackClaim(
+            state=state,
+            owner=owner,
+            generation=generation,
+            provider=session.provider,
+            nonce=session.nonce,
+            code_verifier=session.code_verifier,
+        )
+    return claim, None
+
+
+def _fail_oidc_callback_claim(claim, error_code):
+    now = timezone.now()
+    with transaction.atomic():
+        updated = OidcPendingAuth.objects.filter(
+            state=claim.state,
+            status=OidcPendingAuth.STATUS_PROCESSING,
+            callback_claim_owner=claim.owner,
+            callback_claim_generation=claim.generation,
+            callback_claim_expires_at__gt=now,
+        ).update(
+            status=OidcPendingAuth.STATUS_ERROR,
+            error_code=error_code,
+            authenticated_user=None,
+            callback_claim_owner=None,
+            callback_claim_expires_at=None,
+        )
+    return updated == 1
+
+
+def _oidc_callback_claim_is_live(pending, claim, now):
+    return bool(
+        pending
+        and pending.status == OidcPendingAuth.STATUS_PROCESSING
+        and pending.callback_claim_owner == claim.owner
+        and pending.callback_claim_generation == claim.generation
+        and pending.callback_claim_expires_at
+        and pending.callback_claim_expires_at > now
+    )
+
+
+def _complete_oidc_callback_claim(claim, issuer, claims):
+    with transaction.atomic():
+        pending = OidcPendingAuth.objects.select_for_update(of=("self",)).filter(state=claim.state).first()
+        if not _oidc_callback_claim_is_live(pending, claim, timezone.now()):
+            raise _OidcCallbackClaimLost("OIDC callback claim is no longer authoritative")
+        user = _resolve_oidc_user(
+            claim.provider,
+            issuer,
+            claims,
+            defer_policy_revocation=True,
+        )
+        if pending.callback_claim_expires_at <= timezone.now():
+            raise _OidcCallbackClaimLost("OIDC callback claim expired while provisioning")
+        pending.authenticated_user = user
+        pending.status = OidcPendingAuth.STATUS_DONE
+        pending.error_code = ""
+        pending.callback_claim_owner = None
+        pending.callback_claim_expires_at = None
+        pending.save(
+            update_fields=[
+                "authenticated_user",
+                "status",
+                "error_code",
+                "callback_claim_owner",
+                "callback_claim_expires_at",
+            ]
+        )
+    return user
+
+
+def _reject_oidc_policy_claim(claim, user_id):
+    with transaction.atomic():
+        pending = OidcPendingAuth.objects.select_for_update(of=("self",)).filter(state=claim.state).first()
+        if not _oidc_callback_claim_is_live(pending, claim, timezone.now()):
+            raise _OidcCallbackClaimLost("OIDC callback claim is no longer authoritative")
+        revoke_user_credentials((user_id,))
+        if pending.callback_claim_expires_at <= timezone.now():
+            raise _OidcCallbackClaimLost("OIDC callback claim expired while revoking credentials")
+        pending.status = OidcPendingAuth.STATUS_ERROR
+        pending.error_code = "policy_rejected"
+        pending.authenticated_user = None
+        pending.callback_claim_owner = None
+        pending.callback_claim_expires_at = None
+        pending.save(
+            update_fields=[
+                "status",
+                "error_code",
+                "authenticated_user",
+                "callback_claim_owner",
+                "callback_claim_expires_at",
+            ]
+        )
+
+
 def oidc_callback(request):
     state = str(request.GET.get("state", "")).strip()
     code = str(request.GET.get("code", "")).strip()
-    session = OidcPendingAuth.objects.filter(Q(state=state)).first() if state else None
     provider_error = str(request.GET.get("error", "")).strip()
-    if provider_error and session:
-        OidcPendingAuth.objects.filter(
-            state=state,
-            status=OidcPendingAuth.STATUS_PENDING,
-        ).update(
-            status=OidcPendingAuth.STATUS_ERROR,
-            error_code="provider_denied",
-        )
-        return HttpResponse("OIDC authorization was not completed.", status=400)
-    if not state or not code or not session:
+    if provider_error:
+        if not state:
+            return HttpResponse("Invalid OIDC callback", status=400)
+        return _reject_pending_oidc_callback(state)
+    if not state or not code:
         return HttpResponse("Invalid OIDC callback", status=400)
-    if timezone.now() - session.created_at > datetime.timedelta(minutes=OIDC_PENDING_MINUTES):
-        session.delete()
-        return HttpResponse("OIDC authorization expired", status=408)
-    if session.status == OidcPendingAuth.STATUS_DONE:
-        return HttpResponse("OIDC authorization completed. You can close this window.")
-    if session.status != OidcPendingAuth.STATUS_PENDING:
-        return HttpResponse("OIDC authorization was not completed.", status=400)
-    provider = getattr(settings, "OIDC_PROVIDERS", {}).get(session.provider)
+
+    claim, claim_response = _claim_oidc_callback(state)
+    if claim_response:
+        return claim_response
+    provider = getattr(settings, "OIDC_PROVIDERS", {}).get(claim.provider)
     if not provider:
-        session.status = OidcPendingAuth.STATUS_ERROR
-        session.error_code = "provider_not_configured"
-        session.save(update_fields=["status", "error_code"])
+        if not _fail_oidc_callback_claim(claim, "provider_not_configured"):
+            return HttpResponse("OIDC authorization was already consumed.", status=409)
         return HttpResponse("OIDC provider is not configured", status=400)
     try:
         metadata = _oidc_metadata(
@@ -1796,36 +2007,54 @@ def oidc_callback(request):
         token = client.fetch_token(
             metadata["token_endpoint"],
             code=code,
-            code_verifier=session.code_verifier,
+            code_verifier=claim.code_verifier,
             allow_redirects=False,
         )
-        claims = _validate_oidc_id_token(token, metadata, provider, session.nonce)
+        claims = _validate_oidc_id_token(token, metadata, provider, claim.nonce)
         issuer = str(claims["iss"]).rstrip("/")
-        user = _resolve_oidc_user(session.provider, issuer, claims)
-        with transaction.atomic():
-            pending = OidcPendingAuth.objects.select_for_update().filter(state=state).first()
-            if not pending or pending.status != OidcPendingAuth.STATUS_PENDING:
-                return HttpResponse("OIDC authorization was already consumed.", status=409)
-            pending.authenticated_user = user
-            pending.status = OidcPendingAuth.STATUS_DONE
-            pending.error_code = ""
-            pending.save(update_fields=["authenticated_user", "status", "error_code"])
-        _log_event(request, "api_oidc_callback_success", username=user.username)
-    except Exception as exc:  # noqa: BLE001 - external provider failures are normalized
-        OidcPendingAuth.objects.filter(
-            state=state,
-            status=OidcPendingAuth.STATUS_PENDING,
-        ).update(
-            status=OidcPendingAuth.STATUS_ERROR,
-            error_code="verification_failed",
-        )
+        user = _complete_oidc_callback_claim(claim, issuer, claims)
+    except _OidcCallbackClaimLost:
+        return HttpResponse("OIDC authorization was already consumed.", status=409)
+    except _OidcPolicyDenied as exc:
+        try:
+            _reject_oidc_policy_claim(claim, exc.user_id)
+        except _OidcCallbackClaimLost:
+            return HttpResponse("OIDC authorization was already consumed.", status=409)
+        except Exception as revocation_exc:  # noqa: BLE001 - callback response remains bounded
+            _log_event(
+                request,
+                "api_oidc_callback_failed",
+                level="error",
+                error_type=type(revocation_exc).__name__,
+                claim_generation=claim.generation,
+            )
+            return HttpResponse("OIDC authorization could not be finalized", status=503)
         _log_event(
             request,
             "api_oidc_callback_failed",
             level="warning",
             error_type=type(exc).__name__,
+            claim_generation=claim.generation,
         )
         return HttpResponse("OIDC authorization failed", status=400)
+    except Exception as exc:  # noqa: BLE001 - external provider failures are normalized
+        claim_failed = _fail_oidc_callback_claim(claim, "verification_failed")
+        _log_event(
+            request,
+            "api_oidc_callback_failed",
+            level="warning",
+            error_type=type(exc).__name__,
+            claim_generation=claim.generation,
+        )
+        if not claim_failed:
+            return HttpResponse("OIDC authorization was already consumed.", status=409)
+        return HttpResponse("OIDC authorization failed", status=400)
+    _log_event(
+        request,
+        "api_oidc_callback_success",
+        username=user.username,
+        claim_generation=claim.generation,
+    )
     return HttpResponse("OIDC authorization completed. You can close this window.")
 
 
@@ -2987,7 +3216,10 @@ def ab_peer_delete(request, guid):
             request, "api_ab_peer_delete_denied", level="warning", username=user.username, guid=guid, reason="read_only"
         )
         return JsonResponse({"error": "Read-only"}, status=403)
-    postdata = _load_json(request)
+    postdata = _load_json(
+        request,
+        max_bytes=settings.JSON_ADDRESS_BOOK_BULK_MAX_BODY_BYTES,
+    )
     if (
         not isinstance(postdata, list)
         or len(postdata) > 1000
@@ -3188,7 +3420,10 @@ def ab_tag_delete(request, guid):
             request, "api_ab_tag_delete_denied", level="warning", username=user.username, guid=guid, reason="read_only"
         )
         return JsonResponse({"error": "Read-only"}, status=403)
-    postdata = _load_json(request)
+    postdata = _load_json(
+        request,
+        max_bytes=settings.JSON_MANAGEMENT_BATCH_MAX_BODY_BYTES,
+    )
     if (
         not isinstance(postdata, list)
         or len(postdata) > MAX_AB_TAGS
@@ -3862,7 +4097,7 @@ def _audit_controller_note_by_capability(request, postdata):
 
 
 def _audit_conn(request):
-    postdata = _load_json_object(request)
+    postdata = _load_json_object(request, max_bytes=settings.JSON_AUDIT_MAX_BODY_BYTES)
     if "note" in postdata and "uuid" not in postdata:
         return _audit_controller_note(request, postdata)
     token, user, error = _audit_device_context(request, postdata)
@@ -4221,7 +4456,7 @@ def _audit_conn(request):
 
 
 def _audit_file(request):
-    postdata = _load_json_object(request)
+    postdata = _load_json_object(request, max_bytes=settings.JSON_AUDIT_MAX_BODY_BYTES)
     token, user, error = _audit_device_context(request, postdata)
     if error:
         return error
@@ -4514,7 +4749,7 @@ def _audit_file(request):
 
 
 def _audit_alarm(request):
-    postdata = _load_json_object(request)
+    postdata = _load_json_object(request, max_bytes=settings.JSON_AUDIT_MAX_BODY_BYTES)
     token, user, error = _audit_device_context(request, postdata)
     if error:
         return error
@@ -4536,10 +4771,7 @@ def _audit_alarm(request):
         return JsonResponse({"error": "Invalid alarm information"}, status=400)
     if isinstance(raw_info, str) and len(raw_info.encode()) > MAX_AUDIT_INFO_BYTES:
         return JsonResponse({"error": "Alarm information is too large"}, status=413)
-    try:
-        info = json.loads(raw_info) if isinstance(raw_info, str) else raw_info
-    except (TypeError, ValueError, json.JSONDecodeError):
-        return JsonResponse({"error": "Invalid alarm information"}, status=400)
+    info = load_json_text(raw_info, max_bytes=MAX_AUDIT_INFO_BYTES) if isinstance(raw_info, str) else raw_info
     if not isinstance(info, dict):
         return JsonResponse({"error": "Invalid alarm information"}, status=400)
     audit_ref = _bounded_audit_text(postdata.get("conn_audit_ref", ""), 256)
@@ -4683,15 +4915,20 @@ def _filter_text(qs, field, value):
     return qs.filter(**{field: value})
 
 
-def _require_admin(request, event):
-    _token, user = _get_token_user(request)
+def _require_admin_context(request, event):
+    token, user = _get_token_user(request)
     if not user:
         _log_event(request, f"{event}_unauthorized", level="warning")
-        return None, JsonResponse({"error": "Invalid token"}, status=401)
+        return None, None, JsonResponse({"error": "Invalid token"}, status=401)
     if not user.is_admin:
         _log_event(request, f"{event}_denied", level="warning", username=user.username)
-        return user, JsonResponse({"error": "Admin required"}, status=403)
-    return user, None
+        return token, user, JsonResponse({"error": "Admin required"}, status=403)
+    return token, user, None
+
+
+def _require_admin(request, event):
+    _token, user, error = _require_admin_context(request, event)
+    return user, error
 
 
 def _device_guid(device):
@@ -4877,28 +5114,89 @@ def user_status(request, guid, action):
     target_pk = _numeric_pk(guid, UserProfile)
     if target_pk is None:
         return JsonResponse({"error": "Invalid user identifier"}, status=400)
-    try:
-        with transaction.atomic():
-            target = UserProfile.objects.select_for_update().filter(pk=target_pk).first()
-            if not target:
-                return JsonResponse({"error": "User not found"}, status=404)
-            if target.id == admin_user.id and action == "disable":
-                return JsonResponse({"error": "Cannot disable current user"}, status=400)
-            target.is_active = action == "enable"
-            target.save(update_fields=["is_active"])
-            if not target.is_active:
-                revoke_user_credentials((target.pk,))
-    except CredentialGenerationExhausted:
+    operation_id, operation_error = _operation_id_or_error(request)
+    if operation_error:
+        return operation_error
+    operation = f"user_status_{action}"
+
+    def mutate():
+        target = UserProfile.objects.select_for_update().filter(pk=target_pk).first()
+        if not target:
+            return ManagementMutation(
+                status_code=404,
+                body={"error": "User not found"},
+                applied={"users": 0},
+                result_state={"missing": {"users": [str(target_pk)]}},
+            )
+        if target.id == admin_user.id and action == "disable":
+            return ManagementMutation(
+                status_code=400,
+                body={"error": "Cannot disable current user"},
+                applied={"users": 0},
+                result_state={"error": "current_user"},
+            )
+        try:
+            with transaction.atomic():
+                target.is_active = action == "enable"
+                target.save(update_fields=["is_active"])
+                revoked_tokens = 0
+                if not target.is_active:
+                    revoked_tokens = revoke_user_credentials((target.pk,)).deleted_tokens
+        except CredentialGenerationExhausted:
+            return ManagementMutation(
+                status_code=409,
+                body={"error": "Credential revocation failed"},
+                applied={"users": 0},
+                result_state={"error": "credential_generation_exhausted"},
+            )
+        target.refresh_from_db(fields=("is_active", "credential_generation"))
+        return ManagementMutation(
+            status_code=200,
+            body={
+                "result": "OK",
+                "guid": str(target.pk),
+                "status": 1 if target.is_active else 0,
+                "revoked_tokens": revoked_tokens,
+            },
+            applied={"users": 1},
+            result_state={
+                "user": {
+                    "id": target.pk,
+                    "is_active": target.is_active,
+                    "credential_generation": target.credential_generation,
+                },
+                "revoked_tokens": revoked_tokens,
+            },
+        )
+
+    response = _execute_management_batch(
+        actor=admin_user,
+        operation_id=operation_id,
+        operation=operation,
+        request_document={"operation": operation, "user": str(target_pk)},
+        requested={"users": 1},
+        mutation=mutate,
+    )
+    body = json.loads(response.content)
+    if response.status_code != 200:
         _log_event(
             request,
             f"api_user_{action}_failed",
-            level="error",
+            level="warning",
             username=admin_user.username,
             target=guid,
+            operation_id=str(operation_id),
         )
-        return JsonResponse({"error": "Credential revocation failed"}, status=409)
-    _log_event(request, f"api_user_{action}", username=admin_user.username, target=target.username)
-    return JsonResponse(_serialize_user(target))
+        return response
+    _log_event(
+        request,
+        f"api_user_{action}",
+        username=admin_user.username,
+        target=body["guid"],
+        operation_id=str(operation_id),
+        operation_generation=body["operation_generation"],
+    )
+    return response
 
 
 def user_delete(request, guid):
@@ -4940,7 +5238,10 @@ def users_force_logout(request):
     admin_user, error = _require_admin(request, "api_users_force_logout")
     if error:
         return error
-    data = _load_json_object(request)
+    data = _load_json_object(
+        request,
+        max_bytes=settings.JSON_MANAGEMENT_BATCH_MAX_BODY_BYTES,
+    )
     try:
         guids = parse_model_pk_list(
             data.get("user_guids"),
@@ -4949,25 +5250,86 @@ def users_force_logout(request):
         )
     except InvalidIdentifier:
         return JsonResponse({"error": "Invalid user list"}, status=400)
-    try:
-        revocation = revoke_user_credentials(guids)
-    except CredentialGenerationExhausted:
-        _log_event(request, "api_users_force_logout_failed", level="error", username=admin_user.username)
-        return JsonResponse({"error": "Credential revocation failed"}, status=409)
+    if not guids:
+        return JsonResponse({"error": "User list required"}, status=400)
+    if admin_user.pk in guids:
+        return JsonResponse({"error": "Cannot force logout current user"}, status=400)
+    operation_id, operation_error = _operation_id_or_error(request)
+    if operation_error:
+        return operation_error
+    requested = {"users": len(guids)}
+    request_document = {
+        "operation": "users_force_logout",
+        "users": [str(user_id) for user_id in guids],
+    }
+
+    def mutate():
+        users = list(
+            UserProfile.objects.select_for_update()
+            .filter(pk__in=guids)
+            .order_by("pk")
+            .only("pk", "credential_generation")
+        )
+        found = {user.pk for user in users}
+        missing = [str(user_id) for user_id in guids if user_id not in found]
+        if missing:
+            return ManagementMutation(
+                status_code=409,
+                body={"error": "Batch targets changed", "missing": {"users": missing}},
+                applied={"users": 0},
+                result_state={"missing": {"users": missing}},
+            )
+        try:
+            revocation = revoke_user_credentials(guids)
+        except CredentialGenerationExhausted:
+            return ManagementMutation(
+                status_code=409,
+                body={"error": "Credential revocation failed"},
+                applied={"users": 0},
+                result_state={"error": "credential_generation_exhausted"},
+            )
+        if revocation.revoked_users != len(guids):
+            raise RuntimeError("Credential revocation did not apply the complete target set")
+        state = list(UserProfile.objects.filter(pk__in=guids).order_by("pk").values("pk", "credential_generation"))
+        return ManagementMutation(
+            status_code=200,
+            body={
+                "result": "OK",
+                "deleted": revocation.deleted_tokens,
+                "revoked_users": revocation.revoked_users,
+            },
+            applied={"users": revocation.revoked_users},
+            result_state={"users": state},
+        )
+
+    response = _execute_management_batch(
+        actor=admin_user,
+        operation_id=operation_id,
+        operation="users_force_logout",
+        request_document=request_document,
+        requested=requested,
+        mutation=mutate,
+    )
+    body = json.loads(response.content)
+    if response.status_code != 200:
+        _log_event(
+            request,
+            "api_users_force_logout_failed",
+            level="warning",
+            username=admin_user.username,
+            operation_id=str(operation_id),
+        )
+        return response
     _log_event(
         request,
         "api_users_force_logout",
         username=admin_user.username,
-        deleted=revocation.deleted_tokens,
-        revoked_users=revocation.revoked_users,
+        operation_id=str(operation_id),
+        operation_generation=body["operation_generation"],
+        deleted=body["deleted"],
+        revoked_users=body["revoked_users"],
     )
-    return JsonResponse(
-        {
-            "result": "OK",
-            "deleted": revocation.deleted_tokens,
-            "revoked_users": revocation.revoked_users,
-        }
-    )
+    return response
 
 
 def devices(request):
@@ -5005,22 +5367,97 @@ def devices(request):
 
 
 def device_status(request, guid, action):
-    admin_user, error = _require_admin(request, f"api_device_{action}")
+    admin_token, admin_user, error = _require_admin_context(request, f"api_device_{action}")
     if error:
         return error
     device_pk = _numeric_pk(guid, RemoteDevice)
     if device_pk is None:
         return JsonResponse({"error": "Invalid device identifier"}, status=400)
-    with transaction.atomic():
+    operation_id, operation_error = _operation_id_or_error(request)
+    if operation_error:
+        return operation_error
+    operation = f"device_status_{action}"
+
+    def mutate():
         device = RemoteDevice.objects.select_for_update().filter(pk=device_pk).first()
         if not device:
-            return JsonResponse({"error": "Device not found"}, status=404)
+            return ManagementMutation(
+                status_code=404,
+                body={"error": "Device not found"},
+                applied={"devices": 0},
+                result_state={"missing": {"devices": [str(device_pk)]}},
+            )
+        if device.pk == admin_token.device_id and action == "disable":
+            return ManagementMutation(
+                status_code=400,
+                body={"error": "Cannot disable current device"},
+                applied={"devices": 0},
+                result_state={"error": "current_device"},
+            )
+        if action == "disable" and device.deployment_generation >= MAX_DEPLOYMENT_GENERATION:
+            return ManagementMutation(
+                status_code=409,
+                body={"error": "Device authority revocation failed"},
+                applied={"devices": 0},
+                result_state={"error": "deployment_generation_exhausted"},
+            )
         device.is_active = action == "enable"
-        device.save(update_fields=["is_active", "update_time"])
+        update_fields = ["is_active", "update_time"]
         if not device.is_active:
-            _revoke_device_tokens(device)
-    _log_event(request, f"api_device_{action}", username=admin_user.username, rid=device.rid)
-    return JsonResponse(_serialize_device(device))
+            device.deployment_generation += 1
+            update_fields.append("deployment_generation")
+        device.save(update_fields=update_fields)
+        revoked_tokens = 0
+        if not device.is_active:
+            revoked_tokens = _revoke_device_tokens(device)
+        return ManagementMutation(
+            status_code=200,
+            body={
+                "result": "OK",
+                "guid": str(device.pk),
+                "status": 1 if device.is_active else 0,
+                "revoked_tokens": revoked_tokens,
+            },
+            applied={"devices": 1},
+            result_state={
+                "device": {
+                    "id": device.pk,
+                    "rid": device.rid,
+                    "is_active": device.is_active,
+                    "deployment_generation": device.deployment_generation,
+                },
+                "revoked_tokens": revoked_tokens,
+            },
+        )
+
+    response = _execute_management_batch(
+        actor=admin_user,
+        operation_id=operation_id,
+        operation=operation,
+        request_document={"operation": operation, "device": str(device_pk)},
+        requested={"devices": 1},
+        mutation=mutate,
+    )
+    body = json.loads(response.content)
+    if response.status_code != 200:
+        _log_event(
+            request,
+            f"api_device_{action}_failed",
+            level="warning",
+            username=admin_user.username,
+            target=guid,
+            operation_id=str(operation_id),
+        )
+        return response
+    _log_event(
+        request,
+        f"api_device_{action}",
+        username=admin_user.username,
+        target=body["guid"],
+        operation_id=str(operation_id),
+        operation_generation=body["operation_generation"],
+    )
+    return response
 
 
 def device_approve_recovery(request, guid):
@@ -5060,21 +5497,77 @@ def device_approve_recovery(request, guid):
 
 
 def device_delete(request, guid):
-    admin_user, error = _require_admin(request, "api_device_delete")
+    admin_token, admin_user, error = _require_admin_context(request, "api_device_delete")
     if error:
         return error
     device_pk = _numeric_pk(guid, RemoteDevice)
     if device_pk is None:
         return JsonResponse({"error": "Invalid device identifier"}, status=400)
-    with transaction.atomic():
+    operation_id, operation_error = _operation_id_or_error(request)
+    if operation_error:
+        return operation_error
+
+    def mutate():
         device = RemoteDevice.objects.select_for_update().filter(pk=device_pk).first()
         if not device:
-            return JsonResponse({"error": "Device not found"}, status=404)
+            return ManagementMutation(
+                status_code=404,
+                body={"error": "Device not found"},
+                applied={"devices": 0},
+                result_state={"missing": {"devices": [str(device_pk)]}},
+            )
+        if device.pk == admin_token.device_id:
+            return ManagementMutation(
+                status_code=400,
+                body={"error": "Cannot delete current device"},
+                applied={"devices": 0},
+                result_state={"error": "current_device"},
+            )
         rid = device.rid
-        _revoke_device_tokens(device)
+        revoked_tokens = _revoke_device_tokens(device)
         device.delete()
-    _log_event(request, "api_device_deleted", username=admin_user.username, rid=rid)
-    return JsonResponse({"result": "OK"})
+        return ManagementMutation(
+            status_code=200,
+            body={
+                "result": "OK",
+                "deleted_device": {"guid": str(device_pk)},
+                "revoked_tokens": revoked_tokens,
+            },
+            applied={"devices": 1},
+            result_state={
+                "deleted_device": {"id": device_pk, "rid": rid},
+                "revoked_tokens": revoked_tokens,
+            },
+        )
+
+    response = _execute_management_batch(
+        actor=admin_user,
+        operation_id=operation_id,
+        operation="device_delete",
+        request_document={"operation": "device_delete", "device": str(device_pk)},
+        requested={"devices": 1},
+        mutation=mutate,
+    )
+    body = json.loads(response.content)
+    if response.status_code != 200:
+        _log_event(
+            request,
+            "api_device_delete_failed",
+            level="warning",
+            username=admin_user.username,
+            target=guid,
+            operation_id=str(operation_id),
+        )
+        return response
+    _log_event(
+        request,
+        "api_device_deleted",
+        username=admin_user.username,
+        target=body["deleted_device"]["guid"],
+        operation_id=str(operation_id),
+        operation_generation=body["operation_generation"],
+    )
+    return response
 
 
 def device_assign(request, guid):
@@ -5352,18 +5845,80 @@ def device_group_detail(request, guid):
                 return JsonResponse({"error": "Device group already exists"}, status=409)
         return JsonResponse(_serialize_device_group(group))
     elif request.method == "POST":
-        ids = _load_json(request)
-        ids = _rid_list(ids)
-        if ids is None or any(not re.fullmatch(r"[A-Za-z0-9_-]{6,16}", item) for item in ids):
-            return JsonResponse({"error": "Device id list required"}, status=400)
-        group = DeviceGroup.objects.filter(guid=group_guid).first()
-        if not group:
-            return JsonResponse({"error": "Device group not found"}, status=404)
-        updated = RemoteDevice.objects.filter(rid__in=[str(x) for x in ids]).update(device_group=group)
-        _log_event(
-            request, "api_device_group_add_devices", username=admin_user.username, target=group.name, updated=updated
+        ids = _load_json(
+            request,
+            max_bytes=settings.JSON_MANAGEMENT_BATCH_MAX_BODY_BYTES,
         )
-        return JsonResponse({"result": "OK", "updated": updated})
+        ids = _rid_list(ids)
+        if not ids or any(not re.fullmatch(r"[A-Za-z0-9_-]{6,16}", item) for item in ids):
+            return JsonResponse({"error": "Device id list required"}, status=400)
+        operation_id, operation_error = _operation_id_or_error(request)
+        if operation_error:
+            return operation_error
+        requested = {"devices": len(ids)}
+        request_document = {
+            "operation": "device_group_add_devices",
+            "group": str(group_guid),
+            "devices": ids,
+        }
+
+        def mutate():
+            group = DeviceGroup.objects.select_for_update().filter(guid=group_guid).first()
+            if not group:
+                return ManagementMutation(
+                    status_code=404,
+                    body={"error": "Device group not found"},
+                    applied={"devices": 0},
+                    result_state={"error": "group_not_found"},
+                )
+            devices = list(
+                RemoteDevice.objects.select_for_update().filter(rid__in=ids).order_by("pk").only("pk", "rid")
+            )
+            found = {device.rid for device in devices}
+            missing = [rid for rid in ids if rid not in found]
+            if missing:
+                return ManagementMutation(
+                    status_code=409,
+                    body={"error": "Batch targets changed", "missing": {"devices": missing}},
+                    applied={"devices": 0},
+                    result_state={"missing": {"devices": missing}},
+                )
+            device_ids = [device.pk for device in devices]
+            updated = RemoteDevice.objects.filter(pk__in=device_ids).update(device_group=group)
+            if updated != len(ids):
+                raise RuntimeError("Device group assignment did not apply the complete target set")
+            state = list(
+                RemoteDevice.objects.filter(pk__in=device_ids)
+                .order_by("pk")
+                .values("rid", "device_group_id", "policy_generation")
+            )
+            return ManagementMutation(
+                status_code=200,
+                body={"result": "OK", "updated": updated},
+                applied={"devices": updated},
+                result_state={"devices": state},
+            )
+
+        response = _execute_management_batch(
+            actor=admin_user,
+            operation_id=operation_id,
+            operation="device_group_add_devices",
+            request_document=request_document,
+            requested=requested,
+            mutation=mutate,
+        )
+        body = json.loads(response.content)
+        _log_event(
+            request,
+            "api_device_group_add_devices" if response.status_code == 200 else "api_device_group_add_devices_failed",
+            level="info" if response.status_code == 200 else "warning",
+            username=admin_user.username,
+            target=str(group_guid),
+            operation_id=str(operation_id),
+            operation_generation=body.get("operation_generation"),
+            updated=body.get("updated", 0),
+        )
+        return response
     else:
         with transaction.atomic():
             group = DeviceGroup.objects.select_for_update().filter(guid=group_guid).first()
@@ -5383,21 +5938,91 @@ def device_group_remove_devices(request, guid):
         group_guid = parse_uuid(guid)
     except InvalidIdentifier:
         return JsonResponse({"error": "Invalid device group identifier"}, status=400)
-    group = DeviceGroup.objects.filter(guid=group_guid).first()
-    if not group:
-        return JsonResponse({"error": "Device group not found"}, status=404)
-    ids = _load_json(request)
-    ids = _rid_list(ids)
-    if ids is None or any(not re.fullmatch(r"[A-Za-z0-9_-]{6,16}", item) for item in ids):
-        return JsonResponse({"error": "Device id list required"}, status=400)
-    updated = RemoteDevice.objects.filter(
-        rid__in=[str(x) for x in ids],
-        device_group=group,
-    ).update(device_group=None)
-    _log_event(
-        request, "api_device_group_remove_devices", username=admin_user.username, target=group.name, updated=updated
+    ids = _load_json(
+        request,
+        max_bytes=settings.JSON_MANAGEMENT_BATCH_MAX_BODY_BYTES,
     )
-    return JsonResponse({"result": "OK", "updated": updated})
+    ids = _rid_list(ids)
+    if not ids or any(not re.fullmatch(r"[A-Za-z0-9_-]{6,16}", item) for item in ids):
+        return JsonResponse({"error": "Device id list required"}, status=400)
+    operation_id, operation_error = _operation_id_or_error(request)
+    if operation_error:
+        return operation_error
+    requested = {"devices": len(ids)}
+    request_document = {
+        "operation": "device_group_remove_devices",
+        "group": str(group_guid),
+        "devices": ids,
+    }
+
+    def mutate():
+        group = DeviceGroup.objects.select_for_update().filter(guid=group_guid).first()
+        if not group:
+            return ManagementMutation(
+                status_code=404,
+                body={"error": "Device group not found"},
+                applied={"devices": 0},
+                result_state={"error": "group_not_found"},
+            )
+        devices = list(
+            RemoteDevice.objects.select_for_update()
+            .filter(rid__in=ids)
+            .order_by("pk")
+            .only("pk", "rid", "device_group_id")
+        )
+        found = {device.rid for device in devices}
+        missing = [rid for rid in ids if rid not in found]
+        wrong_group = [device.rid for device in devices if device.device_group_id != group.pk]
+        if missing or wrong_group:
+            return ManagementMutation(
+                status_code=409,
+                body={
+                    "error": "Batch targets changed",
+                    "missing": {"devices": missing},
+                    "rejected": {"not_in_group": wrong_group},
+                },
+                applied={"devices": 0},
+                result_state={
+                    "missing": {"devices": missing},
+                    "rejected": {"not_in_group": wrong_group},
+                },
+            )
+        device_ids = [device.pk for device in devices]
+        updated = RemoteDevice.objects.filter(pk__in=device_ids, device_group=group).update(device_group=None)
+        if updated != len(ids):
+            raise RuntimeError("Device group removal did not apply the complete target set")
+        state = list(
+            RemoteDevice.objects.filter(pk__in=device_ids)
+            .order_by("pk")
+            .values("rid", "device_group_id", "policy_generation")
+        )
+        return ManagementMutation(
+            status_code=200,
+            body={"result": "OK", "updated": updated},
+            applied={"devices": updated},
+            result_state={"devices": state},
+        )
+
+    response = _execute_management_batch(
+        actor=admin_user,
+        operation_id=operation_id,
+        operation="device_group_remove_devices",
+        request_document=request_document,
+        requested=requested,
+        mutation=mutate,
+    )
+    body = json.loads(response.content)
+    _log_event(
+        request,
+        "api_device_group_remove_devices" if response.status_code == 200 else "api_device_group_remove_devices_failed",
+        level="info" if response.status_code == 200 else "warning",
+        username=admin_user.username,
+        target=str(group_guid),
+        operation_id=str(operation_id),
+        operation_generation=body.get("operation_generation"),
+        updated=body.get("updated", 0),
+    )
+    return response
 
 
 def strategies(request):
@@ -5540,17 +6165,18 @@ def strategy_assign(request):
     admin_user, error = _require_admin(request, "api_strategy_assign")
     if error:
         return error
-    data = _load_json_object(request)
-    strategy = None
+    data = _load_json_object(
+        request,
+        max_bytes=settings.JSON_MANAGEMENT_BATCH_MAX_BODY_BYTES,
+    )
     strategy_guid = data.get("strategy")
     if strategy_guid not in (None, ""):
         try:
             strategy_guid = parse_uuid(strategy_guid)
         except InvalidIdentifier:
             return JsonResponse({"error": "Invalid strategy"}, status=400)
-        strategy = StrategyProfile.objects.filter(guid=strategy_guid).first()
-        if not strategy:
-            return JsonResponse({"error": "Strategy not found"}, status=404)
+    else:
+        strategy_guid = None
     try:
         peer_guids = parse_model_pk_list(
             data.get("peers", []),
@@ -5570,18 +6196,110 @@ def strategy_assign(request):
         return JsonResponse({"error": "Invalid assignment targets"}, status=400)
     if not peer_guids and not user_guids and not group_guids:
         return JsonResponse({"error": "No assignment targets"}, status=400)
-    with transaction.atomic():
-        devices_updated = RemoteDevice.objects.filter(pk__in=peer_guids).update(strategy=strategy)
-        users_updated = UserProfile.objects.filter(pk__in=user_guids).update(strategy=strategy)
-        groups = DeviceGroup.objects.filter(guid__in=group_guids)
-        groups_updated = groups.update(strategy=strategy)
+    operation_id, operation_error = _operation_id_or_error(request)
+    if operation_error:
+        return operation_error
+    requested = {
+        "devices": len(peer_guids),
+        "users": len(user_guids),
+        "groups": len(group_guids),
+    }
+    request_document = {
+        "operation": "strategy_assign",
+        "strategy": str(strategy_guid) if strategy_guid else None,
+        "peers": [str(peer_id) for peer_id in peer_guids],
+        "users": [str(user_id) for user_id in user_guids],
+        "groups": [str(group_id) for group_id in group_guids],
+    }
+
+    def mutate():
+        strategy = None
+        if strategy_guid:
+            strategy = StrategyProfile.objects.select_for_update().filter(guid=strategy_guid).first()
+            if not strategy:
+                return ManagementMutation(
+                    status_code=404,
+                    body={"error": "Strategy not found"},
+                    applied=dict.fromkeys(requested, 0),
+                    result_state={"error": "strategy_not_found"},
+                )
+        groups = list(
+            DeviceGroup.objects.select_for_update().filter(guid__in=group_guids).order_by("pk").only("pk", "guid")
+        )
+        users = list(UserProfile.objects.select_for_update().filter(pk__in=user_guids).order_by("pk").only("pk"))
+        group_ids = [group.pk for group in groups]
+        user_ids = [user.pk for user in users]
+        affected_device_ids = set(peer_guids)
+        affected_device_ids.update(device_ids_affected_by_groups(group_ids))
+        affected_device_ids.update(device_ids_affected_by_users(user_ids))
+        locked_devices = list(
+            RemoteDevice.objects.select_for_update().filter(pk__in=affected_device_ids).order_by("pk").only("pk")
+        )
+        found_devices = {device.pk for device in locked_devices}
+        found_users = {user.pk for user in users}
+        found_groups = {group.guid for group in groups}
+        missing = {
+            "devices": [str(peer_id) for peer_id in peer_guids if peer_id not in found_devices],
+            "users": [str(user_id) for user_id in user_guids if user_id not in found_users],
+            "groups": [str(group_id) for group_id in group_guids if group_id not in found_groups],
+        }
+        if any(missing.values()):
+            return ManagementMutation(
+                status_code=409,
+                body={"error": "Batch targets changed", "missing": missing},
+                applied=dict.fromkeys(requested, 0),
+                result_state={"missing": missing},
+            )
+        device_ids = list(peer_guids)
+        groups_updated = DeviceGroup.objects.filter(pk__in=group_ids).update(strategy=strategy)
+        users_updated = UserProfile.objects.filter(pk__in=user_ids).update(strategy=strategy)
+        devices_updated = RemoteDevice.objects.filter(pk__in=device_ids).update(strategy=strategy)
+        applied = {
+            "devices": devices_updated,
+            "users": users_updated,
+            "groups": groups_updated,
+        }
+        if applied != requested:
+            raise RuntimeError("Strategy assignment did not apply the complete target set")
+        state = {
+            "strategy": str(strategy.guid) if strategy else None,
+            "devices": list(
+                RemoteDevice.objects.filter(pk__in=device_ids)
+                .order_by("pk")
+                .values("pk", "strategy_id", "policy_generation")
+            ),
+            "users": list(UserProfile.objects.filter(pk__in=user_ids).order_by("pk").values("pk", "strategy_id")),
+            "groups": [
+                {"guid": str(group.guid), "strategy_id": group.strategy_id}
+                for group in DeviceGroup.objects.filter(pk__in=group_ids).order_by("pk")
+            ],
+        }
+        return ManagementMutation(
+            status_code=200,
+            body={"result": "OK", **applied},
+            applied=applied,
+            result_state=state,
+        )
+
+    response = _execute_management_batch(
+        actor=admin_user,
+        operation_id=operation_id,
+        operation="strategy_assign",
+        request_document=request_document,
+        requested=requested,
+        mutation=mutate,
+    )
+    body = json.loads(response.content)
     _log_event(
         request,
-        "api_strategy_assign",
+        "api_strategy_assign" if response.status_code == 200 else "api_strategy_assign_failed",
+        level="info" if response.status_code == 200 else "warning",
         username=admin_user.username,
-        strategy=strategy.name if strategy else "",
-        devices=devices_updated,
-        users=users_updated,
-        groups=groups_updated,
+        strategy=str(strategy_guid or ""),
+        operation_id=str(operation_id),
+        operation_generation=body.get("operation_generation"),
+        devices=body.get("devices", 0),
+        users=body.get("users", 0),
+        groups=body.get("groups", 0),
     )
-    return JsonResponse({"result": "OK", "devices": devices_updated, "users": users_updated, "groups": groups_updated})
+    return response

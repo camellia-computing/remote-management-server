@@ -227,6 +227,7 @@ class ApiTestMixin:
 
     def _post_json(self, path, payload, token=None):
         headers = self._auth_headers(token)
+        headers["HTTP_IDEMPOTENCY_KEY"] = str(uuid.uuid4())
         return self.client.post(
             path,
             data=json.dumps(payload),
@@ -245,6 +246,7 @@ class ApiTestMixin:
 
     def _delete_json(self, path, payload=None, token=None):
         headers = self._auth_headers(token)
+        headers["HTTP_IDEMPOTENCY_KEY"] = str(uuid.uuid4())
         return self.client.delete(
             path,
             data=json.dumps(payload if payload is not None else {}),
@@ -914,6 +916,9 @@ class ApiContractTests(ApiTestMixin, TestCase):
                 "retained_share_links": 0,
                 "request_rate_buckets": 0,
                 "request_rate_leases": 0,
+                "expired_management_batch_operations": 0,
+                "management_batch_operations_purged": 0,
+                "management_batch_operations_remaining": 0,
                 "recording_active_expired": 0,
                 "recording_finalized_purged": 0,
                 "recording_aborted_purged": 0,
