@@ -5106,6 +5106,43 @@ def _is_online(updated_at):
     return (timezone.now() - updated_at).total_seconds() <= 120 if updated_at else False
 
 
+def _username_conflict_response(request, admin_user, *, phase):
+    _log_event(
+        request,
+        "api_users_create_conflict",
+        level="warning",
+        username=admin_user.username,
+        reason="username_conflict",
+        phase=phase,
+    )
+    return JsonResponse(
+        {
+            "error": "User already exists",
+            "code": "username_conflict",
+        },
+        status=409,
+    )
+
+
+def _locked_user_group(group_name):
+    def find_group():
+        return Group.objects.select_for_update().filter(name__iexact=group_name).order_by("pk").first()
+
+    group = find_group()
+    if group:
+        return group
+    for attempt in range(3):
+        try:
+            with transaction.atomic():
+                return Group.objects.create(name=group_name)
+        except IntegrityError:
+            group = find_group()
+            if group:
+                return group
+            if attempt == 2:
+                raise
+
+
 def users(request):
     if request.method == "POST":
         admin_user, error = _require_admin(request, "api_users_create")
@@ -5156,7 +5193,7 @@ def users(request):
         ):
             return JsonResponse({"error": "Invalid user payload"}, status=400)
         if UserProfile.objects.by_username(username).exists():
-            return JsonResponse({"error": "User already exists"}, status=409)
+            return _username_conflict_response(request, admin_user, phase="precheck")
         candidate = UserProfile(
             username=username,
             email=email,
@@ -5164,27 +5201,29 @@ def users(request):
         )
         try:
             candidate.set_password(password)
-            candidate.full_clean()
+            candidate.full_clean(validate_unique=False)
+        except ValueError, ValidationError:
+            return JsonResponse({"error": "Invalid user payload"}, status=400)
+        try:
             password_validation.validate_password(password, user=candidate)
         except ValidationError:
             return JsonResponse({"error": "Password does not meet security requirements"}, status=400)
-        try:
-            with transaction.atomic():
-                user = UserProfile.objects.create_user(
-                    username=username,
-                    password=password,
-                    email=email,
-                    note=note,
-                )
-                if group_name:
-                    group = Group.objects.filter(
-                        name__iexact=group_name,
-                    ).first()
-                    if not group:
-                        group = Group.objects.create(name=group_name)
-                    user.groups.add(group)
-        except IntegrityError:
-            return JsonResponse({"error": "User already exists"}, status=409)
+        with transaction.atomic():
+            try:
+                with transaction.atomic():
+                    user = UserProfile.objects.create_user(
+                        username=username,
+                        password=password,
+                        email=email,
+                        note=note,
+                    )
+            except IntegrityError, ValidationError:
+                if UserProfile.objects.by_username(username).exists():
+                    return _username_conflict_response(request, admin_user, phase="insert")
+                raise
+            if group_name:
+                group = _locked_user_group(group_name)
+                user.groups.add(group)
         _log_event(
             request,
             "api_users_created",

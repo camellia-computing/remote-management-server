@@ -124,6 +124,8 @@ sudo systemctl enable --now camellia-remote-management-cleanup.timer
 
 Username identity v1先对去除首尾空白的输入执行NFKC，再执行Unicode full casefold和第二次NFKC；显示用户名保存第一次NFKC结果，登录、OIDC分配、账号查找及登录限流桶只使用对应UTF-8 binary canonical key。PostgreSQL的`lower/iexact`和locale不再参与账号身份。新Compose cluster固定为UTF8、builtin locale provider、`C.UTF-8`和collation version 1；已有volume、外部数据库及恢复目标必须满足相同契约。迁移0026发现历史collision时只输出有界user ID与canonical digest并停止，不自动合并、改名或转移账号；管理员必须在离线审计后显式解决冲突再重跑迁移。
 
+`POST /api/users`只有在username canonical预检命中，或user insert的独立savepoint失败后再次读到同一canonical账号时，才返回`409`与机器码`username_conflict`。指定的新Group发生并发创建时，服务会在savepoint回滚后锁定并复用已提交Group，保证不同新用户可加入同一目标；Group无法读回、M2M或其他未知完整性错误保持5xx并回滚整笔user创建，不会冒充用户名已存在。
+
 首次升级已有volume前必须确认环境中的`BOOTSTRAP_USER/PASSWORD`就是旧cluster的现有superuser；错误映射会fail closed，不能通过临时把runtime升为superuser绕过。五类密码轮换时先在受保护环境文件中写入互不相同的新值，再通过controller离线收敛并验证；旧目标密码随事务提交失效。Bootstrap本身是root-only break-glass凭据，轮换或使用必须审计，不能作为日常migration、备份、探针或排障登录。
 systemd 运维单元仅允许通过本机 Unix socket 调用 Docker；该 socket
 等同宿主机 root 权限，必须只允许 root 访问，并保护部署目录和环境文件不被非特权用户修改。
