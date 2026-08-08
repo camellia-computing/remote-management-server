@@ -116,7 +116,7 @@ def env_choice(name, default, choices):
 def canonical_base64_bytes(value, expected_size):
     try:
         decoded = base64.b64decode(value, validate=True)
-    except (binascii.Error, ValueError):
+    except binascii.Error, ValueError:
         return None
     if len(decoded) != expected_size or base64.b64encode(decoded).decode("ascii") != value:
         return None
@@ -413,13 +413,13 @@ OIDC_PROVIDERS = {}
 OIDC_HTTP_TIMEOUT_SECONDS = env_int("CAMELLIA_REMOTE_OIDC_HTTP_TIMEOUT_SECONDS", 10, 2, 60)
 OIDC_CALLBACK_CLAIM_LEASE_SECONDS = env_int(
     "CAMELLIA_REMOTE_OIDC_CALLBACK_CLAIM_LEASE_SECONDS",
-    max(60, OIDC_HTTP_TIMEOUT_SECONDS * 3 + 15),
+    max(60, OIDC_HTTP_TIMEOUT_SECONDS * 4 + 15),
     30,
     600,
 )
-if OIDC_CALLBACK_CLAIM_LEASE_SECONDS < OIDC_HTTP_TIMEOUT_SECONDS * 3 + 15:
+if OIDC_CALLBACK_CLAIM_LEASE_SECONDS < OIDC_HTTP_TIMEOUT_SECONDS * 4 + 15:
     raise ImproperlyConfigured(
-        "CAMELLIA_REMOTE_OIDC_CALLBACK_CLAIM_LEASE_SECONDS must cover discovery, token, and JWKS deadlines"
+        "CAMELLIA_REMOTE_OIDC_CALLBACK_CLAIM_LEASE_SECONDS must cover discovery, token, JWKS, and key-rotation refresh deadlines"
     )
 _oidc_name = os.environ.get("CAMELLIA_REMOTE_OIDC_NAME", "").strip()
 _oidc_issuer = os.environ.get("CAMELLIA_REMOTE_OIDC_ISSUER", "").strip()

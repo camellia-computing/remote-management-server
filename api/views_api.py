@@ -1,7 +1,7 @@
 import base64
 import binascii
+import copy
 import datetime
-import functools
 import hashlib
 import ipaddress
 import json
@@ -9,7 +9,10 @@ import logging
 import math
 import re
 import secrets
+import threading
+import time
 import uuid
+from collections import OrderedDict
 from dataclasses import dataclass
 from urllib.parse import urlsplit
 
@@ -27,6 +30,7 @@ from django.http import HttpResponse, HttpResponseRedirect, JsonResponse
 from django.utils import timezone
 from django.utils.translation import gettext as _
 from joserfc import jwt
+from joserfc.errors import InvalidKeyIdError
 from joserfc.jwk import KeySet
 from joserfc.jwt import JWTClaimsRegistry
 
@@ -96,6 +100,13 @@ from api.models import (
     StrategyProfile,
     UserProfile,
 )
+from api.oidc_documents import (
+    OIDC_DOCUMENT_MAX_BYTES,
+    parse_oidc_json,
+    validate_oidc_discovery,
+    validate_oidc_jwks,
+    validated_signing_algorithms,
+)
 from api.policy_generation import (
     InvalidManagedPolicy,
     device_ids_affected_by_groups,
@@ -104,7 +115,7 @@ from api.policy_generation import (
     normalize_policy_options,
 )
 from api.rate_limits import enforce_authenticated_rate_limit
-from api.request_utils import client_ip, load_json_body, load_json_object, load_json_text
+from api.request_utils import InvalidJsonPayload, client_ip, load_json_body, load_json_object, load_json_text
 from api.tag_colors import normalize_tag_color
 from api.username_identity import canonical_username_key, check_username_identity, normalize_username
 from camellia_remote_management.observability import log_structured_event
@@ -115,7 +126,6 @@ DEVICE_LEASE_SECONDS = 60
 MAX_DEPLOY_KEY_LEN = 512
 OIDC_PENDING_MINUTES = settings.OIDC_PENDING_RETENTION_MINUTES
 OIDC_MAX_PENDING_PER_IP = 20
-OIDC_DOCUMENT_MAX_BYTES = 1024 * 1024
 MAX_OIDC_CALLBACK_CLAIM_GENERATION = (1 << 63) - 1
 MAX_DEVICE_UUID_TEXT_LEN = 344
 MAX_AUDIT_INFO_BYTES = 16 * 1024
@@ -134,20 +144,9 @@ MAX_ALLOWED_INCOMINGS = 500
 PAGINATION_CONTRACT_VERSION = 1
 MAX_API_PAGE_SIZE = 500
 MAX_API_PAGE_OFFSET = 10_000
-OIDC_SAFE_ID_TOKEN_ALGORITHMS = frozenset(
-    {
-        "RS256",
-        "RS384",
-        "RS512",
-        "PS256",
-        "PS384",
-        "PS512",
-        "ES256",
-        "ES384",
-        "ES512",
-        "EdDSA",
-    }
-)
+OIDC_DOCUMENT_CACHE_MAX_ENTRIES = 16
+OIDC_DOCUMENT_CACHE_TTL_SECONDS = 300
+OIDC_DOCUMENT_CACHE_STALE_SECONDS = 900
 
 
 @dataclass(frozen=True)
@@ -158,6 +157,22 @@ class _OidcCallbackClaim:
     provider: str
     nonce: str
     code_verifier: str
+
+
+@dataclass(frozen=True)
+class _OidcDocumentCacheEntry:
+    document: dict
+    etag: str
+    fresh_until: float
+    stale_until: float
+
+
+@dataclass
+class _OidcDocumentFlight:
+    event: threading.Event
+    error: Exception | None = None
+    fallback_document: dict | None = None
+    fallback_until: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -176,6 +191,11 @@ class _InvalidPagination(ValueError):
 
 class _OidcCallbackClaimLost(RuntimeError):
     pass
+
+
+_oidc_document_cache = OrderedDict()
+_oidc_document_inflight = {}
+_oidc_document_cache_lock = threading.Lock()
 
 
 def _load_json(request, *, max_bytes=None):
@@ -554,54 +574,206 @@ def _oidc_endpoint_allowed(url, allowed_hosts):
     return hostname in frozenset(allowed_hosts)
 
 
-def _fetch_oidc_json(url, allowed_hosts):
+def _oidc_response_content_type(response):
+    raw_value = response.headers.get("Content-Type", "")
+    if not isinstance(raw_value, str) or not raw_value or len(raw_value) > 255:
+        raise ValueError("OIDC response has an invalid Content-Type")
+    parts = raw_value.split(";")
+    media_type = parts[0].strip().lower()
+    if media_type not in ("application/json", "application/jwk-set+json"):
+        raise ValueError("OIDC response is not JSON")
+    parameters = {}
+    for raw_parameter in parts[1:]:
+        if "=" not in raw_parameter:
+            raise ValueError("OIDC response has ambiguous Content-Type parameters")
+        raw_name, raw_parameter_value = raw_parameter.split("=", 1)
+        name = raw_name.strip().lower()
+        value = raw_parameter_value.strip()
+        if len(value) >= 2 and value[0] == value[-1] == '"':
+            value = value[1:-1]
+        elif value.startswith('"') or value.endswith('"'):
+            raise ValueError("OIDC response has ambiguous Content-Type parameters")
+        value = value.lower()
+        if not name or not value or name in parameters or "\\" in value or '"' in value:
+            raise ValueError("OIDC response has ambiguous Content-Type parameters")
+        parameters[name] = value
+    if set(parameters) - {"charset"} or parameters.get("charset", "utf-8") != "utf-8":
+        raise ValueError("OIDC response must contain UTF-8 JSON")
+
+
+def _request_oidc_json(url, allowed_hosts, *, etag=""):
     if not _oidc_endpoint_allowed(url, allowed_hosts):
         raise ValueError("OIDC endpoint is outside the configured host allowlist")
     timeout = getattr(settings, "OIDC_HTTP_TIMEOUT_SECONDS", 10)
+    headers = {"Accept": "application/json, application/jwk-set+json"}
+    if etag:
+        headers["If-None-Match"] = etag
     with requests.get(
         url,
         timeout=timeout,
         allow_redirects=False,
         stream=True,
-        headers={"Accept": "application/json"},
+        headers=headers,
     ) as response:
+        if response.status_code == 304:
+            return None, etag, True
         response.raise_for_status()
+        _oidc_response_content_type(response)
         content_length = response.headers.get("Content-Length")
-        if content_length and int(content_length) > OIDC_DOCUMENT_MAX_BYTES:
-            raise ValueError("OIDC document is too large")
+        if content_length is not None:
+            if (
+                not isinstance(content_length, str)
+                or not content_length
+                or len(content_length) > 10
+                or not content_length.isascii()
+                or not content_length.isdecimal()
+                or (len(content_length) > 1 and content_length.startswith("0"))
+            ):
+                raise ValueError("OIDC response has an invalid Content-Length")
+            if int(content_length) > OIDC_DOCUMENT_MAX_BYTES:
+                raise ValueError("OIDC document is too large")
         body = bytearray()
         for chunk in response.iter_content(64 * 1024):
             body.extend(chunk)
             if len(body) > OIDC_DOCUMENT_MAX_BYTES:
                 raise ValueError("OIDC document is too large")
-    document = json.loads(body)
-    if not isinstance(document, dict):
-        raise ValueError("OIDC document must be a JSON object")
+        response_etag = response.headers.get("ETag", "")
+        if (
+            not isinstance(response_etag, str)
+            or len(response_etag) > 256
+            or any(ord(character) < 32 or ord(character) == 127 for character in response_etag)
+        ):
+            response_etag = ""
+    return parse_oidc_json(bytes(body)), response_etag, False
+
+
+def _fetch_oidc_json(url, allowed_hosts):
+    document, _etag, not_modified = _request_oidc_json(url, allowed_hosts)
+    if not_modified:
+        raise ValueError("OIDC endpoint returned an unsolicited not-modified response")
     return document
 
 
-@functools.lru_cache(maxsize=16)
+def _copy_oidc_document(document):
+    return copy.deepcopy(document)
+
+
+def _clear_oidc_document_cache():
+    with _oidc_document_cache_lock:
+        _oidc_document_cache.clear()
+
+
+def _cached_oidc_document(url, allowed_hosts, *, document_type, validator, force_refresh=False):
+    allowed_hosts = tuple(sorted(frozenset(allowed_hosts)))
+    cache_key = (document_type, url, allowed_hosts)
+    wait_timeout = getattr(settings, "OIDC_HTTP_TIMEOUT_SECONDS", 10) + 1
+    while True:
+        now = time.monotonic()
+        with _oidc_document_cache_lock:
+            cached = _oidc_document_cache.get(cache_key)
+            if cached is not None and not force_refresh and now < cached.fresh_until:
+                _oidc_document_cache.move_to_end(cache_key)
+                return _copy_oidc_document(cached.document)
+            inflight = _oidc_document_inflight.get(cache_key)
+            if inflight is None:
+                inflight = _OidcDocumentFlight(event=threading.Event())
+                _oidc_document_inflight[cache_key] = inflight
+                leader = True
+            else:
+                leader = False
+        if leader:
+            break
+        if not inflight.event.wait(wait_timeout):
+            with _oidc_document_cache_lock:
+                stale = _oidc_document_cache.get(cache_key)
+                if stale is not None and time.monotonic() < stale.stale_until:
+                    return _copy_oidc_document(stale.document)
+            raise ValueError("OIDC document single-flight timed out")
+        if inflight.error is not None:
+            if inflight.fallback_document is not None and time.monotonic() < inflight.fallback_until:
+                return _copy_oidc_document(inflight.fallback_document)
+            raise inflight.error
+        force_refresh = False
+
+    flight_error = None
+    fallback_document = None
+    fallback_until = 0.0
+    try:
+        etag = cached.etag if cached is not None else ""
+        raw_document, response_etag, not_modified = _request_oidc_json(
+            url,
+            allowed_hosts,
+            etag=etag,
+        )
+        if not_modified:
+            if cached is None:
+                raise ValueError("OIDC endpoint returned an unsolicited not-modified response")
+            document = cached.document
+            response_etag = cached.etag
+        else:
+            document = validator(raw_document)
+        stored_at = time.monotonic()
+        entry = _OidcDocumentCacheEntry(
+            document=_copy_oidc_document(document),
+            etag=response_etag,
+            fresh_until=stored_at + OIDC_DOCUMENT_CACHE_TTL_SECONDS,
+            stale_until=stored_at + OIDC_DOCUMENT_CACHE_TTL_SECONDS + OIDC_DOCUMENT_CACHE_STALE_SECONDS,
+        )
+        with _oidc_document_cache_lock:
+            _oidc_document_cache[cache_key] = entry
+            _oidc_document_cache.move_to_end(cache_key)
+            while len(_oidc_document_cache) > OIDC_DOCUMENT_CACHE_MAX_ENTRIES:
+                _oidc_document_cache.popitem(last=False)
+        return _copy_oidc_document(document)
+    except requests.RequestException as error:
+        if cached is not None and time.monotonic() < cached.stale_until:
+            flight_error = error
+            fallback_document = _copy_oidc_document(cached.document)
+            fallback_until = cached.stale_until
+            return _copy_oidc_document(cached.document)
+        flight_error = error
+        raise
+    except Exception as error:
+        flight_error = error
+        raise
+    finally:
+        with _oidc_document_cache_lock:
+            completed = _oidc_document_inflight.pop(cache_key, None)
+            if completed is not None:
+                completed.error = flight_error
+                completed.fallback_document = fallback_document
+                completed.fallback_until = fallback_until
+                completed.event.set()
+
+
 def _oidc_metadata(issuer, allowed_hosts):
     issuer = str(issuer or "").rstrip("/")
     if not _oidc_endpoint_allowed(issuer, allowed_hosts):
         raise ValueError("OIDC issuer is outside the configured host allowlist")
-    metadata = _fetch_oidc_json(
+
+    def validate(document):
+        metadata = validate_oidc_discovery(document)
+        metadata_issuer = str(metadata["issuer"]).rstrip("/")
+        if metadata_issuer != issuer:
+            raise ValueError("OIDC discovery issuer mismatch")
+        metadata["issuer"] = metadata_issuer
+        for key in ("authorization_endpoint", "token_endpoint", "jwks_uri"):
+            if not _oidc_endpoint_allowed(metadata[key], allowed_hosts):
+                raise ValueError(f"OIDC discovery contains an invalid {key}")
+        userinfo_endpoint = metadata.get("userinfo_endpoint")
+        if userinfo_endpoint and not _oidc_endpoint_allowed(userinfo_endpoint, allowed_hosts):
+            raise ValueError("OIDC discovery contains an invalid userinfo_endpoint")
+        return metadata
+
+    return _cached_oidc_document(
         f"{issuer}/.well-known/openid-configuration",
         allowed_hosts,
+        document_type="discovery-v1",
+        validator=validate,
     )
-    metadata_issuer = str(metadata.get("issuer") or "").rstrip("/")
-    if metadata_issuer != issuer:
-        raise ValueError("OIDC discovery issuer mismatch")
-    for key in ("authorization_endpoint", "token_endpoint", "jwks_uri"):
-        if not _oidc_endpoint_allowed(metadata.get(key), allowed_hosts):
-            raise ValueError(f"OIDC discovery contains an invalid {key}")
-    userinfo_endpoint = metadata.get("userinfo_endpoint")
-    if userinfo_endpoint and not _oidc_endpoint_allowed(
-        userinfo_endpoint,
-        allowed_hosts,
-    ):
-        raise ValueError("OIDC discovery contains an invalid userinfo_endpoint")
-    return metadata
+
+
+_oidc_metadata.cache_clear = _clear_oidc_document_cache
 
 
 def _oidc_client(provider, state=None):
@@ -616,20 +788,74 @@ def _oidc_client(provider, state=None):
     )
 
 
+def _oidc_jwks(metadata, provider, *, force_refresh=False):
+    return _cached_oidc_document(
+        metadata["jwks_uri"],
+        provider["allowed_hosts"],
+        document_type="jwks-v1",
+        validator=validate_oidc_jwks,
+        force_refresh=force_refresh,
+    )
+
+
+def _oidc_token_header(encoded):
+    parts = encoded.split(".")
+    if len(parts) != 3 or not parts[0] or len(parts[0]) > 8192:
+        raise ValueError("OIDC ID token has an invalid compact header")
+    encoded_header = parts[0]
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", encoded_header):
+        raise ValueError("OIDC ID token has an invalid compact header")
+    try:
+        raw_header = base64.b64decode(
+            encoded_header + ("=" * (-len(encoded_header) % 4)),
+            altchars=b"-_",
+            validate=True,
+        )
+        if base64.urlsafe_b64encode(raw_header).rstrip(b"=").decode("ascii") != encoded_header:
+            raise ValueError("non-canonical header")
+        header = load_json_text(raw_header.decode("utf-8"), max_bytes=16 * 1024)
+    except (UnicodeDecodeError, ValueError, InvalidJsonPayload) as error:
+        raise ValueError("OIDC ID token has an invalid compact header") from error
+    if not isinstance(header, dict):
+        raise ValueError("OIDC ID token header must be an object")
+    algorithm = header.get("alg")
+    kid = header.get("kid")
+    if (
+        not isinstance(algorithm, str)
+        or not algorithm
+        or not isinstance(kid, str)
+        or not 1 <= len(kid) <= 128
+        or not kid.isascii()
+        or any(ord(character) < 33 or ord(character) > 126 for character in kid)
+    ):
+        raise ValueError("OIDC ID token header must contain bounded alg and kid")
+    return algorithm, kid
+
+
+def _decode_oidc_id_token(encoded, jwks, algorithms):
+    algorithm, kid = _oidc_token_header(encoded)
+    if algorithm not in algorithms:
+        raise ValueError("OIDC ID token algorithm is not allowed")
+    if not any(
+        key.get("kid") == kid and (key.get("alg") is None or key.get("alg") == algorithm)
+        for key in jwks.get("keys", ())
+    ):
+        raise InvalidKeyIdError(f"No key for kid: '{kid}'")
+    key_set = KeySet.import_key_set(jwks)
+    return jwt.decode(encoded, key_set, algorithms=algorithms)
+
+
 def _validate_oidc_id_token(token, metadata, provider, nonce):
     encoded = token.get("id_token")
     if not isinstance(encoded, str) or not encoded or len(encoded) > 64 * 1024:
         raise ValueError("OIDC provider did not return an ID token")
-    jwks = _fetch_oidc_json(
-        metadata["jwks_uri"],
-        provider["allowed_hosts"],
-    )
-    key_set = KeySet.import_key_set(jwks)
-    configured_algorithms = metadata.get("id_token_signing_alg_values_supported") or ["RS256"]
-    algorithms = [value for value in configured_algorithms if value in OIDC_SAFE_ID_TOKEN_ALGORITHMS]
-    if not algorithms:
-        raise ValueError("OIDC provider has no supported ID token algorithm")
-    decoded = jwt.decode(encoded, key_set, algorithms=algorithms)
+    algorithms = validated_signing_algorithms(metadata.get("id_token_signing_alg_values_supported"))
+    jwks = validate_oidc_jwks(_oidc_jwks(metadata, provider))
+    try:
+        decoded = _decode_oidc_id_token(encoded, jwks, algorithms)
+    except InvalidKeyIdError:
+        refreshed_jwks = validate_oidc_jwks(_oidc_jwks(metadata, provider, force_refresh=True))
+        decoded = _decode_oidc_id_token(encoded, refreshed_jwks, algorithms)
     claims = decoded.claims
     issuer = str(metadata["issuer"]).rstrip("/")
     registry = JWTClaimsRegistry(
