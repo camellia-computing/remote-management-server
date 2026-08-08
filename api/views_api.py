@@ -10,6 +10,7 @@ import math
 import re
 import secrets
 import uuid
+from dataclasses import dataclass
 from urllib.parse import urlsplit
 
 import requests
@@ -113,6 +114,7 @@ MAX_DEPLOY_KEY_LEN = 512
 OIDC_PENDING_MINUTES = settings.OIDC_PENDING_RETENTION_MINUTES
 OIDC_MAX_PENDING_PER_IP = 20
 OIDC_DOCUMENT_MAX_BYTES = 1024 * 1024
+MAX_OIDC_CALLBACK_CLAIM_GENERATION = (1 << 63) - 1
 MAX_DEVICE_UUID_TEXT_LEN = 344
 MAX_AUDIT_INFO_BYTES = 16 * 1024
 MAX_AUDIT_NOTE_BYTES = 16 * 1024
@@ -141,6 +143,20 @@ OIDC_SAFE_ID_TOKEN_ALGORITHMS = frozenset(
         "EdDSA",
     }
 )
+
+
+@dataclass(frozen=True)
+class _OidcCallbackClaim:
+    state: str
+    owner: uuid.UUID
+    generation: int
+    provider: str
+    nonce: str
+    code_verifier: str
+
+
+class _OidcCallbackClaimLost(RuntimeError):
+    pass
 
 
 def _load_json(request, *, max_bytes=None):
@@ -344,6 +360,12 @@ class _OidcPolicyRevocationRequired(Exception):
     def __init__(self, user_id):
         self.user_id = user_id
         super().__init__("OIDC policy revocation is required")
+
+
+class _OidcPolicyDenied(PermissionError):
+    def __init__(self, user_id):
+        self.user_id = user_id
+        super().__init__("OIDC auto-provision policy no longer permits this identity")
 
 
 def _device_by_identity(rid, device_uuid, *, for_update=False):
@@ -668,7 +690,7 @@ def _oidc_auto_provision_allowed(provider, claims):
     return True
 
 
-def _resolve_oidc_user(provider_name, issuer, claims):
+def _resolve_oidc_user(provider_name, issuer, claims, *, defer_policy_revocation=False):
     provider = getattr(settings, "OIDC_PROVIDERS", {}).get(provider_name)
     if not provider or str(provider.get("issuer") or "").rstrip("/") != issuer:
         raise ValueError("OIDC provider does not match the validated issuer")
@@ -730,14 +752,16 @@ def _resolve_oidc_user(provider_name, issuer, claims):
                     )
             break
         except _OidcPolicyRevocationRequired as exc:
-            revoke_user_credentials((exc.user_id,))
-            raise PermissionError("OIDC auto-provision policy no longer permits this identity") from None
+            if not defer_policy_revocation:
+                revoke_user_credentials((exc.user_id,))
+            raise _OidcPolicyDenied(exc.user_id) from None
         except (IntegrityError, ValidationError):
             identity = OidcIdentity.objects.select_related("user").filter(issuer=issuer, subject=subject).first()
             if identity:
                 if identity.is_auto_provisioned and not auto_provision_allowed:
-                    revoke_user_credentials((identity.user_id,))
-                    raise PermissionError("OIDC auto-provision policy no longer permits this identity") from None
+                    if not defer_policy_revocation:
+                        revoke_user_credentials((identity.user_id,))
+                    raise _OidcPolicyDenied(identity.user_id) from None
                 user = identity.user
                 break
     if user is None:
@@ -1781,34 +1805,197 @@ def oidc_auth_query(request):
     return JsonResponse(body)
 
 
+def _oidc_callback_deadline(session):
+    return session.created_at + datetime.timedelta(minutes=OIDC_PENDING_MINUTES)
+
+
+def _reject_pending_oidc_callback(state):
+    now = timezone.now()
+    with transaction.atomic():
+        session = OidcPendingAuth.objects.select_for_update(of=("self",)).filter(state=state).first()
+        if not session:
+            return HttpResponse("Invalid OIDC callback", status=400)
+        if now >= _oidc_callback_deadline(session):
+            session.delete()
+            return HttpResponse("OIDC authorization expired", status=408)
+        if session.status == OidcPendingAuth.STATUS_DONE:
+            return HttpResponse("OIDC authorization completed. You can close this window.")
+        if session.status == OidcPendingAuth.STATUS_PROCESSING:
+            return HttpResponse("OIDC authorization is already being processed.", status=409)
+        if session.status != OidcPendingAuth.STATUS_PENDING:
+            return HttpResponse("OIDC authorization was not completed.", status=400)
+        session.status = OidcPendingAuth.STATUS_ERROR
+        session.error_code = "provider_denied"
+        session.save(update_fields=["status", "error_code"])
+    return HttpResponse("OIDC authorization was not completed.", status=400)
+
+
+def _claim_oidc_callback(state):
+    now = timezone.now()
+    with transaction.atomic():
+        session = OidcPendingAuth.objects.select_for_update(of=("self",)).filter(state=state).first()
+        if not session:
+            return None, HttpResponse("Invalid OIDC callback", status=400)
+        deadline = _oidc_callback_deadline(session)
+        if now >= deadline:
+            session.delete()
+            return None, HttpResponse("OIDC authorization expired", status=408)
+        if session.status == OidcPendingAuth.STATUS_DONE:
+            return None, HttpResponse("OIDC authorization completed. You can close this window.")
+        if session.status == OidcPendingAuth.STATUS_ERROR:
+            return None, HttpResponse("OIDC authorization was not completed.", status=400)
+        if session.status == OidcPendingAuth.STATUS_PROCESSING:
+            if not session.callback_claim_expires_at or session.callback_claim_expires_at > now:
+                return None, HttpResponse("OIDC authorization is already being processed.", status=409)
+        elif session.status != OidcPendingAuth.STATUS_PENDING:
+            raise RuntimeError("OIDC callback state is invalid")
+        if session.callback_claim_generation >= MAX_OIDC_CALLBACK_CLAIM_GENERATION:
+            session.status = OidcPendingAuth.STATUS_ERROR
+            session.error_code = "claim_generation_exhausted"
+            session.callback_claim_owner = None
+            session.callback_claim_expires_at = None
+            session.save(
+                update_fields=[
+                    "status",
+                    "error_code",
+                    "callback_claim_owner",
+                    "callback_claim_expires_at",
+                ]
+            )
+            return None, HttpResponse("OIDC authorization failed", status=409)
+        owner = uuid.uuid4()
+        generation = session.callback_claim_generation + 1
+        expires_at = min(
+            now + datetime.timedelta(seconds=settings.OIDC_CALLBACK_CLAIM_LEASE_SECONDS),
+            deadline,
+        )
+        session.status = OidcPendingAuth.STATUS_PROCESSING
+        session.error_code = ""
+        session.callback_claim_owner = owner
+        session.callback_claim_generation = generation
+        session.callback_claim_expires_at = expires_at
+        session.save(
+            update_fields=[
+                "status",
+                "error_code",
+                "callback_claim_owner",
+                "callback_claim_generation",
+                "callback_claim_expires_at",
+            ]
+        )
+        claim = _OidcCallbackClaim(
+            state=state,
+            owner=owner,
+            generation=generation,
+            provider=session.provider,
+            nonce=session.nonce,
+            code_verifier=session.code_verifier,
+        )
+    return claim, None
+
+
+def _fail_oidc_callback_claim(claim, error_code):
+    now = timezone.now()
+    with transaction.atomic():
+        updated = OidcPendingAuth.objects.filter(
+            state=claim.state,
+            status=OidcPendingAuth.STATUS_PROCESSING,
+            callback_claim_owner=claim.owner,
+            callback_claim_generation=claim.generation,
+            callback_claim_expires_at__gt=now,
+        ).update(
+            status=OidcPendingAuth.STATUS_ERROR,
+            error_code=error_code,
+            authenticated_user=None,
+            callback_claim_owner=None,
+            callback_claim_expires_at=None,
+        )
+    return updated == 1
+
+
+def _oidc_callback_claim_is_live(pending, claim, now):
+    return bool(
+        pending
+        and pending.status == OidcPendingAuth.STATUS_PROCESSING
+        and pending.callback_claim_owner == claim.owner
+        and pending.callback_claim_generation == claim.generation
+        and pending.callback_claim_expires_at
+        and pending.callback_claim_expires_at > now
+    )
+
+
+def _complete_oidc_callback_claim(claim, issuer, claims):
+    with transaction.atomic():
+        pending = OidcPendingAuth.objects.select_for_update(of=("self",)).filter(state=claim.state).first()
+        if not _oidc_callback_claim_is_live(pending, claim, timezone.now()):
+            raise _OidcCallbackClaimLost("OIDC callback claim is no longer authoritative")
+        user = _resolve_oidc_user(
+            claim.provider,
+            issuer,
+            claims,
+            defer_policy_revocation=True,
+        )
+        if pending.callback_claim_expires_at <= timezone.now():
+            raise _OidcCallbackClaimLost("OIDC callback claim expired while provisioning")
+        pending.authenticated_user = user
+        pending.status = OidcPendingAuth.STATUS_DONE
+        pending.error_code = ""
+        pending.callback_claim_owner = None
+        pending.callback_claim_expires_at = None
+        pending.save(
+            update_fields=[
+                "authenticated_user",
+                "status",
+                "error_code",
+                "callback_claim_owner",
+                "callback_claim_expires_at",
+            ]
+        )
+    return user
+
+
+def _reject_oidc_policy_claim(claim, user_id):
+    with transaction.atomic():
+        pending = OidcPendingAuth.objects.select_for_update(of=("self",)).filter(state=claim.state).first()
+        if not _oidc_callback_claim_is_live(pending, claim, timezone.now()):
+            raise _OidcCallbackClaimLost("OIDC callback claim is no longer authoritative")
+        revoke_user_credentials((user_id,))
+        if pending.callback_claim_expires_at <= timezone.now():
+            raise _OidcCallbackClaimLost("OIDC callback claim expired while revoking credentials")
+        pending.status = OidcPendingAuth.STATUS_ERROR
+        pending.error_code = "policy_rejected"
+        pending.authenticated_user = None
+        pending.callback_claim_owner = None
+        pending.callback_claim_expires_at = None
+        pending.save(
+            update_fields=[
+                "status",
+                "error_code",
+                "authenticated_user",
+                "callback_claim_owner",
+                "callback_claim_expires_at",
+            ]
+        )
+
+
 def oidc_callback(request):
     state = str(request.GET.get("state", "")).strip()
     code = str(request.GET.get("code", "")).strip()
-    session = OidcPendingAuth.objects.filter(Q(state=state)).first() if state else None
     provider_error = str(request.GET.get("error", "")).strip()
-    if provider_error and session:
-        OidcPendingAuth.objects.filter(
-            state=state,
-            status=OidcPendingAuth.STATUS_PENDING,
-        ).update(
-            status=OidcPendingAuth.STATUS_ERROR,
-            error_code="provider_denied",
-        )
-        return HttpResponse("OIDC authorization was not completed.", status=400)
-    if not state or not code or not session:
+    if provider_error:
+        if not state:
+            return HttpResponse("Invalid OIDC callback", status=400)
+        return _reject_pending_oidc_callback(state)
+    if not state or not code:
         return HttpResponse("Invalid OIDC callback", status=400)
-    if timezone.now() - session.created_at > datetime.timedelta(minutes=OIDC_PENDING_MINUTES):
-        session.delete()
-        return HttpResponse("OIDC authorization expired", status=408)
-    if session.status == OidcPendingAuth.STATUS_DONE:
-        return HttpResponse("OIDC authorization completed. You can close this window.")
-    if session.status != OidcPendingAuth.STATUS_PENDING:
-        return HttpResponse("OIDC authorization was not completed.", status=400)
-    provider = getattr(settings, "OIDC_PROVIDERS", {}).get(session.provider)
+
+    claim, claim_response = _claim_oidc_callback(state)
+    if claim_response:
+        return claim_response
+    provider = getattr(settings, "OIDC_PROVIDERS", {}).get(claim.provider)
     if not provider:
-        session.status = OidcPendingAuth.STATUS_ERROR
-        session.error_code = "provider_not_configured"
-        session.save(update_fields=["status", "error_code"])
+        if not _fail_oidc_callback_claim(claim, "provider_not_configured"):
+            return HttpResponse("OIDC authorization was already consumed.", status=409)
         return HttpResponse("OIDC provider is not configured", status=400)
     try:
         metadata = _oidc_metadata(
@@ -1819,36 +2006,54 @@ def oidc_callback(request):
         token = client.fetch_token(
             metadata["token_endpoint"],
             code=code,
-            code_verifier=session.code_verifier,
+            code_verifier=claim.code_verifier,
             allow_redirects=False,
         )
-        claims = _validate_oidc_id_token(token, metadata, provider, session.nonce)
+        claims = _validate_oidc_id_token(token, metadata, provider, claim.nonce)
         issuer = str(claims["iss"]).rstrip("/")
-        user = _resolve_oidc_user(session.provider, issuer, claims)
-        with transaction.atomic():
-            pending = OidcPendingAuth.objects.select_for_update().filter(state=state).first()
-            if not pending or pending.status != OidcPendingAuth.STATUS_PENDING:
-                return HttpResponse("OIDC authorization was already consumed.", status=409)
-            pending.authenticated_user = user
-            pending.status = OidcPendingAuth.STATUS_DONE
-            pending.error_code = ""
-            pending.save(update_fields=["authenticated_user", "status", "error_code"])
-        _log_event(request, "api_oidc_callback_success", username=user.username)
-    except Exception as exc:  # noqa: BLE001 - external provider failures are normalized
-        OidcPendingAuth.objects.filter(
-            state=state,
-            status=OidcPendingAuth.STATUS_PENDING,
-        ).update(
-            status=OidcPendingAuth.STATUS_ERROR,
-            error_code="verification_failed",
-        )
+        user = _complete_oidc_callback_claim(claim, issuer, claims)
+    except _OidcCallbackClaimLost:
+        return HttpResponse("OIDC authorization was already consumed.", status=409)
+    except _OidcPolicyDenied as exc:
+        try:
+            _reject_oidc_policy_claim(claim, exc.user_id)
+        except _OidcCallbackClaimLost:
+            return HttpResponse("OIDC authorization was already consumed.", status=409)
+        except Exception as revocation_exc:  # noqa: BLE001 - callback response remains bounded
+            _log_event(
+                request,
+                "api_oidc_callback_failed",
+                level="error",
+                error_type=type(revocation_exc).__name__,
+                claim_generation=claim.generation,
+            )
+            return HttpResponse("OIDC authorization could not be finalized", status=503)
         _log_event(
             request,
             "api_oidc_callback_failed",
             level="warning",
             error_type=type(exc).__name__,
+            claim_generation=claim.generation,
         )
         return HttpResponse("OIDC authorization failed", status=400)
+    except Exception as exc:  # noqa: BLE001 - external provider failures are normalized
+        claim_failed = _fail_oidc_callback_claim(claim, "verification_failed")
+        _log_event(
+            request,
+            "api_oidc_callback_failed",
+            level="warning",
+            error_type=type(exc).__name__,
+            claim_generation=claim.generation,
+        )
+        if not claim_failed:
+            return HttpResponse("OIDC authorization was already consumed.", status=409)
+        return HttpResponse("OIDC authorization failed", status=400)
+    _log_event(
+        request,
+        "api_oidc_callback_success",
+        username=user.username,
+        claim_generation=claim.generation,
+    )
     return HttpResponse("OIDC authorization completed. You can close this window.")
 
 

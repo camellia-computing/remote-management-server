@@ -411,6 +411,16 @@ if not DEBUG and not DEVICE_VERIFICATION_TOKEN:
 
 OIDC_PROVIDERS = {}
 OIDC_HTTP_TIMEOUT_SECONDS = env_int("CAMELLIA_REMOTE_OIDC_HTTP_TIMEOUT_SECONDS", 10, 2, 60)
+OIDC_CALLBACK_CLAIM_LEASE_SECONDS = env_int(
+    "CAMELLIA_REMOTE_OIDC_CALLBACK_CLAIM_LEASE_SECONDS",
+    max(60, OIDC_HTTP_TIMEOUT_SECONDS * 3 + 15),
+    30,
+    600,
+)
+if OIDC_CALLBACK_CLAIM_LEASE_SECONDS < OIDC_HTTP_TIMEOUT_SECONDS * 3 + 15:
+    raise ImproperlyConfigured(
+        "CAMELLIA_REMOTE_OIDC_CALLBACK_CLAIM_LEASE_SECONDS must cover discovery, token, and JWKS deadlines"
+    )
 _oidc_name = os.environ.get("CAMELLIA_REMOTE_OIDC_NAME", "").strip()
 _oidc_issuer = os.environ.get("CAMELLIA_REMOTE_OIDC_ISSUER", "").strip()
 _oidc_client_id = os.environ.get("CAMELLIA_REMOTE_OIDC_CLIENT_ID", "").strip()

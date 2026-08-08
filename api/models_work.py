@@ -1720,6 +1720,7 @@ class OidcPendingAuth(models.Model):
     """Pending OIDC authorization state, shared across workers."""
 
     STATUS_PENDING = "pending"
+    STATUS_PROCESSING = "processing"
     STATUS_DONE = "done"
     STATUS_ERROR = "error"
 
@@ -1748,6 +1749,9 @@ class OidcPendingAuth(models.Model):
     code_verifier = EncryptedTextField(verbose_name="PKCE Code Verifier", max_length=128)
     status = models.CharField(verbose_name="Status", max_length=16, default=STATUS_PENDING, db_index=True)
     error_code = models.CharField(verbose_name="Error Code", max_length=64, blank=True, default="")
+    callback_claim_owner = models.UUIDField(null=True, blank=True, editable=False)
+    callback_claim_generation = models.PositiveBigIntegerField(default=0, editable=False)
+    callback_claim_expires_at = models.DateTimeField(null=True, blank=True, editable=False)
     authenticated_user = models.ForeignKey(
         settings.AUTH_USER_MODEL,
         null=True,
@@ -1766,11 +1770,28 @@ class OidcPendingAuth(models.Model):
                 condition=models.Q(
                     status__in=(
                         "pending",
+                        "processing",
                         "done",
                         "error",
                     ),
                 ),
                 name="valid_oidc_pending_status",
+            ),
+            models.CheckConstraint(
+                condition=(
+                    models.Q(
+                        status="processing",
+                        callback_claim_owner__isnull=False,
+                        callback_claim_generation__gte=1,
+                        callback_claim_expires_at__isnull=False,
+                    )
+                    | models.Q(
+                        ~models.Q(status="processing"),
+                        callback_claim_owner__isnull=True,
+                        callback_claim_expires_at__isnull=True,
+                    )
+                ),
+                name="valid_oidc_callback_claim",
             ),
         ]
 
