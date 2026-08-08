@@ -79,6 +79,8 @@ Management为每个upload生成独立32-byte data key，只把其规范Base64值
 
 地址簿和待处理OIDC中的secret使用带key ID的`secretbox:v2` envelope认证加密；数据库key inventory保存不含业务明文的canary和fingerprint，readiness会拒绝错误key或replica配置分裂。shared profile的默认连接密码不再存入通用`info` JSON，而是迁移到显式加密字段；profile列表永不加载或返回该字段，Client仅在目标RID已存在且当前地址簿权限有效时调用目标绑定的即时credential API。连接凭据只通过已认证且通过地址簿权限校验的运行时 API 返回。Django 管理表单将其作为只写字段，CSV/Excel 导出不包含连接凭据。
 
+五个地址簿browser导出使用`address-book-export-v1`合同。只有完全缺失`format`时才默认`csv`；显式值严格区分大小写并只接受`csv`、`xls`、`xlsx`，其中旧调用方的`xls`是生成OOXML `.xlsx`的明确alias，当前UI统一发送`xlsx`。单地址簿导出的`kind`只有缺失时默认`peers`，显式值只接受`peers`或`tags`。空值、重复query、大小写变体、未知或超长值都会在数据查询和artifact构建前返回有界JSON 400、机器码`invalid_export_parameter`及支持值，不回显原始输入。成功响应通过`X-Camellia-Export-Schema`、`X-Camellia-Export-Format`和适用时的`X-Camellia-Export-Kind`声明实际schema；调用方必须同时校验这些header、Content-Type、扩展名与CSV/ZIP magic，不能把请求参数当成实际artifact格式。
+
 设备API和Web工作台使用显式的窄字段inventory projection：管理员只查询全局device，普通用户只合并本人device与本人精确`personal-<owner-id>` profile中的peer，并以`source/owner/rid`标识数据来源；数据库在构造Python对象前完成权限过滤、稳定排序和分页。`/api/peers`保留页码参数并额外返回绑定viewer、权限范围和status filter的一小时签名`nextCursor`，新调用方应使用cursor避免并发插入/删除造成重复页。首页用独立聚合和top-6查询。`DeviceInfo-v1.xlsx`只读取版本化allowlist，通过数据库iterator、write-only workbook、受限memory spool和`FileResponse`交付；行数、压缩输出字节与生成deadline任一超过`.env.example`预算时拒绝导出，不允许通过增加worker内存绕过。
 
 所有基于浏览器session的页面、导出、根跳转和WebUI2状态响应，无论成功、重定向、方法拒绝、CSRF拒绝或应用错误，都统一返回`Cache-Control: no-store, private`、`Pragma: no-cache`、`Expires: 0`和`Referrer-Policy: no-referrer`。edge、CDN和APM不得覆盖或缓存这些响应；静态资产与health端点不套用session响应策略，继续使用各自的缓存与可用性合同。Management不注册service worker或CacheStorage写入；若未来新增，必须显式禁止保存authenticated response并补充浏览器缓存生命周期测试。logout不发送`Clear-Site-Data`，避免清除同源静态资产或干扰其他活动窗口，它不能替代每个敏感响应自身的`no-store`控制。

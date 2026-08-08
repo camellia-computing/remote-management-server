@@ -70,6 +70,10 @@ DEVICE_INVENTORY_EXPORT_HEADERS = (
     "status",
     "update_time",
 )
+ADDRESS_BOOK_EXPORT_SCHEMA = "address-book-export-v1"
+ADDRESS_BOOK_EXPORT_FORMATS = ("csv", "xls", "xlsx")
+ADDRESS_BOOK_EXPORT_FORMAT_ALIASES = {"xls": "xlsx"}
+ADDRESS_BOOK_EXPORT_KINDS = ("peers", "tags")
 
 
 def _filename_stamp():
@@ -89,6 +93,44 @@ def _log_event(request, event, level="info", **extra):
     }
     attributes.update({k: v for k, v in extra.items() if v is not None})
     log_structured_event(logger, request, event, level=level, attributes=attributes)
+
+
+def _parse_address_book_export_parameter(request, parameter, *, supported_values, default, aliases=None):
+    values = request.GET.getlist(parameter)
+    if not values:
+        return default, None
+    if len(values) != 1 or values[0] not in supported_values:
+        _log_event(
+            request,
+            "front_ab_export_rejected",
+            level="warning",
+            parameter=parameter,
+            reason="invalid_export_parameter",
+        )
+        response = JsonResponse(
+            {
+                "error": _("导出参数无效。"),
+                "code": "invalid_export_parameter",
+                "parameter": parameter,
+                "supported_values": list(supported_values),
+                "export_schema": ADDRESS_BOOK_EXPORT_SCHEMA,
+            },
+            status=400,
+        )
+        response["X-Camellia-Export-Schema"] = ADDRESS_BOOK_EXPORT_SCHEMA
+        return None, response
+    value = values[0]
+    if aliases:
+        value = aliases.get(value, value)
+    return value, None
+
+
+def _address_book_export_response(response, *, export_format, kind=None):
+    response["X-Camellia-Export-Schema"] = ADDRESS_BOOK_EXPORT_SCHEMA
+    response["X-Camellia-Export-Format"] = export_format
+    if kind is not None:
+        response["X-Camellia-Export-Kind"] = kind
+    return response
 
 
 def _ab_audit_query_digest(search_term):
@@ -1837,7 +1879,15 @@ def ab_books_export(request):
     u = _get_current_user(request)
     if not u:
         return HttpResponseRedirect("/api/user_action?action=login")
-    export_format = str(request.GET.get("format", "csv")).lower()
+    export_format, error_response = _parse_address_book_export_parameter(
+        request,
+        "format",
+        supported_values=ADDRESS_BOOK_EXPORT_FORMATS,
+        default="csv",
+        aliases=ADDRESS_BOOK_EXPORT_FORMAT_ALIASES,
+    )
+    if error_response:
+        return error_response
     filter_q = str(request.GET.get("q", "")).strip()
     profiles_qs = _ab_accessible_profiles(u, filter_q).order_by("name")
     profiles = list(profiles_qs)
@@ -1845,7 +1895,7 @@ def ab_books_export(request):
 
     headers = [_("地址簿名称"), _("地址簿 GUID"), _("所属用户"), _("备注（可选）"), _("设备"), _("标签")]
 
-    if export_format in ("xls", "xlsx"):
+    if export_format == "xlsx":
         rows = []
         for profile in profiles:
             peers_count = profile.peers.count()
@@ -1862,7 +1912,7 @@ def ab_books_export(request):
             )
         response = xlsx_response(f"ab_books_{filename_stamp}.xlsx", _("地址簿列表"), headers, rows)
         _log_event(request, "front_ab_books_export", username=u.username, count=len(profiles))
-        return response
+        return _address_book_export_response(response, export_format=export_format)
 
     output = StringIO()
     writer = safe_csv_writer(output)
@@ -1883,7 +1933,7 @@ def ab_books_export(request):
     response = HttpResponse(output.getvalue(), content_type="text/csv; charset=utf-8")
     response["Content-Disposition"] = f"attachment; filename=ab_books_{filename_stamp}.csv"
     _log_event(request, "front_ab_books_export", username=u.username, count=len(profiles))
-    return response
+    return _address_book_export_response(response, export_format=export_format)
 
 
 @login_required(login_url="/api/user_action?action=login")
@@ -2223,8 +2273,23 @@ def ab_book_export(request):
     if not u:
         return HttpResponseRedirect("/api/user_action?action=login")
     guid = request.GET.get("guid", "")
-    kind = str(request.GET.get("kind", "peers")).lower()
-    export_format = str(request.GET.get("format", "csv")).lower()
+    export_format, error_response = _parse_address_book_export_parameter(
+        request,
+        "format",
+        supported_values=ADDRESS_BOOK_EXPORT_FORMATS,
+        default="csv",
+        aliases=ADDRESS_BOOK_EXPORT_FORMAT_ALIASES,
+    )
+    if error_response:
+        return error_response
+    kind, error_response = _parse_address_book_export_parameter(
+        request,
+        "kind",
+        supported_values=ADDRESS_BOOK_EXPORT_KINDS,
+        default="peers",
+    )
+    if error_response:
+        return error_response
     profile, owner, _rule = _get_profile_access_web(u, guid)
     if not profile:
         return HttpResponseRedirect("/api/ab_books")
@@ -2235,7 +2300,7 @@ def ab_book_export(request):
     if kind == "tags":
         rows = list(RemoteTag.objects.filter(profile=profile))
         headers = [_("标签名称"), _("颜色")]
-        if export_format in ("xls", "xlsx"):
+        if export_format == "xlsx":
             response = xlsx_response(
                 f"ab_tags_{filename_stamp}.xlsx",
                 _("标签列表"),
@@ -2243,7 +2308,7 @@ def ab_book_export(request):
                 [[tag.tag_name, tag.tag_color] for tag in rows],
             )
             _log_event(request, "front_ab_book_export", username=u.username, guid=profile.guid, kind="tags")
-            return response
+            return _address_book_export_response(response, export_format=export_format, kind=kind)
         output = StringIO()
         writer = safe_csv_writer(output)
         writer.writerow(headers)
@@ -2252,7 +2317,7 @@ def ab_book_export(request):
         response = HttpResponse(output.getvalue(), content_type="text/csv; charset=utf-8")
         response["Content-Disposition"] = f"attachment; filename=ab_tags_{filename_stamp}.csv"
         _log_event(request, "front_ab_book_export", username=u.username, guid=profile.guid, kind="tags")
-        return response
+        return _address_book_export_response(response, export_format=export_format, kind=kind)
 
     rows = list(
         RemotePeer.objects.filter(profile=profile).prefetch_related(
@@ -2266,7 +2331,7 @@ def ab_book_export(request):
     # Portable exports intentionally omit connection credentials. They remain
     # available only through authenticated, access-scoped runtime APIs.
     headers = [_("设备ID"), _("别名"), _("备注"), _("标签")]
-    if export_format in ("xls", "xlsx"):
+    if export_format == "xlsx":
         response = xlsx_response(
             f"ab_peers_{filename_stamp}.xlsx",
             _("设备列表"),
@@ -2282,7 +2347,7 @@ def ab_book_export(request):
             ],
         )
         _log_event(request, "front_ab_book_export", username=u.username, guid=profile.guid, kind="peers")
-        return response
+        return _address_book_export_response(response, export_format=export_format, kind=kind)
 
     output = StringIO()
     writer = safe_csv_writer(output)
@@ -2299,7 +2364,7 @@ def ab_book_export(request):
     response = HttpResponse(output.getvalue(), content_type="text/csv; charset=utf-8")
     response["Content-Disposition"] = f"attachment; filename=ab_peers_{filename_stamp}.csv"
     _log_event(request, "front_ab_book_export", username=u.username, guid=profile.guid, kind="peers")
-    return response
+    return _address_book_export_response(response, export_format=export_format, kind=kind)
 
 
 @login_required(login_url="/api/user_action?action=login")
@@ -2440,7 +2505,15 @@ def tag_export(request):
     u = _get_current_user(request)
     if not u:
         return HttpResponseRedirect("/api/user_action?action=login")
-    export_format = str(request.GET.get("format", "csv")).lower()
+    export_format, error_response = _parse_address_book_export_parameter(
+        request,
+        "format",
+        supported_values=ADDRESS_BOOK_EXPORT_FORMATS,
+        default="csv",
+        aliases=ADDRESS_BOOK_EXPORT_FORMAT_ALIASES,
+    )
+    if error_response:
+        return error_response
     filter_q = str(request.GET.get("q", "")).strip()
     profiles = list(_ab_accessible_profiles(u, None).select_related("owner"))
     profile_map = {p.guid: p for p in profiles}
@@ -2453,7 +2526,7 @@ def tag_export(request):
     filename_stamp = _filename_stamp()
     headers = [_("标签名称"), _("颜色"), _("地址簿"), _("地址簿 GUID"), _("所属用户")]
 
-    if export_format in ("xls", "xlsx"):
+    if export_format == "xlsx":
         xlsx_rows = []
         for tag in rows:
             profile = tag.profile
@@ -2468,7 +2541,7 @@ def tag_export(request):
             )
         response = xlsx_response(f"ab_tags_{filename_stamp}.xlsx", _("标签列表"), headers, xlsx_rows)
         _log_event(request, "front_tag_export", username=u.username, count=len(rows))
-        return response
+        return _address_book_export_response(response, export_format=export_format)
 
     output = StringIO()
     writer = safe_csv_writer(output)
@@ -2487,7 +2560,7 @@ def tag_export(request):
     response = HttpResponse(output.getvalue(), content_type="text/csv; charset=utf-8")
     response["Content-Disposition"] = f"attachment; filename=ab_tags_{filename_stamp}.csv"
     _log_event(request, "front_tag_export", username=u.username, count=len(rows))
-    return response
+    return _address_book_export_response(response, export_format=export_format)
 
 
 @login_required(login_url="/api/user_action?action=login")
@@ -2649,28 +2722,39 @@ def ab_rules_export(request):
         _log_event(request, "front_ab_rules_export_denied", level="warning", username=u.username)
         return HttpResponseRedirect("/api/home")
 
-    export_format = str(request.GET.get("format", "csv")).lower()
+    export_format, error_response = _parse_address_book_export_parameter(
+        request,
+        "format",
+        supported_values=ADDRESS_BOOK_EXPORT_FORMATS,
+        default="csv",
+        aliases=ADDRESS_BOOK_EXPORT_FORMAT_ALIASES,
+    )
+    if error_response:
+        return error_response
     filter_q = str(request.GET.get("q", "")).strip()
     rules = _collect_global_rules(filter_q)
     filename_stamp = _filename_stamp()
 
-    if export_format in ("xls", "xlsx"):
+    if export_format == "xlsx":
         headers = [_("地址簿"), _("地址簿 GUID"), _("所属用户"), _("类型"), _("目标"), _("权限")]
-        return xlsx_response(
-            f"ab_rules_{filename_stamp}.xlsx",
-            _("地址簿规则"),
-            headers,
-            [
+        return _address_book_export_response(
+            xlsx_response(
+                f"ab_rules_{filename_stamp}.xlsx",
+                _("地址簿规则"),
+                headers,
                 [
-                    entry.get("profile_name", ""),
-                    entry.get("profile_guid", ""),
-                    entry.get("owner", ""),
-                    entry.get("target_type", ""),
-                    entry.get("target_name", ""),
-                    entry.get("rule_label", ""),
-                ]
-                for entry in rules
-            ],
+                    [
+                        entry.get("profile_name", ""),
+                        entry.get("profile_guid", ""),
+                        entry.get("owner", ""),
+                        entry.get("target_type", ""),
+                        entry.get("target_name", ""),
+                        entry.get("rule_label", ""),
+                    ]
+                    for entry in rules
+                ],
+            ),
+            export_format=export_format,
         )
 
     output = StringIO()
@@ -2689,7 +2773,7 @@ def ab_rules_export(request):
         )
     response = HttpResponse(output.getvalue(), content_type="text/csv; charset=utf-8")
     response["Content-Disposition"] = f"attachment; filename=ab_rules_{filename_stamp}.csv"
-    return response
+    return _address_book_export_response(response, export_format=export_format)
 
 
 @login_required(login_url="/api/user_action?action=login")
@@ -2697,7 +2781,15 @@ def ab_shares_export(request):
     u = _get_current_user(request)
     if not u:
         return HttpResponseRedirect("/api/user_action?action=login")
-    export_format = str(request.GET.get("format", "csv")).lower()
+    export_format, error_response = _parse_address_book_export_parameter(
+        request,
+        "format",
+        supported_values=ADDRESS_BOOK_EXPORT_FORMATS,
+        default="csv",
+        aliases=ADDRESS_BOOK_EXPORT_FORMAT_ALIASES,
+    )
+    if error_response:
+        return error_response
     filter_q = str(request.GET.get("q", "")).strip()
 
     shares = AddressBookShare.objects.select_related("profile", "user", "profile__owner").exclude(
@@ -2716,7 +2808,7 @@ def ab_shares_export(request):
     filename_stamp = _filename_stamp()
 
     headers = [_("地址簿"), _("地址簿 GUID"), _("所属用户"), _("共享给用户"), _("权限"), _("创建时间")]
-    if export_format in ("xls", "xlsx"):
+    if export_format == "xlsx":
         xlsx_rows = []
         for share in rows:
             profile = share.profile
@@ -2732,7 +2824,7 @@ def ab_shares_export(request):
             )
         response = xlsx_response(f"ab_shares_{filename_stamp}.xlsx", _("地址簿共享列表"), headers, xlsx_rows)
         _log_event(request, "front_ab_shares_export", username=u.username, count=len(rows))
-        return response
+        return _address_book_export_response(response, export_format=export_format)
 
     output = StringIO()
     writer = safe_csv_writer(output)
@@ -2752,7 +2844,7 @@ def ab_shares_export(request):
     response = HttpResponse(output.getvalue(), content_type="text/csv; charset=utf-8")
     response["Content-Disposition"] = f"attachment; filename=ab_shares_{filename_stamp}.csv"
     _log_event(request, "front_ab_shares_export", username=u.username, count=len(rows))
-    return response
+    return _address_book_export_response(response, export_format=export_format)
 
 
 @login_required(login_url="/api/user_action?action=login")
