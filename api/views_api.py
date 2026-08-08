@@ -131,6 +131,9 @@ MAX_AB_TAGS_PER_PEER = 32
 MAX_AB_PROFILE_PASSWORD_BYTES = 240
 MAX_MANAGEMENT_BATCH_ITEMS = 500
 MAX_ALLOWED_INCOMINGS = 500
+PAGINATION_CONTRACT_VERSION = 1
+MAX_API_PAGE_SIZE = 500
+MAX_API_PAGE_OFFSET = 10_000
 OIDC_SAFE_ID_TOKEN_ALGORITHMS = frozenset(
     {
         "RS256",
@@ -155,6 +158,20 @@ class _OidcCallbackClaim:
     provider: str
     nonce: str
     code_verifier: str
+
+
+@dataclass(frozen=True)
+class _Pagination:
+    current: int
+    page_size: int
+    start: int
+    end: int
+
+
+class _InvalidPagination(ValueError):
+    def __init__(self, field):
+        self.field = field
+        super().__init__(f"invalid pagination field: {field}")
 
 
 class _OidcCallbackClaimLost(RuntimeError):
@@ -2548,7 +2565,9 @@ def ab_shared_profiles(request):
     if not user:
         _log_event(request, "api_ab_shared_profiles_unauthorized", level="warning")
         return JsonResponse({"error": "Invalid token"}, status=401)
-    current, page_size, _start, _end = _pagination(request)
+    pagination, error_response = _pagination_or_error(request)
+    if error_response:
+        return error_response
     items = {}
 
     def add_profile(p, rule_value):
@@ -2593,18 +2612,22 @@ def ab_shared_profiles(request):
     data = list(items.values())
     data.sort(key=lambda x: x.get("name", ""))
     total = len(data)
-    start = (current - 1) * page_size
-    end = start + page_size
     _log_event(
         request,
         "api_ab_shared_profiles",
         level="debug",
         username=user.username,
         total=total,
-        page=current,
-        page_size=page_size,
+        page=pagination.current,
+        page_size=pagination.page_size,
     )
-    return JsonResponse({"total": total, "data": data[start:end]})
+    return JsonResponse(
+        {
+            "total": total,
+            **_pagination_response_fields(pagination),
+            "data": data[pagination.start : pagination.end],
+        }
+    )
 
 
 def ab_shared_credential(request):
@@ -2810,6 +2833,9 @@ def ab_rules(request):
             return HttpResponseRedirect("/api/ab_rules")
         _log_event(request, "api_ab_rules_unauthorized", level="warning")
         return JsonResponse({"error": "Invalid token"}, status=401)
+    pagination, error_response = _pagination_or_error(request)
+    if error_response:
+        return error_response
     guid = request.GET.get("ab", "") or request.GET.get("guid", "")
     if not guid:
         return JsonResponse({"error": "Invalid guid"}, status=400)
@@ -2821,7 +2847,6 @@ def ab_rules(request):
     if not user.is_admin and str(profile.owner_id) != str(user.id):
         _log_event(request, "api_ab_rules_denied", level="warning", username=user.username, guid=guid)
         return JsonResponse({"error": "No access"}, status=403)
-    current, page_size, _start, _end = _pagination(request)
     data = []
     shares = AddressBookShare.objects.filter(Q(profile=profile)).select_related("user")
     for share in shares:
@@ -2843,10 +2868,14 @@ def ab_rules(request):
             }
         )
     total = len(data)
-    start = (current - 1) * page_size
-    end = start + page_size
     _log_event(request, "api_ab_rules", level="debug", username=user.username, guid=guid, total=total)
-    return JsonResponse({"total": total, "data": data[start:end]})
+    return JsonResponse(
+        {
+            "total": total,
+            **_pagination_response_fields(pagination),
+            "data": data[pagination.start : pagination.end],
+        }
+    )
 
 
 def ab_rule(request):
@@ -3077,6 +3106,9 @@ def ab_peers(request):
     if not user:
         _log_event(request, "api_ab_peers_unauthorized", level="warning")
         return JsonResponse({"error": "Invalid token"}, status=401)
+    pagination, error_response = _pagination_or_error(request)
+    if error_response:
+        return error_response
     guid = request.GET.get("ab", "") or _personal_guid(user)
     profile, owner, _rule = _get_profile_access(user, guid)
     if guid == _personal_guid(user):
@@ -3085,7 +3117,6 @@ def ab_peers(request):
     if not owner:
         _log_event(request, "api_ab_peers_denied", level="warning", username=user.username, guid=guid)
         return JsonResponse({"error": "No access"}, status=403)
-    current, page_size, _start, _end = _pagination(request)
     qs = (
         RemotePeer.objects.filter(profile=profile)
         .prefetch_related(
@@ -3098,11 +3129,9 @@ def ab_peers(request):
         .order_by("rid")
     )
     total = qs.count()
-    start = (current - 1) * page_size
-    end = start + page_size
     data = []
     is_personal = guid == _personal_guid(owner)
-    for p in qs[start:end]:
+    for p in qs[pagination.start : pagination.end]:
         tags = [tag.tag_name for tag in p.ordered_tags]
         item = {
             "id": p.rid,
@@ -3130,10 +3159,16 @@ def ab_peers(request):
         username=user.username,
         guid=guid,
         total=total,
-        page=current,
-        page_size=page_size,
+        page=pagination.current,
+        page_size=pagination.page_size,
     )
-    return JsonResponse({"total": total, "data": data})
+    return JsonResponse(
+        {
+            "total": total,
+            **_pagination_response_fields(pagination),
+            "data": data,
+        }
+    )
 
 
 def ab_tags(request, guid):
@@ -4967,26 +5002,104 @@ def audit(request):
     return _audit_conn(request)
 
 
-def _pagination(request, default=100):
-    try:
-        current = max(1, int(request.GET.get("current", 1)))
-        page_size = max(1, min(500, int(request.GET.get("pageSize", default))))
-    except TypeError, ValueError:
-        current = 1
-        page_size = default
+def _strict_pagination_integer(request, field, *, default, maximum):
+    values = request.GET.getlist(field)
+    if not values:
+        return default
+    value = values[0]
+    if (
+        len(values) != 1
+        or not isinstance(value, str)
+        or len(value) > len(str(maximum))
+        or not re.fullmatch(r"[1-9][0-9]*", value, flags=re.ASCII)
+    ):
+        raise _InvalidPagination(field)
+    parsed = int(value)
+    if parsed > maximum:
+        raise _InvalidPagination(field)
+    return parsed
+
+
+def _pagination(request, default=100, *, enforce_offset_budget=True):
+    if not isinstance(default, int) or isinstance(default, bool) or not 1 <= default <= MAX_API_PAGE_SIZE:
+        raise ValueError("default page size is outside the pagination contract")
+    current = _strict_pagination_integer(
+        request,
+        "current",
+        default=1,
+        maximum=MAX_API_PAGE_OFFSET + 1,
+    )
+    page_size = _strict_pagination_integer(
+        request,
+        "pageSize",
+        default=default,
+        maximum=MAX_API_PAGE_SIZE,
+    )
     start = (current - 1) * page_size
-    return current, page_size, start, start + page_size
+    if enforce_offset_budget and start > MAX_API_PAGE_OFFSET:
+        raise _InvalidPagination("current")
+    return _Pagination(
+        current=current,
+        page_size=page_size,
+        start=start,
+        end=start + page_size,
+    )
 
 
-def _paged_response(request, qs, serializer, default_page_size=100):
-    current, page_size, start, end = _pagination(request, default_page_size)
-    total = qs.count() if isinstance(qs, QuerySet) else len(qs)
-    rows = qs[start:end]
+def _pagination_error_response(request, error):
+    _log_event(
+        request,
+        "api_pagination_rejected",
+        level="warning",
+        field=error.field,
+        reason="invalid_pagination",
+    )
+    return JsonResponse(
+        {
+            "error": "Invalid pagination",
+            "code": "invalid_pagination",
+            "pagination_contract_version": PAGINATION_CONTRACT_VERSION,
+            "field": error.field,
+            "limits": {
+                "max_page_size": MAX_API_PAGE_SIZE,
+                "max_offset": MAX_API_PAGE_OFFSET,
+            },
+        },
+        status=400,
+    )
+
+
+def _pagination_or_error(request, default=100, *, enforce_offset_budget=True):
+    try:
+        return _pagination(
+            request,
+            default,
+            enforce_offset_budget=enforce_offset_budget,
+        ), None
+    except _InvalidPagination as error:
+        return None, _pagination_error_response(request, error)
+
+
+def _pagination_response_fields(pagination):
+    return {
+        "pagination_contract_version": PAGINATION_CONTRACT_VERSION,
+        "current": pagination.current,
+        "pageSize": pagination.page_size,
+    }
+
+
+def _paged_response(request, qs, serializer, default_page_size=100, *, pagination=None, total=None):
+    if pagination is None:
+        pagination, error_response = _pagination_or_error(request, default_page_size)
+        if error_response:
+            return error_response
+    if total is None:
+        total = qs.count() if isinstance(qs, QuerySet) else len(qs)
+    rows = qs[pagination.start : pagination.end]
     return JsonResponse(
         {
             "total": total,
-            "current": current,
-            "pageSize": page_size,
+            **_pagination_response_fields(pagination),
             "data": [serializer(item) for item in rows],
         }
     )
@@ -5236,6 +5349,9 @@ def users(request):
     if not user:
         _log_event(request, "api_users_unauthorized", level="warning")
         return JsonResponse({"error": "Invalid token"}, status=401)
+    pagination, error_response = _pagination_or_error(request)
+    if error_response:
+        return error_response
     qs = UserProfile.objects.select_related("strategy").prefetch_related("groups").order_by("id")
     if not user.is_admin:
         qs = qs.filter(Q(id=user.id))
@@ -5246,8 +5362,10 @@ def users(request):
         qs = qs.filter(Q(is_active=True))
     elif status == "0":
         qs = qs.filter(Q(is_active=False))
-    _log_event(request, "api_users", level="debug", username=user.username, total=qs.count())
-    return _paged_response(request, qs.distinct(), _serialize_user)
+    qs = qs.distinct()
+    total = qs.count()
+    _log_event(request, "api_users", level="debug", username=user.username, total=total)
+    return _paged_response(request, qs, _serialize_user, pagination=pagination, total=total)
 
 
 def user_status(request, guid, action):
@@ -5493,6 +5611,9 @@ def devices(request):
     if not user:
         _log_event(request, "api_devices_unauthorized", level="warning")
         return JsonResponse({"error": "Invalid token"}, status=401)
+    pagination, error_response = _pagination_or_error(request)
+    if error_response:
+        return error_response
     qs = (
         RemoteDevice.objects.select_related(
             "owner__strategy",
@@ -5519,7 +5640,7 @@ def devices(request):
     if group_name:
         lookup = "owner__groups__name__icontains" if "%" in group_name else "owner__groups__name"
         qs = qs.filter(**{lookup: group_name.replace("%", "")}).distinct()
-    return _paged_response(request, qs, _serialize_device)
+    return _paged_response(request, qs, _serialize_device, pagination=pagination)
 
 
 def device_status(request, guid, action):
@@ -5872,35 +5993,55 @@ def peers(request):
     status_filter = request.GET.get("status", "")
     if status_filter not in ("0", "1"):
         status_filter = ""
-    current, page_size, start, _end = _pagination(request)
-    inventory = DeviceInventory(user)
     cursor_value = str(request.GET.get("cursor", "") or "").strip()
+    pagination, error_response = _pagination_or_error(
+        request,
+        enforce_offset_budget=not bool(cursor_value),
+    )
+    if error_response:
+        return error_response
+    inventory = DeviceInventory(user)
     rid_after = ""
     if cursor_value:
         try:
             rid_after = load_inventory_cursor(cursor_value, user, status_filter)
         except InvalidInventoryCursor:
             return JsonResponse({"error": "Invalid inventory cursor"}, status=400)
-        start = 0
+        offset = 0
+    else:
+        offset = pagination.start
 
     total = inventory.count(status_filter=status_filter)
     rows = inventory.rows(
-        offset=start,
-        limit=page_size + 1 if cursor_value else page_size,
+        offset=offset,
+        limit=pagination.page_size + 1 if cursor_value else pagination.page_size,
         status_filter=status_filter,
         rid_after=rid_after,
     )
     next_cursor = ""
-    has_more = len(rows) > page_size if cursor_value else bool(rows) and start + len(rows) < total
+    has_more = len(rows) > pagination.page_size if cursor_value else bool(rows) and pagination.start + len(rows) < total
     if cursor_value and has_more:
-        rows = rows[:page_size]
+        rows = rows[: pagination.page_size]
     if has_more:
         next_cursor = dump_inventory_cursor(rows[-1], user, status_filter)
     data = [row.as_api_dict() for row in rows]
     _log_event(
-        request, "api_peers", level="debug", username=user.username, total=total, page=current, page_size=page_size
+        request,
+        "api_peers",
+        level="debug",
+        username=user.username,
+        total=total,
+        page=pagination.current,
+        page_size=pagination.page_size,
     )
-    return JsonResponse({"total": total, "data": data, "nextCursor": next_cursor})
+    return JsonResponse(
+        {
+            "total": total,
+            **_pagination_response_fields(pagination),
+            "data": data,
+            "nextCursor": next_cursor,
+        }
+    )
 
 
 def device_group_accessible(request):
@@ -5987,9 +6128,12 @@ def device_groups(request):
     admin_user, error = _require_admin(request, "api_device_groups")
     if error:
         return error
+    pagination, error_response = _pagination_or_error(request)
+    if error_response:
+        return error_response
     qs = DeviceGroup.objects.select_related("strategy").order_by("name")
     qs = _filter_text(qs, "name", request.GET.get("name"))
-    return _paged_response(request, qs, _serialize_device_group)
+    return _paged_response(request, qs, _serialize_device_group, pagination=pagination)
 
 
 def device_group_detail(request, guid):
