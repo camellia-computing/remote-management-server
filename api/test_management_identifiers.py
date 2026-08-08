@@ -77,6 +77,7 @@ class ManagementIdentifierHttpTests(TestCase):
             path,
             data=json.dumps(payload),
             content_type="application/json",
+            HTTP_IDEMPOTENCY_KEY=str(uuid.uuid4()),
             **self.auth,
         )
 
@@ -280,12 +281,18 @@ class ManagementIdentifierHttpTests(TestCase):
             200,
         )
         self.assertEqual(
-            self.post_json(f"/api/device-groups/{group_guid.upper()}", []).status_code,
+            self.post_json(
+                f"/api/device-groups/{group_guid.upper()}",
+                [self.managed_device.rid],
+            ).status_code,
             200,
         )
         missing = str(uuid.UUID(int=0))
         self.assert_error(self.client.get(f"/api/strategies/{missing}", **self.auth), 404)
-        self.assert_error(self.post_json(f"/api/device-groups/{missing}", []), 404)
+        self.assert_error(
+            self.post_json(f"/api/device-groups/{missing}", [self.managed_device.rid]),
+            404,
+        )
 
     def test_every_uuid_path_method_rejects_before_payload_or_mutation(self):
         invalid = "not-a-uuid"
@@ -436,17 +443,13 @@ class TypedIdentifierParserTests(TestCase):
                 with self.subTest(value=repr(value)), self.assertRaises(InvalidIdentifier):
                     parse_uuid(value)
 
-    def test_typed_lists_deduplicate_after_parsing_and_fail_whole_mixed_input(self):
+    def test_typed_lists_reject_duplicates_and_fail_whole_mixed_input(self):
         expected = uuid.uuid4()
         with self.assertNumQueries(0):
-            self.assertEqual(
-                parse_model_pk_list(["1", "1", "2"], UserProfile, max_items=3),
-                [1, 2],
-            )
-            self.assertEqual(
-                parse_uuid_list([str(expected), str(expected).upper()], max_items=2),
-                [expected],
-            )
+            with self.assertRaises(InvalidIdentifier):
+                parse_model_pk_list(["1", "1", "2"], UserProfile, max_items=3)
+            with self.assertRaises(InvalidIdentifier):
+                parse_uuid_list([str(expected), str(expected).upper()], max_items=2)
             with self.assertRaises(InvalidIdentifier):
                 parse_model_pk_list(["1", str(AUTO_FIELD_MAX + 1)], UserProfile, max_items=2)
             with self.assertRaises(InvalidIdentifier):

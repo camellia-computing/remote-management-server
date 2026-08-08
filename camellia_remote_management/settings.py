@@ -498,6 +498,12 @@ SHARE_LINK_RETENTION_DAYS = env_int(
     1,
     365,
 )
+MANAGEMENT_OPERATION_RETENTION_DAYS = env_int(
+    "CAMELLIA_REMOTE_MANAGEMENT_OPERATION_RETENTION_DAYS",
+    30,
+    1,
+    365,
+)
 
 # Recording uploads contain highly sensitive session data. Keep each request
 # bounded before Django materializes request.body, and cap the resulting file so

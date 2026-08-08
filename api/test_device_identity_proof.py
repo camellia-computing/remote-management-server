@@ -5,6 +5,7 @@ import hashlib
 import hmac
 import json
 import threading
+import uuid
 from unittest import mock
 
 from django.contrib import admin
@@ -67,7 +68,10 @@ class DeviceIdentityProofTests(TestCase):
         )
 
     def post_json(self, path, payload, token=None):
-        headers = {"HTTP_AUTHORIZATION": f"Bearer {token}"} if token else {}
+        headers = {
+            "HTTP_IDEMPOTENCY_KEY": str(uuid.uuid4()),
+            **({"HTTP_AUTHORIZATION": f"Bearer {token}"} if token else {}),
+        }
         return self.client.post(
             path,
             data=json.dumps(payload),
@@ -807,7 +811,10 @@ class PostgreSQLDeviceIdentityProofTests(TransactionTestCase):
 
     @staticmethod
     def post_json(client, path, payload, token=None):
-        headers = {"HTTP_AUTHORIZATION": f"Bearer {token}"} if token else {}
+        headers = {
+            "HTTP_IDEMPOTENCY_KEY": str(uuid.uuid4()),
+            **({"HTTP_AUTHORIZATION": f"Bearer {token}"} if token else {}),
+        }
         return client.post(
             path,
             data=json.dumps(payload),

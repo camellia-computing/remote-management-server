@@ -65,6 +65,12 @@ from api.identifiers import (
     parse_uuid_list,
 )
 from api.login_admission import complete_login_success, reserve_login_attempt
+from api.management_operations import (
+    ManagementMutation,
+    ManagementOperationConflict,
+    execute_management_operation,
+    operation_id_from_request,
+)
 from api.models import (
     AddressBookProfile,
     AddressBookRule,
@@ -90,6 +96,8 @@ from api.models import (
 )
 from api.policy_generation import (
     InvalidManagedPolicy,
+    device_ids_affected_by_groups,
+    device_ids_affected_by_users,
     managed_policy_document,
     normalize_policy_options,
 )
@@ -1044,13 +1052,28 @@ def _rid_list(value):
     result = []
     seen = set()
     for item in value:
-        item = str(item).strip()
-        if not item or len(item) > 64:
+        if not isinstance(item, str) or not item or len(item) > 64 or item != item.strip():
             return None
-        if item not in seen:
-            seen.add(item)
-            result.append(item)
+        if item in seen:
+            return None
+        seen.add(item)
+        result.append(item)
     return result
+
+
+def _operation_id_or_error(request):
+    try:
+        return operation_id_from_request(request), None
+    except InvalidIdentifier:
+        return None, JsonResponse({"error": "Valid Idempotency-Key required"}, status=400)
+
+
+def _execute_management_batch(**kwargs):
+    try:
+        result = execute_management_operation(**kwargs)
+    except ManagementOperationConflict:
+        return JsonResponse({"error": "Operation identifier conflict"}, status=409)
+    return JsonResponse(result.body, status=result.status_code)
 
 
 def _strict_bool(value):
@@ -4955,25 +4978,86 @@ def users_force_logout(request):
         )
     except InvalidIdentifier:
         return JsonResponse({"error": "Invalid user list"}, status=400)
-    try:
-        revocation = revoke_user_credentials(guids)
-    except CredentialGenerationExhausted:
-        _log_event(request, "api_users_force_logout_failed", level="error", username=admin_user.username)
-        return JsonResponse({"error": "Credential revocation failed"}, status=409)
+    if not guids:
+        return JsonResponse({"error": "User list required"}, status=400)
+    if admin_user.pk in guids:
+        return JsonResponse({"error": "Cannot force logout current user"}, status=400)
+    operation_id, operation_error = _operation_id_or_error(request)
+    if operation_error:
+        return operation_error
+    requested = {"users": len(guids)}
+    request_document = {
+        "operation": "users_force_logout",
+        "users": [str(user_id) for user_id in guids],
+    }
+
+    def mutate():
+        users = list(
+            UserProfile.objects.select_for_update()
+            .filter(pk__in=guids)
+            .order_by("pk")
+            .only("pk", "credential_generation")
+        )
+        found = {user.pk for user in users}
+        missing = [str(user_id) for user_id in guids if user_id not in found]
+        if missing:
+            return ManagementMutation(
+                status_code=409,
+                body={"error": "Batch targets changed", "missing": {"users": missing}},
+                applied={"users": 0},
+                result_state={"missing": {"users": missing}},
+            )
+        try:
+            revocation = revoke_user_credentials(guids)
+        except CredentialGenerationExhausted:
+            return ManagementMutation(
+                status_code=409,
+                body={"error": "Credential revocation failed"},
+                applied={"users": 0},
+                result_state={"error": "credential_generation_exhausted"},
+            )
+        if revocation.revoked_users != len(guids):
+            raise RuntimeError("Credential revocation did not apply the complete target set")
+        state = list(UserProfile.objects.filter(pk__in=guids).order_by("pk").values("pk", "credential_generation"))
+        return ManagementMutation(
+            status_code=200,
+            body={
+                "result": "OK",
+                "deleted": revocation.deleted_tokens,
+                "revoked_users": revocation.revoked_users,
+            },
+            applied={"users": revocation.revoked_users},
+            result_state={"users": state},
+        )
+
+    response = _execute_management_batch(
+        actor=admin_user,
+        operation_id=operation_id,
+        operation="users_force_logout",
+        request_document=request_document,
+        requested=requested,
+        mutation=mutate,
+    )
+    body = json.loads(response.content)
+    if response.status_code != 200:
+        _log_event(
+            request,
+            "api_users_force_logout_failed",
+            level="warning",
+            username=admin_user.username,
+            operation_id=str(operation_id),
+        )
+        return response
     _log_event(
         request,
         "api_users_force_logout",
         username=admin_user.username,
-        deleted=revocation.deleted_tokens,
-        revoked_users=revocation.revoked_users,
+        operation_id=str(operation_id),
+        operation_generation=body["operation_generation"],
+        deleted=body["deleted"],
+        revoked_users=body["revoked_users"],
     )
-    return JsonResponse(
-        {
-            "result": "OK",
-            "deleted": revocation.deleted_tokens,
-            "revoked_users": revocation.revoked_users,
-        }
-    )
+    return response
 
 
 def devices(request):
@@ -5363,16 +5447,75 @@ def device_group_detail(request, guid):
             max_bytes=settings.JSON_MANAGEMENT_BATCH_MAX_BODY_BYTES,
         )
         ids = _rid_list(ids)
-        if ids is None or any(not re.fullmatch(r"[A-Za-z0-9_-]{6,16}", item) for item in ids):
+        if not ids or any(not re.fullmatch(r"[A-Za-z0-9_-]{6,16}", item) for item in ids):
             return JsonResponse({"error": "Device id list required"}, status=400)
-        group = DeviceGroup.objects.filter(guid=group_guid).first()
-        if not group:
-            return JsonResponse({"error": "Device group not found"}, status=404)
-        updated = RemoteDevice.objects.filter(rid__in=[str(x) for x in ids]).update(device_group=group)
-        _log_event(
-            request, "api_device_group_add_devices", username=admin_user.username, target=group.name, updated=updated
+        operation_id, operation_error = _operation_id_or_error(request)
+        if operation_error:
+            return operation_error
+        requested = {"devices": len(ids)}
+        request_document = {
+            "operation": "device_group_add_devices",
+            "group": str(group_guid),
+            "devices": ids,
+        }
+
+        def mutate():
+            group = DeviceGroup.objects.select_for_update().filter(guid=group_guid).first()
+            if not group:
+                return ManagementMutation(
+                    status_code=404,
+                    body={"error": "Device group not found"},
+                    applied={"devices": 0},
+                    result_state={"error": "group_not_found"},
+                )
+            devices = list(
+                RemoteDevice.objects.select_for_update().filter(rid__in=ids).order_by("pk").only("pk", "rid")
+            )
+            found = {device.rid for device in devices}
+            missing = [rid for rid in ids if rid not in found]
+            if missing:
+                return ManagementMutation(
+                    status_code=409,
+                    body={"error": "Batch targets changed", "missing": {"devices": missing}},
+                    applied={"devices": 0},
+                    result_state={"missing": {"devices": missing}},
+                )
+            device_ids = [device.pk for device in devices]
+            updated = RemoteDevice.objects.filter(pk__in=device_ids).update(device_group=group)
+            if updated != len(ids):
+                raise RuntimeError("Device group assignment did not apply the complete target set")
+            state = list(
+                RemoteDevice.objects.filter(pk__in=device_ids)
+                .order_by("pk")
+                .values("rid", "device_group_id", "policy_generation")
+            )
+            return ManagementMutation(
+                status_code=200,
+                body={"result": "OK", "updated": updated},
+                applied={"devices": updated},
+                result_state={"devices": state},
+            )
+
+        response = _execute_management_batch(
+            actor=admin_user,
+            operation_id=operation_id,
+            operation="device_group_add_devices",
+            request_document=request_document,
+            requested=requested,
+            mutation=mutate,
         )
-        return JsonResponse({"result": "OK", "updated": updated})
+        body = json.loads(response.content)
+        _log_event(
+            request,
+            "api_device_group_add_devices" if response.status_code == 200 else "api_device_group_add_devices_failed",
+            level="info" if response.status_code == 200 else "warning",
+            username=admin_user.username,
+            target=str(group_guid),
+            operation_id=str(operation_id),
+            operation_generation=body.get("operation_generation"),
+            updated=body.get("updated", 0),
+        )
+        return response
     else:
         with transaction.atomic():
             group = DeviceGroup.objects.select_for_update().filter(guid=group_guid).first()
@@ -5392,24 +5535,91 @@ def device_group_remove_devices(request, guid):
         group_guid = parse_uuid(guid)
     except InvalidIdentifier:
         return JsonResponse({"error": "Invalid device group identifier"}, status=400)
-    group = DeviceGroup.objects.filter(guid=group_guid).first()
-    if not group:
-        return JsonResponse({"error": "Device group not found"}, status=404)
     ids = _load_json(
         request,
         max_bytes=settings.JSON_MANAGEMENT_BATCH_MAX_BODY_BYTES,
     )
     ids = _rid_list(ids)
-    if ids is None or any(not re.fullmatch(r"[A-Za-z0-9_-]{6,16}", item) for item in ids):
+    if not ids or any(not re.fullmatch(r"[A-Za-z0-9_-]{6,16}", item) for item in ids):
         return JsonResponse({"error": "Device id list required"}, status=400)
-    updated = RemoteDevice.objects.filter(
-        rid__in=[str(x) for x in ids],
-        device_group=group,
-    ).update(device_group=None)
-    _log_event(
-        request, "api_device_group_remove_devices", username=admin_user.username, target=group.name, updated=updated
+    operation_id, operation_error = _operation_id_or_error(request)
+    if operation_error:
+        return operation_error
+    requested = {"devices": len(ids)}
+    request_document = {
+        "operation": "device_group_remove_devices",
+        "group": str(group_guid),
+        "devices": ids,
+    }
+
+    def mutate():
+        group = DeviceGroup.objects.select_for_update().filter(guid=group_guid).first()
+        if not group:
+            return ManagementMutation(
+                status_code=404,
+                body={"error": "Device group not found"},
+                applied={"devices": 0},
+                result_state={"error": "group_not_found"},
+            )
+        devices = list(
+            RemoteDevice.objects.select_for_update()
+            .filter(rid__in=ids)
+            .order_by("pk")
+            .only("pk", "rid", "device_group_id")
+        )
+        found = {device.rid for device in devices}
+        missing = [rid for rid in ids if rid not in found]
+        wrong_group = [device.rid for device in devices if device.device_group_id != group.pk]
+        if missing or wrong_group:
+            return ManagementMutation(
+                status_code=409,
+                body={
+                    "error": "Batch targets changed",
+                    "missing": {"devices": missing},
+                    "rejected": {"not_in_group": wrong_group},
+                },
+                applied={"devices": 0},
+                result_state={
+                    "missing": {"devices": missing},
+                    "rejected": {"not_in_group": wrong_group},
+                },
+            )
+        device_ids = [device.pk for device in devices]
+        updated = RemoteDevice.objects.filter(pk__in=device_ids, device_group=group).update(device_group=None)
+        if updated != len(ids):
+            raise RuntimeError("Device group removal did not apply the complete target set")
+        state = list(
+            RemoteDevice.objects.filter(pk__in=device_ids)
+            .order_by("pk")
+            .values("rid", "device_group_id", "policy_generation")
+        )
+        return ManagementMutation(
+            status_code=200,
+            body={"result": "OK", "updated": updated},
+            applied={"devices": updated},
+            result_state={"devices": state},
+        )
+
+    response = _execute_management_batch(
+        actor=admin_user,
+        operation_id=operation_id,
+        operation="device_group_remove_devices",
+        request_document=request_document,
+        requested=requested,
+        mutation=mutate,
     )
-    return JsonResponse({"result": "OK", "updated": updated})
+    body = json.loads(response.content)
+    _log_event(
+        request,
+        "api_device_group_remove_devices" if response.status_code == 200 else "api_device_group_remove_devices_failed",
+        level="info" if response.status_code == 200 else "warning",
+        username=admin_user.username,
+        target=str(group_guid),
+        operation_id=str(operation_id),
+        operation_generation=body.get("operation_generation"),
+        updated=body.get("updated", 0),
+    )
+    return response
 
 
 def strategies(request):
@@ -5556,16 +5766,14 @@ def strategy_assign(request):
         request,
         max_bytes=settings.JSON_MANAGEMENT_BATCH_MAX_BODY_BYTES,
     )
-    strategy = None
     strategy_guid = data.get("strategy")
     if strategy_guid not in (None, ""):
         try:
             strategy_guid = parse_uuid(strategy_guid)
         except InvalidIdentifier:
             return JsonResponse({"error": "Invalid strategy"}, status=400)
-        strategy = StrategyProfile.objects.filter(guid=strategy_guid).first()
-        if not strategy:
-            return JsonResponse({"error": "Strategy not found"}, status=404)
+    else:
+        strategy_guid = None
     try:
         peer_guids = parse_model_pk_list(
             data.get("peers", []),
@@ -5585,18 +5793,110 @@ def strategy_assign(request):
         return JsonResponse({"error": "Invalid assignment targets"}, status=400)
     if not peer_guids and not user_guids and not group_guids:
         return JsonResponse({"error": "No assignment targets"}, status=400)
-    with transaction.atomic():
-        devices_updated = RemoteDevice.objects.filter(pk__in=peer_guids).update(strategy=strategy)
-        users_updated = UserProfile.objects.filter(pk__in=user_guids).update(strategy=strategy)
-        groups = DeviceGroup.objects.filter(guid__in=group_guids)
-        groups_updated = groups.update(strategy=strategy)
+    operation_id, operation_error = _operation_id_or_error(request)
+    if operation_error:
+        return operation_error
+    requested = {
+        "devices": len(peer_guids),
+        "users": len(user_guids),
+        "groups": len(group_guids),
+    }
+    request_document = {
+        "operation": "strategy_assign",
+        "strategy": str(strategy_guid) if strategy_guid else None,
+        "peers": [str(peer_id) for peer_id in peer_guids],
+        "users": [str(user_id) for user_id in user_guids],
+        "groups": [str(group_id) for group_id in group_guids],
+    }
+
+    def mutate():
+        strategy = None
+        if strategy_guid:
+            strategy = StrategyProfile.objects.select_for_update().filter(guid=strategy_guid).first()
+            if not strategy:
+                return ManagementMutation(
+                    status_code=404,
+                    body={"error": "Strategy not found"},
+                    applied=dict.fromkeys(requested, 0),
+                    result_state={"error": "strategy_not_found"},
+                )
+        groups = list(
+            DeviceGroup.objects.select_for_update().filter(guid__in=group_guids).order_by("pk").only("pk", "guid")
+        )
+        users = list(UserProfile.objects.select_for_update().filter(pk__in=user_guids).order_by("pk").only("pk"))
+        group_ids = [group.pk for group in groups]
+        user_ids = [user.pk for user in users]
+        affected_device_ids = set(peer_guids)
+        affected_device_ids.update(device_ids_affected_by_groups(group_ids))
+        affected_device_ids.update(device_ids_affected_by_users(user_ids))
+        locked_devices = list(
+            RemoteDevice.objects.select_for_update().filter(pk__in=affected_device_ids).order_by("pk").only("pk")
+        )
+        found_devices = {device.pk for device in locked_devices}
+        found_users = {user.pk for user in users}
+        found_groups = {group.guid for group in groups}
+        missing = {
+            "devices": [str(peer_id) for peer_id in peer_guids if peer_id not in found_devices],
+            "users": [str(user_id) for user_id in user_guids if user_id not in found_users],
+            "groups": [str(group_id) for group_id in group_guids if group_id not in found_groups],
+        }
+        if any(missing.values()):
+            return ManagementMutation(
+                status_code=409,
+                body={"error": "Batch targets changed", "missing": missing},
+                applied=dict.fromkeys(requested, 0),
+                result_state={"missing": missing},
+            )
+        device_ids = list(peer_guids)
+        groups_updated = DeviceGroup.objects.filter(pk__in=group_ids).update(strategy=strategy)
+        users_updated = UserProfile.objects.filter(pk__in=user_ids).update(strategy=strategy)
+        devices_updated = RemoteDevice.objects.filter(pk__in=device_ids).update(strategy=strategy)
+        applied = {
+            "devices": devices_updated,
+            "users": users_updated,
+            "groups": groups_updated,
+        }
+        if applied != requested:
+            raise RuntimeError("Strategy assignment did not apply the complete target set")
+        state = {
+            "strategy": str(strategy.guid) if strategy else None,
+            "devices": list(
+                RemoteDevice.objects.filter(pk__in=device_ids)
+                .order_by("pk")
+                .values("pk", "strategy_id", "policy_generation")
+            ),
+            "users": list(UserProfile.objects.filter(pk__in=user_ids).order_by("pk").values("pk", "strategy_id")),
+            "groups": [
+                {"guid": str(group.guid), "strategy_id": group.strategy_id}
+                for group in DeviceGroup.objects.filter(pk__in=group_ids).order_by("pk")
+            ],
+        }
+        return ManagementMutation(
+            status_code=200,
+            body={"result": "OK", **applied},
+            applied=applied,
+            result_state=state,
+        )
+
+    response = _execute_management_batch(
+        actor=admin_user,
+        operation_id=operation_id,
+        operation="strategy_assign",
+        request_document=request_document,
+        requested=requested,
+        mutation=mutate,
+    )
+    body = json.loads(response.content)
     _log_event(
         request,
-        "api_strategy_assign",
+        "api_strategy_assign" if response.status_code == 200 else "api_strategy_assign_failed",
+        level="info" if response.status_code == 200 else "warning",
         username=admin_user.username,
-        strategy=strategy.name if strategy else "",
-        devices=devices_updated,
-        users=users_updated,
-        groups=groups_updated,
+        strategy=str(strategy_guid or ""),
+        operation_id=str(operation_id),
+        operation_generation=body.get("operation_generation"),
+        devices=body.get("devices", 0),
+        users=body.get("users", 0),
+        groups=body.get("groups", 0),
     )
-    return JsonResponse({"result": "OK", "devices": devices_updated, "users": users_updated, "groups": groups_updated})
+    return response

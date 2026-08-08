@@ -13,6 +13,7 @@ from api.models import (
     DeviceRecoveryApproval,
     LoginAdmissionLock,
     LoginAttempt,
+    ManagementBatchOperation,
     OidcPendingAuth,
     RemoteToken,
     RequestRateBucket,
@@ -23,7 +24,7 @@ from camellia_remote_management.observability import background_operation
 
 
 class Command(BaseCommand):
-    help = "Delete expired authentication, request-admission, and retained share state."
+    help = "Delete expired authentication, request-admission, operation-receipt, and retained share state."
 
     def add_arguments(self, parser):
         parser.add_argument(
@@ -35,7 +36,7 @@ class Command(BaseCommand):
             "--batch-size",
             type=int,
             default=settings.INGESTION_CLEANUP_BATCH_SIZE,
-            help="Maximum number of rows processed per persistent-ingestion category.",
+            help="Maximum number of rows processed per bounded retention category.",
         )
 
     def handle(self, *args, **options):
@@ -50,6 +51,9 @@ class Command(BaseCommand):
         login_cutoff = now - datetime.timedelta(minutes=settings.LOGIN_ATTEMPT_RETENTION_MINUTES)
         oidc_cutoff = now - datetime.timedelta(minutes=settings.OIDC_PENDING_RETENTION_MINUTES)
         share_cutoff = now - datetime.timedelta(days=settings.SHARE_LINK_RETENTION_DAYS)
+        management_operation_cutoff = now - datetime.timedelta(
+            days=settings.MANAGEMENT_OPERATION_RETENTION_DAYS,
+        )
 
         login_attempts = LoginAttempt.objects.filter(created_at__lt=login_cutoff)
         login_admission_locks = LoginAdmissionLock.objects.filter(updated_at__lt=login_cutoff)
@@ -64,6 +68,15 @@ class Command(BaseCommand):
         )
         request_rate_buckets = RequestRateBucket.objects.filter(expires_at__lte=now)
         request_rate_leases = RequestRateLease.objects.filter(expires_at__lte=now)
+        expired_management_operations = ManagementBatchOperation.objects.filter(
+            created_at__lt=management_operation_cutoff,
+        )
+        expired_management_operation_count = expired_management_operations.count()
+        management_operation_generations = list(
+            expired_management_operations.order_by("created_at", "generation").values_list("generation", flat=True)[
+                :batch_size
+            ]
+        )
 
         result = {
             "expired_access_tokens": access_tokens.count(),
@@ -76,6 +89,9 @@ class Command(BaseCommand):
             "retained_share_links": retained_share_links.count(),
             "request_rate_buckets": request_rate_buckets.count(),
             "request_rate_leases": request_rate_leases.count(),
+            "expired_management_batch_operations": expired_management_operation_count,
+            "management_batch_operations_purged": 0,
+            "management_batch_operations_remaining": expired_management_operation_count,
         }
         if not options["dry_run"]:
             with transaction.atomic():
@@ -89,6 +105,15 @@ class Command(BaseCommand):
                 retained_share_links.delete()
                 request_rate_buckets.delete()
                 request_rate_leases.delete()
+                if management_operation_generations:
+                    deleted_management_operations = ManagementBatchOperation.objects.filter(
+                        generation__in=management_operation_generations,
+                    ).delete()[0]
+                    result["management_batch_operations_purged"] = deleted_management_operations
+                    result["management_batch_operations_remaining"] = max(
+                        expired_management_operation_count - deleted_management_operations,
+                        0,
+                    )
 
         result["dry_run"] = bool(options["dry_run"])
         result.update(

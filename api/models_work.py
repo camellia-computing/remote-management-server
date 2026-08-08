@@ -160,6 +160,39 @@ class RemoteToken(models.Model):
         verbose_name_plural = _("令牌列表")
 
 
+class ManagementBatchOperation(models.Model):
+    """Durable authority for one replay-safe management batch mutation."""
+
+    generation = models.BigAutoField(primary_key=True)
+    operation_id = models.UUIDField(unique=True, editable=False)
+    actor = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="management_batch_operations",
+        editable=False,
+    )
+    operation = models.CharField(max_length=64, editable=False)
+    request_digest = models.CharField(max_length=64, editable=False)
+    status_code = models.PositiveSmallIntegerField(editable=False)
+    response = models.JSONField(editable=False)
+    created_at = models.DateTimeField(auto_now_add=True, db_index=True)
+
+    class Meta:
+        ordering = ("-generation",)
+        indexes = [
+            models.Index(
+                fields=("actor", "created_at"),
+                name="mgmt_batch_actor_created_idx",
+            )
+        ]
+        constraints = [
+            models.CheckConstraint(
+                condition=models.Q(status_code__gte=200, status_code__lt=500),
+                name="valid_mgmt_batch_status",
+            )
+        ]
+
+
 class DeviceProofChallenge(models.Model):
     """Short-lived, one-use challenge for device key possession proofs."""
 
