@@ -6,6 +6,8 @@ from django.db.migrations.executor import MigrationExecutor
 from django.test import TransactionTestCase
 from django.utils import timezone
 
+from api.migration_test_support import restore_latest_migration_state
+
 
 class FileAuditLifecycleMigrationTests(TransactionTestCase):
     migrate_from = ("api", "0018_connection_audit_lease")
@@ -117,4 +119,4 @@ class FileAuditLifecycleMigrationTests(TransactionTestCase):
                 0,
             )
         finally:
-            MigrationExecutor(connection).migrate([self.migrate_to])
+            restore_latest_migration_state()

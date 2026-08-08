@@ -158,6 +158,8 @@ python3 "$envelope_helper" unpack \
         pg_restore --single-transaction --exit-on-error --format=custom --no-owner --no-acl
 set +o pipefail
 "${compose[@]}" run --rm --no-deps -T database-bootstrap
+"${compose[@]}" run --rm --no-deps -T management python manage.py check_username_identity >/dev/null || \
+    die "restored username identity contract is invalid"
 set -o pipefail
 python3 "$envelope_helper" unpack \
         --expect-backup-id "$expected_backup_id" \

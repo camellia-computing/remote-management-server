@@ -92,8 +92,11 @@ class DeploymentGateTests(unittest.TestCase):
 
         run_script = (ROOT / "run.sh").read_text()
         migration_check = run_script.index("python manage.py migrate --check")
+        username_identity_check = run_script.index("python manage.py check_username_identity")
         gunicorn = run_script.index("exec gunicorn")
         self.assertLess(migration_check, gunicorn)
+        self.assertLess(migration_check, username_identity_check)
+        self.assertLess(username_identity_check, gunicorn)
 
         maintenance = MAINTENANCE.read_text()
         self.assertIn('deployment_lock="$lease_dir/deployment.lock"', maintenance)

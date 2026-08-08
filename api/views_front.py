@@ -48,6 +48,7 @@ from api.models import (
 from api.request_utils import STRICT_SHARE_JSON_ATTRIBUTE, client_ip, load_json_form_field
 from api.response_security import protect_credential_response
 from api.tag_colors import normalize_tag_color, tag_color_css
+from api.username_identity import canonical_username_key, normalize_username
 from api.xlsx import SpreadsheetBudgetExceeded, bounded_xlsx_file_response, safe_csv_writer, xlsx_response
 from camellia_remote_management.observability import log_structured_event
 
@@ -121,7 +122,7 @@ def _load_ab_audit_cursor(value, search_term):
         audit_id = int(payload["id"])
         if not timezone.is_aware(created_at) or audit_id < 1:
             raise ValueError("invalid cursor boundary")
-    except (KeyError, TypeError, ValueError, signing.BadSignature):
+    except KeyError, TypeError, ValueError, signing.BadSignature:
         return None
     return payload["direction"], created_at, audit_id
 
@@ -174,14 +175,12 @@ def user_login(request):
     if request.method != "POST":
         return JsonResponse({"code": 0, "msg": _("请求方式错误。")}, status=405)
 
-    username = request.POST.get("account", "").strip()
+    try:
+        username = normalize_username(request.POST.get("account", ""))
+    except ValueError:
+        username = ""
     password = request.POST.get("password", "")
-    if (
-        not username
-        or len(username) > UserProfile._meta.get_field("username").max_length
-        or not password
-        or len(password) > settings.MAX_PASSWORD_LENGTH
-    ):
+    if not username or not password or len(password) > settings.MAX_PASSWORD_LENGTH:
         return JsonResponse({"code": 0, "msg": _("登录信息无效。")}, status=400)
 
     client_ip = _client_ip(request)
@@ -221,7 +220,10 @@ def user_register(request):
         _log_event(request, "front_register_denied", level="warning", reason="registration_disabled")
         return JsonResponse(result, status=403)
 
-    username = request.POST.get("user", "").strip()
+    try:
+        username = normalize_username(request.POST.get("user", ""))
+    except ValueError:
+        username = ""
     password1 = request.POST.get("pwd", "")
     password2 = request.POST.get("repassword", "")
     client_ip = _client_ip(request)
@@ -260,7 +262,7 @@ def user_register(request):
         _log_event(request, "front_register_failed", level="warning", username=username, reason="weak_password")
         return JsonResponse(result, status=400)
 
-    if UserProfile.objects.filter(username__iexact=username).exists():
+    if UserProfile.objects.by_username(username).exists():
         info = _("用户名已存在。")
         result["msg"] = info
         _log_event(request, "front_register_failed", level="warning", username=username, reason="username_exists")
@@ -271,7 +273,7 @@ def user_register(request):
             password=password1,
             is_active=True,
         )
-    except (IntegrityError, ValidationError):
+    except IntegrityError, ValidationError:
         result["msg"] = _("用户名已存在。")
         _log_event(request, "front_register_failed", level="warning", username=username, reason="username_exists")
         return JsonResponse(result, status=409)
@@ -301,9 +303,18 @@ def _find_user(value, *, active_only=False):
     value = str(value or "").strip()
     if not value or len(value) > 150:
         return None
-    query = Q(username__iexact=value)
+    queries = []
+    try:
+        queries.append(Q(username_canonical=canonical_username_key(value)))
+    except ValueError:
+        pass
     if value.isascii() and value.isdigit():
-        query |= Q(pk=int(value))
+        queries.append(Q(pk=int(value)))
+    if not queries:
+        return None
+    query = queries[0]
+    for candidate in queries[1:]:
+        query |= candidate
     users = UserProfile.objects.filter(query)
     if active_only:
         users = users.filter(is_active=True)
@@ -468,7 +479,7 @@ def _ab_accessible_profiles(user, filter_q=None):
 def _parse_rule(value):
     try:
         rule = int(value)
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         return 1
     return rule if rule in (1, 2, 3) else 1
 

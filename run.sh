@@ -65,6 +65,7 @@ case "${CAMELLIA_REMOTE_RUN_MIGRATIONS:-false}" in
 esac
 
 python manage.py migrate --check
+python manage.py check_username_identity
 python manage.py check --deploy
 
 exec gunicorn camellia_remote_management.wsgi:application \

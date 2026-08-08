@@ -88,6 +88,8 @@ postgres_major="$((server_version_num / 10000))"
 checkpoint_json="$("${compose[@]}" exec -T management python manage.py recording_backup begin \
     --backup-id "$backup_id" --requested-at "$timestamp")" || die "cannot begin a consistent recording checkpoint"
 checkpoint_started=1
+"${compose[@]}" exec -T management python manage.py check_username_identity >/dev/null || \
+    die "username identity contract is invalid"
 checkpoint_values="$(CAMELLIA_REMOTE_CHECKPOINT_JSON="$checkpoint_json" CAMELLIA_REMOTE_BACKUP_ID="$backup_id" python3 -c '
 import json, os
 value = json.loads(os.environ["CAMELLIA_REMOTE_CHECKPOINT_JSON"])

@@ -6,6 +6,8 @@ from django.db.migrations.executor import MigrationExecutor
 from django.test import TransactionTestCase
 from django.utils import timezone
 
+from api.migration_test_support import restore_latest_migration_state
+
 
 class ConnectionAuditLeaseMigrationTests(TransactionTestCase):
     migrate_from = ("api", "0017_recording_inventory_backup")
@@ -173,4 +175,4 @@ class ConnectionAuditLeaseMigrationTests(TransactionTestCase):
                 expected = (2, 4) if usage.scope == "global" else (1, 2)
                 self.assertEqual((usage.items, usage.events), expected)
         finally:
-            MigrationExecutor(connection).migrate([self.migrate_to])
+            restore_latest_migration_state()
