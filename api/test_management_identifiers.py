@@ -135,6 +135,8 @@ class ManagementIdentifierHttpTests(TestCase):
         self.assert_error(
             self.client.post(
                 f"/api/users/{AUTO_FIELD_MAX}/enable",
+                data=json.dumps({}),
+                content_type="application/json",
                 HTTP_IDEMPOTENCY_KEY=str(uuid.uuid4()),
                 **self.auth,
             ),
@@ -143,6 +145,8 @@ class ManagementIdentifierHttpTests(TestCase):
         self.assert_error(
             self.client.post(
                 f"/api/devices/{AUTO_FIELD_MAX}/disable",
+                data=json.dumps({}),
+                content_type="application/json",
                 HTTP_IDEMPOTENCY_KEY=str(uuid.uuid4()),
                 **self.auth,
             ),

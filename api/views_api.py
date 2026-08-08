@@ -1093,6 +1093,66 @@ def _operation_id_or_error(request):
         return None, JsonResponse({"error": "Valid Idempotency-Key required"}, status=400)
 
 
+MUTATION_FIELD_CONTRACT_VERSION = 1
+MAX_MUTATION_ERROR_FIELDS = 16
+
+
+def _mutation_fields_error(
+    data,
+    *,
+    allowed,
+    required=(),
+    require_any=False,
+    exactly_one=(),
+    prefix="",
+):
+    allowed = frozenset(allowed)
+    supplied = frozenset(data)
+    unknown = sorted(f"{prefix}{field}" for field in supplied - allowed)
+    missing = sorted(f"{prefix}{field}" for field in frozenset(required) - supplied)
+    conflicting = []
+    required_one_of = []
+    for alternatives in exactly_one:
+        alternatives = frozenset(alternatives)
+        present = supplied & alternatives
+        if len(present) > 1:
+            conflicting.extend(f"{prefix}{field}" for field in present)
+        elif not present:
+            required_one_of.append(sorted(f"{prefix}{field}" for field in alternatives))
+    if (
+        not unknown
+        and not missing
+        and not conflicting
+        and not required_one_of
+        and (not require_any or supplied & allowed)
+    ):
+        return None
+    body = {
+        "error": "Invalid request fields",
+        "code": "invalid_request_fields",
+        "field_contract_version": MUTATION_FIELD_CONTRACT_VERSION,
+    }
+    if unknown:
+        body["unknown_fields"] = unknown[:MAX_MUTATION_ERROR_FIELDS]
+        if len(unknown) > MAX_MUTATION_ERROR_FIELDS:
+            body["unknown_field_count"] = len(unknown)
+    if missing:
+        body["missing_fields"] = missing
+    if conflicting:
+        body["conflicting_fields"] = sorted(conflicting)[:MAX_MUTATION_ERROR_FIELDS]
+    if required_one_of:
+        body["required_one_of"] = required_one_of
+    if require_any and not supplied & allowed:
+        body["required_any_of"] = sorted(f"{prefix}{field}" for field in allowed)
+    return JsonResponse(body, status=400)
+
+
+def _optional_empty_mutation_body_error(request):
+    if not request.body:
+        return None
+    return _mutation_fields_error(_load_json_object(request), allowed=())
+
+
 def _execute_management_batch(**kwargs):
     try:
         result = execute_management_operation(**kwargs)
@@ -5026,8 +5086,16 @@ def users(request):
         if error:
             return error
         data = _load_json_object(request)
+        field_error = _mutation_fields_error(
+            data,
+            allowed={"name", "username", "password", "email", "note", "group_name"},
+            required={"password"},
+            exactly_one=({"name", "username"},),
+        )
+        if field_error:
+            return field_error
         username = _model_text_value(
-            data.get("name") or data.get("username"),
+            data["name"] if "name" in data else data["username"],
             UserProfile,
             "username",
             allow_empty=False,
@@ -5087,7 +5155,13 @@ def users(request):
                     user.groups.add(group)
         except IntegrityError:
             return JsonResponse({"error": "User already exists"}, status=409)
-        _log_event(request, "api_users_created", username=admin_user.username, target=username)
+        _log_event(
+            request,
+            "api_users_created",
+            username=admin_user.username,
+            target=username,
+            changed_fields=sorted(data),
+        )
         return JsonResponse(_serialize_user(user))
     _token, user = _get_token_user(request)
     if not user:
@@ -5114,6 +5188,9 @@ def user_status(request, guid, action):
     target_pk = _numeric_pk(guid, UserProfile)
     if target_pk is None:
         return JsonResponse({"error": "Invalid user identifier"}, status=400)
+    field_error = _optional_empty_mutation_body_error(request)
+    if field_error:
+        return field_error
     operation_id, operation_error = _operation_id_or_error(request)
     if operation_error:
         return operation_error
@@ -5206,6 +5283,9 @@ def user_delete(request, guid):
     target_pk = _numeric_pk(guid, UserProfile)
     if target_pk is None:
         return JsonResponse({"error": "Invalid user identifier"}, status=400)
+    field_error = _optional_empty_mutation_body_error(request)
+    if field_error:
+        return field_error
     with transaction.atomic():
         target = UserProfile.objects.select_for_update().filter(pk=target_pk).first()
         if not target:
@@ -5242,6 +5322,13 @@ def users_force_logout(request):
         request,
         max_bytes=settings.JSON_MANAGEMENT_BATCH_MAX_BODY_BYTES,
     )
+    field_error = _mutation_fields_error(
+        data,
+        allowed={"user_guids"},
+        required={"user_guids"},
+    )
+    if field_error:
+        return field_error
     try:
         guids = parse_model_pk_list(
             data.get("user_guids"),
@@ -5373,6 +5460,9 @@ def device_status(request, guid, action):
     device_pk = _numeric_pk(guid, RemoteDevice)
     if device_pk is None:
         return JsonResponse({"error": "Invalid device identifier"}, status=400)
+    field_error = _optional_empty_mutation_body_error(request)
+    if field_error:
+        return field_error
     operation_id, operation_error = _operation_id_or_error(request)
     if operation_error:
         return operation_error
@@ -5467,7 +5557,15 @@ def device_approve_recovery(request, guid):
     device_pk = _numeric_pk(guid, RemoteDevice)
     if device_pk is None:
         return JsonResponse({"error": "Invalid device identifier"}, status=400)
-    public_key = str(_load_json_object(request).get("pk", "")).strip()
+    data = _load_json_object(request)
+    field_error = _mutation_fields_error(
+        data,
+        allowed={"pk"},
+        required={"pk"},
+    )
+    if field_error:
+        return field_error
+    public_key = str(data["pk"]).strip()
     with transaction.atomic():
         device = RemoteDevice.objects.select_for_update().filter(pk=device_pk).first()
         if not device:
@@ -5503,6 +5601,9 @@ def device_delete(request, guid):
     device_pk = _numeric_pk(guid, RemoteDevice)
     if device_pk is None:
         return JsonResponse({"error": "Invalid device identifier"}, status=400)
+    field_error = _optional_empty_mutation_body_error(request)
+    if field_error:
+        return field_error
     operation_id, operation_error = _operation_id_or_error(request)
     if operation_error:
         return operation_error
@@ -5578,9 +5679,17 @@ def device_assign(request, guid):
     if device_pk is None:
         return JsonResponse({"error": "Invalid device identifier"}, status=400)
     data = _load_json_object(request)
+    field_error = _mutation_fields_error(
+        data,
+        allowed={"type", "value"},
+        required={"type", "value"},
+    )
+    if field_error:
+        return field_error
     typ = str(data.get("type") or "")
     value = data.get("value")
     owner_changed = False
+    changed_fields = []
     owner = _user_by_identifier(value, active_only=True) if typ == "user_name" else None
     if typ == "user_name" and not owner:
         return JsonResponse({"error": "Active user not found"}, status=404)
@@ -5597,6 +5706,7 @@ def device_assign(request, guid):
         if typ == "user_name":
             owner_changed = device.owner_id != owner.id
             device.owner = owner
+            changed_fields.append("owner")
         elif typ == "device_group_name":
             group_name = _bounded_text_value(value, 480)
             if group_name is not None:
@@ -5607,6 +5717,7 @@ def device_assign(request, guid):
             if group_name and not group:
                 return JsonResponse({"error": "Device group not found"}, status=404)
             device.device_group = group
+            changed_fields.append("device_group")
         elif typ == "strategy_name":
             strategy_name = _bounded_text_value(value, 240)
             if strategy_name is not None:
@@ -5617,6 +5728,7 @@ def device_assign(request, guid):
             if strategy_name and not strategy:
                 return JsonResponse({"error": "Strategy not found"}, status=404)
             device.strategy = strategy
+            changed_fields.append("strategy")
         elif typ in ("note", "device_username", "device_name"):
             field_name = {
                 "note": "note",
@@ -5633,12 +5745,21 @@ def device_assign(request, guid):
             if text_value is None:
                 return JsonResponse({"error": "Invalid assignment value"}, status=400)
             setattr(device, field_name, text_value)
+            changed_fields.append(field_name)
         elif typ == "ab":
             if not isinstance(value, dict):
                 return JsonResponse(
                     {"error": "Address-book assignment must be an object"},
                     status=400,
                 )
+            nested_field_error = _mutation_fields_error(
+                value,
+                allowed=DEVICE_ADDRESS_BOOK_FIELDS,
+                require_any=True,
+                prefix="value.",
+            )
+            if nested_field_error:
+                return nested_field_error
             ab_updates = _validated_device_update_fields(
                 value,
                 DEVICE_ADDRESS_BOOK_FIELDS,
@@ -5657,12 +5778,20 @@ def device_assign(request, guid):
                 )
             for field, field_value in ab_updates.items():
                 setattr(device, field, field_value)
+            changed_fields.extend(ab_updates)
         else:
             return JsonResponse({"error": "Invalid assign type"}, status=400)
-        device.save()
+        device.save(update_fields=(*changed_fields, "update_time"))
         if owner_changed:
             _revoke_device_tokens(device)
-    _log_event(request, "api_device_assigned", username=admin_user.username, rid=device.rid, typ=typ)
+    _log_event(
+        request,
+        "api_device_assigned",
+        username=admin_user.username,
+        rid=device.rid,
+        typ=typ,
+        changed_fields=sorted(changed_fields),
+    )
     return JsonResponse(_serialize_device(device))
 
 
@@ -5734,6 +5863,13 @@ def device_groups(request):
         if error:
             return error
         data = _load_json_object(request)
+        field_error = _mutation_fields_error(
+            data,
+            allowed={"name", "note", "allowed_incomings", "strategy_name"},
+            required={"name"},
+        )
+        if field_error:
+            return field_error
         name = _model_text_value(
             data.get("name"),
             DeviceGroup,
@@ -5771,7 +5907,13 @@ def device_groups(request):
                 {"error": "Device group already exists"},
                 status=409,
             )
-        _log_event(request, "api_device_groups_created", username=admin_user.username, target=name)
+        _log_event(
+            request,
+            "api_device_groups_created",
+            username=admin_user.username,
+            target=name,
+            changed_fields=sorted(data),
+        )
         return JsonResponse(_serialize_device_group(group))
     admin_user, error = _require_admin(request, "api_device_groups")
     if error:
@@ -5791,8 +5933,14 @@ def device_group_detail(request, guid):
         return JsonResponse({"error": "Invalid device group identifier"}, status=400)
     if request.method == "PATCH":
         data = _load_json_object(request)
-        if not data:
-            return JsonResponse({"error": "Invalid device group"}, status=400)
+        field_error = _mutation_fields_error(
+            data,
+            allowed={"name", "note", "allowed_incomings", "strategy_name"},
+            require_any=True,
+        )
+        if field_error:
+            return field_error
+        changed_model_fields = []
         with transaction.atomic():
             group = DeviceGroup.objects.select_for_update().filter(guid=group_guid).first()
             if not group:
@@ -5807,6 +5955,7 @@ def device_group_detail(request, guid):
                 if new_name is None:
                     return JsonResponse({"error": "Invalid name"}, status=400)
                 group.name = new_name
+                changed_model_fields.append("name")
             if "note" in data:
                 note = _model_text_value(
                     data.get("note"),
@@ -5818,6 +5967,7 @@ def device_group_detail(request, guid):
                 if note is None:
                     return JsonResponse({"error": "Invalid note"}, status=400)
                 group.note = note
+                changed_model_fields.append("note")
             if "allowed_incomings" in data:
                 allowed_incomings = _allowed_incomings_value(data.get("allowed_incomings"))
                 if allowed_incomings is None:
@@ -5826,6 +5976,7 @@ def device_group_detail(request, guid):
                         status=400,
                     )
                 group.allowed_incomings = allowed_incomings
+                changed_model_fields.append("allowed_incomings")
             if "strategy_name" in data:
                 strategy_name = _bounded_text_value(
                     data.get("strategy_name"),
@@ -5839,10 +5990,18 @@ def device_group_detail(request, guid):
                 if strategy_name and not strategy:
                     return JsonResponse({"error": "Strategy not found"}, status=404)
                 group.strategy = strategy
+                changed_model_fields.append("strategy")
             try:
-                group.save()
+                group.save(update_fields=(*changed_model_fields, "updated_at"))
             except IntegrityError:
                 return JsonResponse({"error": "Device group already exists"}, status=409)
+        _log_event(
+            request,
+            "api_device_group_updated",
+            username=admin_user.username,
+            target=group.name,
+            changed_fields=sorted(data),
+        )
         return JsonResponse(_serialize_device_group(group))
     elif request.method == "POST":
         ids = _load_json(
@@ -5920,6 +6079,9 @@ def device_group_detail(request, guid):
         )
         return response
     else:
+        field_error = _optional_empty_mutation_body_error(request)
+        if field_error:
+            return field_error
         with transaction.atomic():
             group = DeviceGroup.objects.select_for_update().filter(guid=group_guid).first()
             if not group:
@@ -6031,6 +6193,13 @@ def strategies(request):
         return error
     if request.method == "POST":
         data = _load_json_object(request)
+        field_error = _mutation_fields_error(
+            data,
+            allowed={"name", "config_options", "enabled"},
+            required={"name"},
+        )
+        if field_error:
+            return field_error
         name = _model_text_value(
             data.get("name"),
             StrategyProfile,
@@ -6056,6 +6225,7 @@ def strategies(request):
             "api_strategy_created",
             username=admin_user.username,
             target=name,
+            changed_fields=sorted(data),
         )
         return JsonResponse(_serialize_strategy(strategy))
     qs = StrategyProfile.objects.all().order_by("name")
@@ -6077,8 +6247,14 @@ def strategy_detail(request, guid):
         return JsonResponse(_serialize_strategy(strategy))
     elif request.method == "PATCH":
         data = _load_json_object(request)
-        if not data:
-            return JsonResponse({"error": "Invalid strategy"}, status=400)
+        field_error = _mutation_fields_error(
+            data,
+            allowed={"name", "config_options", "enabled"},
+            require_any=True,
+        )
+        if field_error:
+            return field_error
+        changed_model_fields = []
         with transaction.atomic():
             strategy = StrategyProfile.objects.select_for_update().filter(guid=strategy_guid).first()
             if not strategy:
@@ -6093,6 +6269,7 @@ def strategy_detail(request, guid):
                 if name is None:
                     return JsonResponse({"error": "Invalid strategy name"}, status=400)
                 strategy.name = name
+                changed_model_fields.append("name")
             if "config_options" in data:
                 options = _strategy_options_value(
                     data.get("config_options"),
@@ -6103,6 +6280,7 @@ def strategy_detail(request, guid):
                         status=400,
                     )
                 strategy.config_options = options
+                changed_model_fields.append("config_options")
             if "enabled" in data:
                 enabled = _strict_bool(data.get("enabled"))
                 if enabled is None:
@@ -6111,8 +6289,9 @@ def strategy_detail(request, guid):
                         status=400,
                     )
                 strategy.enabled = enabled
+                changed_model_fields.append("enabled")
             try:
-                strategy.save()
+                strategy.save(update_fields=(*changed_model_fields, "updated_at"))
             except IntegrityError:
                 return JsonResponse({"error": "Strategy already exists"}, status=409)
         _log_event(
@@ -6120,9 +6299,13 @@ def strategy_detail(request, guid):
             "api_strategy_updated",
             username=admin_user.username,
             target=strategy.name,
+            changed_fields=sorted(data),
         )
         return JsonResponse(_serialize_strategy(strategy))
     else:
+        field_error = _optional_empty_mutation_body_error(request)
+        if field_error:
+            return field_error
         with transaction.atomic():
             strategy = StrategyProfile.objects.select_for_update().filter(guid=strategy_guid).first()
             if not strategy:
@@ -6146,17 +6329,32 @@ def strategy_status(request, guid):
         strategy_guid = parse_uuid(guid)
     except InvalidIdentifier:
         return JsonResponse({"error": "Invalid strategy identifier"}, status=400)
+    data = _load_json(request)
+    if isinstance(data, dict):
+        field_error = _mutation_fields_error(
+            data,
+            allowed={"enabled"},
+            required={"enabled"},
+        )
+        if field_error:
+            return field_error
+        enabled = _strict_bool(data["enabled"])
+    else:
+        enabled = _strict_bool(data)
+    if enabled is None:
+        return JsonResponse({"error": "Boolean enabled value required"}, status=400)
     strategy = StrategyProfile.objects.filter(guid=strategy_guid).first()
     if not strategy:
         return JsonResponse({"error": "Strategy not found"}, status=404)
-    data = _load_json(request)
-    enabled = _strict_bool(data if isinstance(data, bool) else data.get("enabled") if isinstance(data, dict) else None)
-    if enabled is None:
-        return JsonResponse({"error": "Boolean enabled value required"}, status=400)
     strategy.enabled = enabled
     strategy.save(update_fields=["enabled", "updated_at"])
     _log_event(
-        request, "api_strategy_status", username=admin_user.username, target=strategy.name, enabled=strategy.enabled
+        request,
+        "api_strategy_status",
+        username=admin_user.username,
+        target=strategy.name,
+        enabled=strategy.enabled,
+        changed_fields=["enabled"],
     )
     return JsonResponse(_serialize_strategy(strategy))
 
@@ -6169,6 +6367,12 @@ def strategy_assign(request):
         request,
         max_bytes=settings.JSON_MANAGEMENT_BATCH_MAX_BODY_BYTES,
     )
+    field_error = _mutation_fields_error(
+        data,
+        allowed={"strategy", "peers", "users", "groups"},
+    )
+    if field_error:
+        return field_error
     strategy_guid = data.get("strategy")
     if strategy_guid not in (None, ""):
         try:
