@@ -94,7 +94,7 @@ from api.policy_generation import (
     normalize_policy_options,
 )
 from api.rate_limits import enforce_authenticated_rate_limit
-from api.request_utils import client_ip, load_json_body, load_json_object
+from api.request_utils import client_ip, load_json_body, load_json_object, load_json_text
 from api.tag_colors import normalize_tag_color
 from camellia_remote_management.observability import log_structured_event
 
@@ -135,12 +135,12 @@ OIDC_SAFE_ID_TOKEN_ALGORITHMS = frozenset(
 )
 
 
-def _load_json(request):
-    return load_json_body(request)
+def _load_json(request, *, max_bytes=None):
+    return load_json_body(request, max_bytes=max_bytes)
 
 
-def _load_json_object(request):
-    return load_json_object(request)
+def _load_json_object(request, *, max_bytes=None):
+    return load_json_object(request, max_bytes=max_bytes)
 
 
 def _get_bearer_token(request):
@@ -1355,7 +1355,7 @@ def _finalize_personal_device_peer(user, device):
 
 def login(request):
     result = {}
-    data = _load_json_object(request)
+    data = _load_json_object(request, max_bytes=settings.JSON_AUTH_MAX_BODY_BYTES)
 
     username_value = data.get("username", "")
     username = username_value.strip() if isinstance(username_value, str) else ""
@@ -1634,7 +1634,7 @@ def login_options(request):
 
 
 def oidc_auth(request):
-    data = _load_json_object(request)
+    data = _load_json_object(request, max_bytes=settings.JSON_AUTH_MAX_BODY_BYTES)
     provider_name = _oidc_provider_name(data.get("op"))
     provider = getattr(settings, "OIDC_PROVIDERS", {}).get(provider_name)
     if not provider:
@@ -1707,7 +1707,7 @@ def oidc_auth(request):
 
 
 def oidc_auth_query(request):
-    data = _load_json_object(request)
+    data = _load_json_object(request, max_bytes=settings.JSON_AUTH_MAX_BODY_BYTES)
     poll_code = str(data.get("code", "")).strip()
     rid = data.get("id", "")
     device_uuid = data.get("uuid", "")
@@ -2987,7 +2987,10 @@ def ab_peer_delete(request, guid):
             request, "api_ab_peer_delete_denied", level="warning", username=user.username, guid=guid, reason="read_only"
         )
         return JsonResponse({"error": "Read-only"}, status=403)
-    postdata = _load_json(request)
+    postdata = _load_json(
+        request,
+        max_bytes=settings.JSON_ADDRESS_BOOK_BULK_MAX_BODY_BYTES,
+    )
     if (
         not isinstance(postdata, list)
         or len(postdata) > 1000
@@ -3188,7 +3191,10 @@ def ab_tag_delete(request, guid):
             request, "api_ab_tag_delete_denied", level="warning", username=user.username, guid=guid, reason="read_only"
         )
         return JsonResponse({"error": "Read-only"}, status=403)
-    postdata = _load_json(request)
+    postdata = _load_json(
+        request,
+        max_bytes=settings.JSON_MANAGEMENT_BATCH_MAX_BODY_BYTES,
+    )
     if (
         not isinstance(postdata, list)
         or len(postdata) > MAX_AB_TAGS
@@ -3862,7 +3868,7 @@ def _audit_controller_note_by_capability(request, postdata):
 
 
 def _audit_conn(request):
-    postdata = _load_json_object(request)
+    postdata = _load_json_object(request, max_bytes=settings.JSON_AUDIT_MAX_BODY_BYTES)
     if "note" in postdata and "uuid" not in postdata:
         return _audit_controller_note(request, postdata)
     token, user, error = _audit_device_context(request, postdata)
@@ -4221,7 +4227,7 @@ def _audit_conn(request):
 
 
 def _audit_file(request):
-    postdata = _load_json_object(request)
+    postdata = _load_json_object(request, max_bytes=settings.JSON_AUDIT_MAX_BODY_BYTES)
     token, user, error = _audit_device_context(request, postdata)
     if error:
         return error
@@ -4514,7 +4520,7 @@ def _audit_file(request):
 
 
 def _audit_alarm(request):
-    postdata = _load_json_object(request)
+    postdata = _load_json_object(request, max_bytes=settings.JSON_AUDIT_MAX_BODY_BYTES)
     token, user, error = _audit_device_context(request, postdata)
     if error:
         return error
@@ -4536,10 +4542,7 @@ def _audit_alarm(request):
         return JsonResponse({"error": "Invalid alarm information"}, status=400)
     if isinstance(raw_info, str) and len(raw_info.encode()) > MAX_AUDIT_INFO_BYTES:
         return JsonResponse({"error": "Alarm information is too large"}, status=413)
-    try:
-        info = json.loads(raw_info) if isinstance(raw_info, str) else raw_info
-    except (TypeError, ValueError, json.JSONDecodeError):
-        return JsonResponse({"error": "Invalid alarm information"}, status=400)
+    info = load_json_text(raw_info, max_bytes=MAX_AUDIT_INFO_BYTES) if isinstance(raw_info, str) else raw_info
     if not isinstance(info, dict):
         return JsonResponse({"error": "Invalid alarm information"}, status=400)
     audit_ref = _bounded_audit_text(postdata.get("conn_audit_ref", ""), 256)
@@ -4940,7 +4943,10 @@ def users_force_logout(request):
     admin_user, error = _require_admin(request, "api_users_force_logout")
     if error:
         return error
-    data = _load_json_object(request)
+    data = _load_json_object(
+        request,
+        max_bytes=settings.JSON_MANAGEMENT_BATCH_MAX_BODY_BYTES,
+    )
     try:
         guids = parse_model_pk_list(
             data.get("user_guids"),
@@ -5352,7 +5358,10 @@ def device_group_detail(request, guid):
                 return JsonResponse({"error": "Device group already exists"}, status=409)
         return JsonResponse(_serialize_device_group(group))
     elif request.method == "POST":
-        ids = _load_json(request)
+        ids = _load_json(
+            request,
+            max_bytes=settings.JSON_MANAGEMENT_BATCH_MAX_BODY_BYTES,
+        )
         ids = _rid_list(ids)
         if ids is None or any(not re.fullmatch(r"[A-Za-z0-9_-]{6,16}", item) for item in ids):
             return JsonResponse({"error": "Device id list required"}, status=400)
@@ -5386,7 +5395,10 @@ def device_group_remove_devices(request, guid):
     group = DeviceGroup.objects.filter(guid=group_guid).first()
     if not group:
         return JsonResponse({"error": "Device group not found"}, status=404)
-    ids = _load_json(request)
+    ids = _load_json(
+        request,
+        max_bytes=settings.JSON_MANAGEMENT_BATCH_MAX_BODY_BYTES,
+    )
     ids = _rid_list(ids)
     if ids is None or any(not re.fullmatch(r"[A-Za-z0-9_-]{6,16}", item) for item in ids):
         return JsonResponse({"error": "Device id list required"}, status=400)
@@ -5540,7 +5552,10 @@ def strategy_assign(request):
     admin_user, error = _require_admin(request, "api_strategy_assign")
     if error:
         return error
-    data = _load_json_object(request)
+    data = _load_json_object(
+        request,
+        max_bytes=settings.JSON_MANAGEMENT_BATCH_MAX_BODY_BYTES,
+    )
     strategy = None
     strategy_guid = data.get("strategy")
     if strategy_guid not in (None, ""):
