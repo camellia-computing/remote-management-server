@@ -57,6 +57,13 @@ from api.device_inventory import (
     load_inventory_cursor,
 )
 from api.encrypted_fields import verify_key_canary
+from api.identifiers import (
+    InvalidIdentifier,
+    parse_model_pk,
+    parse_model_pk_list,
+    parse_uuid,
+    parse_uuid_list,
+)
 from api.login_admission import complete_login_success, reserve_login_attempt
 from api.models import (
     AddressBookProfile,
@@ -1031,14 +1038,14 @@ def _allowed_incomings_value(value):
     return result
 
 
-def _identifier_list(value, *, numeric=False):
+def _rid_list(value):
     if not isinstance(value, list) or len(value) > MAX_MANAGEMENT_BATCH_ITEMS:
         return None
     result = []
     seen = set()
     for item in value:
         item = str(item).strip()
-        if not item or len(item) > 64 or (numeric and (not item.isascii() or not item.isdigit())):
+        if not item or len(item) > 64:
             return None
         if item not in seen:
             seen.add(item)
@@ -1056,18 +1063,21 @@ def _user_by_identifier(value, *, active_only=False):
         return None
     query = Q(username__iexact=value)
     if value.isascii() and value.isdigit():
-        query |= Q(pk=int(value))
+        try:
+            query |= Q(pk=parse_model_pk(value, UserProfile))
+        except InvalidIdentifier:
+            pass
     users = UserProfile.objects.filter(query)
     if active_only:
         users = users.filter(is_active=True)
     return users.order_by("pk").first()
 
 
-def _numeric_pk(value):
-    value = str(value or "").strip()
-    if not value or len(value) > 20 or not value.isascii() or not value.isdigit():
+def _numeric_pk(value, model):
+    try:
+        return parse_model_pk(value, model)
+    except InvalidIdentifier:
         return None
-    return int(value)
 
 
 def _validated_tags(tags):
@@ -2159,14 +2169,6 @@ def record(request):
     if not token or not user or not _get_active_token_device(token, user):
         _log_event(request, "api_record_unauthorized", level="warning")
         return JsonResponse({"error": "Invalid device token"}, status=401)
-    try:
-        try:
-            required_bytes = int(request.META.get("CONTENT_LENGTH", "0") or 0)
-        except (TypeError, ValueError):
-            required_bytes = 0
-        ingestion_governance.check_recording_storage_capability(max(0, required_bytes))
-    except ingestion_governance.RecordingStorageUnavailable as error:
-        return ingestion_governance.storage_error_response(error)
     return recording_uploads.handle_record_upload(request, token)
 
 
@@ -4868,21 +4870,16 @@ def users(request):
     return _paged_response(request, qs.distinct(), _serialize_user)
 
 
-def _user_by_guid(guid):
-    pk = _numeric_pk(guid)
-    return UserProfile.objects.filter(pk=pk).first() if pk is not None else None
-
-
 def user_status(request, guid, action):
     admin_user, error = _require_admin(request, f"api_user_{action}")
     if error:
         return error
+    target_pk = _numeric_pk(guid, UserProfile)
+    if target_pk is None:
+        return JsonResponse({"error": "Invalid user identifier"}, status=400)
     try:
         with transaction.atomic():
-            target_pk = _numeric_pk(guid)
-            target = (
-                UserProfile.objects.select_for_update().filter(pk=target_pk).first() if target_pk is not None else None
-            )
+            target = UserProfile.objects.select_for_update().filter(pk=target_pk).first()
             if not target:
                 return JsonResponse({"error": "User not found"}, status=404)
             if target.id == admin_user.id and action == "disable":
@@ -4908,9 +4905,11 @@ def user_delete(request, guid):
     admin_user, error = _require_admin(request, "api_user_delete")
     if error:
         return error
+    target_pk = _numeric_pk(guid, UserProfile)
+    if target_pk is None:
+        return JsonResponse({"error": "Invalid user identifier"}, status=400)
     with transaction.atomic():
-        target_pk = _numeric_pk(guid)
-        target = UserProfile.objects.select_for_update().filter(pk=target_pk).first() if target_pk is not None else None
+        target = UserProfile.objects.select_for_update().filter(pk=target_pk).first()
         if not target:
             return JsonResponse({"error": "User not found"}, status=404)
         if target.id == admin_user.id:
@@ -4942,8 +4941,13 @@ def users_force_logout(request):
     if error:
         return error
     data = _load_json_object(request)
-    guids = _identifier_list(data.get("user_guids"), numeric=True)
-    if guids is None:
+    try:
+        guids = parse_model_pk_list(
+            data.get("user_guids"),
+            UserProfile,
+            max_items=MAX_MANAGEMENT_BATCH_ITEMS,
+        )
+    except InvalidIdentifier:
         return JsonResponse({"error": "Invalid user list"}, status=400)
     try:
         revocation = revoke_user_credentials(guids)
@@ -5000,30 +5004,15 @@ def devices(request):
     return _paged_response(request, qs, _serialize_device)
 
 
-def _device_by_guid(guid):
-    pk = _numeric_pk(guid)
-    return (
-        RemoteDevice.objects.select_related(
-            "owner__strategy",
-            "device_group__strategy",
-            "strategy",
-        )
-        .filter(pk=pk)
-        .first()
-        if pk is not None
-        else None
-    )
-
-
 def device_status(request, guid, action):
     admin_user, error = _require_admin(request, f"api_device_{action}")
     if error:
         return error
-    device_pk = _numeric_pk(guid)
+    device_pk = _numeric_pk(guid, RemoteDevice)
+    if device_pk is None:
+        return JsonResponse({"error": "Invalid device identifier"}, status=400)
     with transaction.atomic():
-        device = (
-            RemoteDevice.objects.select_for_update().filter(pk=device_pk).first() if device_pk is not None else None
-        )
+        device = RemoteDevice.objects.select_for_update().filter(pk=device_pk).first()
         if not device:
             return JsonResponse({"error": "Device not found"}, status=404)
         device.is_active = action == "enable"
@@ -5038,12 +5027,12 @@ def device_approve_recovery(request, guid):
     admin_user, error = _require_admin(request, "api_device_approve_recovery")
     if error:
         return error
-    device_pk = _numeric_pk(guid)
+    device_pk = _numeric_pk(guid, RemoteDevice)
+    if device_pk is None:
+        return JsonResponse({"error": "Invalid device identifier"}, status=400)
     public_key = str(_load_json_object(request).get("pk", "")).strip()
     with transaction.atomic():
-        device = (
-            RemoteDevice.objects.select_for_update().filter(pk=device_pk).first() if device_pk is not None else None
-        )
+        device = RemoteDevice.objects.select_for_update().filter(pk=device_pk).first()
         if not device:
             return JsonResponse({"error": "Device not found"}, status=404)
         if not device.is_active or not device.owner_id or not device.public_key_hash:
@@ -5074,11 +5063,11 @@ def device_delete(request, guid):
     admin_user, error = _require_admin(request, "api_device_delete")
     if error:
         return error
-    device_pk = _numeric_pk(guid)
+    device_pk = _numeric_pk(guid, RemoteDevice)
+    if device_pk is None:
+        return JsonResponse({"error": "Invalid device identifier"}, status=400)
     with transaction.atomic():
-        device = (
-            RemoteDevice.objects.select_for_update().filter(pk=device_pk).first() if device_pk is not None else None
-        )
+        device = RemoteDevice.objects.select_for_update().filter(pk=device_pk).first()
         if not device:
             return JsonResponse({"error": "Device not found"}, status=404)
         rid = device.rid
@@ -5092,11 +5081,13 @@ def device_assign(request, guid):
     admin_user, error = _require_admin(request, "api_device_assign")
     if error:
         return error
+    device_pk = _numeric_pk(guid, RemoteDevice)
+    if device_pk is None:
+        return JsonResponse({"error": "Invalid device identifier"}, status=400)
     data = _load_json_object(request)
     typ = str(data.get("type") or "")
     value = data.get("value")
     owner_changed = False
-    device_pk = _numeric_pk(guid)
     owner = _user_by_identifier(value, active_only=True) if typ == "user_name" else None
     if typ == "user_name" and not owner:
         return JsonResponse({"error": "Active user not found"}, status=404)
@@ -5107,8 +5098,6 @@ def device_assign(request, guid):
                 return JsonResponse({"error": "Active user not found"}, status=404)
         device = (
             RemoteDevice.objects.select_for_update(of=("self",)).select_related("owner").filter(pk=device_pk).first()
-            if device_pk is not None
-            else None
         )
         if not device:
             return JsonResponse({"error": "Device not found"}, status=404)
@@ -5299,20 +5288,20 @@ def device_groups(request):
     return _paged_response(request, qs, _serialize_device_group)
 
 
-def _device_group_by_guid(guid):
-    return DeviceGroup.objects.filter(guid=guid).first()
-
-
 def device_group_detail(request, guid):
     admin_user, error = _require_admin(request, "api_device_group_detail")
     if error:
         return error
+    try:
+        group_guid = parse_uuid(guid)
+    except InvalidIdentifier:
+        return JsonResponse({"error": "Invalid device group identifier"}, status=400)
     if request.method == "PATCH":
         data = _load_json_object(request)
         if not data:
             return JsonResponse({"error": "Invalid device group"}, status=400)
         with transaction.atomic():
-            group = DeviceGroup.objects.select_for_update().filter(guid=guid).first()
+            group = DeviceGroup.objects.select_for_update().filter(guid=group_guid).first()
             if not group:
                 return JsonResponse({"error": "Device group not found"}, status=404)
             if "name" in data:
@@ -5364,10 +5353,10 @@ def device_group_detail(request, guid):
         return JsonResponse(_serialize_device_group(group))
     elif request.method == "POST":
         ids = _load_json(request)
-        ids = _identifier_list(ids)
+        ids = _rid_list(ids)
         if ids is None or any(not re.fullmatch(r"[A-Za-z0-9_-]{6,16}", item) for item in ids):
             return JsonResponse({"error": "Device id list required"}, status=400)
-        group = _device_group_by_guid(guid)
+        group = DeviceGroup.objects.filter(guid=group_guid).first()
         if not group:
             return JsonResponse({"error": "Device group not found"}, status=404)
         updated = RemoteDevice.objects.filter(rid__in=[str(x) for x in ids]).update(device_group=group)
@@ -5377,7 +5366,7 @@ def device_group_detail(request, guid):
         return JsonResponse({"result": "OK", "updated": updated})
     else:
         with transaction.atomic():
-            group = DeviceGroup.objects.select_for_update().filter(guid=guid).first()
+            group = DeviceGroup.objects.select_for_update().filter(guid=group_guid).first()
             if not group:
                 return JsonResponse({"error": "Device group not found"}, status=404)
             name = group.name
@@ -5390,11 +5379,15 @@ def device_group_remove_devices(request, guid):
     admin_user, error = _require_admin(request, "api_device_group_remove_devices")
     if error:
         return error
-    group = _device_group_by_guid(guid)
+    try:
+        group_guid = parse_uuid(guid)
+    except InvalidIdentifier:
+        return JsonResponse({"error": "Invalid device group identifier"}, status=400)
+    group = DeviceGroup.objects.filter(guid=group_guid).first()
     if not group:
         return JsonResponse({"error": "Device group not found"}, status=404)
     ids = _load_json(request)
-    ids = _identifier_list(ids)
+    ids = _rid_list(ids)
     if ids is None or any(not re.fullmatch(r"[A-Za-z0-9_-]{6,16}", item) for item in ids):
         return JsonResponse({"error": "Device id list required"}, status=400)
     updated = RemoteDevice.objects.filter(
@@ -5448,8 +5441,12 @@ def strategy_detail(request, guid):
     admin_user, error = _require_admin(request, "api_strategy_detail")
     if error:
         return error
+    try:
+        strategy_guid = parse_uuid(guid)
+    except InvalidIdentifier:
+        return JsonResponse({"error": "Invalid strategy identifier"}, status=400)
     if request.method == "GET":
-        strategy = StrategyProfile.objects.filter(guid=guid).first()
+        strategy = StrategyProfile.objects.filter(guid=strategy_guid).first()
         if not strategy:
             return JsonResponse({"error": "Strategy not found"}, status=404)
         return JsonResponse(_serialize_strategy(strategy))
@@ -5458,7 +5455,7 @@ def strategy_detail(request, guid):
         if not data:
             return JsonResponse({"error": "Invalid strategy"}, status=400)
         with transaction.atomic():
-            strategy = StrategyProfile.objects.select_for_update().filter(guid=guid).first()
+            strategy = StrategyProfile.objects.select_for_update().filter(guid=strategy_guid).first()
             if not strategy:
                 return JsonResponse({"error": "Strategy not found"}, status=404)
             if "name" in data:
@@ -5502,7 +5499,7 @@ def strategy_detail(request, guid):
         return JsonResponse(_serialize_strategy(strategy))
     else:
         with transaction.atomic():
-            strategy = StrategyProfile.objects.select_for_update().filter(guid=guid).first()
+            strategy = StrategyProfile.objects.select_for_update().filter(guid=strategy_guid).first()
             if not strategy:
                 return JsonResponse({"error": "Strategy not found"}, status=404)
             name = strategy.name
@@ -5520,7 +5517,11 @@ def strategy_status(request, guid):
     admin_user, error = _require_admin(request, "api_strategy_status")
     if error:
         return error
-    strategy = StrategyProfile.objects.filter(guid=guid).first()
+    try:
+        strategy_guid = parse_uuid(guid)
+    except InvalidIdentifier:
+        return JsonResponse({"error": "Invalid strategy identifier"}, status=400)
+    strategy = StrategyProfile.objects.filter(guid=strategy_guid).first()
     if not strategy:
         return JsonResponse({"error": "Strategy not found"}, status=404)
     data = _load_json(request)
@@ -5542,16 +5543,30 @@ def strategy_assign(request):
     data = _load_json_object(request)
     strategy = None
     strategy_guid = data.get("strategy")
-    if strategy_guid:
-        if not isinstance(strategy_guid, str) or len(strategy_guid) > 64:
+    if strategy_guid not in (None, ""):
+        try:
+            strategy_guid = parse_uuid(strategy_guid)
+        except InvalidIdentifier:
             return JsonResponse({"error": "Invalid strategy"}, status=400)
         strategy = StrategyProfile.objects.filter(guid=strategy_guid).first()
         if not strategy:
             return JsonResponse({"error": "Strategy not found"}, status=404)
-    peer_guids = _identifier_list(data.get("peers", []), numeric=True)
-    user_guids = _identifier_list(data.get("users", []), numeric=True)
-    group_guids = _identifier_list(data.get("groups", []))
-    if peer_guids is None or user_guids is None or group_guids is None:
+    try:
+        peer_guids = parse_model_pk_list(
+            data.get("peers", []),
+            RemoteDevice,
+            max_items=MAX_MANAGEMENT_BATCH_ITEMS,
+        )
+        user_guids = parse_model_pk_list(
+            data.get("users", []),
+            UserProfile,
+            max_items=MAX_MANAGEMENT_BATCH_ITEMS,
+        )
+        group_guids = parse_uuid_list(
+            data.get("groups", []),
+            max_items=MAX_MANAGEMENT_BATCH_ITEMS,
+        )
+    except InvalidIdentifier:
         return JsonResponse({"error": "Invalid assignment targets"}, status=400)
     if not peer_guids and not user_guids and not group_guids:
         return JsonResponse({"error": "No assignment targets"}, status=400)

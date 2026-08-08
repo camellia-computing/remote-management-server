@@ -2,8 +2,10 @@ import logging
 import time
 
 from django.http import JsonResponse
+from django.urls import Resolver404, resolve
 
 from api.address_book_errors import AuthorizationGenerationExhausted
+from api.identifiers import InvalidIdentifier
 from api.rate_limits import (
     RateLimitBackendUnavailable,
     RateLimitRejected,
@@ -11,7 +13,7 @@ from api.rate_limits import (
     rate_limit_response,
 )
 from api.request_utils import InvalidJsonPayload
-from api.response_security import CREDENTIAL_RESPONSE_MARKER, protect_credential_response
+from api.response_security import SENSITIVE_RESPONSE_MARKER, protect_sensitive_response
 from camellia_remote_management.access_logging import REQUEST_ID_HEADER
 from camellia_remote_management.observability import (
     EVENT_ID_HEADER,
@@ -23,6 +25,16 @@ from camellia_remote_management.observability import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _is_sensitive_response_route(request):
+    resolver_match = getattr(request, "resolver_match", None)
+    if resolver_match is None:
+        try:
+            resolver_match = resolve(request.path_info)
+        except Resolver404:
+            return False
+    return bool(getattr(resolver_match.func, SENSITIVE_RESPONSE_MARKER, False))
 
 
 class SafeAccessLogMiddleware:
@@ -49,9 +61,8 @@ class SafeAccessLogMiddleware:
             raise
         else:
             context = finish_request_context(request, context)
-            resolver_match = getattr(request, "resolver_match", None)
-            if resolver_match and getattr(resolver_match.func, CREDENTIAL_RESPONSE_MARKER, False):
-                protect_credential_response(response)
+            if _is_sensitive_response_route(request):
+                protect_sensitive_response(response)
             response[REQUEST_ID_HEADER] = context.request_id
             response[TRACEPARENT_HEADER] = context.traceparent
             if context.event_id:
@@ -80,6 +91,8 @@ class ApiExceptionMiddleware:
     def process_exception(self, request, exception):
         if isinstance(exception, InvalidJsonPayload):
             return JsonResponse({"error": "Invalid JSON payload"}, status=400)
+        if isinstance(exception, InvalidIdentifier):
+            return JsonResponse({"error": "Invalid identifier"}, status=400)
         if isinstance(exception, AuthorizationGenerationExhausted):
             return JsonResponse(
                 {"error": "Address-book authorization generation exhausted"},

@@ -40,10 +40,42 @@ def _error_response(error):
 
 
 def _request_content_length(request):
-    try:
-        return int(request.META.get("CONTENT_LENGTH", "0") or 0)
-    except (TypeError, ValueError):
-        return -1
+    if "HTTP_TRANSFER_ENCODING" in request.META:
+        raise UploadRequestError(
+            "Transfer-Encoding is not supported",
+            status=400,
+            code="unsupported_transfer_encoding",
+        )
+    if "HTTP_CONTENT_LENGTH" in request.META:
+        raise UploadRequestError(
+            "Ambiguous Content-Length",
+            status=400,
+            code="invalid_content_length",
+        )
+    raw_length = request.META.get("CONTENT_LENGTH")
+    if raw_length is None or raw_length == "":
+        raise UploadRequestError(
+            "Content-Length is required",
+            status=411,
+            code="content_length_required",
+        )
+    if not isinstance(raw_length, str) or not raw_length.isascii() or not raw_length.isdecimal():
+        raise UploadRequestError(
+            "Invalid Content-Length",
+            status=400,
+            code="invalid_content_length",
+        )
+    normalized_length = raw_length.lstrip("0") or "0"
+    maximum_length = str(settings.RECORD_UPLOAD_MAX_CHUNK_BYTES)
+    if len(normalized_length) > len(maximum_length) or (
+        len(normalized_length) == len(maximum_length) and normalized_length > maximum_length
+    ):
+        raise UploadRequestError(
+            "Upload chunk is too large",
+            status=413,
+            code="chunk_too_large",
+        )
+    return int(normalized_length)
 
 
 def _parse_uuid(value, name):
@@ -829,33 +861,29 @@ def _abort_upload(request, token, content_length):
 
 
 def handle_record_upload(request, token):
-    if request.GET.get("version", "") != str(PROTOCOL_VERSION):
-        return JsonResponse(
-            {
-                "error": "Unsupported recording upload protocol",
-                "code": "unsupported_protocol",
-                "required_protocol": PROTOCOL_VERSION,
-            },
-            status=426,
-        )
-    operation = request.GET.get("type", "")
-    content_length = _request_content_length(request)
-    if content_length < 0 or content_length > settings.RECORD_UPLOAD_MAX_CHUNK_BYTES:
-        return JsonResponse(
-            {"error": "Upload chunk is too large", "code": "chunk_too_large"},
-            status=413,
-        )
-    handlers = {
-        "new": _create_upload,
-        "status": _status_upload,
-        "part": _commit_part,
-        "finalize": _finalize_upload,
-        "abort": _abort_upload,
-    }
-    handler = handlers.get(operation)
-    if handler is None:
-        return JsonResponse({"error": "Invalid type", "code": "invalid_operation"}, status=400)
     try:
+        content_length = _request_content_length(request)
+        ingestion_governance.check_recording_storage_capability(content_length)
+        if request.GET.get("version", "") != str(PROTOCOL_VERSION):
+            return JsonResponse(
+                {
+                    "error": "Unsupported recording upload protocol",
+                    "code": "unsupported_protocol",
+                    "required_protocol": PROTOCOL_VERSION,
+                },
+                status=426,
+            )
+        operation = request.GET.get("type", "")
+        handlers = {
+            "new": _create_upload,
+            "status": _status_upload,
+            "part": _commit_part,
+            "finalize": _finalize_upload,
+            "abort": _abort_upload,
+        }
+        handler = handlers.get(operation)
+        if handler is None:
+            return JsonResponse({"error": "Invalid type", "code": "invalid_operation"}, status=400)
         return handler(request, token, content_length)
     except UploadRequestError as error:
         return _error_response(error)

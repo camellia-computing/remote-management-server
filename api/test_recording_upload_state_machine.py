@@ -159,6 +159,7 @@ class RecordingUploadStateMachineTests(TestCase):
             f"/api/record?{urlencode(query)}",
             data=body,
             content_type="application/octet-stream",
+            CONTENT_LENGTH=str(len(body)),
             **self.headers,
         )
 
@@ -854,6 +855,7 @@ class RecordingUploadStateMachineTests(TestCase):
             "/api/record?type=new&file=legacy.webm",
             data=b"",
             content_type="application/octet-stream",
+            CONTENT_LENGTH="0",
             **self.headers,
         )
 
@@ -1378,6 +1380,7 @@ class RecordingUploadConcurrencyTests(TransactionTestCase):
             ),
             data=b"",
             content_type="application/octet-stream",
+            CONTENT_LENGTH="0",
             HTTP_AUTHORIZATION=f"Bearer {self.raw_token}",
         )
         self.assertEqual(response.status_code, 201, response.content)
@@ -1404,6 +1407,7 @@ class RecordingUploadConcurrencyTests(TransactionTestCase):
                     ),
                     data=b"",
                     content_type="application/octet-stream",
+                    CONTENT_LENGTH="0",
                     HTTP_AUTHORIZATION=f"Bearer {self.raw_token}",
                 )
                 return response.status_code, response.json()
@@ -1439,6 +1443,7 @@ class RecordingUploadConcurrencyTests(TransactionTestCase):
                     ),
                     data=body,
                     content_type="application/octet-stream",
+                    CONTENT_LENGTH=str(len(body)),
                     HTTP_AUTHORIZATION=f"Bearer {self.raw_token}",
                 )
                 return response.status_code, response.json()
@@ -1572,6 +1577,7 @@ class RecordingUploadConcurrencyTests(TransactionTestCase):
                     ),
                     data=body,
                     content_type="application/octet-stream",
+                    CONTENT_LENGTH=str(len(body)),
                     HTTP_AUTHORIZATION=f"Bearer {self.raw_token}",
                 )
                 return response.status_code, response.json()

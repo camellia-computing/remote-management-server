@@ -1922,6 +1922,7 @@ class SensitiveIngestionTests(ApiTestMixin, TestCase):
             f"/api/record?{query}",
             data=body,
             content_type="application/octet-stream",
+            CONTENT_LENGTH=str(len(body)),
             **self._auth_headers(token),
         )
 
