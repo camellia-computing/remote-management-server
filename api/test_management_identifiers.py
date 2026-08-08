@@ -133,11 +133,19 @@ class ManagementIdentifierHttpTests(TestCase):
 
     def test_valid_but_missing_pk_paths_are_404_at_autofield_boundary(self):
         self.assert_error(
-            self.client.post(f"/api/users/{AUTO_FIELD_MAX}/enable", **self.auth),
+            self.client.post(
+                f"/api/users/{AUTO_FIELD_MAX}/enable",
+                HTTP_IDEMPOTENCY_KEY=str(uuid.uuid4()),
+                **self.auth,
+            ),
             404,
         )
         self.assert_error(
-            self.client.post(f"/api/devices/{AUTO_FIELD_MAX}/disable", **self.auth),
+            self.client.post(
+                f"/api/devices/{AUTO_FIELD_MAX}/disable",
+                HTTP_IDEMPOTENCY_KEY=str(uuid.uuid4()),
+                **self.auth,
+            ),
             404,
         )
 

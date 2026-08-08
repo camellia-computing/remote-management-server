@@ -3,6 +3,7 @@ import concurrent.futures
 import datetime
 import json
 import threading
+import uuid
 from unittest.mock import patch
 
 from django.contrib import admin
@@ -41,7 +42,10 @@ class TokenSubjectIntegrityTests(TestCase):
 
     @staticmethod
     def post_json(path, payload, token=None):
-        headers = {"HTTP_AUTHORIZATION": f"Bearer {token}"} if token else {}
+        headers = {
+            "HTTP_IDEMPOTENCY_KEY": str(uuid.uuid4()),
+            **({"HTTP_AUTHORIZATION": f"Bearer {token}"} if token else {}),
+        }
         return Client().post(
             path,
             data=json.dumps(payload),

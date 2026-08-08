@@ -43,6 +43,7 @@ from api.credential_sessions import (
     revoke_user_credentials,
 )
 from api.device_identity import (
+    MAX_DEPLOYMENT_GENERATION,
     DeviceProofError,
     DeviceRecoveryRequired,
     consume_deployment_proof,
@@ -4914,15 +4915,20 @@ def _filter_text(qs, field, value):
     return qs.filter(**{field: value})
 
 
-def _require_admin(request, event):
-    _token, user = _get_token_user(request)
+def _require_admin_context(request, event):
+    token, user = _get_token_user(request)
     if not user:
         _log_event(request, f"{event}_unauthorized", level="warning")
-        return None, JsonResponse({"error": "Invalid token"}, status=401)
+        return None, None, JsonResponse({"error": "Invalid token"}, status=401)
     if not user.is_admin:
         _log_event(request, f"{event}_denied", level="warning", username=user.username)
-        return user, JsonResponse({"error": "Admin required"}, status=403)
-    return user, None
+        return token, user, JsonResponse({"error": "Admin required"}, status=403)
+    return token, user, None
+
+
+def _require_admin(request, event):
+    _token, user, error = _require_admin_context(request, event)
+    return user, error
 
 
 def _device_guid(device):
@@ -5108,28 +5114,89 @@ def user_status(request, guid, action):
     target_pk = _numeric_pk(guid, UserProfile)
     if target_pk is None:
         return JsonResponse({"error": "Invalid user identifier"}, status=400)
-    try:
-        with transaction.atomic():
-            target = UserProfile.objects.select_for_update().filter(pk=target_pk).first()
-            if not target:
-                return JsonResponse({"error": "User not found"}, status=404)
-            if target.id == admin_user.id and action == "disable":
-                return JsonResponse({"error": "Cannot disable current user"}, status=400)
-            target.is_active = action == "enable"
-            target.save(update_fields=["is_active"])
-            if not target.is_active:
-                revoke_user_credentials((target.pk,))
-    except CredentialGenerationExhausted:
+    operation_id, operation_error = _operation_id_or_error(request)
+    if operation_error:
+        return operation_error
+    operation = f"user_status_{action}"
+
+    def mutate():
+        target = UserProfile.objects.select_for_update().filter(pk=target_pk).first()
+        if not target:
+            return ManagementMutation(
+                status_code=404,
+                body={"error": "User not found"},
+                applied={"users": 0},
+                result_state={"missing": {"users": [str(target_pk)]}},
+            )
+        if target.id == admin_user.id and action == "disable":
+            return ManagementMutation(
+                status_code=400,
+                body={"error": "Cannot disable current user"},
+                applied={"users": 0},
+                result_state={"error": "current_user"},
+            )
+        try:
+            with transaction.atomic():
+                target.is_active = action == "enable"
+                target.save(update_fields=["is_active"])
+                revoked_tokens = 0
+                if not target.is_active:
+                    revoked_tokens = revoke_user_credentials((target.pk,)).deleted_tokens
+        except CredentialGenerationExhausted:
+            return ManagementMutation(
+                status_code=409,
+                body={"error": "Credential revocation failed"},
+                applied={"users": 0},
+                result_state={"error": "credential_generation_exhausted"},
+            )
+        target.refresh_from_db(fields=("is_active", "credential_generation"))
+        return ManagementMutation(
+            status_code=200,
+            body={
+                "result": "OK",
+                "guid": str(target.pk),
+                "status": 1 if target.is_active else 0,
+                "revoked_tokens": revoked_tokens,
+            },
+            applied={"users": 1},
+            result_state={
+                "user": {
+                    "id": target.pk,
+                    "is_active": target.is_active,
+                    "credential_generation": target.credential_generation,
+                },
+                "revoked_tokens": revoked_tokens,
+            },
+        )
+
+    response = _execute_management_batch(
+        actor=admin_user,
+        operation_id=operation_id,
+        operation=operation,
+        request_document={"operation": operation, "user": str(target_pk)},
+        requested={"users": 1},
+        mutation=mutate,
+    )
+    body = json.loads(response.content)
+    if response.status_code != 200:
         _log_event(
             request,
             f"api_user_{action}_failed",
-            level="error",
+            level="warning",
             username=admin_user.username,
             target=guid,
+            operation_id=str(operation_id),
         )
-        return JsonResponse({"error": "Credential revocation failed"}, status=409)
-    _log_event(request, f"api_user_{action}", username=admin_user.username, target=target.username)
-    return JsonResponse(_serialize_user(target))
+        return response
+    _log_event(
+        request,
+        f"api_user_{action}",
+        username=admin_user.username,
+        target=body["guid"],
+        operation_id=str(operation_id),
+        operation_generation=body["operation_generation"],
+    )
+    return response
 
 
 def user_delete(request, guid):
@@ -5300,22 +5367,97 @@ def devices(request):
 
 
 def device_status(request, guid, action):
-    admin_user, error = _require_admin(request, f"api_device_{action}")
+    admin_token, admin_user, error = _require_admin_context(request, f"api_device_{action}")
     if error:
         return error
     device_pk = _numeric_pk(guid, RemoteDevice)
     if device_pk is None:
         return JsonResponse({"error": "Invalid device identifier"}, status=400)
-    with transaction.atomic():
+    operation_id, operation_error = _operation_id_or_error(request)
+    if operation_error:
+        return operation_error
+    operation = f"device_status_{action}"
+
+    def mutate():
         device = RemoteDevice.objects.select_for_update().filter(pk=device_pk).first()
         if not device:
-            return JsonResponse({"error": "Device not found"}, status=404)
+            return ManagementMutation(
+                status_code=404,
+                body={"error": "Device not found"},
+                applied={"devices": 0},
+                result_state={"missing": {"devices": [str(device_pk)]}},
+            )
+        if device.pk == admin_token.device_id and action == "disable":
+            return ManagementMutation(
+                status_code=400,
+                body={"error": "Cannot disable current device"},
+                applied={"devices": 0},
+                result_state={"error": "current_device"},
+            )
+        if action == "disable" and device.deployment_generation >= MAX_DEPLOYMENT_GENERATION:
+            return ManagementMutation(
+                status_code=409,
+                body={"error": "Device authority revocation failed"},
+                applied={"devices": 0},
+                result_state={"error": "deployment_generation_exhausted"},
+            )
         device.is_active = action == "enable"
-        device.save(update_fields=["is_active", "update_time"])
+        update_fields = ["is_active", "update_time"]
         if not device.is_active:
-            _revoke_device_tokens(device)
-    _log_event(request, f"api_device_{action}", username=admin_user.username, rid=device.rid)
-    return JsonResponse(_serialize_device(device))
+            device.deployment_generation += 1
+            update_fields.append("deployment_generation")
+        device.save(update_fields=update_fields)
+        revoked_tokens = 0
+        if not device.is_active:
+            revoked_tokens = _revoke_device_tokens(device)
+        return ManagementMutation(
+            status_code=200,
+            body={
+                "result": "OK",
+                "guid": str(device.pk),
+                "status": 1 if device.is_active else 0,
+                "revoked_tokens": revoked_tokens,
+            },
+            applied={"devices": 1},
+            result_state={
+                "device": {
+                    "id": device.pk,
+                    "rid": device.rid,
+                    "is_active": device.is_active,
+                    "deployment_generation": device.deployment_generation,
+                },
+                "revoked_tokens": revoked_tokens,
+            },
+        )
+
+    response = _execute_management_batch(
+        actor=admin_user,
+        operation_id=operation_id,
+        operation=operation,
+        request_document={"operation": operation, "device": str(device_pk)},
+        requested={"devices": 1},
+        mutation=mutate,
+    )
+    body = json.loads(response.content)
+    if response.status_code != 200:
+        _log_event(
+            request,
+            f"api_device_{action}_failed",
+            level="warning",
+            username=admin_user.username,
+            target=guid,
+            operation_id=str(operation_id),
+        )
+        return response
+    _log_event(
+        request,
+        f"api_device_{action}",
+        username=admin_user.username,
+        target=body["guid"],
+        operation_id=str(operation_id),
+        operation_generation=body["operation_generation"],
+    )
+    return response
 
 
 def device_approve_recovery(request, guid):
@@ -5355,21 +5497,77 @@ def device_approve_recovery(request, guid):
 
 
 def device_delete(request, guid):
-    admin_user, error = _require_admin(request, "api_device_delete")
+    admin_token, admin_user, error = _require_admin_context(request, "api_device_delete")
     if error:
         return error
     device_pk = _numeric_pk(guid, RemoteDevice)
     if device_pk is None:
         return JsonResponse({"error": "Invalid device identifier"}, status=400)
-    with transaction.atomic():
+    operation_id, operation_error = _operation_id_or_error(request)
+    if operation_error:
+        return operation_error
+
+    def mutate():
         device = RemoteDevice.objects.select_for_update().filter(pk=device_pk).first()
         if not device:
-            return JsonResponse({"error": "Device not found"}, status=404)
+            return ManagementMutation(
+                status_code=404,
+                body={"error": "Device not found"},
+                applied={"devices": 0},
+                result_state={"missing": {"devices": [str(device_pk)]}},
+            )
+        if device.pk == admin_token.device_id:
+            return ManagementMutation(
+                status_code=400,
+                body={"error": "Cannot delete current device"},
+                applied={"devices": 0},
+                result_state={"error": "current_device"},
+            )
         rid = device.rid
-        _revoke_device_tokens(device)
+        revoked_tokens = _revoke_device_tokens(device)
         device.delete()
-    _log_event(request, "api_device_deleted", username=admin_user.username, rid=rid)
-    return JsonResponse({"result": "OK"})
+        return ManagementMutation(
+            status_code=200,
+            body={
+                "result": "OK",
+                "deleted_device": {"guid": str(device_pk)},
+                "revoked_tokens": revoked_tokens,
+            },
+            applied={"devices": 1},
+            result_state={
+                "deleted_device": {"id": device_pk, "rid": rid},
+                "revoked_tokens": revoked_tokens,
+            },
+        )
+
+    response = _execute_management_batch(
+        actor=admin_user,
+        operation_id=operation_id,
+        operation="device_delete",
+        request_document={"operation": "device_delete", "device": str(device_pk)},
+        requested={"devices": 1},
+        mutation=mutate,
+    )
+    body = json.loads(response.content)
+    if response.status_code != 200:
+        _log_event(
+            request,
+            "api_device_delete_failed",
+            level="warning",
+            username=admin_user.username,
+            target=guid,
+            operation_id=str(operation_id),
+        )
+        return response
+    _log_event(
+        request,
+        "api_device_deleted",
+        username=admin_user.username,
+        target=body["deleted_device"]["guid"],
+        operation_id=str(operation_id),
+        operation_generation=body["operation_generation"],
+    )
+    return response
 
 
 def device_assign(request, guid):

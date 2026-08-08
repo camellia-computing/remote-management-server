@@ -80,7 +80,10 @@ class DeviceIdentityProofTests(TestCase):
         )
 
     def delete_json(self, path, payload, token=None):
-        headers = {"HTTP_AUTHORIZATION": f"Bearer {token}"} if token else {}
+        headers = {
+            "HTTP_IDEMPOTENCY_KEY": str(uuid.uuid4()),
+            **({"HTTP_AUTHORIZATION": f"Bearer {token}"} if token else {}),
+        }
         return self.client.delete(
             path,
             data=json.dumps(payload),

@@ -246,6 +246,7 @@ class ApiTestMixin:
 
     def _delete_json(self, path, payload=None, token=None):
         headers = self._auth_headers(token)
+        headers["HTTP_IDEMPOTENCY_KEY"] = str(uuid.uuid4())
         return self.client.delete(
             path,
             data=json.dumps(payload if payload is not None else {}),
