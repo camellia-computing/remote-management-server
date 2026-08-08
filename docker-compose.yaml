@@ -140,6 +140,7 @@ services:
       POSTGRES_DB: ${CAMELLIA_REMOTE_DATABASE_NAME:-camellia_remote}
       POSTGRES_USER: ${CAMELLIA_REMOTE_DATABASE_BOOTSTRAP_USER:?Set the existing or new cluster bootstrap superuser}
       POSTGRES_PASSWORD: ${CAMELLIA_REMOTE_DATABASE_BOOTSTRAP_PASSWORD:?Set the bootstrap password}
+      POSTGRES_INITDB_ARGS: --encoding=UTF8 --locale-provider=builtin --builtin-locale=C.UTF-8
       CAMELLIA_REMOTE_DATABASE_PROBE_USER: ${CAMELLIA_REMOTE_DATABASE_PROBE_USER:?Set the probe role}
       CAMELLIA_REMOTE_DATABASE_PROBE_PASSWORD: ${CAMELLIA_REMOTE_DATABASE_PROBE_PASSWORD:?Set the probe password}
     volumes:

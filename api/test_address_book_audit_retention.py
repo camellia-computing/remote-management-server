@@ -6,6 +6,7 @@ from django.db import connection, transaction
 from django.db.migrations.executor import MigrationExecutor
 from django.test import TestCase, TransactionTestCase, override_settings
 
+from api.migration_test_support import restore_latest_migration_state
 from api.models import AddressBookProfile, AddressBookRuleAudit, AddressBookShare, RemoteDevice, UserProfile
 from api.views_api import _audit_ab_rule, _issue_access_token
 
@@ -226,4 +227,4 @@ class AddressBookAuditMigrationTests(TransactionTestCase):
             self.assertIsNone(retained.profile_id)
             self.assertEqual(retained.profile_guid, "audit-migration-profile")
         finally:
-            MigrationExecutor(connection).migrate([self.migrate_to])
+            restore_latest_migration_state()

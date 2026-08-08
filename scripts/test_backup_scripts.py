@@ -133,6 +133,11 @@ class BackupScriptsTests(unittest.TestCase):
                     if operation in {"finish", "abort", "restore-preflight"}:
                         print("{}")
                         raise SystemExit(0)
+                if "check_username_identity" in args:
+                    if mode == "username-identity-fail":
+                        raise SystemExit(45)
+                    print("username identity contract is valid")
+                    raise SystemExit(0)
                 if "database-bootstrap" in args:
                     raise SystemExit(0)
                 if "database-probe" in args:
@@ -297,6 +302,20 @@ class BackupScriptsTests(unittest.TestCase):
             fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
             collision = self.run_backup()
         self.assertEqual(collision.returncode, 75, collision.stderr)
+
+    def test_backup_and_restore_reject_invalid_username_identity(self):
+        failed_backup = self.run_backup(FAKE_DOCKER_MODE="username-identity-fail")
+        self.assertNotEqual(failed_backup.returncode, 0)
+        self.assertEqual(list(self.backups.glob("*.dump.age")), [])
+        self.assertEqual(list(self.backups.glob("*.bundle.age")), [])
+
+        self.assertEqual(self.run_backup().returncode, 0)
+        artifact = next(self.backups.glob("postgres-*.dump.age"))
+        self.restore_capture.unlink(missing_ok=True)
+        failed_restore = self.run_restore(artifact, FAKE_DOCKER_MODE="username-identity-fail")
+        self.assertNotEqual(failed_restore.returncode, 0)
+        self.assertTrue(self.restore_capture.exists())
+        self.assertFalse(self.recording_restore_capture.exists())
 
     def test_retention_removes_only_complete_expired_backup_pairs(self):
         self.backups.mkdir()

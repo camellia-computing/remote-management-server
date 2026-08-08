@@ -9,6 +9,7 @@ from django.test import TestCase, TransactionTestCase, override_settings
 from django.test.utils import CaptureQueriesContext
 
 from api.encrypted_fields import FIELD_PREFIX
+from api.migration_test_support import restore_latest_migration_state
 from api.models import AddressBookProfile, AddressBookShare, RemoteDevice, RemotePeer, UserProfile
 from api.views_api import _issue_access_token
 
@@ -313,4 +314,4 @@ class SharedProfileCredentialMigrationTests(TransactionTestCase):
                 {"password": "legacy-json-password", "theme": "dark"},
             )
         finally:
-            MigrationExecutor(connection).migrate([self.migrate_to])
+            restore_latest_migration_state()

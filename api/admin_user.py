@@ -20,6 +20,7 @@ from api.audit_queries import (
     filter_alarm_logs,
 )
 from api.credential_sessions import revoke_device_credentials, revoke_user_credentials
+from api.username_identity import canonical_username_key, normalize_username
 
 AUDIT_ADMIN_BROWSE_LIMIT = 10_000
 
@@ -106,9 +107,15 @@ class UserCreationForm(forms.ModelForm):
         )
 
     def clean_username(self):
-        username = (self.cleaned_data.get("username") or "").strip()
-        if not username:
-            raise forms.ValidationError(_("用户名不能为空。"))
+        try:
+            username = normalize_username(self.cleaned_data.get("username"))
+        except ValueError as exc:
+            raise forms.ValidationError(_("用户名不能为空或格式不正确。")) from exc
+        users = models.UserProfile.objects.filter(username_canonical=canonical_username_key(username))
+        if self.instance.pk:
+            users = users.exclude(pk=self.instance.pk)
+        if users.exists():
+            raise forms.ValidationError(_("用户名已存在。"))
         return username
 
     def clean_password2(self):
@@ -159,9 +166,15 @@ class UserChangeForm(forms.ModelForm):
         )
 
     def clean_username(self):
-        username = (self.cleaned_data.get("username") or "").strip()
-        if not username:
-            raise forms.ValidationError(_("用户名不能为空。"))
+        try:
+            username = normalize_username(self.cleaned_data.get("username"))
+        except ValueError as exc:
+            raise forms.ValidationError(_("用户名不能为空或格式不正确。")) from exc
+        users = models.UserProfile.objects.filter(username_canonical=canonical_username_key(username))
+        if self.instance.pk:
+            users = users.exclude(pk=self.instance.pk)
+        if users.exists():
+            raise forms.ValidationError(_("用户名已存在。"))
         return username
 
     def clean_password(self):

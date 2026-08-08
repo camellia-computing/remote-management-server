@@ -20,6 +20,7 @@ from django.test import (
 from django.utils import timezone
 
 from api.admin_user import RemoteDeviceAdminCustom
+from api.migration_test_support import restore_latest_migration_state
 from api.models import RemoteDevice, RemoteToken, UserProfile
 from api.views_api import _issue_access_token
 
@@ -247,6 +248,7 @@ class TokenSubjectMigrationTests(TransactionTestCase):
     migrate_to = ("api", "0006_remotetoken_subject_user")
 
     def test_existing_owned_tokens_are_bound_and_ownerless_tokens_are_removed(self):
+        self.addCleanup(restore_latest_migration_state)
         executor = MigrationExecutor(connection)
         executor.migrate([self.migrate_from])
         old_apps = executor.loader.project_state([self.migrate_from]).apps

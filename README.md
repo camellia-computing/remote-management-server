@@ -11,7 +11,7 @@ Camellia Remote 的生产管理平面：提供账号与设备管理、地址簿�
 
 ## 本地开发
 
-日常开发和 CI 使用 Python 3.13+、uv 0.12.0 和 PostgreSQL 18。仅快速开发时可使用 SQLite：
+日常开发和 CI 使用 Python 3.14、uv 0.12.0 和 PostgreSQL 18。Username identity v1固定使用Python 3.14内置的Unicode 16.0.0数据；其他Python/Unicode数据版本会在迁移或启动检查时fail closed。仅快速开发时可使用 SQLite：
 
 ```bash
 uv sync --locked --all-groups
@@ -79,6 +79,8 @@ Management为每个upload生成独立32-byte data key，只把其规范Base64值
 
 地址簿和待处理OIDC中的secret使用带key ID的`secretbox:v2` envelope认证加密；数据库key inventory保存不含业务明文的canary和fingerprint，readiness会拒绝错误key或replica配置分裂。shared profile的默认连接密码不再存入通用`info` JSON，而是迁移到显式加密字段；profile列表永不加载或返回该字段，Client仅在目标RID已存在且当前地址簿权限有效时调用目标绑定的即时credential API。连接凭据只通过已认证且通过地址簿权限校验的运行时 API 返回。Django 管理表单将其作为只写字段，CSV/Excel 导出不包含连接凭据。
 
+五个地址簿browser导出使用`address-book-export-v1`合同。只有完全缺失`format`时才默认`csv`；显式值严格区分大小写并只接受`csv`、`xls`、`xlsx`，其中旧调用方的`xls`是生成OOXML `.xlsx`的明确alias，当前UI统一发送`xlsx`。单地址簿导出的`kind`只有缺失时默认`peers`，显式值只接受`peers`或`tags`。空值、重复query、大小写变体、未知或超长值都会在数据查询和artifact构建前返回有界JSON 400、机器码`invalid_export_parameter`及支持值，不回显原始输入。成功响应通过`X-Camellia-Export-Schema`、`X-Camellia-Export-Format`和适用时的`X-Camellia-Export-Kind`声明实际schema；调用方必须同时校验这些header、Content-Type、扩展名与CSV/ZIP magic，不能把请求参数当成实际artifact格式。
+
 设备API和Web工作台使用显式的窄字段inventory projection：管理员只查询全局device，普通用户只合并本人device与本人精确`personal-<owner-id>` profile中的peer，并以`source/owner/rid`标识数据来源；数据库在构造Python对象前完成权限过滤、稳定排序和分页。`/api/peers`保留页码参数并额外返回绑定viewer、权限范围和status filter的一小时签名`nextCursor`，新调用方应使用cursor避免并发插入/删除造成重复页。首页用独立聚合和top-6查询。`DeviceInfo-v1.xlsx`只读取版本化allowlist，通过数据库iterator、write-only workbook、受限memory spool和`FileResponse`交付；行数、压缩输出字节与生成deadline任一超过`.env.example`预算时拒绝导出，不允许通过增加worker内存绕过。
 
 所有基于浏览器session的页面、导出、根跳转和WebUI2状态响应，无论成功、重定向、方法拒绝、CSRF拒绝或应用错误，都统一返回`Cache-Control: no-store, private`、`Pragma: no-cache`、`Expires: 0`和`Referrer-Policy: no-referrer`。edge、CDN和APM不得覆盖或缓存这些响应；静态资产与health端点不套用session响应策略，继续使用各自的缓存与可用性合同。Management不注册service worker或CacheStorage写入；若未来新增，必须显式禁止保存authenticated response并补充浏览器缓存生命周期测试。logout不发送`Clear-Site-Data`，避免清除同源静态资产或干扰其他活动窗口，它不能替代每个敏感响应自身的`no-store`控制。
@@ -120,7 +122,11 @@ sudo systemctl enable --now camellia-remote-management-backup.timer
 sudo systemctl enable --now camellia-remote-management-cleanup.timer
 ```
 
-生产环境应把 `CAMELLIA_REMOTE_MANAGEMENT_IMAGE` 固定为发布清单记录的 `ghcr.io/...@sha256:...`，不得使用浮动标签。systemd没有在线`reload`入口；升级必须使用显式stop/start或受审部署流程。每次stack start由单飞controller先停止旧Management，启动PostgreSQL但不等待尚未创建的probe，使用bootstrap superuser在advisory-lock事务内创建/收敛角色、ownership、membership、当前ACL与migration default ACL，再以probe执行真实`SELECT 1`健康检查。随后只用migration owner运行一次性`migrate`，再次bootstrap验证新对象，最后用runtime DML credential启动`restart: no`应用。Runtime不是database/schema/table owner，且始终为`NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS`；`django_migrations`对runtime只读，不能伪造schema ledger。Backup只拥有业务读取能力，probe没有public schema或业务表权限。Controller与maintenance enter/leave共用root-owned deployment lock，maintenance lease存在时不会执行Docker命令。Engine或container restart不会自动拉起Management；任何直接启动仍会由`run.sh`的`migrate --check`在Gunicorn绑定端口前拒绝未应用migration。应用崩溃必须告警并进入受控stack start，不能用Docker自动restart绕过migration gate。
+生产环境应把 `CAMELLIA_REMOTE_MANAGEMENT_IMAGE` 固定为发布清单记录的 `ghcr.io/...@sha256:...`，不得使用浮动标签。systemd没有在线`reload`入口；升级必须使用显式stop/start或受审部署流程。每次stack start由单飞controller先停止旧Management，启动PostgreSQL但不等待尚未创建的probe，使用bootstrap superuser在advisory-lock事务内创建/收敛角色、ownership、membership、当前ACL与migration default ACL，再以probe执行真实`SELECT 1`健康检查。随后只用migration owner运行一次性`migrate`，再次bootstrap验证新对象，最后用runtime DML credential启动`restart: no`应用。Runtime不是database/schema/table owner，且始终为`NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS`；`django_migrations`对runtime只读，不能伪造schema ledger。Backup只拥有业务读取能力，probe没有public schema或业务表权限。Controller与maintenance enter/leave共用root-owned deployment lock，maintenance lease存在时不会执行Docker命令。Engine或container restart不会自动拉起Management；任何直接启动仍会由`run.sh`的`migrate --check`及`check_username_identity`在Gunicorn绑定端口前拒绝未应用migration、canonical drift或错误数据库契约。应用崩溃必须告警并进入受控stack start，不能用Docker自动restart绕过migration gate。
+
+Username identity v1先对去除首尾空白的输入执行NFKC，再执行Unicode full casefold和第二次NFKC；显示用户名保存第一次NFKC结果，登录、OIDC分配、账号查找及登录限流桶只使用对应UTF-8 binary canonical key。PostgreSQL的`lower/iexact`和locale不再参与账号身份。新Compose cluster固定为UTF8、builtin locale provider、`C.UTF-8`和collation version 1；已有volume、外部数据库及恢复目标必须满足相同契约。迁移0026发现历史collision时只输出有界user ID与canonical digest并停止，不自动合并、改名或转移账号；管理员必须在离线审计后显式解决冲突再重跑迁移。
+
+`POST /api/users`只有在username canonical预检命中，或user insert的独立savepoint失败后再次读到同一canonical账号时，才返回`409`与机器码`username_conflict`。指定的新Group发生并发创建时，服务会在savepoint回滚后锁定并复用已提交Group，保证不同新用户可加入同一目标；Group无法读回、M2M或其他未知完整性错误保持5xx并回滚整笔user创建，不会冒充用户名已存在。
 
 首次升级已有volume前必须确认环境中的`BOOTSTRAP_USER/PASSWORD`就是旧cluster的现有superuser；错误映射会fail closed，不能通过临时把runtime升为superuser绕过。五类密码轮换时先在受保护环境文件中写入互不相同的新值，再通过controller离线收敛并验证；旧目标密码随事务提交失效。Bootstrap本身是root-only break-glass凭据，轮换或使用必须审计，不能作为日常migration、备份、探针或排障登录。
 systemd 运维单元仅允许通过本机 Unix socket 调用 Docker；该 socket
@@ -130,7 +136,7 @@ Compose 默认仅在同主机、不可从外部路由的 `backend` 网络内使�
 
 ## 备份、恢复与运维
 
-每小时定时器先锁定数据库中的recording backup singleton；它会等待已经开始的record mutation/retention/hold操作完成，并让后续录像变更以503和`Retry-After`暂停。锁内逐对象认证`PRIV-011`密文、核对finalized plaintext/ciphertext size与digest、拒绝missing/extra/corrupt对象，并把owner/device generation、upload/object identity、storage/encryption/KEK版本、retention/hold和时间快照写入不可变epoch inventory。随后在同一冻结时点生成两个同backup ID、epoch UUID和inventory SHA-256绑定的artifact：`postgres-<UTC时间>-<随机backup-id>.dump.age`和`recordings-<UTC时间>-<随机backup-id>.bundle.age`。数据库由一次性`database-backup`客户端以只读backup角色输出custom-format dump；录像bundle只流式读取清单中的opaque ciphertext。两者分别由受审固定版本（当前基线 `age v1.2.1`）认证加密，recording data key明文和envelope不会进入外部manifest，只有两个artifact都完整落盘后才清除冻结。任一失败会删除本轮artifact并abort epoch；SIGKILL/宿主掉电导致的残留冻结必须先调查artifact状态，再显式运行`python manage.py recording_backup abort --backup-id ID`，不得直接改control row。
+每小时定时器先锁定数据库中的recording backup singleton；它会等待已经开始的record mutation/retention/hold操作完成，并让后续录像变更以503和`Retry-After`暂停。锁内逐对象认证`PRIV-011`密文、核对finalized plaintext/ciphertext size与digest、拒绝missing/extra/corrupt对象，并把owner/device generation、upload/object identity、storage/encryption/KEK版本、retention/hold和时间快照写入不可变epoch inventory。随后先完整验证username canonical/schema/database contract，再在同一冻结时点生成两个同backup ID、epoch UUID和inventory SHA-256绑定的artifact：`postgres-<UTC时间>-<随机backup-id>.dump.age`和`recordings-<UTC时间>-<随机backup-id>.bundle.age`。数据库由一次性`database-backup`客户端以只读backup角色输出custom-format dump；录像bundle只流式读取清单中的opaque ciphertext。两者分别由受审固定版本（当前基线 `age v1.2.1`）认证加密，recording data key明文和envelope不会进入外部manifest，只有两个artifact都完整落盘后才清除冻结。任一失败会删除本轮artifact并abort epoch；SIGKILL/宿主掉电导致的残留冻结必须先调查artifact状态，再显式运行`python manage.py recording_backup abort --backup-id ID`，不得直接改control row。
 
 `CAMELLIA_REMOTE_BACKUP_AGE_RECIPIENT`、`CAMELLIA_REMOTE_BACKUP_AGE_KEY_ID` 和 `CAMELLIA_REMOTE_BACKUP_DEPLOYMENT_ID` 必须显式配置。recipient 对应的恢复 identity 只能放在 root/管理员拥有的 0400 或 0600 文件中，不能放入普通 management runtime 容器、镜像、环境文件或备份 artifact；identity 与应用数据加密 key 必须分离。两个配对artifact必须作为一个不可分割备份集复制、保留和删除，备份目录必须位于独立、加密且受监控的存储；至少每天复制到故障域外，并按季度执行恢复演练。锁竞争返回退出码75，监控应将其视为本轮跳过而非成功。
 
@@ -138,7 +144,7 @@ backup/cleanup unit没有启动业务栈的权限：它们只在stack已经是`a
 
 恢复流程（必须先在隔离环境演练）：先从反向代理摘流并执行 `sudo /opt/camellia-remote-management/management-maintenance.sh enter --reason restore-INCIDENT-ID`。该命令先原子创建`/run/camellia-remote-management/maintenance.lease`，再停止两个timer、正在执行的backup/cleanup和stack，最后确认官方Compose项目没有残留容器；任一步失败都会保留lease并fail closed。随后只启动隔离的PostgreSQL service、创建空数据库，并确认recordings volume没有任何authoritative object；脚本拒绝覆盖现存对象。准备root拥有且权限为0400/0600的identity，设置与备份一致的 `CAMELLIA_REMOTE_BACKUP_DEPLOYMENT_ID`、`CAMELLIA_REMOTE_DATABASE_NAME`、`CAMELLIA_REMOTE_BACKUP_POSTGRES_MAJOR` 和 `CAMELLIA_REMOTE_BACKUP_AGE_KEY_ID`，然后执行 `CAMELLIA_REMOTE_BACKUP_AGE_IDENTITY_FILE=/etc/camellia-remote-management/backup-identity.txt /opt/camellia-remote-management/restore-postgres.sh /var/backups/camellia-remote-management/postgres-<UTC时间>-<backup-id>.dump.age`；同目录、同时间和backup ID的`recordings-....bundle.age`必须存在。
 
-脚本先让age完整认证两个密文artifact，验证二者deployment/database/PostgreSQL/key、backup ID、epoch UUID和inventory digest完全一致，并在修改数据库前执行空volume preflight。随后bootstrap空库角色，只用migration credential通过`database-restore`执行`pg_restore --single-transaction --exit-on-error --no-owner --no-acl`；再按恢复数据库内的epoch snapshot逐对象以O_EXCL写回ciphertext、复核metadata/size/SHA-256和双向object count，全部成功后才把epoch标成restored并解除DB内restore gate。任何DB-only、volume-only、错时点配对、missing/extra/corrupt object、密文、manifest、主版本或角色边界不匹配都fail closed且不得恢复流量；失败可能留下受控的partial restore和仍激活的DB gate，必须在maintenance lease内调查并从重新清空的目标重做，不能手工清gate或拼接备份。恢复用0600临时文件在退出时删除；其中database dump仍是敏感明文，recording bundle只含应用层认证密文，两者都必须位于受保护的临时filesystem。
+脚本先让age完整认证两个密文artifact，验证二者deployment/database/PostgreSQL/key、backup ID、epoch UUID和inventory digest完全一致，并在修改数据库前执行空volume preflight。随后bootstrap空库角色，只用migration credential通过`database-restore`执行`pg_restore --single-transaction --exit-on-error --no-owner --no-acl`；恢复数据库后必须先完整验证username canonical/schema与目标UTF8/builtin/C.UTF-8/version 1契约，之后才按epoch snapshot逐对象以O_EXCL写回ciphertext、复核metadata/size/SHA-256和双向object count。全部成功后才把epoch标成restored并解除DB内restore gate。任何DB-only、volume-only、错时点配对、missing/extra/corrupt object、密文、manifest、主版本、username identity或角色边界不匹配都fail closed且不得恢复流量；失败可能留下受控的partial restore和仍激活的DB gate，必须在maintenance lease内调查并从重新清空的目标重做，不能手工清gate或拼接备份。恢复用0600临时文件在退出时删除；其中database dump仍是敏感明文，recording bundle只含应用层认证密文，两者都必须位于受保护的临时filesystem。
 
 在lease存在且timer停止期间完成migration、schema/key和隔离readiness验证；不要恢复外部流量。验证后停止所有隔离Compose容器，再执行 `sudo /opt/camellia-remote-management/management-maintenance.sh leave --confirm-validated`。该命令只解除lease，不会自动启动任何服务；随后手动启动stack，验证`/health/ready`，最后才恢复流量并手动启动backup/cleanup timer。`status`子命令可读取当前lease和stack状态。不得通过删除lease文件、让lease自动过期或只停止stack来绕过该状态机，也不得在未演练时覆盖现有数据库。
 

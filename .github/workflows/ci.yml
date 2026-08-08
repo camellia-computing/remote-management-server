@@ -326,6 +326,7 @@ jobs:
           POSTGRES_DB: camellia_remote_ci
           POSTGRES_USER: camellia_remote_ci
           POSTGRES_PASSWORD: ci-postgres-password
+          POSTGRES_INITDB_ARGS: --encoding=UTF8 --locale-provider=builtin --builtin-locale=C.UTF-8
         ports:
           - 5432:5432
         options: >-
@@ -433,6 +434,7 @@ jobs:
           POSTGRES_DB: camellia_remote_container_ci
           POSTGRES_USER: camellia_remote_container_ci
           POSTGRES_PASSWORD: ci-postgres-password
+          POSTGRES_INITDB_ARGS: --encoding=UTF8 --locale-provider=builtin --builtin-locale=C.UTF-8
         ports:
           - 5432:5432
         options: >-

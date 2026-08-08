@@ -6,6 +6,8 @@ from django.db.migrations.executor import MigrationExecutor
 from django.test import TransactionTestCase
 from django.utils import timezone
 
+from api.migration_test_support import restore_latest_migration_state
+
 
 class AuditDisplaySnapshotMigrationTests(TransactionTestCase):
     migrate_from = ("api", "0019_file_audit_lifecycle")
@@ -81,4 +83,4 @@ class AuditDisplaySnapshotMigrationTests(TransactionTestCase):
             self.assertEqual(migrated.host_device_name_at_create, "")
             self.assertEqual(migrated.controller_device_name_at_bind, "")
         finally:
-            MigrationExecutor(connection).migrate([self.migrate_to])
+            restore_latest_migration_state()

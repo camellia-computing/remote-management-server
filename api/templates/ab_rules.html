@@ -7,7 +7,7 @@
   <a class="btn btn-secondary btn-xs" href="/api/ab_manage">{% trans "返回权限配置" %}</a>
   <a class="btn btn-ghost btn-xs" href="/api/ab_audit">{% trans "规则审计" %}</a>
   <a class="btn btn-ghost btn-xs" href="/api/ab_rules_export?format=csv{% if filter_q %}&q={{ filter_q|urlencode }}{% endif %}">{% trans "导出 CSV" %}</a>
-  <a class="btn btn-ghost btn-xs" href="/api/ab_rules_export?format=xls{% if filter_q %}&q={{ filter_q|urlencode }}{% endif %}">{% trans "导出 Excel" %}</a>
+  <a class="btn btn-ghost btn-xs" href="/api/ab_rules_export?format=xlsx{% if filter_q %}&q={{ filter_q|urlencode }}{% endif %}">{% trans "导出 Excel" %}</a>
 {% endblock %}
 
 {% block content %}

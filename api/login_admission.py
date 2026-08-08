@@ -9,6 +9,7 @@ from django.db.models import Count, Q
 from django.utils import timezone
 
 from api.models import LoginAdmissionLock, LoginAttempt
+from api.username_identity import canonical_username
 
 LOGIN_SCOPE = "login"
 REGISTER_SCOPE = "register"
@@ -31,8 +32,11 @@ def _canonical_ip(value):
 
 
 def _bounded_scope_text(value):
-    value = value if isinstance(value, str) else str(value)
-    return value.casefold()[:_MAX_SCOPE_TEXT]
+    try:
+        return canonical_username(value)[:_MAX_SCOPE_TEXT]
+    except ValueError:
+        value = value if isinstance(value, str) else str(value)
+        return value.casefold()[:_MAX_SCOPE_TEXT]
 
 
 def scope_hash(scope, username):

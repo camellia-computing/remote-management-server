@@ -6,6 +6,8 @@ from django.db.migrations.executor import MigrationExecutor
 from django.test import TransactionTestCase
 from django.utils import timezone
 
+from api.migration_test_support import restore_latest_migration_state
+
 
 class AuditEvidenceReceiptMigrationTests(TransactionTestCase):
     migrate_from = ("api", "0022_device_inventory_indexes")
@@ -163,4 +165,4 @@ class AuditEvidenceReceiptMigrationTests(TransactionTestCase):
             self.assertIn("positive_audit_reporter_sequence", forwarded)
             self.assertIn("unique_audit_reporter_sequence", forwarded)
         finally:
-            MigrationExecutor(connection).migrate([self.migrate_to])
+            restore_latest_migration_state()
