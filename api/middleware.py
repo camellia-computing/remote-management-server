@@ -5,6 +5,7 @@ from django.http import JsonResponse
 from django.urls import Resolver404, resolve
 
 from api.address_book_errors import AuthorizationGenerationExhausted
+from api.identifiers import InvalidIdentifier
 from api.rate_limits import (
     RateLimitBackendUnavailable,
     RateLimitRejected,
@@ -90,6 +91,8 @@ class ApiExceptionMiddleware:
     def process_exception(self, request, exception):
         if isinstance(exception, InvalidJsonPayload):
             return JsonResponse({"error": "Invalid JSON payload"}, status=400)
+        if isinstance(exception, InvalidIdentifier):
+            return JsonResponse({"error": "Invalid identifier"}, status=400)
         if isinstance(exception, AuthorizationGenerationExhausted):
             return JsonResponse(
                 {"error": "Address-book authorization generation exhausted"},
