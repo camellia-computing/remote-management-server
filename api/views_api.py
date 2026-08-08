@@ -2159,14 +2159,6 @@ def record(request):
     if not token or not user or not _get_active_token_device(token, user):
         _log_event(request, "api_record_unauthorized", level="warning")
         return JsonResponse({"error": "Invalid device token"}, status=401)
-    try:
-        try:
-            required_bytes = int(request.META.get("CONTENT_LENGTH", "0") or 0)
-        except (TypeError, ValueError):
-            required_bytes = 0
-        ingestion_governance.check_recording_storage_capability(max(0, required_bytes))
-    except ingestion_governance.RecordingStorageUnavailable as error:
-        return ingestion_governance.storage_error_response(error)
     return recording_uploads.handle_record_upload(request, token)
 
 
