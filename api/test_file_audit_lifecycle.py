@@ -167,6 +167,7 @@ class FileAuditLifecycleTests(ApiTestMixin, TestCase):
                 "transfer_revision": 1,
                 "transfer_state": "started",
                 "transferred_bytes": 0,
+                "response_schema_version": 1,
             },
         )
         file_log = FileLog.objects.get()
@@ -353,7 +354,8 @@ class FileAuditLifecycleTests(ApiTestMixin, TestCase):
         rejected = self._post_file(payload)
 
         self.assertEqual(rejected.status_code, 409, rejected.content)
-        self.assertEqual(rejected.json()["error"], "Audit event identity conflict")
+        self.assertEqual(rejected.json()["code"], "audit_event_identity_conflict")
+        self.assertEqual(rejected.json()["message"], "Audit event identity conflict")
         self.assertEqual(FileLog.objects.count(), 0)
         legacy = ConnectionAuditEvent.objects.get(event_id=legacy_event_id)
         self.assertIsNone(legacy.reporter_sequence)

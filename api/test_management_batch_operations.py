@@ -112,7 +112,10 @@ class ManagementBatchOperationTests(TestCase):
     def assert_zero_application_conflict(self, response):
         self.assertEqual(response.status_code, 409, response.content)
         body = response.json()
-        self.assertIn("error", body)
+        self.assertIn("message", body)
+        self.assertNotIn("error", body)
+        self.assertRegex(body["code"], r"^[a-z][a-z0-9_]{0,63}$")
+        self.assertFalse(body["retryable"])
         self.assertEqual(body["applied"], dict.fromkeys(body["requested"], 0))
         self.assertEqual(body["management_operation_receipt_version"], 1)
         self.assertRegex(body["request_digest"], r"^[0-9a-f]{64}$")
@@ -215,7 +218,10 @@ class ManagementBatchOperationTests(TestCase):
         )
 
         self.assertEqual(response.status_code, 400, response.content)
-        self.assertEqual(response.json(), {"error": "Cannot force logout current user"})
+        self.assertEqual(response.json()["message"], "Cannot force logout current user")
+        self.assertEqual(response.json()["response_schema_version"], 1)
+        self.assertFalse(response.json()["retryable"])
+        self.assertNotIn("error", response.json())
         self.admin.refresh_from_db()
         self.assertEqual(self.admin.credential_generation, original_generation)
         self.assertTrue(RemoteToken.objects.filter(device=self.admin_device).exists())
@@ -330,7 +336,10 @@ class ManagementBatchOperationTests(TestCase):
         )
 
         self.assertEqual(conflict.status_code, 409, conflict.content)
-        self.assertEqual(conflict.json(), {"error": "Operation identifier conflict"})
+        self.assertEqual(conflict.json()["message"], "Operation identifier conflict")
+        self.assertEqual(conflict.json()["response_schema_version"], 1)
+        self.assertFalse(conflict.json()["retryable"])
+        self.assertNotIn("error", conflict.json())
         self.second_device.refresh_from_db()
         self.assertIsNone(self.second_device.device_group_id)
         self.assertEqual(ManagementBatchOperation.objects.filter(operation_id=operation_id).count(), 1)
@@ -360,7 +369,10 @@ class ManagementBatchOperationTests(TestCase):
         )
 
         self.assertEqual(conflict.status_code, 409, conflict.content)
-        self.assertEqual(conflict.json(), {"error": "Operation identifier conflict"})
+        self.assertEqual(conflict.json()["message"], "Operation identifier conflict")
+        self.assertEqual(conflict.json()["response_schema_version"], 1)
+        self.assertFalse(conflict.json()["retryable"])
+        self.assertNotIn("error", conflict.json())
         self.assertEqual(ManagementBatchOperation.objects.filter(operation_id=operation_id).count(), 1)
 
     def test_group_and_force_logout_success_receipts_report_exact_application(self):

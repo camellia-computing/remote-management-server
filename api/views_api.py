@@ -116,6 +116,7 @@ from api.policy_generation import (
 )
 from api.rate_limits import enforce_authenticated_rate_limit
 from api.request_utils import InvalidJsonPayload, client_ip, load_json_body, load_json_object, load_json_text
+from api.response_contract import RESPONSE_SCHEMA_VERSION, empty_success, json_error, json_pending
 from api.tag_colors import normalize_tag_color
 from api.username_identity import canonical_username_key, check_username_identity, normalize_username
 from camellia_remote_management.observability import log_structured_event
@@ -1824,7 +1825,7 @@ def sysinfo(request):
     device_uuid = postdata.get("uuid")
     if not _valid_device_identity(rid, device_uuid):
         _log_event(request, "api_sysinfo_missing_id", level="warning")
-        return HttpResponse("ID_NOT_FOUND", status=400)
+        return json_error("device_identity_invalid", "Invalid device identity", status=400)
     token, user = _get_device_token_user(request, rid, device_uuid)
     if not token or not user:
         _log_event(request, "api_sysinfo_unauthorized", level="warning", rid=rid)
@@ -1855,7 +1856,7 @@ def sysinfo(request):
         _log_event(request, "api_sysinfo_conflict", level="warning", username=user.username, rid=rid)
         return JsonResponse({"error": "Device identity conflict"}, status=409)
     _log_event(request, "api_sysinfo_updated", level="debug", username=user.username, rid=rid, uuid=device_uuid)
-    return HttpResponse("SYSINFO_UPDATED")
+    return JsonResponse({"updated": True, "sysinfo_schema_version": 1})
 
 
 def heartbeat(request):
@@ -1955,7 +1956,7 @@ def sysinfo_ver(request):
     if not user:
         return JsonResponse({"error": "Invalid token"}, status=401)
     _log_event(request, "api_sysinfo_ver", level="debug", username=user.username)
-    return HttpResponse("1")
+    return JsonResponse({"sysinfo_schema_version": 1})
 
 
 def health_live(request):
@@ -1997,7 +1998,7 @@ def health_ready(request):
 def login_options(request):
     _log_event(request, "api_login_options", level="debug")
     providers = getattr(settings, "OIDC_PROVIDERS", {})
-    return JsonResponse([f"oidc/{name}" for name in providers.keys()], safe=False)
+    return JsonResponse({"options": [f"oidc/{name}" for name in providers.keys()]})
 
 
 def oidc_auth(request):
@@ -2073,13 +2074,27 @@ def oidc_auth(request):
     return JsonResponse({"code": poll_code, "url": auth_url})
 
 
+def _oidc_poll_pending_response():
+    return json_pending(
+        "oidc_pending",
+        "OIDC authorization is still pending",
+        retry_after=1,
+    )
+
+
+def _oidc_poll_error_response(code, message, *, status):
+    return json_error(code, message, status=status, pending=False)
+
+
 def oidc_auth_query(request):
     data = _load_json_object(request, max_bytes=settings.JSON_AUTH_MAX_BODY_BYTES)
     poll_code = str(data.get("code", "")).strip()
     rid = data.get("id", "")
     device_uuid = data.get("uuid", "")
-    if not poll_code or len(poll_code) > 128 or not _valid_device_identity(rid, device_uuid):
-        return JsonResponse({"error": "No authed oidc is found"})
+    if not _valid_device_identity(rid, device_uuid):
+        return _oidc_poll_error_response("oidc_poll_invalid", "Invalid device identity", status=400)
+    if not poll_code or len(poll_code) > 128:
+        return _oidc_poll_error_response("oidc_poll_invalid", "Invalid OIDC poll code", status=400)
     with transaction.atomic():
         session = (
             OidcPendingAuth.objects.select_for_update(of=("self",))
@@ -2088,21 +2103,21 @@ def oidc_auth_query(request):
             .first()
         )
         if not session:
-            return JsonResponse({"error": "No authed oidc is found"})
+            return _oidc_poll_error_response("oidc_poll_invalid", "Invalid OIDC poll code", status=400)
         if not secrets.compare_digest(session.rid, rid) or not secrets.compare_digest(session.device_uuid, device_uuid):
-            return JsonResponse({"error": "OIDC authorization failed"}, status=403)
+            return _oidc_poll_error_response("oidc_authorization_failed", "OIDC authorization failed", status=403)
         if timezone.now() - session.created_at > datetime.timedelta(minutes=OIDC_PENDING_MINUTES):
             session.delete()
-            return JsonResponse({"error": "OIDC authorization timeout"}, status=408)
+            return _oidc_poll_error_response("oidc_authorization_timeout", "OIDC authorization timeout", status=408)
         if session.status == OidcPendingAuth.STATUS_ERROR:
             session.delete()
-            return JsonResponse({"error": "OIDC authorization failed"}, status=400)
+            return _oidc_poll_error_response("oidc_authorization_failed", "OIDC authorization failed", status=400)
         if session.status != OidcPendingAuth.STATUS_DONE or not session.authenticated_user:
-            return JsonResponse({"error": "No authed oidc is found"})
+            return _oidc_poll_pending_response()
         user = session.authenticated_user
         if not user.is_active:
             session.delete()
-            return JsonResponse({"error": "OIDC authorization failed"}, status=403)
+            return _oidc_poll_error_response("oidc_authorization_failed", "OIDC authorization failed", status=403)
         try:
             device = _claim_session_device(
                 user,
@@ -2116,10 +2131,10 @@ def oidc_auth_query(request):
             _token, raw_token = _issue_access_token(user, device)
         except DeviceIdentityConflict, IntegrityError:
             session.delete()
-            return JsonResponse({"error": "OIDC authorization failed"}, status=409)
+            return _oidc_poll_error_response("oidc_authorization_conflict", "OIDC authorization failed", status=409)
         except PermissionError, DeviceProofError:
             session.delete()
-            return JsonResponse({"error": "OIDC authorization failed"}, status=403)
+            return _oidc_poll_error_response("oidc_authorization_failed", "OIDC authorization failed", status=403)
         body = _auth_body(user, raw_token)
         session.delete()
     return JsonResponse(body)
@@ -2496,7 +2511,7 @@ def devices_cli(request):
         _log_event(request, "api_devices_cli_conflict", level="warning", username=user.username, rid=rid)
         return JsonResponse({"error": "Device identity conflict"}, status=409)
     _log_event(request, "api_devices_cli_updated", username=user.username, rid=rid)
-    return HttpResponse("")
+    return empty_success()
 
 
 def devices_proof_challenge(request):
@@ -3481,7 +3496,7 @@ def ab_peer_add(request, guid):
     except ValueError:
         return JsonResponse({"error": "Invalid peer"}, status=400)
     _log_event(request, "api_ab_peer_add", username=user.username, guid=guid, rid=rid)
-    return HttpResponse("")
+    return empty_success()
 
 
 def ab_peer_update(request, guid):
@@ -3542,7 +3557,7 @@ def ab_peer_update(request, guid):
     except ValueError:
         return JsonResponse({"error": "Invalid peer"}, status=400)
     _log_event(request, "api_ab_peer_update", username=user.username, guid=guid, rid=rid)
-    return HttpResponse("")
+    return empty_success()
 
 
 def ab_peer_delete(request, guid):
@@ -3587,7 +3602,7 @@ def ab_peer_delete(request, guid):
             return JsonResponse({"error": "Authorization changed"}, status=403)
         RemotePeer.objects.filter(profile=profile, rid__in=postdata).delete()
     _log_event(request, "api_ab_peer_delete", username=user.username, guid=guid, count=len(postdata))
-    return HttpResponse("")
+    return empty_success()
 
 
 def ab_tag_add(request, guid):
@@ -3640,7 +3655,7 @@ def ab_tag_add(request, guid):
             defaults={"tag_color": color},
         )
     _log_event(request, "api_ab_tag_add", username=user.username, guid=guid, tag=name)
-    return HttpResponse("")
+    return empty_success()
 
 
 def ab_tag_rename(request, guid):
@@ -3704,7 +3719,7 @@ def ab_tag_rename(request, guid):
             old_tag.tag_name = new
             old_tag.save(update_fields=["tag_name"])
     _log_event(request, "api_ab_tag_rename", username=user.username, guid=guid, old=old, new=new)
-    return HttpResponse("")
+    return empty_success()
 
 
 def ab_tag_update(request, guid):
@@ -3746,7 +3761,7 @@ def ab_tag_update(request, guid):
             tag_color=str(color),
         )
     _log_event(request, "api_ab_tag_update", username=user.username, guid=guid, tag=name)
-    return HttpResponse("")
+    return empty_success()
 
 
 def ab_tag_delete(request, guid):
@@ -3794,20 +3809,20 @@ def ab_tag_delete(request, guid):
             tag_name__in=postdata,
         ).delete()
     _log_event(request, "api_ab_tag_delete", username=user.username, guid=guid, count=len(postdata))
-    return HttpResponse("")
+    return empty_success()
 
 
 def _audit_device_context(request, postdata):
     rid = postdata.get("id")
     device_uuid = postdata.get("uuid")
     if not _valid_device_identity(rid, device_uuid):
-        return None, None, JsonResponse({"error": "Invalid device identity"}, status=400)
+        return None, None, json_error("audit_device_identity_invalid", "Invalid device identity", status=400)
     token, user = _get_device_token_user(request, rid, device_uuid)
     if not token or not user:
-        return None, None, JsonResponse({"error": "Invalid device token"}, status=401)
+        return None, None, json_error("audit_device_token_invalid", "Invalid device token", status=401)
     device = _get_active_token_device(token, user)
     if not device:
-        return None, None, JsonResponse({"error": "Device is not active"}, status=403)
+        return None, None, json_error("audit_device_not_active", "Device is not active", status=403)
     return token, user, None
 
 
@@ -3886,23 +3901,21 @@ def _audit_version_is_current(value):
 
 
 def _audit_upgrade_required(required_version=AUDIT_PROTOCOL_VERSION):
-    return JsonResponse(
-        {
-            "error": "Unsupported audit protocol version",
-            "required_version": required_version,
-        },
+    return json_error(
+        "audit_protocol_upgrade_required",
+        "Unsupported audit protocol version",
         status=426,
+        required_version=required_version,
     )
 
 
 def _audit_evidence_upgrade_required(protocol_version):
-    return JsonResponse(
-        {
-            "error": "Unsupported audit evidence receipt version",
-            "required_version": protocol_version,
-            "required_receipt_version": AUDIT_EVIDENCE_RECEIPT_VERSION,
-        },
+    return json_error(
+        "audit_evidence_upgrade_required",
+        "Unsupported audit evidence receipt version",
         status=426,
+        required_version=protocol_version,
+        required_receipt_version=AUDIT_EVIDENCE_RECEIPT_VERSION,
     )
 
 
@@ -3989,12 +4002,11 @@ def _matching_evidence_event(
 
 
 def _reporter_sequence_conflict(reporter_sequence):
-    return JsonResponse(
-        {
-            "error": "Audit reporter sequence is already bound",
-            "reporter_sequence": reporter_sequence,
-        },
+    return json_error(
+        "audit_reporter_sequence_conflict",
+        "Audit reporter sequence is already bound",
         status=409,
+        reporter_sequence=reporter_sequence,
     )
 
 
@@ -4009,6 +4021,7 @@ def _audit_success_payload(connection_log, event_id):
     if connection_log.state in ConnLog.OPEN_STATES and connection_log.lease_expires_at is not None:
         lease_remaining = max(0, math.ceil((connection_log.lease_expires_at - now).total_seconds()))
     return {
+        "response_schema_version": RESPONSE_SCHEMA_VERSION,
         "version": AUDIT_PROTOCOL_VERSION,
         "audit_session_id": str(connection_log.guid),
         "acknowledged_event_id": str(event_id),
@@ -4032,6 +4045,7 @@ def _file_audit_success(connection_log, transfer_event):
         return JsonResponse(acknowledgement)
     return JsonResponse(
         {
+            "response_schema_version": RESPONSE_SCHEMA_VERSION,
             "version": FILE_AUDIT_PROTOCOL_VERSION,
             "audit_session_id": str(connection_log.guid),
             "acknowledged_event_id": str(transfer_event.connection_event.event_id),
@@ -4044,16 +4058,15 @@ def _file_audit_success(connection_log, transfer_event):
 
 
 def _audit_terminal_conflict(connection_log):
-    return JsonResponse(
-        {
-            "error": "Connection is not active",
-            "version": AUDIT_PROTOCOL_VERSION,
-            "state": connection_log.state,
-            "state_revision": connection_log.state_revision,
-            "terminal_reason": connection_log.terminal_reason,
-            "terminal_source": connection_log.terminal_source,
-        },
+    return json_error(
+        "audit_connection_not_active",
+        "Connection is not active",
         status=409,
+        version=AUDIT_PROTOCOL_VERSION,
+        state=connection_log.state,
+        state_revision=connection_log.state_revision,
+        terminal_reason=connection_log.terminal_reason,
+        terminal_source=connection_log.terminal_source,
     )
 
 
@@ -4106,7 +4119,7 @@ def _locked_host_audit_session(token, user, audit_session_id, *, active=True, re
         .first()
     )
     if not authority:
-        return None, None, JsonResponse({"error": "Connection not found"}, status=404)
+        return None, None, json_error("audit_connection_not_found", "Connection not found", status=404)
     device_ids = {authority["host_device_id"]}
     if require_controller and authority["controller_device_id"] is not None:
         device_ids.add(authority["controller_device_id"])
@@ -4116,7 +4129,7 @@ def _locked_host_audit_session(token, user, audit_session_id, *, active=True, re
     }
     device = locked_devices.get(authority["host_device_id"])
     if not device or device.owner_id != user.id or not device.is_active:
-        return None, None, JsonResponse({"error": "Device is not active"}, status=403)
+        return None, None, json_error("audit_device_not_active", "Device is not active", status=403)
     connection_log = (
         ConnLog.objects.select_for_update()
         .filter(
@@ -4127,13 +4140,21 @@ def _locked_host_audit_session(token, user, audit_session_id, *, active=True, re
         .first()
     )
     if not connection_log:
-        return device, None, JsonResponse({"error": "Connection not found"}, status=404)
+        return device, None, json_error("audit_connection_not_found", "Connection not found", status=404)
     if not _audit_host_authority_is_current(connection_log, device):
-        return device, None, JsonResponse({"error": "Connection authority changed"}, status=403)
+        return (
+            device,
+            None,
+            json_error(
+                "audit_connection_authority_changed",
+                "Connection authority changed",
+                status=403,
+            ),
+        )
     if require_controller:
         controller_device = locked_devices.get(connection_log.controller_device_id)
         if not _audit_controller_authority_is_current(connection_log, controller_device):
-            return device, None, JsonResponse({"error": "Controller is not bound"}, status=403)
+            return device, None, json_error("audit_controller_not_bound", "Controller is not bound", status=403)
     if active:
         now = audit_lifecycle.database_now()
         audit_lifecycle.expire_locked_connection(connection_log, now, source="request_reconciler")
@@ -4214,14 +4235,14 @@ def _audit_event_conflict(request=None, *, kind="unknown"):
             level="warning",
             kind=kind,
         )
-    return JsonResponse({"error": "Audit event identity conflict"}, status=409)
+    return json_error("audit_event_identity_conflict", "Audit event identity conflict", status=409)
 
 
 def _audit_conn_active(request):
     token, user = _get_token_user(request)
     if not token or not user or not _get_active_token_device(token, user):
         _log_event(request, "api_audit_conn_active_unauthorized", level="warning")
-        return JsonResponse("", safe=False, status=401)
+        return json_error("audit_unauthorized", "Invalid audit credential", status=401)
     if not _audit_version_is_current(request.GET.get("version")):
         return _audit_upgrade_required()
     peer_id = _audit_rid(request.GET.get("id", ""))
@@ -4230,12 +4251,12 @@ def _audit_conn_active(request):
     event_id = _audit_uuid4(request.GET.get("event_id"))
     if peer_id is None or session_id is None or conn_type is None or event_id is None:
         _log_event(request, "api_audit_conn_active_failed", level="warning", reason="missing_id")
-        return JsonResponse("", safe=False, status=400)
+        return json_error("audit_request_invalid", "Invalid audit binding request", status=400)
     try:
         with transaction.atomic():
             controller_rid = RemoteDevice.objects.filter(pk=token.device_id).values_list("rid", flat=True).first()
             if controller_rid is None:
-                return JsonResponse("", safe=False, status=403)
+                return json_error("audit_binding_forbidden", "Audit binding is not allowed", status=403)
             candidate = (
                 ConnLog.objects.filter(
                     audit_version=AUDIT_PROTOCOL_VERSION,
@@ -4249,9 +4270,13 @@ def _audit_conn_active(request):
             )
             if candidate is None:
                 # The host publishes the authenticated controller identity after
-                # opening the audit session. Empty 200 keeps the bounded client
-                # retry alive without exposing another session capability.
-                return JsonResponse("", safe=False)
+                # opening the audit session. The explicit pending state keeps the
+                # bounded client retry alive without exposing another capability.
+                return json_pending(
+                    "audit_binding_pending",
+                    "Audit binding is pending",
+                    retry_after=1,
+                )
             locked_devices = {
                 device.id: device
                 for device in RemoteDevice.objects.select_for_update()
@@ -4272,22 +4297,30 @@ def _audit_conn_active(request):
                 .first()
             )
             if not connection_log or not host_device or not controller_device:
-                return JsonResponse("", safe=False, status=403)
+                return json_error("audit_binding_forbidden", "Audit binding is not allowed", status=403)
             if not _audit_host_authority_is_current(connection_log, host_device):
-                return JsonResponse("", safe=False, status=403)
+                return json_error("audit_binding_forbidden", "Audit binding is not allowed", status=403)
             if controller_device.owner_id != user.id or not controller_device.is_active:
-                return JsonResponse("", safe=False, status=403)
+                return json_error("audit_binding_forbidden", "Audit binding is not allowed", status=403)
             if connection_log.conn_type is None:
-                return JsonResponse("", safe=False)
+                return json_pending(
+                    "audit_connection_pending",
+                    "Audit connection type is pending",
+                    retry_after=1,
+                )
             if connection_log.conn_type != conn_type:
-                return JsonResponse("", safe=False, status=409)
+                return json_error("audit_connection_conflict", "Audit connection type conflict", status=409)
             if connection_log.actor_id and connection_log.actor_id != user.id:
-                return JsonResponse("", safe=False, status=403)
+                return json_error("audit_binding_forbidden", "Audit binding is not allowed", status=403)
             now = audit_lifecycle.database_now()
             audit_lifecycle.expire_locked_connection(connection_log, now, source="controller_query")
             if connection_log.state != ConnLog.STATE_ACTIVE:
                 if connection_log.state == ConnLog.STATE_STARTING:
-                    return JsonResponse("", safe=False)
+                    return json_pending(
+                        "audit_connection_pending",
+                        "Audit connection is starting",
+                        retry_after=1,
+                    )
                 return _audit_terminal_conflict(connection_log)
             details = {
                 "controller_device_id": controller_device.rid,
@@ -4311,7 +4344,7 @@ def _audit_conn_active(request):
                 return _audit_success(connection_log, event_id)
             if connection_log.actor_id is None:
                 if connection_log.controller_device_id is not None:
-                    return JsonResponse("", safe=False, status=409)
+                    return json_error("audit_binding_conflict", "Audit binding conflict", status=409)
                 _append_audit_event(
                     connection_log,
                     event_id,
@@ -4338,7 +4371,7 @@ def _audit_conn_active(request):
                 )
             else:
                 if not _audit_controller_authority_is_current(connection_log, controller_device):
-                    return JsonResponse("", safe=False, status=403)
+                    return json_error("audit_binding_forbidden", "Audit binding is not allowed", status=403)
     except IntegrityError:
         return _audit_event_conflict()
     _log_event(
@@ -4384,7 +4417,7 @@ def _audit_controller_note_by_capability(request, postdata):
                 .first()
             )
             if not authority or authority["controller_device_id"] != token.device_id:
-                return JsonResponse({"error": "Connection audit not found"}, status=404)
+                return json_error("audit_connection_not_found", "Connection not found", status=404)
             locked_devices = {
                 device.id: device
                 for device in RemoteDevice.objects.select_for_update()
@@ -4404,13 +4437,17 @@ def _audit_controller_note_by_capability(request, postdata):
                 .first()
             )
             if not connection_log:
-                return JsonResponse({"error": "Connection audit not found"}, status=404)
+                return json_error("audit_connection_not_found", "Connection not found", status=404)
             if not host_device or not controller_device:
-                return JsonResponse({"error": "Connection authority changed"}, status=403)
+                return json_error(
+                    "audit_connection_authority_changed",
+                    "Connection authority changed",
+                    status=403,
+                )
             if not _audit_host_authority_is_current(connection_log, host_device):
                 return JsonResponse({"error": "Connection authority changed"}, status=403)
             if not _audit_controller_authority_is_current(connection_log, controller_device):
-                return JsonResponse({"error": "Controller authority changed"}, status=403)
+                return json_error("audit_controller_authority_changed", "Controller authority changed", status=403)
             existing = _existing_audit_event(event_id)
             if existing:
                 if (
@@ -4474,7 +4511,7 @@ def _audit_conn(request):
             with transaction.atomic():
                 device = _locked_audit_device(token, user)
                 if not device:
-                    return JsonResponse({"error": "Device is not active"}, status=403)
+                    return json_error("audit_device_not_active", "Device is not active", status=403)
                 observed_at = audit_lifecycle.database_now()
                 connection_log = (
                     ConnLog.objects.select_for_update()
@@ -4497,7 +4534,11 @@ def _audit_conn(request):
                         or connection_log.reporter_id != user.id
                         or not _audit_host_authority_is_current(connection_log, device)
                     ):
-                        return JsonResponse({"error": "Connection session conflict"}, status=409)
+                        return json_error(
+                            "audit_connection_session_conflict",
+                            "Connection session conflict",
+                            status=409,
+                        )
                 else:
                     ingestion_governance.reserve_audit_connection(user.id, device.id)
                     connection_log = ConnLog.objects.create(
@@ -4550,7 +4591,7 @@ def _audit_conn(request):
                     )
                     created = True
         except IntegrityError:
-            return JsonResponse({"error": "Connection session conflict"}, status=409)
+            return json_error("audit_connection_session_conflict", "Connection session conflict", status=409)
         _log_event(
             request,
             "api_audit_conn_new",
@@ -4576,12 +4617,16 @@ def _audit_conn(request):
             if authority_error:
                 return authority_error
             if connection_log.conn_id != conn_id or connection_log.session_id != session_id:
-                return JsonResponse({"error": "Connection not found"}, status=404)
+                return json_error("audit_connection_not_found", "Connection not found", status=404)
             if heartbeat_revision < connection_log.heartbeat_revision:
                 return JsonResponse({"error": "Stale audit heartbeat"}, status=409)
             if heartbeat_revision == connection_log.heartbeat_revision:
                 if connection_log.last_heartbeat_id != event_id:
-                    return JsonResponse({"error": "Audit heartbeat identity conflict"}, status=409)
+                    return json_error(
+                        "audit_heartbeat_identity_conflict",
+                        "Audit heartbeat identity conflict",
+                        status=409,
+                    )
                 return _audit_success(connection_log, event_id)
             observed_at = audit_lifecycle.database_now()
             connection_log.heartbeat_revision = heartbeat_revision
@@ -4620,7 +4665,7 @@ def _audit_conn(request):
                 if authority_error:
                     return authority_error
                 if connection_log.conn_id != conn_id or connection_log.session_id != session_id:
-                    return JsonResponse({"error": "Connection not found"}, status=404)
+                    return json_error("audit_connection_not_found", "Connection not found", status=404)
                 existing = _existing_audit_event(event_id)
                 if existing:
                     if (
@@ -4744,7 +4789,7 @@ def _audit_conn(request):
                 if authority_error:
                     return authority_error
                 if connection_log.conn_id != conn_id or connection_log.session_id != session_id:
-                    return JsonResponse({"error": "Connection not found"}, status=404)
+                    return json_error("audit_connection_not_found", "Connection not found", status=404)
                 existing = _existing_audit_event(event_id)
                 if existing:
                     if not _matching_audit_event(
@@ -4765,7 +4810,7 @@ def _audit_conn(request):
                         setattr(connection_log, field, value)
                         update_fields.append(field)
                     elif previous != value:
-                        return JsonResponse({"error": "Connection fact is immutable"}, status=409)
+                        return json_error("audit_connection_fact_immutable", "Connection fact is immutable", status=409)
                 if (
                     connection_log.state == ConnLog.STATE_STARTING
                     and connection_log.from_id
@@ -4906,7 +4951,7 @@ def _audit_file(request):
             if authority_error:
                 return authority_error
             if connection_log.conn_id != conn_id:
-                return JsonResponse({"error": "Connection not found"}, status=404)
+                return json_error("audit_connection_not_found", "Connection not found", status=404)
             if not connection_log.from_id or connection_log.from_id != remote_id:
                 return JsonResponse({"error": "Invalid file audit participant"}, status=403)
             try:
@@ -5064,6 +5109,7 @@ def _audit_file(request):
                 created_at=observed_at,
             )
             acknowledgement = {
+                "response_schema_version": RESPONSE_SCHEMA_VERSION,
                 "version": FILE_AUDIT_PROTOCOL_VERSION,
                 "receipt_version": AUDIT_EVIDENCE_RECEIPT_VERSION,
                 "audit_session_id": str(connection_log.guid),
@@ -5142,7 +5188,7 @@ def _audit_alarm(request):
             if authority_error:
                 return authority_error
             if connection_log.conn_id != conn_id:
-                return JsonResponse({"error": "Connection not found"}, status=404)
+                return json_error("audit_connection_not_found", "Connection not found", status=404)
             if audit_ref and audit_ref != connection_log.audit_ref:
                 return JsonResponse({"error": "Invalid audit reference"}, status=409)
             try:

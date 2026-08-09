@@ -2,7 +2,6 @@ import logging
 import time
 
 from django.conf import settings
-from django.http import JsonResponse
 from django.urls import Resolver404, resolve
 
 from api.address_book_errors import AuthorizationGenerationExhausted
@@ -20,6 +19,7 @@ from api.request_utils import (
     UnsupportedJsonMediaType,
     load_json_form_field,
 )
+from api.response_contract import RESPONSE_MODE_JSON, apply_response_contract, json_error, response_mode
 from api.response_security import SENSITIVE_RESPONSE_MARKER, protect_sensitive_response
 from camellia_remote_management.access_logging import REQUEST_ID_HEADER
 from camellia_remote_management.observability import (
@@ -36,10 +36,10 @@ logger = logging.getLogger(__name__)
 
 def json_envelope_error_response(exception):
     if isinstance(exception, JsonPayloadTooLarge):
-        return JsonResponse({"error": "JSON payload too large"}, status=413)
+        return json_error("json_payload_too_large", "JSON payload too large", status=413)
     if isinstance(exception, UnsupportedJsonMediaType):
-        return JsonResponse({"error": "Unsupported JSON media type"}, status=415)
-    return JsonResponse({"error": "Invalid JSON payload"}, status=400)
+        return json_error("unsupported_json_media_type", "Unsupported JSON media type", status=415)
+    return json_error("invalid_json_payload", "Invalid JSON payload", status=400)
 
 
 def _is_sensitive_response_route(request):
@@ -76,6 +76,7 @@ class SafeAccessLogMiddleware:
             raise
         else:
             context = finish_request_context(request, context)
+            apply_response_contract(request, response)
             if _is_sensitive_response_route(request):
                 protect_sensitive_response(response)
             response[REQUEST_ID_HEADER] = context.request_id
@@ -128,14 +129,24 @@ class ApiExceptionMiddleware:
         if isinstance(exception, InvalidJsonPayload):
             return json_envelope_error_response(exception)
         if isinstance(exception, InvalidIdentifier):
-            return JsonResponse({"error": "Invalid identifier"}, status=400)
+            return json_error("invalid_identifier", "Invalid identifier", status=400)
         if isinstance(exception, AuthorizationGenerationExhausted):
-            return JsonResponse(
-                {"error": "Address-book authorization generation exhausted"},
+            return json_error(
+                "authorization_generation_exhausted",
+                "Address-book authorization generation exhausted",
                 status=409,
             )
         if isinstance(exception, RateLimitRejected):
             return rate_limit_response(exception.admission)
         if isinstance(exception, RateLimitBackendUnavailable):
             return rate_limit_backend_response()
+        if response_mode(request) == RESPONSE_MODE_JSON:
+            log_structured_event(
+                logger,
+                request,
+                "http_request_exception",
+                level="error",
+                error_class=type(exception).__name__,
+            )
+            return json_error("internal_server_error", "Internal server error", status=500)
         return None

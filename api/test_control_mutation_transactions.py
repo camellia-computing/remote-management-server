@@ -96,7 +96,8 @@ class ControlMutationTransactionTests(TestCase):
             with self.subTest(method=method, path=path):
                 response = self._request(method, path)
                 self.assertEqual(response.status_code, 400, response.content)
-                self.assertEqual(response.json(), {"error": "Valid Idempotency-Key required"})
+                self.assertEqual(response.json()["message"], "Valid Idempotency-Key required")
+                self.assertNotIn("error", response.json())
 
         invalid = self._request(
             "post",
@@ -228,7 +229,8 @@ class ControlMutationTransactionTests(TestCase):
         replayed = self._request("post", path, operation_id=operation_id)
 
         self.assertEqual(rejected.status_code, 409, rejected.content)
-        self.assertEqual(first_body["error"], "Credential revocation failed")
+        self.assertEqual(first_body["message"], "Credential revocation failed")
+        self.assertNotIn("error", first_body)
         self.assertEqual(first_body["requested"], {"users": 1})
         self.assertEqual(first_body["applied"], {"users": 0})
         self.assertEqual(replayed.status_code, 409, replayed.content)
@@ -258,7 +260,8 @@ class ControlMutationTransactionTests(TestCase):
         )
 
         self.assertEqual(device_rejected.status_code, 409, device_rejected.content)
-        self.assertEqual(first_device_body["error"], "Device authority revocation failed")
+        self.assertEqual(first_device_body["message"], "Device authority revocation failed")
+        self.assertNotIn("error", first_device_body)
         self.assertEqual(first_device_body["requested"], {"devices": 1})
         self.assertEqual(first_device_body["applied"], {"devices": 0})
         self.assertEqual(device_replayed.status_code, 409, device_replayed.content)
@@ -275,7 +278,8 @@ class ControlMutationTransactionTests(TestCase):
         first_disable_body = disabled.json()
 
         self.assertEqual(disabled.status_code, 400, disabled.content)
-        self.assertEqual(first_disable_body["error"], "Cannot disable current device")
+        self.assertEqual(first_disable_body["message"], "Cannot disable current device")
+        self.assertNotIn("error", first_disable_body)
         self.assertEqual(first_disable_body["applied"], {"devices": 0})
         replayed = self._request("post", disable_path, operation_id=disable_id)
         self.assertEqual(replayed.status_code, 400, replayed.content)
@@ -288,7 +292,8 @@ class ControlMutationTransactionTests(TestCase):
             operation_id=delete_id,
         )
         self.assertEqual(deleted.status_code, 400, deleted.content)
-        self.assertEqual(deleted.json()["error"], "Cannot delete current device")
+        self.assertEqual(deleted.json()["message"], "Cannot delete current device")
+        self.assertNotIn("error", deleted.json())
         self.assertEqual(deleted.json()["applied"], {"devices": 0})
         self.admin_device.refresh_from_db()
         self.assertTrue(self.admin_device.is_active)
@@ -310,7 +315,8 @@ class ControlMutationTransactionTests(TestCase):
         )
 
         self.assertEqual(conflict.status_code, 409, conflict.content)
-        self.assertEqual(conflict.json(), {"error": "Operation identifier conflict"})
+        self.assertEqual(conflict.json()["message"], "Operation identifier conflict")
+        self.assertNotIn("error", conflict.json())
         self.target_device.refresh_from_db()
         self.assertTrue(self.target_device.is_active)
         self.assertEqual(ManagementBatchOperation.objects.filter(operation_id=operation_id).count(), 1)

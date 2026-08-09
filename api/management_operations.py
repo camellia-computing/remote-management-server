@@ -1,5 +1,6 @@
 import hashlib
 import json
+import re
 from dataclasses import dataclass
 
 from django.db import IntegrityError, transaction
@@ -10,6 +11,7 @@ from api.models_work import ManagementBatchOperation
 MANAGEMENT_OPERATION_RECEIPT_VERSION = 1
 MAX_OPERATION_NAME_BYTES = 64
 _BATCH_MUTATION_LOCK_NAMESPACE = (0x43414D45, 0x4C4C4941)  # ASCII "CAMELLIA"
+_MACHINE_CODE = re.compile(r"[a-z][a-z0-9_]{0,63}\Z")
 
 
 class ManagementOperationConflict(RuntimeError):
@@ -146,6 +148,7 @@ def execute_management_operation(
             raise RuntimeError("Management operation produced an invalid outcome")
         body = {
             **outcome.body,
+            "response_schema_version": 1,
             "management_operation_receipt_version": MANAGEMENT_OPERATION_RECEIPT_VERSION,
             "operation_id": str(operation_id),
             "operation": operation,
@@ -155,6 +158,15 @@ def execute_management_operation(
             "requested": requested,
             "applied": outcome.applied,
         }
+        if outcome.status_code >= 400:
+            legacy_message = body.pop("error", None)
+            body.pop("msg", None)
+            code = body.get("code")
+            if not isinstance(code, str) or _MACHINE_CODE.fullmatch(code) is None:
+                body["code"] = "management_operation_failed"
+            message = body.get("message") or legacy_message or "Management operation failed"
+            body["message"] = str(message)[:256]
+            body["retryable"] = bool(body.get("retryable", outcome.status_code in {408, 425, 429, 500, 502, 503, 504}))
         receipt.status_code = outcome.status_code
         receipt.response = body
         receipt.save(update_fields=("status_code", "response"))

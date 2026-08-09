@@ -79,7 +79,8 @@ class MutationFieldContractTests(TestCase):
     def assert_field_error(self, response, *, unknown=None, conflicting=None):
         self.assertEqual(response.status_code, 400, response.content)
         body = response.json()
-        self.assertEqual(body["error"], "Invalid request fields")
+        self.assertEqual(body["message"], "Invalid request fields")
+        self.assertNotIn("error", body)
         self.assertEqual(body["code"], "invalid_request_fields")
         self.assertEqual(body["field_contract_version"], 1)
         if unknown is not None:
@@ -383,7 +384,10 @@ class MutationFieldContractTests(TestCase):
         )
 
         self.assertEqual(response.status_code, 409, response.content)
-        self.assertEqual(response.json(), {"error": "Device is not eligible for recovery"})
+        self.assertEqual(response.json()["message"], "Device is not eligible for recovery")
+        self.assertEqual(response.json()["response_schema_version"], 1)
+        self.assertFalse(response.json()["retryable"])
+        self.assertNotIn("error", response.json())
 
     def test_field_errors_are_sorted_and_do_not_echo_values(self):
         secret = "must-not-appear-" + hashlib.sha256(b"field-contract-secret").hexdigest()
