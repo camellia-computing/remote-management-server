@@ -1652,7 +1652,6 @@ class AddressBookRule(models.Model):
     )
     group = models.ForeignKey(Group, on_delete=models.CASCADE, null=True, blank=True, related_name="address_book_rules")
     is_everyone = models.BooleanField(default=False)
-    target_key = models.CharField(max_length=32, editable=False)
     created_at = models.DateTimeField(verbose_name=_("创建时间"), default=timezone.now)
     updated_at = models.DateTimeField(verbose_name=_("更新时间"), auto_now=True)
 
@@ -1661,8 +1660,19 @@ class AddressBookRule(models.Model):
         verbose_name_plural = _("地址簿规则列表")
         constraints = [
             models.UniqueConstraint(
-                fields=["profile", "target_key"],
-                name="unique_address_book_rule_target",
+                fields=["profile", "user"],
+                condition=models.Q(user__isnull=False),
+                name="unique_ab_rule_profile_user",
+            ),
+            models.UniqueConstraint(
+                fields=["profile", "group"],
+                condition=models.Q(group__isnull=False),
+                name="unique_ab_rule_profile_group",
+            ),
+            models.UniqueConstraint(
+                fields=["profile"],
+                condition=models.Q(is_everyone=True),
+                name="unique_ab_rule_profile_everyone",
             ),
             models.CheckConstraint(
                 condition=models.Q(rule__gte=1, rule__lte=3),
@@ -1679,13 +1689,12 @@ class AddressBookRule(models.Model):
         ]
 
     def save(self, *args, **kwargs):
-        if self.is_everyone and not self.user_id and not self.group_id:
-            self.target_key = "everyone"
-        elif not self.is_everyone and self.user_id and not self.group_id:
-            self.target_key = f"user:{self.user_id}"
-        elif not self.is_everyone and self.group_id and not self.user_id:
-            self.target_key = f"group:{self.group_id}"
-        else:
+        has_valid_target = (
+            (self.is_everyone and not self.user_id and not self.group_id)
+            or (not self.is_everyone and self.user_id and not self.group_id)
+            or (not self.is_everyone and self.group_id and not self.user_id)
+        )
+        if not has_valid_target:
             raise ValueError("Address-book rule must have exactly one target")
         super().save(*args, **kwargs)
 

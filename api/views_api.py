@@ -3171,17 +3171,26 @@ def ab_rule(request):
                 target_type = "user"
                 target_name = target_user.username
             else:
-                target_key = f"group:{target_group.id}" if target_group else "everyone"
-                changed, created = AddressBookRule.objects.update_or_create(
-                    profile=profile,
-                    target_key=target_key,
-                    defaults={
-                        "group": target_group,
-                        "user": None,
-                        "rule": rule_value,
-                        "is_everyone": target_group is None,
-                    },
-                )
+                if target_group:
+                    changed, created = AddressBookRule.objects.update_or_create(
+                        profile=profile,
+                        group=target_group,
+                        defaults={
+                            "user": None,
+                            "rule": rule_value,
+                            "is_everyone": False,
+                        },
+                    )
+                else:
+                    changed, created = AddressBookRule.objects.update_or_create(
+                        profile=profile,
+                        is_everyone=True,
+                        defaults={
+                            "group": None,
+                            "user": None,
+                            "rule": rule_value,
+                        },
+                    )
                 target_type = "group" if target_group else "everyone"
                 target_name = target_group.name if target_group else "Everyone"
             bump_locked_authorization_generation(profile)
@@ -3249,7 +3258,7 @@ def ab_rule(request):
             if not rule_obj:
                 return JsonResponse({"error": "Not found"}, status=404)
             rule_obj.rule = rule_value
-            rule_obj.save(update_fields=("rule", "target_key", "updated_at"))
+            rule_obj.save(update_fields=("rule", "updated_at"))
             if rule_obj.is_everyone:
                 target_type, target_name = "everyone", "Everyone"
             elif rule_obj.group_id:
