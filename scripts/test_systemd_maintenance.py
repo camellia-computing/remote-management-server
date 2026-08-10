@@ -47,6 +47,13 @@ class SystemdMaintenanceTests(unittest.TestCase):
                 conditions = [value for key, value in directives(path, "Service") if key == "ExecCondition"]
                 self.assertEqual(conditions, ["/opt/camellia-remote-management/management-maintenance-guard.sh"])
 
+    def test_cleanup_samples_sequence_capacity_after_retention(self):
+        cleanup = SYSTEMD / "camellia-remote-management-cleanup.service"
+        commands = [value for key, value in directives(cleanup, "Service") if key == "ExecStart"]
+        self.assertEqual(len(commands), 2)
+        self.assertTrue(commands[0].endswith("python manage.py purge_expired_state"))
+        self.assertTrue(commands[1].endswith("python manage.py check_sequence_capacity --fail-level critical"))
+
     def test_guard_skips_inactive_stack_and_maintenance_without_starting_any_unit(self):
         with tempfile.TemporaryDirectory(prefix="camellia-maintenance-guard-") as temporary:
             root = pathlib.Path(temporary)

@@ -241,7 +241,7 @@ DATA_ENCRYPTION_V1_KEY_ID = data_encryption_key_id(
 if DATA_ENCRYPTION_V1_KEY_ID not in DATA_ENCRYPTION_KEYS:
     raise ImproperlyConfigured("CAMELLIA_REMOTE_DATA_ENCRYPTION_V1_KEY_ID must identify a configured key")
 
-DEFAULT_AUTO_FIELD = "django.db.models.AutoField"
+DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 ALLOWED_HOSTS = env_csv("CAMELLIA_REMOTE_ALLOWED_HOSTS", ["127.0.0.1", "localhost"])
 CSRF_TRUSTED_ORIGINS = env_csv("CAMELLIA_REMOTE_CSRF_TRUSTED_ORIGINS", ["http://127.0.0.1:21114"])
 if not DEBUG:
@@ -625,6 +625,20 @@ if not (
 AUDIT_CONNECTION_LEASE_SECONDS = env_int("CAMELLIA_REMOTE_AUDIT_CONNECTION_LEASE_SECONDS", 90, 30, 600)
 AUDIT_RETENTION_DAYS = env_int("CAMELLIA_REMOTE_AUDIT_RETENTION_DAYS", 90, 1, 3650)
 INGESTION_CLEANUP_BATCH_SIZE = env_int("CAMELLIA_REMOTE_INGESTION_CLEANUP_BATCH_SIZE", 100, 1, 1000)
+SEQUENCE_CAPACITY_WARNING_PERCENT = env_int(
+    "CAMELLIA_REMOTE_SEQUENCE_CAPACITY_WARNING_PERCENT",
+    80,
+    1,
+    98,
+)
+SEQUENCE_CAPACITY_CRITICAL_PERCENT = env_int(
+    "CAMELLIA_REMOTE_SEQUENCE_CAPACITY_CRITICAL_PERCENT",
+    95,
+    2,
+    99,
+)
+if SEQUENCE_CAPACITY_CRITICAL_PERCENT <= SEQUENCE_CAPACITY_WARNING_PERCENT:
+    raise ImproperlyConfigured("CAMELLIA_REMOTE_SEQUENCE_CAPACITY_CRITICAL_PERCENT must exceed the warning threshold")
 
 # JSON endpoints reject oversized input before Django materializes or parses it.
 # These route budgets are deliberately independent from recording chunks: a

@@ -333,7 +333,12 @@ class AddressBookAuthorizationBarrierTests(TestCase):
         self.assertEqual(response.status_code, 409, response.content)
         self.assertEqual(
             response.json(),
-            {"error": "Address-book authorization generation exhausted"},
+            {
+                "response_schema_version": 1,
+                "code": "authorization_generation_exhausted",
+                "message": "Address-book authorization generation exhausted",
+                "retryable": False,
+            },
         )
         self.assertEqual(self.profile.owner_id, self.owner.pk)
         self.assertEqual(self.profile.authorization_generation, (1 << 63) - 1)
