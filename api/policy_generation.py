@@ -26,15 +26,20 @@ def normalize_policy_options(value):
         raise InvalidManagedPolicy("policy options must be a bounded object")
     output = {}
     for key, option_value in value.items():
+        try:
+            key_bytes = key.encode("utf-8") if isinstance(key, str) else b""
+            value_bytes = option_value.encode("utf-8") if isinstance(option_value, str) else b""
+        except UnicodeEncodeError as exc:
+            raise InvalidManagedPolicy("policy options contain invalid Unicode") from exc
         if (
             not isinstance(key, str)
             or not key
             or len(key) > MAX_POLICY_KEY_CHARACTERS
-            or len(key.encode("utf-8")) > MAX_POLICY_KEY_BYTES
+            or len(key_bytes) > MAX_POLICY_KEY_BYTES
             or any(ord(character) < 32 for character in key)
             or not isinstance(option_value, str)
             or len(option_value) > MAX_POLICY_VALUE_CHARACTERS
-            or len(option_value.encode("utf-8")) > MAX_POLICY_VALUE_BYTES
+            or len(value_bytes) > MAX_POLICY_VALUE_BYTES
         ):
             raise InvalidManagedPolicy("policy options contain an invalid entry")
         output[key] = option_value

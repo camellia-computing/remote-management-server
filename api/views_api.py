@@ -1946,7 +1946,11 @@ def heartbeat(request):
             "event=invalid_strategy_options strategy_id=%s",
             profile.pk if profile else None,
         )
-        return JsonResponse({"error": "Invalid strategy configuration"}, status=503)
+        return json_error(
+            "invalid_strategy_configuration",
+            "Invalid strategy configuration",
+            status=503,
+        )
     _log_event(request, "api_heartbeat", level="debug", username=user.username, rid=rid, uuid=device_uuid)
     return JsonResponse(response)
 
@@ -5485,13 +5489,20 @@ def _serialize_device_group(group):
 
 
 def _serialize_strategy(strategy):
-    options = _strategy_options_value(strategy.config_options)
+    try:
+        options = normalize_policy_options(strategy.config_options)
+    except InvalidManagedPolicy:
+        logger.error(
+            "event=invalid_strategy_options strategy_id=%s",
+            strategy.pk,
+        )
+        raise
     return {
         "guid": str(strategy.guid),
         "name": strategy.name,
         "enabled": bool(strategy.enabled),
         "status": 1 if strategy.enabled else 0,
-        "config_options": options if options is not None else {},
+        "config_options": options,
         "updated_at": strategy.updated_at.isoformat() if strategy.updated_at else "",
     }
 
@@ -6723,7 +6734,15 @@ def strategies(request):
         )
         return JsonResponse(_serialize_strategy(strategy))
     qs = StrategyProfile.objects.all().order_by("name")
-    return JsonResponse([_serialize_strategy(strategy) for strategy in qs], safe=False)
+    try:
+        data = [_serialize_strategy(strategy) for strategy in qs]
+    except InvalidManagedPolicy:
+        return json_error(
+            "invalid_strategy_configuration",
+            "Invalid strategy configuration",
+            status=503,
+        )
+    return JsonResponse(data, safe=False)
 
 
 def strategy_detail(request, guid):
@@ -6738,7 +6757,15 @@ def strategy_detail(request, guid):
         strategy = StrategyProfile.objects.filter(guid=strategy_guid).first()
         if not strategy:
             return JsonResponse({"error": "Strategy not found"}, status=404)
-        return JsonResponse(_serialize_strategy(strategy))
+        try:
+            data = _serialize_strategy(strategy)
+        except InvalidManagedPolicy:
+            return json_error(
+                "invalid_strategy_configuration",
+                "Invalid strategy configuration",
+                status=503,
+            )
+        return JsonResponse(data)
     elif request.method == "PATCH":
         data = _load_json_object(request)
         field_error = _mutation_fields_error(

@@ -26,6 +26,15 @@ POLICY_ASSIGNMENT_FIELDS = frozenset(
 POLICY_CONTENT_FIELDS = frozenset(("config_options", "enabled"))
 
 
+def _validated_strategy_config_options(value):
+    from api.policy_generation import InvalidManagedPolicy, normalize_policy_options
+
+    try:
+        return normalize_policy_options(value)
+    except InvalidManagedPolicy as exc:
+        raise ValidationError({"config_options": _("策略配置必须是有界的字符串键值映射。")}) from exc
+
+
 class RemoteDeviceQuerySet(models.QuerySet):
     def update(self, **kwargs):
         if "policy_generation" in kwargs:
@@ -45,6 +54,9 @@ class RemoteDeviceQuerySet(models.QuerySet):
 
 class StrategyProfileQuerySet(models.QuerySet):
     def update(self, **kwargs):
+        config_options = kwargs.get("config_options")
+        if "config_options" in kwargs and not hasattr(config_options, "resolve_expression"):
+            kwargs["config_options"] = _validated_strategy_config_options(config_options)
         if not POLICY_CONTENT_FIELDS.intersection(kwargs):
             return super().update(**kwargs)
         from api.policy_generation import (
@@ -60,6 +72,20 @@ class StrategyProfileQuerySet(models.QuerySet):
             updated = super().update(**kwargs)
             bump_device_policy_generations(device_ids, using=self.db)
             return updated
+
+    def bulk_create(self, objs, *args, **kwargs):
+        objs = tuple(objs)
+        for obj in objs:
+            obj.config_options = _validated_strategy_config_options(obj.config_options)
+        return super().bulk_create(objs, *args, **kwargs)
+
+    def bulk_update(self, objs, fields, *args, **kwargs):
+        objs = tuple(objs)
+        fields = tuple(fields)
+        if "config_options" in fields:
+            for obj in objs:
+                obj.config_options = _validated_strategy_config_options(obj.config_options)
+        return super().bulk_update(objs, fields, *args, **kwargs)
 
     def delete(self):
         from api.policy_generation import (
@@ -1421,13 +1447,12 @@ class StrategyProfile(models.Model):
 
     def clean(self):
         super().clean()
-        if not isinstance(self.config_options, dict) or any(
-            not isinstance(key, str) or not isinstance(value, str) for key, value in self.config_options.items()
-        ):
-            raise ValidationError(_("策略配置必须是字符串键值映射。"))
+        self.config_options = _validated_strategy_config_options(self.config_options)
 
     def save(self, *args, **kwargs):
         update_fields = kwargs.get("update_fields")
+        if update_fields is None or "config_options" in update_fields:
+            self.config_options = _validated_strategy_config_options(self.config_options)
         if not self.pk or (update_fields is not None and not POLICY_CONTENT_FIELDS.intersection(update_fields)):
             return super().save(*args, **kwargs)
         database = kwargs.get("using") or router.db_for_write(type(self), instance=self)
