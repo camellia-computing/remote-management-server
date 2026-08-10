@@ -394,16 +394,31 @@ class ManagementIdentifierHttpTests(TestCase):
 
 
 class IdentifierExceptionBoundaryTests(TestCase):
-    def test_validation_error_is_a_bounded_400_but_database_errors_are_not_hidden(self):
+    def test_identifier_and_unhandled_api_errors_use_bounded_machine_contracts(self):
         middleware = ApiExceptionMiddleware(lambda request: None)
         request = RequestFactory().get("/api/strategies/not-a-uuid")
 
         response = middleware.process_exception(request, InvalidIdentifier("invalid UUID"))
 
         self.assertEqual(response.status_code, 400)
-        self.assertEqual(json.loads(response.content), {"error": "Invalid identifier"})
-        self.assertIsNone(middleware.process_exception(request, ValidationError("non-identifier validation failure")))
-        self.assertIsNone(middleware.process_exception(request, DatabaseError("database unavailable")))
+        self.assertEqual(
+            json.loads(response.content),
+            {
+                "response_schema_version": 1,
+                "code": "invalid_identifier",
+                "message": "Invalid identifier",
+                "retryable": False,
+            },
+        )
+        for exception in (
+            ValidationError("non-identifier validation failure"),
+            DatabaseError("database unavailable"),
+        ):
+            with self.subTest(exception=type(exception).__name__):
+                internal = middleware.process_exception(request, exception)
+                self.assertEqual(internal.status_code, 500)
+                self.assertEqual(json.loads(internal.content)["code"], "internal_server_error")
+                self.assertNotIn(str(exception), internal.content.decode())
 
 
 class TypedIdentifierParserTests(TestCase):

@@ -1,7 +1,7 @@
 import base64
 import binascii
+import copy
 import datetime
-import functools
 import hashlib
 import ipaddress
 import json
@@ -9,7 +9,10 @@ import logging
 import math
 import re
 import secrets
+import threading
+import time
 import uuid
+from collections import OrderedDict
 from dataclasses import dataclass
 from urllib.parse import urlsplit
 
@@ -27,6 +30,7 @@ from django.http import HttpResponse, HttpResponseRedirect, JsonResponse
 from django.utils import timezone
 from django.utils.translation import gettext as _
 from joserfc import jwt
+from joserfc.errors import InvalidKeyIdError
 from joserfc.jwk import KeySet
 from joserfc.jwt import JWTClaimsRegistry
 
@@ -96,6 +100,13 @@ from api.models import (
     StrategyProfile,
     UserProfile,
 )
+from api.oidc_documents import (
+    OIDC_DOCUMENT_MAX_BYTES,
+    parse_oidc_json,
+    validate_oidc_discovery,
+    validate_oidc_jwks,
+    validated_signing_algorithms,
+)
 from api.policy_generation import (
     InvalidManagedPolicy,
     device_ids_affected_by_groups,
@@ -104,7 +115,8 @@ from api.policy_generation import (
     normalize_policy_options,
 )
 from api.rate_limits import enforce_authenticated_rate_limit
-from api.request_utils import client_ip, load_json_body, load_json_object, load_json_text
+from api.request_utils import InvalidJsonPayload, client_ip, load_json_body, load_json_object, load_json_text
+from api.response_contract import RESPONSE_SCHEMA_VERSION, empty_success, json_error, json_pending
 from api.tag_colors import normalize_tag_color
 from api.username_identity import canonical_username_key, check_username_identity, normalize_username
 from camellia_remote_management.observability import log_structured_event
@@ -115,7 +127,6 @@ DEVICE_LEASE_SECONDS = 60
 MAX_DEPLOY_KEY_LEN = 512
 OIDC_PENDING_MINUTES = settings.OIDC_PENDING_RETENTION_MINUTES
 OIDC_MAX_PENDING_PER_IP = 20
-OIDC_DOCUMENT_MAX_BYTES = 1024 * 1024
 MAX_OIDC_CALLBACK_CLAIM_GENERATION = (1 << 63) - 1
 MAX_DEVICE_UUID_TEXT_LEN = 344
 MAX_AUDIT_INFO_BYTES = 16 * 1024
@@ -131,20 +142,12 @@ MAX_AB_TAGS_PER_PEER = 32
 MAX_AB_PROFILE_PASSWORD_BYTES = 240
 MAX_MANAGEMENT_BATCH_ITEMS = 500
 MAX_ALLOWED_INCOMINGS = 500
-OIDC_SAFE_ID_TOKEN_ALGORITHMS = frozenset(
-    {
-        "RS256",
-        "RS384",
-        "RS512",
-        "PS256",
-        "PS384",
-        "PS512",
-        "ES256",
-        "ES384",
-        "ES512",
-        "EdDSA",
-    }
-)
+PAGINATION_CONTRACT_VERSION = 1
+MAX_API_PAGE_SIZE = 500
+MAX_API_PAGE_OFFSET = 10_000
+OIDC_DOCUMENT_CACHE_MAX_ENTRIES = 16
+OIDC_DOCUMENT_CACHE_TTL_SECONDS = 300
+OIDC_DOCUMENT_CACHE_STALE_SECONDS = 900
 
 
 @dataclass(frozen=True)
@@ -157,8 +160,43 @@ class _OidcCallbackClaim:
     code_verifier: str
 
 
+@dataclass(frozen=True)
+class _OidcDocumentCacheEntry:
+    document: dict
+    etag: str
+    fresh_until: float
+    stale_until: float
+
+
+@dataclass
+class _OidcDocumentFlight:
+    event: threading.Event
+    error: Exception | None = None
+    fallback_document: dict | None = None
+    fallback_until: float = 0.0
+
+
+@dataclass(frozen=True)
+class _Pagination:
+    current: int
+    page_size: int
+    start: int
+    end: int
+
+
+class _InvalidPagination(ValueError):
+    def __init__(self, field):
+        self.field = field
+        super().__init__(f"invalid pagination field: {field}")
+
+
 class _OidcCallbackClaimLost(RuntimeError):
     pass
+
+
+_oidc_document_cache = OrderedDict()
+_oidc_document_inflight = {}
+_oidc_document_cache_lock = threading.Lock()
 
 
 def _load_json(request, *, max_bytes=None):
@@ -537,54 +575,206 @@ def _oidc_endpoint_allowed(url, allowed_hosts):
     return hostname in frozenset(allowed_hosts)
 
 
-def _fetch_oidc_json(url, allowed_hosts):
+def _oidc_response_content_type(response):
+    raw_value = response.headers.get("Content-Type", "")
+    if not isinstance(raw_value, str) or not raw_value or len(raw_value) > 255:
+        raise ValueError("OIDC response has an invalid Content-Type")
+    parts = raw_value.split(";")
+    media_type = parts[0].strip().lower()
+    if media_type not in ("application/json", "application/jwk-set+json"):
+        raise ValueError("OIDC response is not JSON")
+    parameters = {}
+    for raw_parameter in parts[1:]:
+        if "=" not in raw_parameter:
+            raise ValueError("OIDC response has ambiguous Content-Type parameters")
+        raw_name, raw_parameter_value = raw_parameter.split("=", 1)
+        name = raw_name.strip().lower()
+        value = raw_parameter_value.strip()
+        if len(value) >= 2 and value[0] == value[-1] == '"':
+            value = value[1:-1]
+        elif value.startswith('"') or value.endswith('"'):
+            raise ValueError("OIDC response has ambiguous Content-Type parameters")
+        value = value.lower()
+        if not name or not value or name in parameters or "\\" in value or '"' in value:
+            raise ValueError("OIDC response has ambiguous Content-Type parameters")
+        parameters[name] = value
+    if set(parameters) - {"charset"} or parameters.get("charset", "utf-8") != "utf-8":
+        raise ValueError("OIDC response must contain UTF-8 JSON")
+
+
+def _request_oidc_json(url, allowed_hosts, *, etag=""):
     if not _oidc_endpoint_allowed(url, allowed_hosts):
         raise ValueError("OIDC endpoint is outside the configured host allowlist")
     timeout = getattr(settings, "OIDC_HTTP_TIMEOUT_SECONDS", 10)
+    headers = {"Accept": "application/json, application/jwk-set+json"}
+    if etag:
+        headers["If-None-Match"] = etag
     with requests.get(
         url,
         timeout=timeout,
         allow_redirects=False,
         stream=True,
-        headers={"Accept": "application/json"},
+        headers=headers,
     ) as response:
+        if response.status_code == 304:
+            return None, etag, True
         response.raise_for_status()
+        _oidc_response_content_type(response)
         content_length = response.headers.get("Content-Length")
-        if content_length and int(content_length) > OIDC_DOCUMENT_MAX_BYTES:
-            raise ValueError("OIDC document is too large")
+        if content_length is not None:
+            if (
+                not isinstance(content_length, str)
+                or not content_length
+                or len(content_length) > 10
+                or not content_length.isascii()
+                or not content_length.isdecimal()
+                or (len(content_length) > 1 and content_length.startswith("0"))
+            ):
+                raise ValueError("OIDC response has an invalid Content-Length")
+            if int(content_length) > OIDC_DOCUMENT_MAX_BYTES:
+                raise ValueError("OIDC document is too large")
         body = bytearray()
         for chunk in response.iter_content(64 * 1024):
             body.extend(chunk)
             if len(body) > OIDC_DOCUMENT_MAX_BYTES:
                 raise ValueError("OIDC document is too large")
-    document = json.loads(body)
-    if not isinstance(document, dict):
-        raise ValueError("OIDC document must be a JSON object")
+        response_etag = response.headers.get("ETag", "")
+        if (
+            not isinstance(response_etag, str)
+            or len(response_etag) > 256
+            or any(ord(character) < 32 or ord(character) == 127 for character in response_etag)
+        ):
+            response_etag = ""
+    return parse_oidc_json(bytes(body)), response_etag, False
+
+
+def _fetch_oidc_json(url, allowed_hosts):
+    document, _etag, not_modified = _request_oidc_json(url, allowed_hosts)
+    if not_modified:
+        raise ValueError("OIDC endpoint returned an unsolicited not-modified response")
     return document
 
 
-@functools.lru_cache(maxsize=16)
+def _copy_oidc_document(document):
+    return copy.deepcopy(document)
+
+
+def _clear_oidc_document_cache():
+    with _oidc_document_cache_lock:
+        _oidc_document_cache.clear()
+
+
+def _cached_oidc_document(url, allowed_hosts, *, document_type, validator, force_refresh=False):
+    allowed_hosts = tuple(sorted(frozenset(allowed_hosts)))
+    cache_key = (document_type, url, allowed_hosts)
+    wait_timeout = getattr(settings, "OIDC_HTTP_TIMEOUT_SECONDS", 10) + 1
+    while True:
+        now = time.monotonic()
+        with _oidc_document_cache_lock:
+            cached = _oidc_document_cache.get(cache_key)
+            if cached is not None and not force_refresh and now < cached.fresh_until:
+                _oidc_document_cache.move_to_end(cache_key)
+                return _copy_oidc_document(cached.document)
+            inflight = _oidc_document_inflight.get(cache_key)
+            if inflight is None:
+                inflight = _OidcDocumentFlight(event=threading.Event())
+                _oidc_document_inflight[cache_key] = inflight
+                leader = True
+            else:
+                leader = False
+        if leader:
+            break
+        if not inflight.event.wait(wait_timeout):
+            with _oidc_document_cache_lock:
+                stale = _oidc_document_cache.get(cache_key)
+                if stale is not None and time.monotonic() < stale.stale_until:
+                    return _copy_oidc_document(stale.document)
+            raise ValueError("OIDC document single-flight timed out")
+        if inflight.error is not None:
+            if inflight.fallback_document is not None and time.monotonic() < inflight.fallback_until:
+                return _copy_oidc_document(inflight.fallback_document)
+            raise inflight.error
+        force_refresh = False
+
+    flight_error = None
+    fallback_document = None
+    fallback_until = 0.0
+    try:
+        etag = cached.etag if cached is not None else ""
+        raw_document, response_etag, not_modified = _request_oidc_json(
+            url,
+            allowed_hosts,
+            etag=etag,
+        )
+        if not_modified:
+            if cached is None:
+                raise ValueError("OIDC endpoint returned an unsolicited not-modified response")
+            document = cached.document
+            response_etag = cached.etag
+        else:
+            document = validator(raw_document)
+        stored_at = time.monotonic()
+        entry = _OidcDocumentCacheEntry(
+            document=_copy_oidc_document(document),
+            etag=response_etag,
+            fresh_until=stored_at + OIDC_DOCUMENT_CACHE_TTL_SECONDS,
+            stale_until=stored_at + OIDC_DOCUMENT_CACHE_TTL_SECONDS + OIDC_DOCUMENT_CACHE_STALE_SECONDS,
+        )
+        with _oidc_document_cache_lock:
+            _oidc_document_cache[cache_key] = entry
+            _oidc_document_cache.move_to_end(cache_key)
+            while len(_oidc_document_cache) > OIDC_DOCUMENT_CACHE_MAX_ENTRIES:
+                _oidc_document_cache.popitem(last=False)
+        return _copy_oidc_document(document)
+    except requests.RequestException as error:
+        if cached is not None and time.monotonic() < cached.stale_until:
+            flight_error = error
+            fallback_document = _copy_oidc_document(cached.document)
+            fallback_until = cached.stale_until
+            return _copy_oidc_document(cached.document)
+        flight_error = error
+        raise
+    except Exception as error:
+        flight_error = error
+        raise
+    finally:
+        with _oidc_document_cache_lock:
+            completed = _oidc_document_inflight.pop(cache_key, None)
+            if completed is not None:
+                completed.error = flight_error
+                completed.fallback_document = fallback_document
+                completed.fallback_until = fallback_until
+                completed.event.set()
+
+
 def _oidc_metadata(issuer, allowed_hosts):
     issuer = str(issuer or "").rstrip("/")
     if not _oidc_endpoint_allowed(issuer, allowed_hosts):
         raise ValueError("OIDC issuer is outside the configured host allowlist")
-    metadata = _fetch_oidc_json(
+
+    def validate(document):
+        metadata = validate_oidc_discovery(document)
+        metadata_issuer = str(metadata["issuer"]).rstrip("/")
+        if metadata_issuer != issuer:
+            raise ValueError("OIDC discovery issuer mismatch")
+        metadata["issuer"] = metadata_issuer
+        for key in ("authorization_endpoint", "token_endpoint", "jwks_uri"):
+            if not _oidc_endpoint_allowed(metadata[key], allowed_hosts):
+                raise ValueError(f"OIDC discovery contains an invalid {key}")
+        userinfo_endpoint = metadata.get("userinfo_endpoint")
+        if userinfo_endpoint and not _oidc_endpoint_allowed(userinfo_endpoint, allowed_hosts):
+            raise ValueError("OIDC discovery contains an invalid userinfo_endpoint")
+        return metadata
+
+    return _cached_oidc_document(
         f"{issuer}/.well-known/openid-configuration",
         allowed_hosts,
+        document_type="discovery-v1",
+        validator=validate,
     )
-    metadata_issuer = str(metadata.get("issuer") or "").rstrip("/")
-    if metadata_issuer != issuer:
-        raise ValueError("OIDC discovery issuer mismatch")
-    for key in ("authorization_endpoint", "token_endpoint", "jwks_uri"):
-        if not _oidc_endpoint_allowed(metadata.get(key), allowed_hosts):
-            raise ValueError(f"OIDC discovery contains an invalid {key}")
-    userinfo_endpoint = metadata.get("userinfo_endpoint")
-    if userinfo_endpoint and not _oidc_endpoint_allowed(
-        userinfo_endpoint,
-        allowed_hosts,
-    ):
-        raise ValueError("OIDC discovery contains an invalid userinfo_endpoint")
-    return metadata
+
+
+_oidc_metadata.cache_clear = _clear_oidc_document_cache
 
 
 def _oidc_client(provider, state=None):
@@ -599,20 +789,74 @@ def _oidc_client(provider, state=None):
     )
 
 
+def _oidc_jwks(metadata, provider, *, force_refresh=False):
+    return _cached_oidc_document(
+        metadata["jwks_uri"],
+        provider["allowed_hosts"],
+        document_type="jwks-v1",
+        validator=validate_oidc_jwks,
+        force_refresh=force_refresh,
+    )
+
+
+def _oidc_token_header(encoded):
+    parts = encoded.split(".")
+    if len(parts) != 3 or not parts[0] or len(parts[0]) > 8192:
+        raise ValueError("OIDC ID token has an invalid compact header")
+    encoded_header = parts[0]
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", encoded_header):
+        raise ValueError("OIDC ID token has an invalid compact header")
+    try:
+        raw_header = base64.b64decode(
+            encoded_header + ("=" * (-len(encoded_header) % 4)),
+            altchars=b"-_",
+            validate=True,
+        )
+        if base64.urlsafe_b64encode(raw_header).rstrip(b"=").decode("ascii") != encoded_header:
+            raise ValueError("non-canonical header")
+        header = load_json_text(raw_header.decode("utf-8"), max_bytes=16 * 1024)
+    except (UnicodeDecodeError, ValueError, InvalidJsonPayload) as error:
+        raise ValueError("OIDC ID token has an invalid compact header") from error
+    if not isinstance(header, dict):
+        raise ValueError("OIDC ID token header must be an object")
+    algorithm = header.get("alg")
+    kid = header.get("kid")
+    if (
+        not isinstance(algorithm, str)
+        or not algorithm
+        or not isinstance(kid, str)
+        or not 1 <= len(kid) <= 128
+        or not kid.isascii()
+        or any(ord(character) < 33 or ord(character) > 126 for character in kid)
+    ):
+        raise ValueError("OIDC ID token header must contain bounded alg and kid")
+    return algorithm, kid
+
+
+def _decode_oidc_id_token(encoded, jwks, algorithms):
+    algorithm, kid = _oidc_token_header(encoded)
+    if algorithm not in algorithms:
+        raise ValueError("OIDC ID token algorithm is not allowed")
+    if not any(
+        key.get("kid") == kid and (key.get("alg") is None or key.get("alg") == algorithm)
+        for key in jwks.get("keys", ())
+    ):
+        raise InvalidKeyIdError(f"No key for kid: '{kid}'")
+    key_set = KeySet.import_key_set(jwks)
+    return jwt.decode(encoded, key_set, algorithms=algorithms)
+
+
 def _validate_oidc_id_token(token, metadata, provider, nonce):
     encoded = token.get("id_token")
     if not isinstance(encoded, str) or not encoded or len(encoded) > 64 * 1024:
         raise ValueError("OIDC provider did not return an ID token")
-    jwks = _fetch_oidc_json(
-        metadata["jwks_uri"],
-        provider["allowed_hosts"],
-    )
-    key_set = KeySet.import_key_set(jwks)
-    configured_algorithms = metadata.get("id_token_signing_alg_values_supported") or ["RS256"]
-    algorithms = [value for value in configured_algorithms if value in OIDC_SAFE_ID_TOKEN_ALGORITHMS]
-    if not algorithms:
-        raise ValueError("OIDC provider has no supported ID token algorithm")
-    decoded = jwt.decode(encoded, key_set, algorithms=algorithms)
+    algorithms = validated_signing_algorithms(metadata.get("id_token_signing_alg_values_supported"))
+    jwks = validate_oidc_jwks(_oidc_jwks(metadata, provider))
+    try:
+        decoded = _decode_oidc_id_token(encoded, jwks, algorithms)
+    except InvalidKeyIdError:
+        refreshed_jwks = validate_oidc_jwks(_oidc_jwks(metadata, provider, force_refresh=True))
+        decoded = _decode_oidc_id_token(encoded, refreshed_jwks, algorithms)
     claims = decoded.claims
     issuer = str(metadata["issuer"]).rstrip("/")
     registry = JWTClaimsRegistry(
@@ -1581,7 +1825,7 @@ def sysinfo(request):
     device_uuid = postdata.get("uuid")
     if not _valid_device_identity(rid, device_uuid):
         _log_event(request, "api_sysinfo_missing_id", level="warning")
-        return HttpResponse("ID_NOT_FOUND", status=400)
+        return json_error("device_identity_invalid", "Invalid device identity", status=400)
     token, user = _get_device_token_user(request, rid, device_uuid)
     if not token or not user:
         _log_event(request, "api_sysinfo_unauthorized", level="warning", rid=rid)
@@ -1612,7 +1856,7 @@ def sysinfo(request):
         _log_event(request, "api_sysinfo_conflict", level="warning", username=user.username, rid=rid)
         return JsonResponse({"error": "Device identity conflict"}, status=409)
     _log_event(request, "api_sysinfo_updated", level="debug", username=user.username, rid=rid, uuid=device_uuid)
-    return HttpResponse("SYSINFO_UPDATED")
+    return JsonResponse({"updated": True, "sysinfo_schema_version": 1})
 
 
 def heartbeat(request):
@@ -1712,7 +1956,7 @@ def sysinfo_ver(request):
     if not user:
         return JsonResponse({"error": "Invalid token"}, status=401)
     _log_event(request, "api_sysinfo_ver", level="debug", username=user.username)
-    return HttpResponse("1")
+    return JsonResponse({"sysinfo_schema_version": 1})
 
 
 def health_live(request):
@@ -1754,7 +1998,7 @@ def health_ready(request):
 def login_options(request):
     _log_event(request, "api_login_options", level="debug")
     providers = getattr(settings, "OIDC_PROVIDERS", {})
-    return JsonResponse([f"oidc/{name}" for name in providers.keys()], safe=False)
+    return JsonResponse({"options": [f"oidc/{name}" for name in providers.keys()]})
 
 
 def oidc_auth(request):
@@ -1830,13 +2074,27 @@ def oidc_auth(request):
     return JsonResponse({"code": poll_code, "url": auth_url})
 
 
+def _oidc_poll_pending_response():
+    return json_pending(
+        "oidc_pending",
+        "OIDC authorization is still pending",
+        retry_after=1,
+    )
+
+
+def _oidc_poll_error_response(code, message, *, status):
+    return json_error(code, message, status=status, pending=False)
+
+
 def oidc_auth_query(request):
     data = _load_json_object(request, max_bytes=settings.JSON_AUTH_MAX_BODY_BYTES)
     poll_code = str(data.get("code", "")).strip()
     rid = data.get("id", "")
     device_uuid = data.get("uuid", "")
-    if not poll_code or len(poll_code) > 128 or not _valid_device_identity(rid, device_uuid):
-        return JsonResponse({"error": "No authed oidc is found"})
+    if not _valid_device_identity(rid, device_uuid):
+        return _oidc_poll_error_response("oidc_poll_invalid", "Invalid device identity", status=400)
+    if not poll_code or len(poll_code) > 128:
+        return _oidc_poll_error_response("oidc_poll_invalid", "Invalid OIDC poll code", status=400)
     with transaction.atomic():
         session = (
             OidcPendingAuth.objects.select_for_update(of=("self",))
@@ -1845,21 +2103,21 @@ def oidc_auth_query(request):
             .first()
         )
         if not session:
-            return JsonResponse({"error": "No authed oidc is found"})
+            return _oidc_poll_error_response("oidc_poll_invalid", "Invalid OIDC poll code", status=400)
         if not secrets.compare_digest(session.rid, rid) or not secrets.compare_digest(session.device_uuid, device_uuid):
-            return JsonResponse({"error": "OIDC authorization failed"}, status=403)
+            return _oidc_poll_error_response("oidc_authorization_failed", "OIDC authorization failed", status=403)
         if timezone.now() - session.created_at > datetime.timedelta(minutes=OIDC_PENDING_MINUTES):
             session.delete()
-            return JsonResponse({"error": "OIDC authorization timeout"}, status=408)
+            return _oidc_poll_error_response("oidc_authorization_timeout", "OIDC authorization timeout", status=408)
         if session.status == OidcPendingAuth.STATUS_ERROR:
             session.delete()
-            return JsonResponse({"error": "OIDC authorization failed"}, status=400)
+            return _oidc_poll_error_response("oidc_authorization_failed", "OIDC authorization failed", status=400)
         if session.status != OidcPendingAuth.STATUS_DONE or not session.authenticated_user:
-            return JsonResponse({"error": "No authed oidc is found"})
+            return _oidc_poll_pending_response()
         user = session.authenticated_user
         if not user.is_active:
             session.delete()
-            return JsonResponse({"error": "OIDC authorization failed"}, status=403)
+            return _oidc_poll_error_response("oidc_authorization_failed", "OIDC authorization failed", status=403)
         try:
             device = _claim_session_device(
                 user,
@@ -1873,10 +2131,10 @@ def oidc_auth_query(request):
             _token, raw_token = _issue_access_token(user, device)
         except DeviceIdentityConflict, IntegrityError:
             session.delete()
-            return JsonResponse({"error": "OIDC authorization failed"}, status=409)
+            return _oidc_poll_error_response("oidc_authorization_conflict", "OIDC authorization failed", status=409)
         except PermissionError, DeviceProofError:
             session.delete()
-            return JsonResponse({"error": "OIDC authorization failed"}, status=403)
+            return _oidc_poll_error_response("oidc_authorization_failed", "OIDC authorization failed", status=403)
         body = _auth_body(user, raw_token)
         session.delete()
     return JsonResponse(body)
@@ -2253,7 +2511,7 @@ def devices_cli(request):
         _log_event(request, "api_devices_cli_conflict", level="warning", username=user.username, rid=rid)
         return JsonResponse({"error": "Device identity conflict"}, status=409)
     _log_event(request, "api_devices_cli_updated", username=user.username, rid=rid)
-    return HttpResponse("")
+    return empty_success()
 
 
 def devices_proof_challenge(request):
@@ -2548,7 +2806,9 @@ def ab_shared_profiles(request):
     if not user:
         _log_event(request, "api_ab_shared_profiles_unauthorized", level="warning")
         return JsonResponse({"error": "Invalid token"}, status=401)
-    current, page_size, _start, _end = _pagination(request)
+    pagination, error_response = _pagination_or_error(request)
+    if error_response:
+        return error_response
     items = {}
 
     def add_profile(p, rule_value):
@@ -2593,18 +2853,22 @@ def ab_shared_profiles(request):
     data = list(items.values())
     data.sort(key=lambda x: x.get("name", ""))
     total = len(data)
-    start = (current - 1) * page_size
-    end = start + page_size
     _log_event(
         request,
         "api_ab_shared_profiles",
         level="debug",
         username=user.username,
         total=total,
-        page=current,
-        page_size=page_size,
+        page=pagination.current,
+        page_size=pagination.page_size,
     )
-    return JsonResponse({"total": total, "data": data[start:end]})
+    return JsonResponse(
+        {
+            "total": total,
+            **_pagination_response_fields(pagination),
+            "data": data[pagination.start : pagination.end],
+        }
+    )
 
 
 def ab_shared_credential(request):
@@ -2810,6 +3074,9 @@ def ab_rules(request):
             return HttpResponseRedirect("/api/ab_rules")
         _log_event(request, "api_ab_rules_unauthorized", level="warning")
         return JsonResponse({"error": "Invalid token"}, status=401)
+    pagination, error_response = _pagination_or_error(request)
+    if error_response:
+        return error_response
     guid = request.GET.get("ab", "") or request.GET.get("guid", "")
     if not guid:
         return JsonResponse({"error": "Invalid guid"}, status=400)
@@ -2821,7 +3088,6 @@ def ab_rules(request):
     if not user.is_admin and str(profile.owner_id) != str(user.id):
         _log_event(request, "api_ab_rules_denied", level="warning", username=user.username, guid=guid)
         return JsonResponse({"error": "No access"}, status=403)
-    current, page_size, _start, _end = _pagination(request)
     data = []
     shares = AddressBookShare.objects.filter(Q(profile=profile)).select_related("user")
     for share in shares:
@@ -2843,10 +3109,14 @@ def ab_rules(request):
             }
         )
     total = len(data)
-    start = (current - 1) * page_size
-    end = start + page_size
     _log_event(request, "api_ab_rules", level="debug", username=user.username, guid=guid, total=total)
-    return JsonResponse({"total": total, "data": data[start:end]})
+    return JsonResponse(
+        {
+            "total": total,
+            **_pagination_response_fields(pagination),
+            "data": data[pagination.start : pagination.end],
+        }
+    )
 
 
 def ab_rule(request):
@@ -3077,6 +3347,9 @@ def ab_peers(request):
     if not user:
         _log_event(request, "api_ab_peers_unauthorized", level="warning")
         return JsonResponse({"error": "Invalid token"}, status=401)
+    pagination, error_response = _pagination_or_error(request)
+    if error_response:
+        return error_response
     guid = request.GET.get("ab", "") or _personal_guid(user)
     profile, owner, _rule = _get_profile_access(user, guid)
     if guid == _personal_guid(user):
@@ -3085,7 +3358,6 @@ def ab_peers(request):
     if not owner:
         _log_event(request, "api_ab_peers_denied", level="warning", username=user.username, guid=guid)
         return JsonResponse({"error": "No access"}, status=403)
-    current, page_size, _start, _end = _pagination(request)
     qs = (
         RemotePeer.objects.filter(profile=profile)
         .prefetch_related(
@@ -3098,11 +3370,9 @@ def ab_peers(request):
         .order_by("rid")
     )
     total = qs.count()
-    start = (current - 1) * page_size
-    end = start + page_size
     data = []
     is_personal = guid == _personal_guid(owner)
-    for p in qs[start:end]:
+    for p in qs[pagination.start : pagination.end]:
         tags = [tag.tag_name for tag in p.ordered_tags]
         item = {
             "id": p.rid,
@@ -3130,10 +3400,16 @@ def ab_peers(request):
         username=user.username,
         guid=guid,
         total=total,
-        page=current,
-        page_size=page_size,
+        page=pagination.current,
+        page_size=pagination.page_size,
     )
-    return JsonResponse({"total": total, "data": data})
+    return JsonResponse(
+        {
+            "total": total,
+            **_pagination_response_fields(pagination),
+            "data": data,
+        }
+    )
 
 
 def ab_tags(request, guid):
@@ -3220,7 +3496,7 @@ def ab_peer_add(request, guid):
     except ValueError:
         return JsonResponse({"error": "Invalid peer"}, status=400)
     _log_event(request, "api_ab_peer_add", username=user.username, guid=guid, rid=rid)
-    return HttpResponse("")
+    return empty_success()
 
 
 def ab_peer_update(request, guid):
@@ -3281,7 +3557,7 @@ def ab_peer_update(request, guid):
     except ValueError:
         return JsonResponse({"error": "Invalid peer"}, status=400)
     _log_event(request, "api_ab_peer_update", username=user.username, guid=guid, rid=rid)
-    return HttpResponse("")
+    return empty_success()
 
 
 def ab_peer_delete(request, guid):
@@ -3326,7 +3602,7 @@ def ab_peer_delete(request, guid):
             return JsonResponse({"error": "Authorization changed"}, status=403)
         RemotePeer.objects.filter(profile=profile, rid__in=postdata).delete()
     _log_event(request, "api_ab_peer_delete", username=user.username, guid=guid, count=len(postdata))
-    return HttpResponse("")
+    return empty_success()
 
 
 def ab_tag_add(request, guid):
@@ -3379,7 +3655,7 @@ def ab_tag_add(request, guid):
             defaults={"tag_color": color},
         )
     _log_event(request, "api_ab_tag_add", username=user.username, guid=guid, tag=name)
-    return HttpResponse("")
+    return empty_success()
 
 
 def ab_tag_rename(request, guid):
@@ -3443,7 +3719,7 @@ def ab_tag_rename(request, guid):
             old_tag.tag_name = new
             old_tag.save(update_fields=["tag_name"])
     _log_event(request, "api_ab_tag_rename", username=user.username, guid=guid, old=old, new=new)
-    return HttpResponse("")
+    return empty_success()
 
 
 def ab_tag_update(request, guid):
@@ -3485,7 +3761,7 @@ def ab_tag_update(request, guid):
             tag_color=str(color),
         )
     _log_event(request, "api_ab_tag_update", username=user.username, guid=guid, tag=name)
-    return HttpResponse("")
+    return empty_success()
 
 
 def ab_tag_delete(request, guid):
@@ -3533,20 +3809,20 @@ def ab_tag_delete(request, guid):
             tag_name__in=postdata,
         ).delete()
     _log_event(request, "api_ab_tag_delete", username=user.username, guid=guid, count=len(postdata))
-    return HttpResponse("")
+    return empty_success()
 
 
 def _audit_device_context(request, postdata):
     rid = postdata.get("id")
     device_uuid = postdata.get("uuid")
     if not _valid_device_identity(rid, device_uuid):
-        return None, None, JsonResponse({"error": "Invalid device identity"}, status=400)
+        return None, None, json_error("audit_device_identity_invalid", "Invalid device identity", status=400)
     token, user = _get_device_token_user(request, rid, device_uuid)
     if not token or not user:
-        return None, None, JsonResponse({"error": "Invalid device token"}, status=401)
+        return None, None, json_error("audit_device_token_invalid", "Invalid device token", status=401)
     device = _get_active_token_device(token, user)
     if not device:
-        return None, None, JsonResponse({"error": "Device is not active"}, status=403)
+        return None, None, json_error("audit_device_not_active", "Device is not active", status=403)
     return token, user, None
 
 
@@ -3625,23 +3901,21 @@ def _audit_version_is_current(value):
 
 
 def _audit_upgrade_required(required_version=AUDIT_PROTOCOL_VERSION):
-    return JsonResponse(
-        {
-            "error": "Unsupported audit protocol version",
-            "required_version": required_version,
-        },
+    return json_error(
+        "audit_protocol_upgrade_required",
+        "Unsupported audit protocol version",
         status=426,
+        required_version=required_version,
     )
 
 
 def _audit_evidence_upgrade_required(protocol_version):
-    return JsonResponse(
-        {
-            "error": "Unsupported audit evidence receipt version",
-            "required_version": protocol_version,
-            "required_receipt_version": AUDIT_EVIDENCE_RECEIPT_VERSION,
-        },
+    return json_error(
+        "audit_evidence_upgrade_required",
+        "Unsupported audit evidence receipt version",
         status=426,
+        required_version=protocol_version,
+        required_receipt_version=AUDIT_EVIDENCE_RECEIPT_VERSION,
     )
 
 
@@ -3728,12 +4002,11 @@ def _matching_evidence_event(
 
 
 def _reporter_sequence_conflict(reporter_sequence):
-    return JsonResponse(
-        {
-            "error": "Audit reporter sequence is already bound",
-            "reporter_sequence": reporter_sequence,
-        },
+    return json_error(
+        "audit_reporter_sequence_conflict",
+        "Audit reporter sequence is already bound",
         status=409,
+        reporter_sequence=reporter_sequence,
     )
 
 
@@ -3748,6 +4021,7 @@ def _audit_success_payload(connection_log, event_id):
     if connection_log.state in ConnLog.OPEN_STATES and connection_log.lease_expires_at is not None:
         lease_remaining = max(0, math.ceil((connection_log.lease_expires_at - now).total_seconds()))
     return {
+        "response_schema_version": RESPONSE_SCHEMA_VERSION,
         "version": AUDIT_PROTOCOL_VERSION,
         "audit_session_id": str(connection_log.guid),
         "acknowledged_event_id": str(event_id),
@@ -3771,6 +4045,7 @@ def _file_audit_success(connection_log, transfer_event):
         return JsonResponse(acknowledgement)
     return JsonResponse(
         {
+            "response_schema_version": RESPONSE_SCHEMA_VERSION,
             "version": FILE_AUDIT_PROTOCOL_VERSION,
             "audit_session_id": str(connection_log.guid),
             "acknowledged_event_id": str(transfer_event.connection_event.event_id),
@@ -3783,16 +4058,15 @@ def _file_audit_success(connection_log, transfer_event):
 
 
 def _audit_terminal_conflict(connection_log):
-    return JsonResponse(
-        {
-            "error": "Connection is not active",
-            "version": AUDIT_PROTOCOL_VERSION,
-            "state": connection_log.state,
-            "state_revision": connection_log.state_revision,
-            "terminal_reason": connection_log.terminal_reason,
-            "terminal_source": connection_log.terminal_source,
-        },
+    return json_error(
+        "audit_connection_not_active",
+        "Connection is not active",
         status=409,
+        version=AUDIT_PROTOCOL_VERSION,
+        state=connection_log.state,
+        state_revision=connection_log.state_revision,
+        terminal_reason=connection_log.terminal_reason,
+        terminal_source=connection_log.terminal_source,
     )
 
 
@@ -3845,7 +4119,7 @@ def _locked_host_audit_session(token, user, audit_session_id, *, active=True, re
         .first()
     )
     if not authority:
-        return None, None, JsonResponse({"error": "Connection not found"}, status=404)
+        return None, None, json_error("audit_connection_not_found", "Connection not found", status=404)
     device_ids = {authority["host_device_id"]}
     if require_controller and authority["controller_device_id"] is not None:
         device_ids.add(authority["controller_device_id"])
@@ -3855,7 +4129,7 @@ def _locked_host_audit_session(token, user, audit_session_id, *, active=True, re
     }
     device = locked_devices.get(authority["host_device_id"])
     if not device or device.owner_id != user.id or not device.is_active:
-        return None, None, JsonResponse({"error": "Device is not active"}, status=403)
+        return None, None, json_error("audit_device_not_active", "Device is not active", status=403)
     connection_log = (
         ConnLog.objects.select_for_update()
         .filter(
@@ -3866,13 +4140,21 @@ def _locked_host_audit_session(token, user, audit_session_id, *, active=True, re
         .first()
     )
     if not connection_log:
-        return device, None, JsonResponse({"error": "Connection not found"}, status=404)
+        return device, None, json_error("audit_connection_not_found", "Connection not found", status=404)
     if not _audit_host_authority_is_current(connection_log, device):
-        return device, None, JsonResponse({"error": "Connection authority changed"}, status=403)
+        return (
+            device,
+            None,
+            json_error(
+                "audit_connection_authority_changed",
+                "Connection authority changed",
+                status=403,
+            ),
+        )
     if require_controller:
         controller_device = locked_devices.get(connection_log.controller_device_id)
         if not _audit_controller_authority_is_current(connection_log, controller_device):
-            return device, None, JsonResponse({"error": "Controller is not bound"}, status=403)
+            return device, None, json_error("audit_controller_not_bound", "Controller is not bound", status=403)
     if active:
         now = audit_lifecycle.database_now()
         audit_lifecycle.expire_locked_connection(connection_log, now, source="request_reconciler")
@@ -3953,14 +4235,14 @@ def _audit_event_conflict(request=None, *, kind="unknown"):
             level="warning",
             kind=kind,
         )
-    return JsonResponse({"error": "Audit event identity conflict"}, status=409)
+    return json_error("audit_event_identity_conflict", "Audit event identity conflict", status=409)
 
 
 def _audit_conn_active(request):
     token, user = _get_token_user(request)
     if not token or not user or not _get_active_token_device(token, user):
         _log_event(request, "api_audit_conn_active_unauthorized", level="warning")
-        return JsonResponse("", safe=False, status=401)
+        return json_error("audit_unauthorized", "Invalid audit credential", status=401)
     if not _audit_version_is_current(request.GET.get("version")):
         return _audit_upgrade_required()
     peer_id = _audit_rid(request.GET.get("id", ""))
@@ -3969,12 +4251,12 @@ def _audit_conn_active(request):
     event_id = _audit_uuid4(request.GET.get("event_id"))
     if peer_id is None or session_id is None or conn_type is None or event_id is None:
         _log_event(request, "api_audit_conn_active_failed", level="warning", reason="missing_id")
-        return JsonResponse("", safe=False, status=400)
+        return json_error("audit_request_invalid", "Invalid audit binding request", status=400)
     try:
         with transaction.atomic():
             controller_rid = RemoteDevice.objects.filter(pk=token.device_id).values_list("rid", flat=True).first()
             if controller_rid is None:
-                return JsonResponse("", safe=False, status=403)
+                return json_error("audit_binding_forbidden", "Audit binding is not allowed", status=403)
             candidate = (
                 ConnLog.objects.filter(
                     audit_version=AUDIT_PROTOCOL_VERSION,
@@ -3988,9 +4270,13 @@ def _audit_conn_active(request):
             )
             if candidate is None:
                 # The host publishes the authenticated controller identity after
-                # opening the audit session. Empty 200 keeps the bounded client
-                # retry alive without exposing another session capability.
-                return JsonResponse("", safe=False)
+                # opening the audit session. The explicit pending state keeps the
+                # bounded client retry alive without exposing another capability.
+                return json_pending(
+                    "audit_binding_pending",
+                    "Audit binding is pending",
+                    retry_after=1,
+                )
             locked_devices = {
                 device.id: device
                 for device in RemoteDevice.objects.select_for_update()
@@ -4011,22 +4297,30 @@ def _audit_conn_active(request):
                 .first()
             )
             if not connection_log or not host_device or not controller_device:
-                return JsonResponse("", safe=False, status=403)
+                return json_error("audit_binding_forbidden", "Audit binding is not allowed", status=403)
             if not _audit_host_authority_is_current(connection_log, host_device):
-                return JsonResponse("", safe=False, status=403)
+                return json_error("audit_binding_forbidden", "Audit binding is not allowed", status=403)
             if controller_device.owner_id != user.id or not controller_device.is_active:
-                return JsonResponse("", safe=False, status=403)
+                return json_error("audit_binding_forbidden", "Audit binding is not allowed", status=403)
             if connection_log.conn_type is None:
-                return JsonResponse("", safe=False)
+                return json_pending(
+                    "audit_connection_pending",
+                    "Audit connection type is pending",
+                    retry_after=1,
+                )
             if connection_log.conn_type != conn_type:
-                return JsonResponse("", safe=False, status=409)
+                return json_error("audit_connection_conflict", "Audit connection type conflict", status=409)
             if connection_log.actor_id and connection_log.actor_id != user.id:
-                return JsonResponse("", safe=False, status=403)
+                return json_error("audit_binding_forbidden", "Audit binding is not allowed", status=403)
             now = audit_lifecycle.database_now()
             audit_lifecycle.expire_locked_connection(connection_log, now, source="controller_query")
             if connection_log.state != ConnLog.STATE_ACTIVE:
                 if connection_log.state == ConnLog.STATE_STARTING:
-                    return JsonResponse("", safe=False)
+                    return json_pending(
+                        "audit_connection_pending",
+                        "Audit connection is starting",
+                        retry_after=1,
+                    )
                 return _audit_terminal_conflict(connection_log)
             details = {
                 "controller_device_id": controller_device.rid,
@@ -4050,7 +4344,7 @@ def _audit_conn_active(request):
                 return _audit_success(connection_log, event_id)
             if connection_log.actor_id is None:
                 if connection_log.controller_device_id is not None:
-                    return JsonResponse("", safe=False, status=409)
+                    return json_error("audit_binding_conflict", "Audit binding conflict", status=409)
                 _append_audit_event(
                     connection_log,
                     event_id,
@@ -4077,7 +4371,7 @@ def _audit_conn_active(request):
                 )
             else:
                 if not _audit_controller_authority_is_current(connection_log, controller_device):
-                    return JsonResponse("", safe=False, status=403)
+                    return json_error("audit_binding_forbidden", "Audit binding is not allowed", status=403)
     except IntegrityError:
         return _audit_event_conflict()
     _log_event(
@@ -4123,7 +4417,7 @@ def _audit_controller_note_by_capability(request, postdata):
                 .first()
             )
             if not authority or authority["controller_device_id"] != token.device_id:
-                return JsonResponse({"error": "Connection audit not found"}, status=404)
+                return json_error("audit_connection_not_found", "Connection not found", status=404)
             locked_devices = {
                 device.id: device
                 for device in RemoteDevice.objects.select_for_update()
@@ -4143,13 +4437,17 @@ def _audit_controller_note_by_capability(request, postdata):
                 .first()
             )
             if not connection_log:
-                return JsonResponse({"error": "Connection audit not found"}, status=404)
+                return json_error("audit_connection_not_found", "Connection not found", status=404)
             if not host_device or not controller_device:
-                return JsonResponse({"error": "Connection authority changed"}, status=403)
+                return json_error(
+                    "audit_connection_authority_changed",
+                    "Connection authority changed",
+                    status=403,
+                )
             if not _audit_host_authority_is_current(connection_log, host_device):
                 return JsonResponse({"error": "Connection authority changed"}, status=403)
             if not _audit_controller_authority_is_current(connection_log, controller_device):
-                return JsonResponse({"error": "Controller authority changed"}, status=403)
+                return json_error("audit_controller_authority_changed", "Controller authority changed", status=403)
             existing = _existing_audit_event(event_id)
             if existing:
                 if (
@@ -4213,7 +4511,7 @@ def _audit_conn(request):
             with transaction.atomic():
                 device = _locked_audit_device(token, user)
                 if not device:
-                    return JsonResponse({"error": "Device is not active"}, status=403)
+                    return json_error("audit_device_not_active", "Device is not active", status=403)
                 observed_at = audit_lifecycle.database_now()
                 connection_log = (
                     ConnLog.objects.select_for_update()
@@ -4236,7 +4534,11 @@ def _audit_conn(request):
                         or connection_log.reporter_id != user.id
                         or not _audit_host_authority_is_current(connection_log, device)
                     ):
-                        return JsonResponse({"error": "Connection session conflict"}, status=409)
+                        return json_error(
+                            "audit_connection_session_conflict",
+                            "Connection session conflict",
+                            status=409,
+                        )
                 else:
                     ingestion_governance.reserve_audit_connection(user.id, device.id)
                     connection_log = ConnLog.objects.create(
@@ -4289,7 +4591,7 @@ def _audit_conn(request):
                     )
                     created = True
         except IntegrityError:
-            return JsonResponse({"error": "Connection session conflict"}, status=409)
+            return json_error("audit_connection_session_conflict", "Connection session conflict", status=409)
         _log_event(
             request,
             "api_audit_conn_new",
@@ -4315,12 +4617,16 @@ def _audit_conn(request):
             if authority_error:
                 return authority_error
             if connection_log.conn_id != conn_id or connection_log.session_id != session_id:
-                return JsonResponse({"error": "Connection not found"}, status=404)
+                return json_error("audit_connection_not_found", "Connection not found", status=404)
             if heartbeat_revision < connection_log.heartbeat_revision:
                 return JsonResponse({"error": "Stale audit heartbeat"}, status=409)
             if heartbeat_revision == connection_log.heartbeat_revision:
                 if connection_log.last_heartbeat_id != event_id:
-                    return JsonResponse({"error": "Audit heartbeat identity conflict"}, status=409)
+                    return json_error(
+                        "audit_heartbeat_identity_conflict",
+                        "Audit heartbeat identity conflict",
+                        status=409,
+                    )
                 return _audit_success(connection_log, event_id)
             observed_at = audit_lifecycle.database_now()
             connection_log.heartbeat_revision = heartbeat_revision
@@ -4359,7 +4665,7 @@ def _audit_conn(request):
                 if authority_error:
                     return authority_error
                 if connection_log.conn_id != conn_id or connection_log.session_id != session_id:
-                    return JsonResponse({"error": "Connection not found"}, status=404)
+                    return json_error("audit_connection_not_found", "Connection not found", status=404)
                 existing = _existing_audit_event(event_id)
                 if existing:
                     if (
@@ -4483,7 +4789,7 @@ def _audit_conn(request):
                 if authority_error:
                     return authority_error
                 if connection_log.conn_id != conn_id or connection_log.session_id != session_id:
-                    return JsonResponse({"error": "Connection not found"}, status=404)
+                    return json_error("audit_connection_not_found", "Connection not found", status=404)
                 existing = _existing_audit_event(event_id)
                 if existing:
                     if not _matching_audit_event(
@@ -4504,7 +4810,7 @@ def _audit_conn(request):
                         setattr(connection_log, field, value)
                         update_fields.append(field)
                     elif previous != value:
-                        return JsonResponse({"error": "Connection fact is immutable"}, status=409)
+                        return json_error("audit_connection_fact_immutable", "Connection fact is immutable", status=409)
                 if (
                     connection_log.state == ConnLog.STATE_STARTING
                     and connection_log.from_id
@@ -4645,7 +4951,7 @@ def _audit_file(request):
             if authority_error:
                 return authority_error
             if connection_log.conn_id != conn_id:
-                return JsonResponse({"error": "Connection not found"}, status=404)
+                return json_error("audit_connection_not_found", "Connection not found", status=404)
             if not connection_log.from_id or connection_log.from_id != remote_id:
                 return JsonResponse({"error": "Invalid file audit participant"}, status=403)
             try:
@@ -4803,6 +5109,7 @@ def _audit_file(request):
                 created_at=observed_at,
             )
             acknowledgement = {
+                "response_schema_version": RESPONSE_SCHEMA_VERSION,
                 "version": FILE_AUDIT_PROTOCOL_VERSION,
                 "receipt_version": AUDIT_EVIDENCE_RECEIPT_VERSION,
                 "audit_session_id": str(connection_log.guid),
@@ -4881,7 +5188,7 @@ def _audit_alarm(request):
             if authority_error:
                 return authority_error
             if connection_log.conn_id != conn_id:
-                return JsonResponse({"error": "Connection not found"}, status=404)
+                return json_error("audit_connection_not_found", "Connection not found", status=404)
             if audit_ref and audit_ref != connection_log.audit_ref:
                 return JsonResponse({"error": "Invalid audit reference"}, status=409)
             try:
@@ -4967,26 +5274,104 @@ def audit(request):
     return _audit_conn(request)
 
 
-def _pagination(request, default=100):
-    try:
-        current = max(1, int(request.GET.get("current", 1)))
-        page_size = max(1, min(500, int(request.GET.get("pageSize", default))))
-    except TypeError, ValueError:
-        current = 1
-        page_size = default
+def _strict_pagination_integer(request, field, *, default, maximum):
+    values = request.GET.getlist(field)
+    if not values:
+        return default
+    value = values[0]
+    if (
+        len(values) != 1
+        or not isinstance(value, str)
+        or len(value) > len(str(maximum))
+        or not re.fullmatch(r"[1-9][0-9]*", value, flags=re.ASCII)
+    ):
+        raise _InvalidPagination(field)
+    parsed = int(value)
+    if parsed > maximum:
+        raise _InvalidPagination(field)
+    return parsed
+
+
+def _pagination(request, default=100, *, enforce_offset_budget=True):
+    if not isinstance(default, int) or isinstance(default, bool) or not 1 <= default <= MAX_API_PAGE_SIZE:
+        raise ValueError("default page size is outside the pagination contract")
+    current = _strict_pagination_integer(
+        request,
+        "current",
+        default=1,
+        maximum=MAX_API_PAGE_OFFSET + 1,
+    )
+    page_size = _strict_pagination_integer(
+        request,
+        "pageSize",
+        default=default,
+        maximum=MAX_API_PAGE_SIZE,
+    )
     start = (current - 1) * page_size
-    return current, page_size, start, start + page_size
+    if enforce_offset_budget and start > MAX_API_PAGE_OFFSET:
+        raise _InvalidPagination("current")
+    return _Pagination(
+        current=current,
+        page_size=page_size,
+        start=start,
+        end=start + page_size,
+    )
 
 
-def _paged_response(request, qs, serializer, default_page_size=100):
-    current, page_size, start, end = _pagination(request, default_page_size)
-    total = qs.count() if isinstance(qs, QuerySet) else len(qs)
-    rows = qs[start:end]
+def _pagination_error_response(request, error):
+    _log_event(
+        request,
+        "api_pagination_rejected",
+        level="warning",
+        field=error.field,
+        reason="invalid_pagination",
+    )
+    return JsonResponse(
+        {
+            "error": "Invalid pagination",
+            "code": "invalid_pagination",
+            "pagination_contract_version": PAGINATION_CONTRACT_VERSION,
+            "field": error.field,
+            "limits": {
+                "max_page_size": MAX_API_PAGE_SIZE,
+                "max_offset": MAX_API_PAGE_OFFSET,
+            },
+        },
+        status=400,
+    )
+
+
+def _pagination_or_error(request, default=100, *, enforce_offset_budget=True):
+    try:
+        return _pagination(
+            request,
+            default,
+            enforce_offset_budget=enforce_offset_budget,
+        ), None
+    except _InvalidPagination as error:
+        return None, _pagination_error_response(request, error)
+
+
+def _pagination_response_fields(pagination):
+    return {
+        "pagination_contract_version": PAGINATION_CONTRACT_VERSION,
+        "current": pagination.current,
+        "pageSize": pagination.page_size,
+    }
+
+
+def _paged_response(request, qs, serializer, default_page_size=100, *, pagination=None, total=None):
+    if pagination is None:
+        pagination, error_response = _pagination_or_error(request, default_page_size)
+        if error_response:
+            return error_response
+    if total is None:
+        total = qs.count() if isinstance(qs, QuerySet) else len(qs)
+    rows = qs[pagination.start : pagination.end]
     return JsonResponse(
         {
             "total": total,
-            "current": current,
-            "pageSize": page_size,
+            **_pagination_response_fields(pagination),
             "data": [serializer(item) for item in rows],
         }
     )
@@ -5236,6 +5621,9 @@ def users(request):
     if not user:
         _log_event(request, "api_users_unauthorized", level="warning")
         return JsonResponse({"error": "Invalid token"}, status=401)
+    pagination, error_response = _pagination_or_error(request)
+    if error_response:
+        return error_response
     qs = UserProfile.objects.select_related("strategy").prefetch_related("groups").order_by("id")
     if not user.is_admin:
         qs = qs.filter(Q(id=user.id))
@@ -5246,8 +5634,10 @@ def users(request):
         qs = qs.filter(Q(is_active=True))
     elif status == "0":
         qs = qs.filter(Q(is_active=False))
-    _log_event(request, "api_users", level="debug", username=user.username, total=qs.count())
-    return _paged_response(request, qs.distinct(), _serialize_user)
+    qs = qs.distinct()
+    total = qs.count()
+    _log_event(request, "api_users", level="debug", username=user.username, total=total)
+    return _paged_response(request, qs, _serialize_user, pagination=pagination, total=total)
 
 
 def user_status(request, guid, action):
@@ -5493,6 +5883,9 @@ def devices(request):
     if not user:
         _log_event(request, "api_devices_unauthorized", level="warning")
         return JsonResponse({"error": "Invalid token"}, status=401)
+    pagination, error_response = _pagination_or_error(request)
+    if error_response:
+        return error_response
     qs = (
         RemoteDevice.objects.select_related(
             "owner__strategy",
@@ -5519,7 +5912,7 @@ def devices(request):
     if group_name:
         lookup = "owner__groups__name__icontains" if "%" in group_name else "owner__groups__name"
         qs = qs.filter(**{lookup: group_name.replace("%", "")}).distinct()
-    return _paged_response(request, qs, _serialize_device)
+    return _paged_response(request, qs, _serialize_device, pagination=pagination)
 
 
 def device_status(request, guid, action):
@@ -5872,35 +6265,55 @@ def peers(request):
     status_filter = request.GET.get("status", "")
     if status_filter not in ("0", "1"):
         status_filter = ""
-    current, page_size, start, _end = _pagination(request)
-    inventory = DeviceInventory(user)
     cursor_value = str(request.GET.get("cursor", "") or "").strip()
+    pagination, error_response = _pagination_or_error(
+        request,
+        enforce_offset_budget=not bool(cursor_value),
+    )
+    if error_response:
+        return error_response
+    inventory = DeviceInventory(user)
     rid_after = ""
     if cursor_value:
         try:
             rid_after = load_inventory_cursor(cursor_value, user, status_filter)
         except InvalidInventoryCursor:
             return JsonResponse({"error": "Invalid inventory cursor"}, status=400)
-        start = 0
+        offset = 0
+    else:
+        offset = pagination.start
 
     total = inventory.count(status_filter=status_filter)
     rows = inventory.rows(
-        offset=start,
-        limit=page_size + 1 if cursor_value else page_size,
+        offset=offset,
+        limit=pagination.page_size + 1 if cursor_value else pagination.page_size,
         status_filter=status_filter,
         rid_after=rid_after,
     )
     next_cursor = ""
-    has_more = len(rows) > page_size if cursor_value else bool(rows) and start + len(rows) < total
+    has_more = len(rows) > pagination.page_size if cursor_value else bool(rows) and pagination.start + len(rows) < total
     if cursor_value and has_more:
-        rows = rows[:page_size]
+        rows = rows[: pagination.page_size]
     if has_more:
         next_cursor = dump_inventory_cursor(rows[-1], user, status_filter)
     data = [row.as_api_dict() for row in rows]
     _log_event(
-        request, "api_peers", level="debug", username=user.username, total=total, page=current, page_size=page_size
+        request,
+        "api_peers",
+        level="debug",
+        username=user.username,
+        total=total,
+        page=pagination.current,
+        page_size=pagination.page_size,
     )
-    return JsonResponse({"total": total, "data": data, "nextCursor": next_cursor})
+    return JsonResponse(
+        {
+            "total": total,
+            **_pagination_response_fields(pagination),
+            "data": data,
+            "nextCursor": next_cursor,
+        }
+    )
 
 
 def device_group_accessible(request):
@@ -5987,9 +6400,12 @@ def device_groups(request):
     admin_user, error = _require_admin(request, "api_device_groups")
     if error:
         return error
+    pagination, error_response = _pagination_or_error(request)
+    if error_response:
+        return error_response
     qs = DeviceGroup.objects.select_related("strategy").order_by("name")
     qs = _filter_text(qs, "name", request.GET.get("name"))
-    return _paged_response(request, qs, _serialize_device_group)
+    return _paged_response(request, qs, _serialize_device_group, pagination=pagination)
 
 
 def device_group_detail(request, guid):

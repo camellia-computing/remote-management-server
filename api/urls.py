@@ -3,21 +3,47 @@ from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.http import require_http_methods
 
 from api import views_api, views_front
+from api.response_contract import (
+    RESPONSE_MODE_BROWSER,
+    RESPONSE_MODE_BROWSER_JSON_POST,
+    RESPONSE_MODE_JSON,
+    RESPONSE_MODE_MARKER,
+)
 from api.response_security import credential_response, sensitive_response
 
 
 def stateless_api(view, *methods):
     """Declare the method contract for APIs that never authenticate by cookie."""
-    return csrf_exempt(require_http_methods(methods)(view))
+    wrapped = csrf_exempt(require_http_methods(methods)(view))
+    setattr(wrapped, RESPONSE_MODE_MARKER, RESPONSE_MODE_JSON)
+    return wrapped
 
 
 def browser_view(view, *methods):
     """Declare the method contract while retaining session and CSRF protection."""
-    return sensitive_response(require_http_methods(methods)(view))
+    wrapped = sensitive_response(require_http_methods(methods)(view))
+    setattr(wrapped, RESPONSE_MODE_MARKER, RESPONSE_MODE_BROWSER)
+    return wrapped
+
+
+def browser_json_post_view(view, *methods):
+    """Use browser HTML for GET and the machine contract for POST."""
+
+    wrapped = sensitive_response(require_http_methods(methods)(view))
+    setattr(wrapped, RESPONSE_MODE_MARKER, RESPONSE_MODE_BROWSER_JSON_POST)
+    return wrapped
 
 
 def credential_stateless_api(view, *methods):
     return credential_response(stateless_api(view, *methods))
+
+
+def credential_stateless_browser(view, *methods):
+    """Declare a CSRF-free browser handoff such as the OIDC callback."""
+
+    wrapped = credential_response(csrf_exempt(require_http_methods(methods)(view)))
+    setattr(wrapped, RESPONSE_MODE_MARKER, RESPONSE_MODE_BROWSER)
+    return wrapped
 
 
 def credential_browser_view(view, *methods):
@@ -28,7 +54,7 @@ urlpatterns = [
     url(r"^login-options$", stateless_api(views_api.login_options, "GET")),
     url(r"^oidc/auth$", credential_stateless_api(views_api.oidc_auth, "POST")),
     url(r"^oidc/auth-query$", credential_stateless_api(views_api.oidc_auth_query, "POST")),
-    url(r"^oidc/callback$", credential_stateless_api(views_api.oidc_callback, "GET")),
+    url(r"^oidc/callback$", credential_stateless_browser(views_api.oidc_callback, "GET")),
     url(r"^login$", credential_stateless_api(views_api.login, "POST")),
     url(r"^logout$", credential_stateless_api(views_api.logout, "POST")),
     url(r"^currentUser$", credential_stateless_api(views_api.currentUser, "POST")),
@@ -107,7 +133,7 @@ urlpatterns = [
         stateless_api(views_api.strategy_detail, "GET", "PATCH", "DELETE"),
     ),
     url(r"^peers$", stateless_api(views_api.peers, "GET")),
-    url(r"^user_action$", browser_view(views_front.user_action, "GET", "POST")),
+    url(r"^user_action$", browser_json_post_view(views_front.user_action, "GET", "POST")),
     url(r"^home$", browser_view(views_front.home, "GET")),
     url(r"^work$", browser_view(views_front.work, "GET")),
     url(r"^ab_dashboard$", browser_view(views_front.ab_dashboard, "GET")),

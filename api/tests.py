@@ -1910,15 +1910,23 @@ class SessionIntegrityTests(ApiTestMixin, TestCase):
         )
         self.assertEqual(locked.status_code, 429)
 
-    def test_out_of_range_pagination_is_clamped(self):
+    def test_nonpositive_pagination_is_rejected(self):
         token = self._login("alice", "alice-pass")
-        for query in ("current=0", "current=-5", "pageSize=-1", "current=0&pageSize=0"):
+        cases = (
+            ("current=0", "current"),
+            ("current=-5", "current"),
+            ("pageSize=-1", "pageSize"),
+            ("current=0&pageSize=0", "current"),
+        )
+        for query, field in cases:
             response = self._post_json(
                 f"/api/ab/peers?{query}",
                 {},
                 token=token,
             )
-            self.assertEqual(response.status_code, 200, f"{query}: {response.content}")
+            self.assertEqual(response.status_code, 400, f"{query}: {response.content}")
+            self.assertEqual(response.json()["code"], "invalid_pagination")
+            self.assertEqual(response.json()["field"], field)
 
 
 class SensitiveIngestionTests(ApiTestMixin, TestCase):

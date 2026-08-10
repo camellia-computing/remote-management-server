@@ -71,7 +71,13 @@ class StrictJsonEnvelopeHttpTests(TestCase):
     def assert_json_error(self, response, status):
         self.assertEqual(response.status_code, status, response.content[:1000])
         self.assertEqual(response.headers["Content-Type"], "application/json")
-        self.assertIn("error", json.loads(response.content))
+        body = json.loads(response.content)
+        self.assertEqual(body["response_schema_version"], 1)
+        self.assertRegex(body["code"], r"^[a-z][a-z0-9_]{0,63}$")
+        self.assertIsInstance(body["message"], str)
+        self.assertIsInstance(body["retryable"], bool)
+        self.assertNotIn("error", body)
+        self.assertNotIn("msg", body)
         self.assertNotIn(b"Traceback", response.content)
         self.assertLessEqual(len(response.content), 256)
 
@@ -122,6 +128,7 @@ class StrictJsonEnvelopeHttpTests(TestCase):
         )
 
         self.assertEqual(response.status_code, 200, response.content[:1000])
+        self.assertEqual(response.json()["response_schema_version"], 1)
         self.strategy.refresh_from_db()
         self.assertIs(self.strategy.enabled, True)
 
@@ -240,7 +247,8 @@ class StrictJsonEnvelopeHttpTests(TestCase):
             **self.auth,
         )
 
-        self.assertEqual(response.status_code, 200, response.content[:1000])
+        self.assertEqual(response.status_code, 204, response.content[:1000])
+        self.assertEqual(response.content, b"")
 
     def test_alarm_embedded_json_uses_the_same_duplicate_and_depth_rules(self):
         raw_values = (

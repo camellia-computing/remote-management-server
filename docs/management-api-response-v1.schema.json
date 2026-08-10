@@ -1,0 +1,124 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/camellia-computing/remote-management-server/blob/main/docs/management-api-response-v1.schema.json",
+  "title": "Camellia Remote Management API response contract v1",
+  "description": "JSON body definitions. Every /api/* and health response also carries X-Camellia-Response-Schema: 1 and X-Camellia-Response-Kind. HTTP 204 has no body; redirects, browser HTML, streams and downloads are versioned only by those headers.",
+  "anyOf": [
+    { "$ref": "#/$defs/error" },
+    { "$ref": "#/$defs/pending" },
+    { "$ref": "#/$defs/versionedObject" },
+    { "$ref": "#/$defs/versionedList" }
+  ],
+  "$defs": {
+    "machineCode": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_]{0,63}$"
+    },
+    "error": {
+      "type": "object",
+      "required": ["response_schema_version", "code", "message", "retryable"],
+      "properties": {
+        "response_schema_version": { "const": 1 },
+        "code": { "$ref": "#/$defs/machineCode" },
+        "message": { "type": "string", "minLength": 1, "maxLength": 256 },
+        "retryable": { "type": "boolean" }
+      },
+      "not": {
+        "anyOf": [
+          { "required": ["error"] },
+          { "required": ["msg"] }
+        ]
+      },
+      "additionalProperties": true
+    },
+    "pending": {
+      "type": "object",
+      "required": ["response_schema_version", "code", "message", "retryable", "pending"],
+      "properties": {
+        "response_schema_version": { "const": 1 },
+        "code": { "$ref": "#/$defs/machineCode" },
+        "message": { "type": "string", "minLength": 1, "maxLength": 256 },
+        "retryable": { "const": true },
+        "pending": { "const": true }
+      },
+      "additionalProperties": true
+    },
+    "versionedObject": {
+      "type": "object",
+      "required": ["response_schema_version"],
+      "properties": {
+        "response_schema_version": { "const": 1 }
+      },
+      "additionalProperties": true
+    },
+    "versionedList": {
+      "type": "array",
+      "description": "Endpoint-specific list payload; schema version is carried by the required response header."
+    },
+    "loginOptions": {
+      "allOf": [
+        { "$ref": "#/$defs/versionedObject" },
+        {
+          "type": "object",
+          "required": ["options"],
+          "properties": {
+            "options": {
+              "type": "array",
+              "maxItems": 32,
+              "items": { "type": "string", "pattern": "^oidc/[A-Za-z0-9._-]{1,64}$" },
+              "uniqueItems": true
+            }
+          }
+        }
+      ]
+    },
+    "sysinfoVersion": {
+      "allOf": [
+        { "$ref": "#/$defs/versionedObject" },
+        {
+          "type": "object",
+          "required": ["sysinfo_schema_version"],
+          "properties": { "sysinfo_schema_version": { "const": 1 } }
+        }
+      ]
+    },
+    "sysinfoUpdated": {
+      "allOf": [
+        { "$ref": "#/$defs/sysinfoVersion" },
+        {
+          "type": "object",
+          "required": ["updated"],
+          "properties": { "updated": { "const": true } }
+        }
+      ]
+    },
+    "auditActive": {
+      "allOf": [
+        { "$ref": "#/$defs/versionedObject" },
+        {
+          "type": "object",
+          "required": [
+            "version",
+            "audit_session_id",
+            "acknowledged_event_id",
+            "event_revision",
+            "state",
+            "state_revision",
+            "heartbeat_revision",
+            "lease_remaining_seconds"
+          ],
+          "properties": {
+            "version": { "const": 3 },
+            "audit_session_id": { "type": "string", "format": "uuid" },
+            "acknowledged_event_id": { "type": "string", "format": "uuid" },
+            "event_revision": { "type": "integer", "minimum": 1 },
+            "state": { "const": "active" },
+            "state_revision": { "type": "integer", "minimum": 1 },
+            "heartbeat_revision": { "type": "integer", "minimum": 0 },
+            "lease_remaining_seconds": { "type": "integer", "minimum": 1 }
+          }
+        }
+      ]
+    }
+  }
+}
