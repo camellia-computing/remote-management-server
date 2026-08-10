@@ -242,7 +242,8 @@ class UsernameIdentityTests(TestCase):
         ) as identity_check:
             response = self.client.get("/health/ready")
         self.assertEqual(response.status_code, 503)
-        self.assertEqual(response.json(), {"status": "not_ready"})
+        self.assertEqual(response.json()["status"], "not_ready")
+        self.assertEqual(response.json()["code"], "http_503_health_ready")
         identity_check.assert_called_once_with(full=False)
 
     def test_fast_identity_check_validates_the_database_authority(self):

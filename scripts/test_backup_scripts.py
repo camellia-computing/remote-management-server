@@ -138,6 +138,15 @@ class BackupScriptsTests(unittest.TestCase):
                         raise SystemExit(45)
                     print("username identity contract is valid")
                     raise SystemExit(0)
+                if "check_release_schema" in args:
+                    if mode == "release-schema-fail":
+                        raise SystemExit(46)
+                    print("release schema contract is valid")
+                    raise SystemExit(0)
+                if args and args[-1] == "migrate":
+                    if mode == "migration-fail":
+                        raise SystemExit(47)
+                    raise SystemExit(0)
                 if "database-bootstrap" in args:
                     raise SystemExit(0)
                 if "database-probe" in args:
@@ -316,6 +325,18 @@ class BackupScriptsTests(unittest.TestCase):
         self.assertNotEqual(failed_restore.returncode, 0)
         self.assertTrue(self.restore_capture.exists())
         self.assertFalse(self.recording_restore_capture.exists())
+
+    def test_restore_rejects_migration_or_release_schema_failure_before_recordings(self):
+        self.assertEqual(self.run_backup().returncode, 0)
+        artifact = next(self.backups.glob("postgres-*.dump.age"))
+        for mode in ("migration-fail", "release-schema-fail"):
+            with self.subTest(mode=mode):
+                self.restore_capture.unlink(missing_ok=True)
+                self.recording_restore_capture.unlink(missing_ok=True)
+                failed = self.run_restore(artifact, FAKE_DOCKER_MODE=mode)
+                self.assertNotEqual(failed.returncode, 0)
+                self.assertTrue(self.restore_capture.exists())
+                self.assertFalse(self.recording_restore_capture.exists())
 
     def test_retention_removes_only_complete_expired_backup_pairs(self):
         self.backups.mkdir()

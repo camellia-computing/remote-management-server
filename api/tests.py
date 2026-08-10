@@ -2281,7 +2281,8 @@ class OperationalEndpointTests(TestCase):
                 response = self.client.get("/health/ready")
 
         self.assertEqual(response.status_code, 503)
-        self.assertEqual(response.json(), {"status": "not_ready"})
+        self.assertEqual(response.json()["status"], "not_ready")
+        self.assertEqual(response.json()["code"], "http_503_health_ready")
 
     @override_settings(
         DEVICE_VERIFICATION_TOKEN="v" * 48,
@@ -2308,7 +2309,8 @@ class OperationalEndpointTests(TestCase):
             response = self.client.get("/health/ready")
 
         self.assertEqual(response.status_code, 503)
-        self.assertEqual(response.json(), {"status": "not_ready"})
+        self.assertEqual(response.json()["status"], "not_ready")
+        self.assertEqual(response.json()["code"], "http_503_health_ready")
 
     @override_settings(
         DEVICE_VERIFICATION_TOKEN="v" * 48,
@@ -2325,7 +2327,8 @@ class OperationalEndpointTests(TestCase):
             HTTP_X_FORWARDED_PROTO="https",
         )
         self.assertEqual(secure.status_code, 200)
-        self.assertEqual(secure.json(), {"status": "ready"})
+        self.assertEqual(secure.json()["status"], "ready")
+        self.assertEqual(secure.json()["response_schema_version"], 1)
 
     @override_settings(
         DEVICE_VERIFICATION_TOKEN="",
@@ -2335,14 +2338,15 @@ class OperationalEndpointTests(TestCase):
         response = self.client.get("/health/ready")
 
         self.assertEqual(response.status_code, 503)
-        self.assertEqual(response.json(), {"status": "not_ready"})
+        self.assertEqual(response.json()["status"], "not_ready")
+        self.assertEqual(response.json()["code"], "http_503_health_ready")
 
     @override_settings(SECURE_SSL_REDIRECT=False)
     def test_liveness_does_not_depend_on_database_readiness(self):
         response = self.client.get("/health/live")
 
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.json(), {"status": "live"})
+        self.assertEqual(response.json(), {"status": "live", "response_schema_version": 1})
 
 
 class DataEncryptionRotationTests(TestCase):

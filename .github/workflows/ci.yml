@@ -401,8 +401,10 @@ jobs:
             exit 1
           fi
 
-      - name: Fresh database migration
-        run: uv run python manage.py migrate --noinput
+      - name: Concurrent leased fresh database migration
+        env:
+          CAMELLIA_REMOTE_MIGRATION_TEST_CONFIRM: ephemeral-empty-database-will-be-migrated
+        run: uv run python scripts/test_migration_runner.py
 
       - name: Verify production PostgreSQL role boundaries
         env:
@@ -531,7 +533,7 @@ jobs:
             -e CAMELLIA_REMOTE_SECURE_TLS=true \
             -v camellia-remote-management-ci-records:/app/records \
             camellia-remote-management-server:ci \
-            python manage.py migrate --noinput
+            python manage.py migrate_with_lease --noinput --actor ci-container
 
       - name: Converge post-migration ACLs and reject runtime DDL
         run: |

@@ -91,7 +91,7 @@ class DeploymentGateTests(unittest.TestCase):
         self.assertNotIn("depends_on:", management)
 
         run_script = (ROOT / "run.sh").read_text()
-        migration_check = run_script.index("python manage.py migrate --check")
+        migration_check = run_script.index("python manage.py check_release_schema")
         username_identity_check = run_script.index("python manage.py check_username_identity")
         gunicorn = run_script.index("exec gunicorn")
         self.assertLess(migration_check, gunicorn)
@@ -217,7 +217,7 @@ class DeploymentGateTests(unittest.TestCase):
             self.assertIn("maintenance lease", result.stderr)
 
     @unittest.skipUnless(importlib.util.find_spec("django"), "Django is not installed in the automation-only Python")
-    def test_django_migrate_check_rejects_pending_schema_and_accepts_current_schema(self):
+    def test_release_schema_check_rejects_pending_schema_and_accepts_current_schema(self):
         with tempfile.TemporaryDirectory(prefix="camellia-migrate-check-") as temporary:
             database = pathlib.Path(temporary) / "migration-check.sqlite3"
             env = {
@@ -233,14 +233,25 @@ class DeploymentGateTests(unittest.TestCase):
                 "CAMELLIA_REMOTE_DEVICE_VERIFICATION_TOKEN": "deployment-gate-device-token-00000000",
                 "CAMELLIA_REMOTE_SQLITE_DB_PATH": str(database),
             }
-            command = [sys.executable, "manage.py", "migrate"]
-            pending = subprocess.run(command + ["--check"], cwd=ROOT, env=env, text=True, capture_output=True)
+            migration_command = [sys.executable, "manage.py", "migrate", "--noinput"]
+            schema_command = [sys.executable, "manage.py", "check_release_schema"]
+            pending = subprocess.run(schema_command, cwd=ROOT, env=env, text=True, capture_output=True)
             self.assertNotEqual(pending.returncode, 0, "an empty database must not pass the runtime migration gate")
 
-            migrated = subprocess.run(command + ["--noinput"], cwd=ROOT, env=env, text=True, capture_output=True)
+            migrated = subprocess.run(migration_command, cwd=ROOT, env=env, text=True, capture_output=True)
             self.assertEqual(migrated.returncode, 0, migrated.stderr)
-            current = subprocess.run(command + ["--check"], cwd=ROOT, env=env, text=True, capture_output=True)
+            current = subprocess.run(schema_command, cwd=ROOT, env=env, text=True, capture_output=True)
             self.assertEqual(current.returncode, 0, current.stderr)
+
+            leased = subprocess.run(
+                [sys.executable, "manage.py", "migrate_with_lease", "--noinput"],
+                cwd=ROOT,
+                env=env,
+                text=True,
+                capture_output=True,
+            )
+            self.assertNotEqual(leased.returncode, 0)
+            self.assertIn("production migration leases require PostgreSQL", leased.stderr)
 
 
 if __name__ == "__main__":

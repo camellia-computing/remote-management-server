@@ -158,6 +158,10 @@ python3 "$envelope_helper" unpack \
         pg_restore --single-transaction --exit-on-error --format=custom --no-owner --no-acl
 set +o pipefail
 "${compose[@]}" run --rm --no-deps -T database-bootstrap
+"${compose[@]}" run --rm --no-deps migrate
+"${compose[@]}" run --rm --no-deps -T database-bootstrap
+"${compose[@]}" run --rm --no-deps -T management python manage.py check_release_schema >/dev/null || \
+    die "restored schema does not match this release"
 "${compose[@]}" run --rm --no-deps -T management python manage.py check_username_identity >/dev/null || \
     die "restored username identity contract is invalid"
 set -o pipefail
