@@ -846,7 +846,7 @@ def _apply_rule_change(request, user, action, rule_guid, rule_value=None, detail
         else:
             old_rule = rule_obj.rule
             rule_obj.rule = rule_value
-            rule_obj.save(update_fields=("rule", "target_key", "updated_at"))
+            rule_obj.save(update_fields=("rule", "updated_at"))
             bump_locked_authorization_generation(profile)
             _audit_rule(profile, user, "rule_update", rule_obj, {"before": old_rule, **(details or {})})
             event = "front_ab_rule_update"
@@ -1530,9 +1530,8 @@ def ab_manage(request):
                     return HttpResponseRedirect("/api/ab_manage")
                 rule_obj, created = AddressBookRule.objects.update_or_create(
                     profile=profile,
-                    target_key=f"group:{group.pk}",
+                    group=group,
                     defaults={
-                        "group": group,
                         "user": None,
                         "rule": rule_value,
                         "is_everyone": False,
@@ -1553,12 +1552,11 @@ def ab_manage(request):
                     return HttpResponseRedirect("/api/ab_manage")
                 rule_obj, created = AddressBookRule.objects.update_or_create(
                     profile=profile,
-                    target_key="everyone",
+                    is_everyone=True,
                     defaults={
                         "group": None,
                         "user": None,
                         "rule": rule_value,
-                        "is_everyone": True,
                     },
                 )
                 bump_locked_authorization_generation(profile)

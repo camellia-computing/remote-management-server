@@ -26,6 +26,15 @@ POLICY_ASSIGNMENT_FIELDS = frozenset(
 POLICY_CONTENT_FIELDS = frozenset(("config_options", "enabled"))
 
 
+def _validated_strategy_config_options(value):
+    from api.policy_generation import InvalidManagedPolicy, normalize_policy_options
+
+    try:
+        return normalize_policy_options(value)
+    except InvalidManagedPolicy as exc:
+        raise ValidationError({"config_options": _("策略配置必须是有界的字符串键值映射。")}) from exc
+
+
 class RemoteDeviceQuerySet(models.QuerySet):
     def update(self, **kwargs):
         if "policy_generation" in kwargs:
@@ -45,6 +54,9 @@ class RemoteDeviceQuerySet(models.QuerySet):
 
 class StrategyProfileQuerySet(models.QuerySet):
     def update(self, **kwargs):
+        config_options = kwargs.get("config_options")
+        if "config_options" in kwargs and not hasattr(config_options, "resolve_expression"):
+            kwargs["config_options"] = _validated_strategy_config_options(config_options)
         if not POLICY_CONTENT_FIELDS.intersection(kwargs):
             return super().update(**kwargs)
         from api.policy_generation import (
@@ -60,6 +72,20 @@ class StrategyProfileQuerySet(models.QuerySet):
             updated = super().update(**kwargs)
             bump_device_policy_generations(device_ids, using=self.db)
             return updated
+
+    def bulk_create(self, objs, *args, **kwargs):
+        objs = tuple(objs)
+        for obj in objs:
+            obj.config_options = _validated_strategy_config_options(obj.config_options)
+        return super().bulk_create(objs, *args, **kwargs)
+
+    def bulk_update(self, objs, fields, *args, **kwargs):
+        objs = tuple(objs)
+        fields = tuple(fields)
+        if "config_options" in fields:
+            for obj in objs:
+                obj.config_options = _validated_strategy_config_options(obj.config_options)
+        return super().bulk_update(objs, fields, *args, **kwargs)
 
     def delete(self):
         from api.policy_generation import (
@@ -324,6 +350,8 @@ class RemotePeer(models.Model):
         related_name="peers",
         blank=True,
         verbose_name=_("标签"),
+        through="RemotePeerTagMembership",
+        through_fields=("peer", "tag"),
     )
     rhash = EncryptedTextField(verbose_name=_("设备链接密码"), max_length=256, blank=True, default="")
     note = models.TextField(verbose_name=_("备注"), blank=True, default="")
@@ -365,14 +393,89 @@ class RemotePeerAdmin(admin.ModelAdmin):
         return ", ".join(sorted(tag.tag_name for tag in obj.tags.all()))
 
 
+class RemotePeerTagMembership(models.Model):
+    """Named peer/tag edge with an explicit address-book scope."""
+
+    peer = models.ForeignKey(
+        RemotePeer,
+        db_column="remotepeer_id",
+        on_delete=models.CASCADE,
+        related_name="tag_memberships",
+    )
+    tag = models.ForeignKey(
+        RemoteTag,
+        db_column="remotetag_id",
+        on_delete=models.CASCADE,
+        related_name="peer_memberships",
+    )
+    # SQLite is a debug-only backend. PostgreSQL makes this column NOT NULL and
+    # binds it to both parent rows with deferrable composite foreign keys.
+    profile = models.ForeignKey(
+        "AddressBookProfile",
+        db_constraint=False,
+        db_index=False,
+        editable=False,
+        null=True,
+        on_delete=models.CASCADE,
+        related_name="peer_tag_memberships",
+    )
+
+    class Meta:
+        db_table = "api_remotepeer_tags"
+        indexes = [models.Index(fields=("profile",), name="peer_tag_profile_idx")]
+        unique_together = (("peer", "tag"),)
+
+    def _validated_profile_id(self, database):
+        peer_profile_id = (
+            RemotePeer._base_manager.using(database)
+            .filter(pk=self.peer_id)
+            .values_list("profile_id", flat=True)
+            .first()
+        )
+        tag_profile_id = (
+            RemoteTag._base_manager.using(database).filter(pk=self.tag_id).values_list("profile_id", flat=True).first()
+        )
+        if peer_profile_id is None or tag_profile_id is None or peer_profile_id != tag_profile_id:
+            raise ValidationError(_("设备和标签必须属于同一个地址簿。"))
+        return peer_profile_id
+
+    def clean(self):
+        super().clean()
+        if self.peer_id and self.tag_id:
+            database = router.db_for_write(type(self), instance=self)
+            self.profile_id = self._validated_profile_id(database)
+
+    def save(self, *args, **kwargs):
+        database = kwargs.get("using") or router.db_for_write(type(self), instance=self)
+        self.profile_id = self._validated_profile_id(database)
+        return super().save(*args, **kwargs)
+
+
 @receiver(m2m_changed, sender=RemotePeer.tags.through)
-def validate_peer_tag_profile(sender, instance, action, reverse, pk_set, **kwargs):
+def validate_peer_tag_profile(sender, instance, action, reverse, pk_set, using, **kwargs):
     """Reject peer/tag links that cross address-book boundaries."""
     if action != "pre_add" or not pk_set:
         return
+    peer_ids = pk_set if reverse else (instance.pk,)
+    tag_ids = (instance.pk,) if reverse else pk_set
+    list(
+        RemotePeer._base_manager.using(using)
+        .select_for_update()
+        .filter(pk__in=peer_ids)
+        .order_by("pk")
+        .values_list("pk", flat=True)
+    )
+    list(
+        RemoteTag._base_manager.using(using)
+        .select_for_update()
+        .filter(pk__in=tag_ids)
+        .order_by("pk")
+        .values_list("pk", flat=True)
+    )
     if reverse:
         has_mismatch = (
-            RemotePeer.objects.filter(pk__in=pk_set)
+            RemotePeer.objects.using(using)
+            .filter(pk__in=pk_set)
             .exclude(
                 profile_id=instance.profile_id,
             )
@@ -380,7 +483,8 @@ def validate_peer_tag_profile(sender, instance, action, reverse, pk_set, **kwarg
         )
     else:
         has_mismatch = (
-            RemoteTag.objects.filter(pk__in=pk_set)
+            RemoteTag.objects.using(using)
+            .filter(pk__in=pk_set)
             .exclude(
                 profile_id=instance.profile_id,
             )
@@ -1157,6 +1261,8 @@ class ShareLink(models.Model):
         RemotePeer,
         related_name="share_links",
         verbose_name=_("机器列表"),
+        through="ShareLinkPeerMembership",
+        through_fields=("share_link", "peer"),
     )
     is_used = models.BooleanField(verbose_name=_("是否使用"), default=False)
     is_expired = models.BooleanField(verbose_name=_("是否过期"), default=False)
@@ -1204,6 +1310,77 @@ class ShareLink(models.Model):
         ]
 
 
+class ShareLinkPeerMembership(models.Model):
+    """Named share edge bound to the peer profile and creator generation."""
+
+    share_link = models.ForeignKey(
+        ShareLink,
+        db_column="sharelink_id",
+        on_delete=models.CASCADE,
+        related_name="peer_memberships",
+    )
+    peer = models.ForeignKey(
+        RemotePeer,
+        db_column="remotepeer_id",
+        on_delete=models.CASCADE,
+        related_name="share_link_memberships",
+    )
+    # These fields remain nullable only for the debug SQLite backend. The
+    # PostgreSQL migration fills and makes both columns NOT NULL before adding
+    # the composite foreign-key authority.
+    profile = models.ForeignKey(
+        "AddressBookProfile",
+        db_constraint=False,
+        db_index=False,
+        editable=False,
+        null=True,
+        on_delete=models.CASCADE,
+        related_name="share_link_peer_memberships",
+    )
+    owner = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        db_constraint=False,
+        db_index=False,
+        editable=False,
+        null=True,
+        on_delete=models.CASCADE,
+        related_name="share_link_peer_memberships",
+    )
+
+    class Meta:
+        db_table = "api_sharelink_peers"
+        indexes = [models.Index(fields=("profile", "owner"), name="share_peer_scope_idx")]
+        unique_together = (("share_link", "peer"),)
+
+    def _validated_scope(self, database):
+        peer_scope = (
+            RemotePeer._base_manager.using(database)
+            .filter(pk=self.peer_id)
+            .values("profile_id", "profile__owner_id")
+            .first()
+        )
+        creator_id = (
+            ShareLink._base_manager.using(database)
+            .filter(pk=self.share_link_id)
+            .values_list("creator_id", flat=True)
+            .first()
+        )
+        if peer_scope is None or creator_id is None or peer_scope["profile__owner_id"] != creator_id:
+            raise ValidationError(_("分享链接只能包含创建者拥有的设备。"))
+        return peer_scope["profile_id"], creator_id
+
+    def clean(self):
+        super().clean()
+        if self.share_link_id and self.peer_id:
+            database = router.db_for_write(type(self), instance=self)
+            self.profile_id, self.owner_id = self._validated_scope(database)
+
+    def save(self, *args, **kwargs):
+        database = kwargs.get("using") or router.db_for_write(type(self), instance=self)
+        self.profile_id, self.owner_id = self._validated_scope(database)
+        return super().save(*args, **kwargs)
+
+
 @receiver(m2m_changed, sender=ShareLink.peers.through)
 def validate_share_link_peer_owner(
     sender,
@@ -1211,14 +1388,28 @@ def validate_share_link_peer_owner(
     action,
     reverse,
     pk_set,
+    using,
     **kwargs,
 ):
     """A share link may disclose only peers owned by its creator."""
     if action != "pre_add" or not pk_set:
         return
+    profile_ids = (
+        (instance.profile_id,)
+        if reverse
+        else RemotePeer.objects.using(using).filter(pk__in=pk_set).values_list("profile_id", flat=True)
+    )
+    list(
+        AddressBookProfile._base_manager.using(using)
+        .select_for_update()
+        .filter(pk__in=profile_ids)
+        .order_by("pk")
+        .values_list("pk", flat=True)
+    )
     if reverse:
         has_mismatch = (
-            ShareLink.objects.filter(pk__in=pk_set)
+            ShareLink.objects.using(using)
+            .filter(pk__in=pk_set)
             .exclude(
                 creator_id=instance.profile.owner_id,
             )
@@ -1226,7 +1417,8 @@ def validate_share_link_peer_owner(
         )
     else:
         has_mismatch = (
-            RemotePeer.objects.filter(pk__in=pk_set)
+            RemotePeer.objects.using(using)
+            .filter(pk__in=pk_set)
             .exclude(
                 profile__owner_id=instance.creator_id,
             )
@@ -1255,13 +1447,12 @@ class StrategyProfile(models.Model):
 
     def clean(self):
         super().clean()
-        if not isinstance(self.config_options, dict) or any(
-            not isinstance(key, str) or not isinstance(value, str) for key, value in self.config_options.items()
-        ):
-            raise ValidationError(_("策略配置必须是字符串键值映射。"))
+        self.config_options = _validated_strategy_config_options(self.config_options)
 
     def save(self, *args, **kwargs):
         update_fields = kwargs.get("update_fields")
+        if update_fields is None or "config_options" in update_fields:
+            self.config_options = _validated_strategy_config_options(self.config_options)
         if not self.pk or (update_fields is not None and not POLICY_CONTENT_FIELDS.intersection(update_fields)):
             return super().save(*args, **kwargs)
         database = kwargs.get("using") or router.db_for_write(type(self), instance=self)
@@ -1440,6 +1631,9 @@ class AddressBookProfile(models.Model):
             if previous["owner_id"] != self.owner_id:
                 if current_generation >= (1 << 63) - 1:
                     raise AuthorizationGenerationExhausted("Address-book authorization generation exhausted")
+                ShareLink._base_manager.using(database).filter(
+                    peers__profile_id=self.pk,
+                ).distinct().delete()
                 requested_generation = current_generation + 1
                 if update_fields is not None:
                     kwargs["update_fields"] = tuple({*update_fields, "authorization_generation"})
@@ -1483,7 +1677,6 @@ class AddressBookRule(models.Model):
     )
     group = models.ForeignKey(Group, on_delete=models.CASCADE, null=True, blank=True, related_name="address_book_rules")
     is_everyone = models.BooleanField(default=False)
-    target_key = models.CharField(max_length=32, editable=False)
     created_at = models.DateTimeField(verbose_name=_("创建时间"), default=timezone.now)
     updated_at = models.DateTimeField(verbose_name=_("更新时间"), auto_now=True)
 
@@ -1492,8 +1685,19 @@ class AddressBookRule(models.Model):
         verbose_name_plural = _("地址簿规则列表")
         constraints = [
             models.UniqueConstraint(
-                fields=["profile", "target_key"],
-                name="unique_address_book_rule_target",
+                fields=["profile", "user"],
+                condition=models.Q(user__isnull=False),
+                name="unique_ab_rule_profile_user",
+            ),
+            models.UniqueConstraint(
+                fields=["profile", "group"],
+                condition=models.Q(group__isnull=False),
+                name="unique_ab_rule_profile_group",
+            ),
+            models.UniqueConstraint(
+                fields=["profile"],
+                condition=models.Q(is_everyone=True),
+                name="unique_ab_rule_profile_everyone",
             ),
             models.CheckConstraint(
                 condition=models.Q(rule__gte=1, rule__lte=3),
@@ -1510,13 +1714,12 @@ class AddressBookRule(models.Model):
         ]
 
     def save(self, *args, **kwargs):
-        if self.is_everyone and not self.user_id and not self.group_id:
-            self.target_key = "everyone"
-        elif not self.is_everyone and self.user_id and not self.group_id:
-            self.target_key = f"user:{self.user_id}"
-        elif not self.is_everyone and self.group_id and not self.user_id:
-            self.target_key = f"group:{self.group_id}"
-        else:
+        has_valid_target = (
+            (self.is_everyone and not self.user_id and not self.group_id)
+            or (not self.is_everyone and self.user_id and not self.group_id)
+            or (not self.is_everyone and self.group_id and not self.user_id)
+        )
+        if not has_valid_target:
             raise ValueError("Address-book rule must have exactly one target")
         super().save(*args, **kwargs)
 

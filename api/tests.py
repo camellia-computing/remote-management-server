@@ -46,6 +46,7 @@ from api.models import (
     StrategyProfile,
     UserProfile,
 )
+from api.policy_generation import InvalidManagedPolicy
 from api.tag_colors import normalize_tag_color, tag_color_css
 from api.xlsx import spreadsheet_safe_value
 from camellia_remote_management import settings as project_settings
@@ -1288,7 +1289,7 @@ class ApiContractTests(ApiTestMixin, TestCase):
         self.assertIsNone(device.strategy_id)
         self.assertEqual(device.device_group_id, group.id)
 
-    def test_heartbeat_fails_closed_for_corrupt_strategy_data(self):
+    def test_heartbeat_rejects_corrupt_strategy_writes_and_fails_closed_on_read_errors(self):
         device = self._device(owner=self.user)
         device_token = self._login("alice", "alice-pass")
         strategy = StrategyProfile.objects.create(
@@ -1297,18 +1298,33 @@ class ApiContractTests(ApiTestMixin, TestCase):
         )
         device.strategy = strategy
         device.save(update_fields=["strategy"])
-        StrategyProfile.objects.filter(pk=strategy.pk).update(
-            config_options={"unexpected": ["non-string-value"]},
-        )
+        with self.assertRaises(ValidationError):
+            StrategyProfile.objects.filter(pk=strategy.pk).update(
+                config_options={"unexpected": ["non-string-value"]},
+            )
+        strategy.refresh_from_db()
+        self.assertEqual(strategy.config_options, {"source": "valid"})
 
-        heartbeat = self._post_json(
-            "/api/heartbeat",
-            {"id": device.rid, "uuid": device.uuid, "modified_at": 0},
-            token=device_token,
-        )
+        with patch(
+            "api.policy_generation.normalize_policy_options",
+            side_effect=InvalidManagedPolicy("injected read failure"),
+        ):
+            heartbeat = self._post_json(
+                "/api/heartbeat",
+                {"id": device.rid, "uuid": device.uuid, "modified_at": 0},
+                token=device_token,
+            )
 
         self.assertEqual(heartbeat.status_code, 503, heartbeat.content)
-        self.assertEqual(heartbeat.json(), {"error": "Invalid strategy configuration"})
+        self.assertEqual(
+            heartbeat.json(),
+            {
+                "response_schema_version": 1,
+                "code": "invalid_strategy_configuration",
+                "message": "Invalid strategy configuration",
+                "retryable": True,
+            },
+        )
 
     def test_disabled_devices_are_blocked_by_login_and_heartbeat(self):
         device = self._device(owner=self.user)
