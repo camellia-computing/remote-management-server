@@ -8,7 +8,7 @@ from django.db.migrations.executor import MigrationExecutor
 from django.test import TestCase, TransactionTestCase, override_settings
 from django.test.utils import CaptureQueriesContext
 
-from api.encrypted_fields import FIELD_PREFIX
+from api.encrypted_fields import FIELD_PREFIX, UNBOUND_FIELD_PREFIX
 from api.migration_test_support import restore_latest_migration_state
 from api.models import AddressBookProfile, AddressBookShare, RemoteDevice, RemotePeer, UserProfile
 from api.views_api import _issue_access_token
@@ -190,7 +190,7 @@ class SharedProfileCredentialTests(TestCase):
             self.reader_token,
         )
         self.assertEqual(retrieved.status_code, 200, retrieved.content)
-        self.assertEqual(retrieved.json(), {"password": canary})
+        self.assertEqual(retrieved.json(), {"password": canary, "response_schema_version": 1})
         self.assert_never_stored(retrieved)
 
         AddressBookShare.objects.filter(profile=profile, user=self.reader).delete()
@@ -302,7 +302,7 @@ class SharedProfileCredentialMigrationTests(TransactionTestCase):
                 )
                 raw_info, raw_password = cursor.fetchone()
             self.assertNotIn("legacy-json-password", json.dumps(raw_info, sort_keys=True))
-            self.assertTrue(raw_password.startswith(FIELD_PREFIX))
+            self.assertTrue(raw_password.startswith(UNBOUND_FIELD_PREFIX))
             self.assertNotIn("legacy-json-password", raw_password)
 
             executor = MigrationExecutor(connection)
