@@ -5,6 +5,7 @@ import json
 import pathlib
 import subprocess
 import sys
+import tempfile
 import unittest
 
 HELPER = pathlib.Path(__file__).with_name("backup_envelope.py")
@@ -141,6 +142,102 @@ class BackupEnvelopeTests(unittest.TestCase):
         result = invoke(["pack", *bad], b"payload")
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(result.stdout, b"")
+
+    def test_backup_set_manifest_binds_final_ciphertext_and_release(self):
+        with tempfile.TemporaryDirectory(prefix="camellia-set-manifest-") as temporary:
+            root = pathlib.Path(temporary)
+            database = root / f"postgres-{CREATED_AT}-{BACKUP_ID}.dump.age"
+            recordings = root / f"recordings-{CREATED_AT}-{BACKUP_ID}.bundle.age"
+            database.write_bytes(b"database ciphertext")
+            recordings.write_bytes(b"recording ciphertext")
+            context = [
+                "--backup-id", BACKUP_ID,
+                "--created-at", CREATED_AT,
+                "--deployment-id", "production-a",
+                "--database-name", "camellia_remote",
+                "--postgres-major", "18",
+                "--key-id", "backup-v1",
+                "--data-encryption-key-id", "data-v3",
+                "--source-revision", "b" * 40,
+                "--management-image", "ghcr.io/example/management@sha256:" + ("c" * 64),
+                "--schema-generation", "management-schema-0032-v1",
+                "--schema-manifest-version", "1",
+                "--migration-count", "50",
+                "--recording-epoch-id", EPOCH_ID,
+                "--recording-inventory-digest", INVENTORY_DIGEST,
+                "--database-artifact", str(database),
+                "--recordings-artifact", str(recordings),
+            ]
+            created = invoke(["set-create", *context, "--verified-at", CREATED_AT, "--completed-at", CREATED_AT])
+            self.assertEqual(created.returncode, 0, created.stderr.decode())
+            manifest = json.loads(created.stdout)
+            self.assertEqual(manifest["format"], "camellia-remote-backup-set-v1")
+            self.assertEqual(manifest["artifacts"]["database"]["bytes"], len(b"database ciphertext"))
+
+            verified = invoke(
+                [
+                    "set-verify",
+                    "--expect-backup-id", BACKUP_ID,
+                    "--expect-created-at", CREATED_AT,
+                    "--expect-deployment-id", "production-a",
+                    "--expect-database-name", "camellia_remote",
+                    "--expect-postgres-major", "18",
+                    "--expect-key-id", "backup-v1",
+                    "--expect-data-encryption-key-id", "data-v3",
+                    "--expect-source-revision", "b" * 40,
+                    "--expect-management-image", "ghcr.io/example/management@sha256:" + ("c" * 64),
+                    "--database-artifact", str(database),
+                    "--recordings-artifact", str(recordings),
+                ],
+                created.stdout,
+            )
+            self.assertEqual(verified.returncode, 0, verified.stderr.decode())
+
+            database.write_bytes(b"database ciphertexu")
+            corrupted = invoke(
+                [
+                    "set-verify",
+                    "--expect-backup-id", BACKUP_ID,
+                    "--expect-created-at", CREATED_AT,
+                    "--expect-deployment-id", "production-a",
+                    "--expect-database-name", "camellia_remote",
+                    "--expect-postgres-major", "18",
+                    "--expect-key-id", "backup-v1",
+                    "--expect-data-encryption-key-id", "data-v3",
+                    "--expect-source-revision", "b" * 40,
+                    "--expect-management-image", "ghcr.io/example/management@sha256:" + ("c" * 64),
+                    "--database-artifact", str(database),
+                    "--recordings-artifact", str(recordings),
+                ],
+                created.stdout,
+            )
+            self.assertNotEqual(corrupted.returncode, 0)
+            self.assertIn(b"digest", corrupted.stderr)
+
+    def test_run_state_is_canonical_and_stale_holder_is_monitorable(self):
+        with tempfile.TemporaryDirectory(prefix="camellia-run-state-") as temporary:
+            state = pathlib.Path(temporary) / ".backup-run.json"
+            created = invoke(
+                [
+                    "run-create",
+                    "--path", str(state),
+                    "--run-id", BACKUP_ID,
+                    "--started-at", "20200101T000000Z",
+                    "--pid", "123",
+                    "--phase", "exporting-database",
+                ]
+            )
+            self.assertEqual(created.returncode, 0, created.stderr.decode())
+            self.assertEqual(json.dumps(json.loads(state.read_bytes()), separators=(",", ":"), sort_keys=True).encode(), state.read_bytes())
+            stale_state = json.loads(state.read_bytes())
+            stale_state["heartbeat_at"] = "20200101T000000Z"
+            state.write_text(json.dumps(stale_state, separators=(",", ":"), sort_keys=True))
+            inspected = invoke(["run-inspect", "--path", str(state), "--stale-seconds", "180"])
+            self.assertEqual(inspected.returncode, 3)
+            self.assertEqual(json.loads(inspected.stdout)["status"], "failed:stale-holder")
+            cleared = invoke(["run-clear", "--path", str(state), "--run-id", BACKUP_ID])
+            self.assertEqual(cleared.returncode, 0, cleared.stderr.decode())
+            self.assertFalse(state.exists())
 
 
 if __name__ == "__main__":

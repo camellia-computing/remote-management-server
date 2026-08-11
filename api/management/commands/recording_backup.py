@@ -8,7 +8,7 @@ from api.database_deadlines import database_operation_budget
 
 
 class Command(BaseCommand):
-    help = "Create, export, complete, abort, or restore a consistent recording backup epoch."
+    help = "Create, export, verify, complete, abort, or restore a consistent recording backup epoch."
 
     def add_arguments(self, parser):
         commands = parser.add_subparsers(dest="operation", required=True)
@@ -18,6 +18,11 @@ class Command(BaseCommand):
 
         export = commands.add_parser("export")
         export.add_argument("--backup-id", required=True)
+
+        verify = commands.add_parser("verify")
+        verify.add_argument("--backup-id", required=True)
+        verify.add_argument("--epoch-id", required=True)
+        verify.add_argument("--inventory-digest", required=True)
 
         for operation in ("finish", "abort"):
             command = commands.add_parser(operation)
@@ -45,6 +50,16 @@ class Command(BaseCommand):
                         raise CommandError("recording backup export requires a binary stdout stream")
                     recording_inventory.export_backup(options["backup_id"], output)
                     output.flush()
+                    return
+                if operation == "verify":
+                    input_stream = getattr(sys.stdin, "buffer", sys.stdin)
+                    epoch = recording_inventory.verify_backup(
+                        options["backup_id"],
+                        options["epoch_id"],
+                        options["inventory_digest"],
+                        input_stream,
+                    )
+                    self.stdout.write(json.dumps(recording_inventory.backup_summary(epoch), sort_keys=True))
                     return
                 if operation == "finish":
                     epoch = recording_inventory.finish_backup(options["backup_id"])

@@ -251,6 +251,7 @@ jobs:
       - name: Validate deployment configuration
         env:
           CAMELLIA_REMOTE_MANAGEMENT_IMAGE: ghcr.io/example/management@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+          CAMELLIA_REMOTE_RELEASE_REVISION: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
           CAMELLIA_REMOTE_SECRET_KEY: ci-only-production-secret-key-with-sufficient-length-000
           CAMELLIA_REMOTE_DATA_ENCRYPTION_KEY_ID: ci-primary-v1
           CAMELLIA_REMOTE_DATA_ENCRYPTION_KEY: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
@@ -281,6 +282,7 @@ jobs:
           [[ "$CAMELLIA_REMOTE_BACKUP_AGE_KEY_ID" =~ ^[a-z0-9][a-z0-9._-]{0,31}$ ]]
           [[ "$CAMELLIA_REMOTE_BACKUP_DEPLOYMENT_ID" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]]
           [[ "$CAMELLIA_REMOTE_BACKUP_POSTGRES_MAJOR" =~ ^[1-9][0-9]{0,2}$ ]]
+          [[ "$CAMELLIA_REMOTE_RELEASE_REVISION" =~ ^([0-9a-f]{40}|[0-9a-f]{64})$ ]]
           systemd-analyze security --offline=yes deploy/systemd/*.service >/dev/null
           docker compose --profile database-operations --env-file /dev/null -f docker-compose.yaml config --quiet
 

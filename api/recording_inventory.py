@@ -565,7 +565,7 @@ def _secure_parent_for_restore(root, relative_path):
     return os.path.join(root, *components)
 
 
-def restore_backup(backup_id, epoch_id, inventory_digest, input_stream):
+def _ready_backup_epoch(backup_id, epoch_id, inventory_digest):
     backup_id = _validate_backup_id(backup_id)
     raw_epoch_id = epoch_id
     try:
@@ -576,8 +576,6 @@ def restore_backup(backup_id, epoch_id, inventory_digest, input_stream):
         raise RecordingInventoryError("Recording backup epoch ID is invalid")
     if not isinstance(inventory_digest, str) or not INVENTORY_DIGEST_RE.fullmatch(inventory_digest):
         raise RecordingInventoryError("Recording inventory digest is invalid")
-    root = _root()
-    _empty_restore_root(root)
     control = RecordingBackupControl.objects.select_related("active_epoch").get(singleton=1)
     epoch = control.active_epoch
     if (
@@ -588,7 +586,10 @@ def restore_backup(backup_id, epoch_id, inventory_digest, input_stream):
         or epoch.inventory_digest != inventory_digest
     ):
         raise RecordingInventoryError("Restored database does not match the recording backup epoch")
+    return epoch
 
+
+def _read_backup_bundle(epoch, input_stream, *, restore_root=None):
     if _read_exact(input_stream, len(BACKUP_MAGIC)) != BACKUP_MAGIC:
         raise RecordingInventoryError("Recording backup magic is invalid")
     header_size = struct.unpack(">I", _read_exact(input_stream, 4))[0]
@@ -619,30 +620,57 @@ def restore_backup(backup_id, epoch_id, inventory_digest, input_stream):
         if row is None or metadata != _snapshot_row_metadata(row) or payload_size != row.ciphertext_size:
             raise RecordingInventoryError("Recording object metadata does not match the restored database")
         if row.object_present:
-            destination = _secure_parent_for_restore(root, row.storage_relative_path)
-            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
-            fd = os.open(destination, flags, 0o600)
+            destination = None
+            fd = None
+            if restore_root is not None:
+                destination = _secure_parent_for_restore(restore_root, row.storage_relative_path)
+                flags = (
+                    os.O_WRONLY
+                    | os.O_CREAT
+                    | os.O_EXCL
+                    | getattr(os, "O_CLOEXEC", 0)
+                    | getattr(os, "O_NOFOLLOW", 0)
+                )
+                fd = os.open(destination, flags, 0o600)
             hasher = hashlib.sha256()
             try:
                 remaining = payload_size
                 while remaining:
                     chunk = _read_exact(input_stream, min(COPY_CHUNK_BYTES, remaining))
-                    recording_uploads._write_all(fd, chunk)
+                    if fd is not None:
+                        recording_uploads._write_all(fd, chunk)
                     hasher.update(chunk)
                     remaining -= len(chunk)
-                os.fsync(fd)
+                if fd is not None:
+                    os.fsync(fd)
             finally:
-                os.close(fd)
+                if fd is not None:
+                    os.close(fd)
             if hasher.hexdigest() != row.ciphertext_digest:
                 raise RecordingInventoryError("Restored recording ciphertext digest does not match inventory")
-            recording_uploads._fsync_directory(os.path.dirname(destination))
+            if destination is not None:
+                recording_uploads._fsync_directory(os.path.dirname(destination))
         elif payload_size != 0 or row.ciphertext_digest:
             raise RecordingInventoryError("Absent recording object has an unexpected backup payload")
         restored += 1
         last_upload_id = upload_id
     if _read_exact(input_stream, 1) != BACKUP_END or input_stream.read(1):
         raise RecordingInventoryError("Recording backup bundle has trailing or missing data")
-    _validate_bidirectional_inventory(root, epoch)
+    if restore_root is not None:
+        _validate_bidirectional_inventory(restore_root, epoch)
+
+
+def verify_backup(backup_id, epoch_id, inventory_digest, input_stream):
+    epoch = _ready_backup_epoch(backup_id, epoch_id, inventory_digest)
+    _read_backup_bundle(epoch, input_stream)
+    return epoch
+
+
+def restore_backup(backup_id, epoch_id, inventory_digest, input_stream):
+    root = _root()
+    _empty_restore_root(root)
+    epoch = _ready_backup_epoch(backup_id, epoch_id, inventory_digest)
+    _read_backup_bundle(epoch, input_stream, restore_root=root)
 
     with transaction.atomic():
         control = RecordingBackupControl.objects.select_for_update().get(singleton=1)
