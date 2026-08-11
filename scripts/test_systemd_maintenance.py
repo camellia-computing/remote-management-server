@@ -47,6 +47,26 @@ class SystemdMaintenanceTests(unittest.TestCase):
                 conditions = [value for key, value in directives(path, "Service") if key == "ExecCondition"]
                 self.assertEqual(conditions, ["/opt/camellia-remote-management/management-maintenance-guard.sh"])
 
+    def test_cleanup_samples_sequence_capacity_after_retention(self):
+        cleanup = SYSTEMD / "camellia-remote-management-cleanup.service"
+        commands = [value for key, value in directives(cleanup, "Service") if key == "ExecStart"]
+        self.assertEqual(commands, ["/opt/camellia-remote-management/run-cleanup.sh"])
+        runner = (ROOT / "deploy" / "run-cleanup.sh").read_text()
+        purge = runner.index("python manage.py purge_expired_state")
+        capacity = runner.index("python manage.py check_sequence_capacity --fail-level critical")
+        self.assertLess(purge, capacity)
+        self.assertIn("CAMELLIA_REMOTE_DATABASE_OPERATION_PROFILE=CLEANUP", runner)
+
+    def test_operations_have_longer_outer_deadlines_than_supervised_jobs(self):
+        cleanup = dict(directives(SYSTEMD / "camellia-remote-management-cleanup.service", "Service"))
+        backup = dict(directives(SYSTEMD / "camellia-remote-management-backup.service", "Service"))
+        self.assertEqual(cleanup["TimeoutStartSec"], "11min")
+        self.assertNotIn("RuntimeMaxSec", cleanup, "RuntimeMaxSec is ignored for Type=oneshot")
+        self.assertEqual(cleanup["KillMode"], "control-group")
+        self.assertEqual(backup["TimeoutStartSec"], "50min")
+        self.assertNotIn("RuntimeMaxSec", backup, "RuntimeMaxSec is ignored for Type=oneshot")
+        self.assertEqual(backup["KillMode"], "control-group")
+
     def test_guard_skips_inactive_stack_and_maintenance_without_starting_any_unit(self):
         with tempfile.TemporaryDirectory(prefix="camellia-maintenance-guard-") as temporary:
             root = pathlib.Path(temporary)

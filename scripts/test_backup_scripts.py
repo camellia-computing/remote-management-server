@@ -106,6 +106,8 @@ class BackupScriptsTests(unittest.TestCase):
                 mode = os.environ.get("FAKE_DOCKER_MODE", "ok")
                 epoch_id = "11111111-1111-4111-8111-111111111111"
                 inventory_digest = "a" * 64
+                if args[:2] == ["container", "ls"]:
+                    raise SystemExit(0)
                 if "recording_backup" in args:
                     operation = args[args.index("recording_backup") + 1]
                     if operation == "begin":
@@ -138,6 +140,15 @@ class BackupScriptsTests(unittest.TestCase):
                         raise SystemExit(45)
                     print("username identity contract is valid")
                     raise SystemExit(0)
+                if "check_release_schema" in args:
+                    if mode == "release-schema-fail":
+                        raise SystemExit(46)
+                    print("release schema contract is valid")
+                    raise SystemExit(0)
+                if args and args[-1] == "migrate":
+                    if mode == "migration-fail":
+                        raise SystemExit(47)
+                    raise SystemExit(0)
                 if "database-bootstrap" in args:
                     raise SystemExit(0)
                 if "database-probe" in args:
@@ -147,6 +158,9 @@ class BackupScriptsTests(unittest.TestCase):
                     print("180000")
                     raise SystemExit(0)
                 if "pg_dump" in args:
+                    if "--lock-wait-timeout=30s" not in args:
+                        print("pg_dump lock deadline is missing", file=sys.stderr)
+                        raise SystemExit(52)
                     if mode == "pg_dump-fail":
                         print("pg_dump failed", file=sys.stderr)
                         raise SystemExit(42)
@@ -183,6 +197,8 @@ class BackupScriptsTests(unittest.TestCase):
                 "CAMELLIA_REMOTE_ENV_FILE": str(self.env_file),
                 "CAMELLIA_REMOTE_BACKUP_DIR": str(self.backups),
                 "CAMELLIA_REMOTE_BACKUP_ENVELOPE_HELPER": str(HELPER),
+                "CAMELLIA_REMOTE_OPERATION_RUNNER": str(ROOT / "deploy" / "run-compose-operation.sh"),
+                "CAMELLIA_REMOTE_DOCKER_BINARY": str(self.fake_docker),
                 "CAMELLIA_REMOTE_BACKUP_AGE_BINARY": str(self.age),
                 "CAMELLIA_REMOTE_BACKUP_AGE_RECIPIENT": self.recipient,
                 "CAMELLIA_REMOTE_BACKUP_AGE_KEY_ID": "backup-v1",
@@ -316,6 +332,18 @@ class BackupScriptsTests(unittest.TestCase):
         self.assertNotEqual(failed_restore.returncode, 0)
         self.assertTrue(self.restore_capture.exists())
         self.assertFalse(self.recording_restore_capture.exists())
+
+    def test_restore_rejects_migration_or_release_schema_failure_before_recordings(self):
+        self.assertEqual(self.run_backup().returncode, 0)
+        artifact = next(self.backups.glob("postgres-*.dump.age"))
+        for mode in ("migration-fail", "release-schema-fail"):
+            with self.subTest(mode=mode):
+                self.restore_capture.unlink(missing_ok=True)
+                self.recording_restore_capture.unlink(missing_ok=True)
+                failed = self.run_restore(artifact, FAKE_DOCKER_MODE=mode)
+                self.assertNotEqual(failed.returncode, 0)
+                self.assertTrue(self.restore_capture.exists())
+                self.assertFalse(self.recording_restore_capture.exists())
 
     def test_retention_removes_only_complete_expired_backup_pairs(self):
         self.backups.mkdir()

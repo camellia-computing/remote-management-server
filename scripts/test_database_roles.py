@@ -10,6 +10,7 @@ import os
 import pathlib
 import re
 import subprocess
+import sys
 import unittest
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -52,6 +53,7 @@ class DatabaseRoleContractTests(unittest.TestCase):
 
         self.assertIn("CAMELLIA_REMOTE_DATABASE_BOOTSTRAP_USER", postgres)
         self.assertIn("CAMELLIA_REMOTE_DATABASE_MIGRATION_USER", migration)
+        self.assertIn("migrate_with_lease", migration)
         self.assertIn("CAMELLIA_REMOTE_DATABASE_RUNTIME_USER", management)
         for forbidden in ("DATABASE_BOOTSTRAP", "DATABASE_MIGRATION"):
             self.assertNotIn(forbidden, management)
@@ -64,11 +66,19 @@ class DatabaseRoleContractTests(unittest.TestCase):
 
     def test_controller_converges_and_verifies_roles_around_migration(self):
         controller = CONTROLLER.read_text()
-        first = controller.index("database-bootstrap")
-        migration = controller.index("migrate", first)
-        second = controller.index("database-bootstrap", first + len("database-bootstrap"))
-        probe = controller.index("database-probe", second)
-        application = controller.index("management", probe)
+        bootstrap_calls = [
+            match.start()
+            for match in re.finditer(
+                r"^run_operation database-bootstrap 300 database-bootstrap$",
+                controller,
+                re.MULTILINE,
+            )
+        ]
+        self.assertEqual(len(bootstrap_calls), 2)
+        first, second = bootstrap_calls
+        migration = controller.index("run_operation migration 2160 migrate", first)
+        probe = controller.index("run_operation database-probe 30 database-probe", second)
+        application = controller.index("up --detach --wait --no-deps management", probe)
         self.assertLess(first, migration)
         self.assertLess(migration, second)
         self.assertLess(second, probe)
@@ -82,6 +92,8 @@ class DatabaseRoleContractTests(unittest.TestCase):
         self.assertIn("database-restore", restore)
         self.assertNotIn("exec -T postgres", restore)
         self.assertGreaterEqual(restore.count("database-bootstrap"), 2)
+        self.assertIn("check_release_schema", restore)
+        self.assertIn("migrate", restore)
         self.assertIn("database-probe", restore)
 
     def test_bootstrap_script_enforces_flags_ownership_acl_and_membership(self):
@@ -381,6 +393,35 @@ class PostgreSQLRoleBoundaryTests(unittest.TestCase):
                 self.passwords["runtime"],
                 "DELETE FROM public.django_migrations;",
             )
+            runtime_schema_environment = {
+                key: value for key, value in os.environ.items() if not key.startswith("CAMELLIA_REMOTE_DATABASE_")
+            } | {
+                "CAMELLIA_REMOTE_DEBUG": "true",
+                "CAMELLIA_REMOTE_SECRET_KEY": "database-role-schema-check",
+                "CAMELLIA_REMOTE_DEVICE_VERIFICATION_TOKEN": "database-role-device-token-000000000",
+                "CAMELLIA_REMOTE_DATABASE_HOST": self.host,
+                "CAMELLIA_REMOTE_DATABASE_PORT": self.port,
+                "CAMELLIA_REMOTE_DATABASE_NAME": self.database,
+                "CAMELLIA_REMOTE_DATABASE_USER": self.roles["runtime"],
+                "CAMELLIA_REMOTE_DATABASE_PASSWORD": self.passwords["runtime"],
+                "CAMELLIA_REMOTE_DATABASE_SSLMODE": "disable",
+            }
+            runtime_schema = subprocess.run(
+                [sys.executable, "manage.py", "check_release_schema"],
+                cwd=ROOT,
+                env=runtime_schema_environment,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(runtime_schema.returncode, 0, runtime_schema.stderr)
+
+        migration_lease = self.psql(
+            self.roles["migration"],
+            self.passwords["migration"],
+            "SELECT pg_try_advisory_lock(4846249595414825281), pg_advisory_unlock(4846249595414825281);",
+        )
+        self.assertEqual(migration_lease.stdout.strip(), "t|t")
 
         duplicate_passwords = self.passwords | {"probe": self.passwords["backup"]}
         with self.assertRaises(subprocess.CalledProcessError):

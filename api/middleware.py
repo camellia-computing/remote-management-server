@@ -2,9 +2,16 @@ import logging
 import time
 
 from django.conf import settings
+from django.db import connection
 from django.urls import Resolver404, resolve
 
 from api.address_book_errors import AuthorizationGenerationExhausted
+from api.database_deadlines import (
+    DatabaseOperationDeadlineExceeded,
+    current_database_timeout_kind,
+    database_operation_budget,
+    database_timeout_kind,
+)
 from api.identifiers import InvalidIdentifier
 from api.rate_limits import (
     RateLimitBackendUnavailable,
@@ -95,6 +102,26 @@ class SafeAccessLogMiddleware:
             reset_request_context(token)
 
 
+class DatabaseDeadlineMiddleware:
+    """Bound all request database work by the active monotonic profile."""
+
+    def __init__(self, get_response):
+        self.get_response = get_response
+
+    def __call__(self, request):
+        with database_operation_budget():
+            response = self.get_response(request)
+            # Django converts exceptions raised by inner middleware into an
+            # HTTP response before outer middleware can catch them.  The SQL
+            # execution wrapper therefore records the timeout in the active
+            # operation context so session/rate-limit failures retain the same
+            # fail-closed response contract as view failures.
+            timeout_kind = current_database_timeout_kind()
+            if timeout_kind and not getattr(response, "_camellia_database_timeout", False):
+                return database_timeout_response(request, timeout_kind)
+            return response
+
+
 class StrictShareJsonPreflightMiddleware:
     """Bound and parse the only CSRF-protected embedded-JSON form before CSRF reads it."""
 
@@ -126,6 +153,9 @@ class ApiExceptionMiddleware:
         return self.get_response(request)
 
     def process_exception(self, request, exception):
+        timeout_kind = database_timeout_kind(exception)
+        if isinstance(exception, DatabaseOperationDeadlineExceeded) or timeout_kind:
+            return database_timeout_response(request, timeout_kind or "operation_deadline")
         if isinstance(exception, InvalidJsonPayload):
             return json_envelope_error_response(exception)
         if isinstance(exception, InvalidIdentifier):
@@ -150,3 +180,28 @@ class ApiExceptionMiddleware:
             )
             return json_error("internal_server_error", "Internal server error", status=500)
         return None
+
+
+def database_timeout_response(request, timeout_kind):
+    """Return the single fail-closed response for every request phase."""
+
+    # PostgreSQL may have cancelled a statement or terminated an idle
+    # transaction. Never return that connection to persistent reuse.
+    connection.close()
+    log_structured_event(
+        logger,
+        request,
+        "database_operation_timeout",
+        level="warning",
+        timeout_kind=timeout_kind,
+    )
+    response = json_error(
+        "database_operation_timeout",
+        "Database operation deadline exceeded",
+        status=503,
+        retryable=False,
+        result="unknown",
+    )
+    response["Retry-After"] = "1"
+    response._camellia_database_timeout = True
+    return response

@@ -4,6 +4,7 @@ import sys
 from django.core.management.base import BaseCommand, CommandError
 
 from api import recording_inventory
+from api.database_deadlines import database_operation_budget
 
 
 class Command(BaseCommand):
@@ -33,39 +34,42 @@ class Command(BaseCommand):
     def handle(self, *args, **options):
         operation = options["operation"]
         try:
-            if operation == "begin":
-                epoch = recording_inventory.begin_backup(options["backup_id"], options["requested_at"])
-                self.stdout.write(json.dumps(recording_inventory.backup_summary(epoch), sort_keys=True))
-                return
-            if operation == "export":
-                output = getattr(getattr(self.stdout, "_out", sys.stdout), "buffer", None)
-                if output is None:
-                    raise CommandError("recording backup export requires a binary stdout stream")
-                recording_inventory.export_backup(options["backup_id"], output)
-                output.flush()
-                return
-            if operation == "finish":
-                epoch = recording_inventory.finish_backup(options["backup_id"])
-                self.stdout.write(json.dumps(recording_inventory.backup_summary(epoch), sort_keys=True))
-                return
-            if operation == "abort":
-                aborted = recording_inventory.abort_backup(
+            with database_operation_budget():
+                if operation == "begin":
+                    epoch = recording_inventory.begin_backup(options["backup_id"], options["requested_at"])
+                    self.stdout.write(json.dumps(recording_inventory.backup_summary(epoch), sort_keys=True))
+                    return
+                if operation == "export":
+                    output = getattr(getattr(self.stdout, "_out", sys.stdout), "buffer", None)
+                    if output is None:
+                        raise CommandError("recording backup export requires a binary stdout stream")
+                    recording_inventory.export_backup(options["backup_id"], output)
+                    output.flush()
+                    return
+                if operation == "finish":
+                    epoch = recording_inventory.finish_backup(options["backup_id"])
+                    self.stdout.write(json.dumps(recording_inventory.backup_summary(epoch), sort_keys=True))
+                    return
+                if operation == "abort":
+                    aborted = recording_inventory.abort_backup(
+                        options["backup_id"],
+                        ignore_mismatch=bool(options["ignore_missing"]),
+                    )
+                    self.stdout.write(
+                        json.dumps({"aborted": aborted, "backup_id": options["backup_id"]}, sort_keys=True)
+                    )
+                    return
+                if operation == "restore-preflight":
+                    recording_inventory.restore_preflight()
+                    self.stdout.write(json.dumps({"recording_restore_preflight": "ok"}, sort_keys=True))
+                    return
+                input_stream = getattr(sys.stdin, "buffer", sys.stdin)
+                epoch = recording_inventory.restore_backup(
                     options["backup_id"],
-                    ignore_mismatch=bool(options["ignore_missing"]),
+                    options["epoch_id"],
+                    options["inventory_digest"],
+                    input_stream,
                 )
-                self.stdout.write(json.dumps({"aborted": aborted, "backup_id": options["backup_id"]}, sort_keys=True))
-                return
-            if operation == "restore-preflight":
-                recording_inventory.restore_preflight()
-                self.stdout.write(json.dumps({"recording_restore_preflight": "ok"}, sort_keys=True))
-                return
-            input_stream = getattr(sys.stdin, "buffer", sys.stdin)
-            epoch = recording_inventory.restore_backup(
-                options["backup_id"],
-                options["epoch_id"],
-                options["inventory_digest"],
-                input_stream,
-            )
-            self.stdout.write(json.dumps(recording_inventory.backup_summary(epoch), sort_keys=True))
+                self.stdout.write(json.dumps(recording_inventory.backup_summary(epoch), sort_keys=True))
         except (recording_inventory.RecordingBackupInProgress, recording_inventory.RecordingInventoryError) as error:
             raise CommandError(str(error)) from error

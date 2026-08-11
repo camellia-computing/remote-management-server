@@ -13,6 +13,16 @@ class InvalidIdentifier(ValidationError):
     """Raised before an untrusted identifier reaches an ORM lookup."""
 
 
+def model_pk_maximum(model):
+    """Return the declared primary-key ceiling independent of the active backend."""
+
+    field_type = model._meta.pk.get_internal_type()
+    try:
+        return _AUTO_FIELD_MAX[field_type]
+    except KeyError as exc:
+        raise TypeError(f"Unsupported primary-key field: {field_type}") from exc
+
+
 def parse_model_pk(value, model):
     """Parse one positive, text-form primary key using the model field type.
 
@@ -21,11 +31,7 @@ def parse_model_pk(value, model):
     backend-derived limits would preserve the production-only overflow.
     """
 
-    field_type = model._meta.pk.get_internal_type()
-    try:
-        maximum = _AUTO_FIELD_MAX[field_type]
-    except KeyError as exc:
-        raise TypeError(f"Unsupported primary-key field: {field_type}") from exc
+    maximum = model_pk_maximum(model)
     if not isinstance(value, str) or not value or not value.isascii() or not value.isdigit():
         raise InvalidIdentifier("A primary key must be ASCII decimal text")
     maximum_text = str(maximum)

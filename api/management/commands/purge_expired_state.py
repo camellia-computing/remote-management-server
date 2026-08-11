@@ -7,6 +7,7 @@ from django.db import transaction
 from django.db.models import Q
 from django.utils import timezone
 
+from api.database_deadlines import database_operation_budget
 from api.ingestion_retention import purge_audit_retention, purge_recording_retention
 from api.models import (
     DeviceProofChallenge,
@@ -40,7 +41,7 @@ class Command(BaseCommand):
         )
 
     def handle(self, *args, **options):
-        with background_operation("purge_expired_state"):
+        with background_operation("purge_expired_state"), database_operation_budget():
             return self._handle(*args, **options)
 
     def _handle(self, *args, **options):

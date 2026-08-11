@@ -115,6 +115,7 @@ from api.policy_generation import (
     normalize_policy_options,
 )
 from api.rate_limits import enforce_authenticated_rate_limit
+from api.release_schema import check_release_schema
 from api.request_utils import InvalidJsonPayload, client_ip, load_json_body, load_json_object, load_json_text
 from api.response_contract import RESPONSE_SCHEMA_VERSION, empty_success, json_error, json_pending
 from api.tag_colors import normalize_tag_color
@@ -1974,6 +1975,7 @@ def health_ready(request):
         with connection.cursor() as cursor:
             cursor.execute("SELECT 1")
             cursor.fetchone()
+        check_release_schema()
         check_username_identity(full=False)
         RemoteDevice.objects.order_by("pk").values_list("pk", flat=True).first()
         key_states = list(DataEncryptionKeyState.objects.order_by("key_id")[: settings.MAX_DATA_ENCRYPTION_KEYS + 1])

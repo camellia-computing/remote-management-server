@@ -660,7 +660,7 @@ class ConnLog(models.Model):
         (STATE_EXPIRED, "Expired"),
     )
 
-    id = models.AutoField(verbose_name="ID", primary_key=True)
+    id = models.BigAutoField(verbose_name="ID", primary_key=True)
     guid = models.UUIDField(
         verbose_name="GUID",
         default=uuid.uuid4,
@@ -885,7 +885,7 @@ class ConnectionAuditEvent(models.Model):
         (KIND_EXPIRED, "Expired"),
     )
 
-    id = models.AutoField(verbose_name="ID", primary_key=True)
+    id = models.BigAutoField(verbose_name="ID", primary_key=True)
     event_id = models.UUIDField(editable=False, unique=True)
     connection = models.ForeignKey(
         ConnLog,
@@ -1022,7 +1022,7 @@ class FileLog(models.Model):
         (SOURCE_PRINTER, "Printer"),
     )
 
-    id = models.AutoField(verbose_name="ID", primary_key=True)
+    id = models.BigAutoField(verbose_name="ID", primary_key=True)
     file = models.CharField(verbose_name="Path", max_length=500)
     remote_id = models.CharField(verbose_name="Remote ID", max_length=16, default="0")
     user_id = models.CharField(verbose_name="User ID", max_length=16, default="0")
@@ -1171,7 +1171,7 @@ class FileLogAdmin(admin.ModelAdmin):
 
 
 class FileTransferAuditEvent(models.Model):
-    id = models.AutoField(verbose_name="ID", primary_key=True)
+    id = models.BigAutoField(verbose_name="ID", primary_key=True)
     transfer = models.ForeignKey(
         FileLog,
         editable=False,
@@ -2466,6 +2466,20 @@ class PersistentIngestionUsage(models.Model):
 
     def __str__(self):
         return f"{self.kind}:{self.scope}:{self.subject_id}"
+
+
+class SequenceCapacityState(models.Model):
+    """Previous production sequence sample used to calculate growth and ETA."""
+
+    sequence_name = models.CharField(max_length=128, primary_key=True, editable=False)
+    last_value = models.PositiveBigIntegerField(default=0, editable=False)
+    sampled_at = models.DateTimeField(editable=False)
+
+    class Meta:
+        ordering = ("sequence_name",)
+
+    def __str__(self):
+        return self.sequence_name
 
 
 class ShareLinkAdmin(admin.ModelAdmin):

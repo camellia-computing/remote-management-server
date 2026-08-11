@@ -9,6 +9,7 @@ from django.test import Client, RequestFactory, TestCase, override_settings
 
 from api.identifiers import (
     InvalidIdentifier,
+    model_pk_maximum,
     parse_model_pk,
     parse_model_pk_list,
     parse_uuid,
@@ -22,7 +23,7 @@ TEST_STORAGES = {
     "default": {"BACKEND": "django.core.files.storage.FileSystemStorage"},
     "staticfiles": {"BACKEND": "django.contrib.staticfiles.storage.StaticFilesStorage"},
 }
-AUTO_FIELD_MAX = (1 << 31) - 1
+AUTO_FIELD_MAX = model_pk_maximum(UserProfile)
 
 
 @override_settings(STORAGES=TEST_STORAGES)
@@ -92,7 +93,9 @@ class ManagementIdentifierHttpTests(TestCase):
     def assert_error(self, response, status):
         self.assertEqual(response.status_code, status, response.content[:1000])
         self.assertEqual(response.headers["Content-Type"], "application/json")
-        self.assertIn("error", json.loads(response.content))
+        payload = json.loads(response.content)
+        self.assertEqual(payload["response_schema_version"], 1)
+        self.assertIsInstance(payload["code"], str)
         self.assertNotIn(b"Traceback", response.content)
 
     def test_malformed_and_out_of_range_pk_paths_are_400_before_mutation(self):
