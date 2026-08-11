@@ -541,9 +541,9 @@ class RecordingUploadStateMachineTests(TestCase):
         plaintext = b"WRONG-KEY-CANARY"
         state = self._create(filename="wrong-data-key.webm")
         committed = self._part(state, plaintext).json()
-        RecordingUpload.objects.filter(pk=state["upload_id"]).update(
-            encrypted_data_key=recording_crypto.encode_data_key(recording_crypto.generate_data_key())
-        )
+        upload = RecordingUpload.objects.get(pk=state["upload_id"])
+        upload.encrypted_data_key = recording_crypto.encode_data_key(recording_crypto.generate_data_key())
+        upload.save(update_fields=("encrypted_data_key",))
 
         wrong_data_key = self._request(
             "finalize",

@@ -1,5 +1,8 @@
 import json
+from dataclasses import dataclass
+from functools import lru_cache
 
+from django.apps import apps as django_apps
 from django.conf import settings
 from django.core.exceptions import ValidationError
 from django.core.management.base import BaseCommand, CommandError
@@ -9,6 +12,8 @@ from api import recording_inventory
 from api.encrypted_fields import (
     FIELD_PREFIX,
     LEGACY_FIELD_PREFIX,
+    UNBOUND_FIELD_PREFIX,
+    build_encryption_context,
     decrypt_text,
     encrypt_text,
     key_canary,
@@ -17,25 +22,113 @@ from api.encrypted_fields import (
 )
 from api.models import DataEncryptionKeyState
 
+
+@dataclass(frozen=True)
+class EncryptedColumn:
+    table: str
+    pk_column: str
+    encrypted_column: str
+    model_label: str
+    context_columns: tuple[str, ...]
+
+
 ENCRYPTED_COLUMNS = (
-    ("api_remotepeer", "id", "rhash"),
-    ("api_remotepeer", "id", "password"),
-    ("api_addressbookprofile", "id", "default_password"),
-    ("api_remotedevice", "id", "address_book_password"),
-    ("api_oidcpendingauth", "state", "nonce"),
-    ("api_oidcpendingauth", "state", "code_verifier"),
-    ("api_recordingupload", "upload_id", "encrypted_data_key"),
+    EncryptedColumn(
+        "api_remotepeer",
+        "id",
+        "rhash",
+        "api.RemotePeer",
+        ("secret_context", "profile_id", "rid"),
+    ),
+    EncryptedColumn(
+        "api_remotepeer",
+        "id",
+        "password",
+        "api.RemotePeer",
+        ("secret_context", "profile_id", "rid"),
+    ),
+    EncryptedColumn(
+        "api_addressbookprofile",
+        "id",
+        "default_password",
+        "api.AddressBookProfile",
+        ("secret_context", "guid"),
+    ),
+    EncryptedColumn(
+        "api_remotedevice",
+        "id",
+        "address_book_password",
+        "api.RemoteDevice",
+        ("secret_context", "deployment_generation", "owner_id", "rid", "uuid"),
+    ),
+    EncryptedColumn(
+        "api_oidcpendingauth",
+        "state",
+        "nonce",
+        "api.OidcPendingAuth",
+        ("secret_context", "state", "provider"),
+    ),
+    EncryptedColumn(
+        "api_oidcpendingauth",
+        "state",
+        "code_verifier",
+        "api.OidcPendingAuth",
+        ("secret_context", "state", "provider"),
+    ),
+    EncryptedColumn(
+        "api_recordingupload",
+        "upload_id",
+        "encrypted_data_key",
+        "api.RecordingUpload",
+        (
+            "secret_context",
+            "upload_id",
+            "device_id_at_create",
+            "owner_id_at_create",
+            "deployment_generation",
+            "storage_object_id",
+        ),
+    ),
 )
 MAX_REPORTED_ERRORS = 20
 
 
 def _envelope_key_id(envelope):
     if envelope.startswith(FIELD_PREFIX):
-        key_id, separator, _encoded = envelope.removeprefix(FIELD_PREFIX).partition(":")
+        key_id, separator, _remainder = envelope.removeprefix(FIELD_PREFIX).partition(":")
+        return key_id if separator else ""
+    if envelope.startswith(UNBOUND_FIELD_PREFIX):
+        key_id, separator, _encoded = envelope.removeprefix(UNBOUND_FIELD_PREFIX).partition(":")
         return key_id if separator else ""
     if envelope.startswith(LEGACY_FIELD_PREFIX):
         return settings.DATA_ENCRYPTION_V1_KEY_ID
     return ""
+
+
+@lru_cache(maxsize=len(ENCRYPTED_COLUMNS))
+def _context_converters(model_label, context_columns):
+    model = django_apps.get_model(model_label)
+    fields_by_attname = {field.attname: field for field in model._meta.concrete_fields}
+    converters = []
+    for column in context_columns:
+        field = fields_by_attname.get(column)
+        if field is None:
+            raise CommandError(f"Encrypted-field context column is unavailable for {model_label}")
+        value_field = field.target_field if field.is_relation else field
+        converters.append(value_field.to_python)
+    return model._meta.label_lower, tuple(converters)
+
+
+def _encryption_context(column, raw_values):
+    model_label, converters = _context_converters(column.model_label, column.context_columns)
+    try:
+        components = (
+            (name, converter(value))
+            for name, converter, value in zip(column.context_columns, converters, raw_values, strict=True)
+        )
+        return build_encryption_context(model_label, column.encrypted_column, components)
+    except (TypeError, ValueError, ValidationError) as exc:
+        raise ValidationError("Encrypted field context is invalid") from exc
 
 
 class Command(BaseCommand):
@@ -71,13 +164,11 @@ class Command(BaseCommand):
             "rewritten": 0,
             "validated": 0,
         }
-        for table, pk_column, encrypted_column in ENCRYPTED_COLUMNS:
+        for column in ENCRYPTED_COLUMNS:
             if max_batches is not None and result["batches"] >= max_batches:
                 break
             self._rotate_column(
-                table,
-                pk_column,
-                encrypted_column,
+                column,
                 batch_size=batch_size,
                 max_batches=max_batches,
                 result=result,
@@ -136,18 +227,20 @@ class Command(BaseCommand):
 
     def _rotate_column(
         self,
-        table,
-        pk_column,
-        encrypted_column,
+        column,
         *,
         batch_size,
         max_batches,
         result,
     ):
+        table = column.table
+        pk_column = column.pk_column
+        encrypted_column = column.encrypted_column
         quote = connection.ops.quote_name
         table_name = quote(table)
         pk_name = quote(pk_column)
         field_name = quote(encrypted_column)
+        context_names = ", ".join(quote(name) for name in column.context_columns)
         last_pk = None
         primary_prefix = f"{FIELD_PREFIX}{settings.DATA_ENCRYPTION_PRIMARY_KEY_ID}:"
         while max_batches is None or result["batches"] < max_batches:
@@ -163,7 +256,8 @@ class Command(BaseCommand):
                     where += f" AND {pk_name} > %s"
                     params.append(last_pk)
                 statement = (
-                    f"SELECT {pk_name}, {field_name} FROM {table_name} "  # noqa: S608 - fixed allowlist
+                    f"SELECT {pk_name}, {field_name}, {context_names} "  # noqa: S608 - fixed allowlist
+                    f"FROM {table_name} "
                     f"WHERE {where} ORDER BY {pk_name} LIMIT %s"
                 )
                 params.append(batch_size)
@@ -177,12 +271,14 @@ class Command(BaseCommand):
 
                 changes = []
                 errors = []
-                for row_pk, envelope in rows:
+                for row in rows:
+                    row_pk, envelope, *raw_context = row
                     try:
-                        plaintext = decrypt_text(envelope)
+                        context = _encryption_context(column, raw_context)
+                        plaintext = decrypt_text(envelope, context=context)
                         result["validated"] += 1
-                        if _envelope_key_id(envelope) != settings.DATA_ENCRYPTION_PRIMARY_KEY_ID:
-                            changes.append((row_pk, envelope, encrypt_text(plaintext)))
+                        if not envelope.startswith(primary_prefix):
+                            changes.append((row_pk, envelope, encrypt_text(plaintext, context=context)))
                     except ValidationError as exc:
                         errors.append(f"{table}.{encrypted_column}[{row_pk!r}]: {exc.message}")
                         if len(errors) >= MAX_REPORTED_ERRORS:
@@ -233,23 +329,25 @@ class Command(BaseCommand):
 
     def _count_key_references(self, key_id):
         quote = connection.ops.quote_name
-        v2_prefix = f"{FIELD_PREFIX}{key_id}:"
+        v3_prefix = f"{FIELD_PREFIX}{key_id}:"
+        v2_prefix = f"{UNBOUND_FIELD_PREFIX}{key_id}:"
         references = 0
-        for table, _pk_column, encrypted_column in ENCRYPTED_COLUMNS:
+        for column in ENCRYPTED_COLUMNS:
             with connection.cursor() as cursor:
                 cursor.execute(
-                    f"SELECT COUNT(*) FROM {quote(table)} "  # noqa: S608 - fixed allowlist
-                    f"WHERE SUBSTR({quote(encrypted_column)}, 1, %s) = %s",
-                    [len(v2_prefix), v2_prefix],
+                    f"SELECT COUNT(*) FROM {quote(column.table)} "  # noqa: S608 - fixed allowlist
+                    f"WHERE SUBSTR({quote(column.encrypted_column)}, 1, %s) = %s "
+                    f"OR SUBSTR({quote(column.encrypted_column)}, 1, %s) = %s",
+                    [len(v3_prefix), v3_prefix, len(v2_prefix), v2_prefix],
                 )
                 references += cursor.fetchone()[0]
         if key_id == settings.DATA_ENCRYPTION_V1_KEY_ID:
             legacy_prefix = LEGACY_FIELD_PREFIX
-            for table, _pk_column, encrypted_column in ENCRYPTED_COLUMNS:
+            for column in ENCRYPTED_COLUMNS:
                 with connection.cursor() as cursor:
                     cursor.execute(
-                        f"SELECT COUNT(*) FROM {quote(table)} "  # noqa: S608 - fixed allowlist
-                        f"WHERE SUBSTR({quote(encrypted_column)}, 1, %s) = %s",
+                        f"SELECT COUNT(*) FROM {quote(column.table)} "  # noqa: S608 - fixed allowlist
+                        f"WHERE SUBSTR({quote(column.encrypted_column)}, 1, %s) = %s",
                         [len(legacy_prefix), legacy_prefix],
                     )
                     references += cursor.fetchone()[0]
@@ -259,13 +357,13 @@ class Command(BaseCommand):
         quote = connection.ops.quote_name
         primary_prefix = f"{FIELD_PREFIX}{primary_key_id}:"
         references = 0
-        for table, _pk_column, encrypted_column in ENCRYPTED_COLUMNS:
+        for column in ENCRYPTED_COLUMNS:
             with connection.cursor() as cursor:
                 cursor.execute(
-                    f"SELECT COUNT(*) FROM {quote(table)} "  # noqa: S608 - fixed allowlist
-                    f"WHERE {quote(encrypted_column)} IS NOT NULL "
-                    f"AND {quote(encrypted_column)} <> %s "
-                    f"AND SUBSTR({quote(encrypted_column)}, 1, %s) <> %s",
+                    f"SELECT COUNT(*) FROM {quote(column.table)} "  # noqa: S608 - fixed allowlist
+                    f"WHERE {quote(column.encrypted_column)} IS NOT NULL "
+                    f"AND {quote(column.encrypted_column)} <> %s "
+                    f"AND SUBSTR({quote(column.encrypted_column)}, 1, %s) <> %s",
                     ["", len(primary_prefix), primary_prefix],
                 )
                 references += cursor.fetchone()[0]
@@ -275,10 +373,14 @@ class Command(BaseCommand):
         quote = connection.ops.quote_name
         validated = 0
         remaining = 0
-        for table, pk_column, encrypted_column in ENCRYPTED_COLUMNS:
+        for column in ENCRYPTED_COLUMNS:
+            table = column.table
+            pk_column = column.pk_column
+            encrypted_column = column.encrypted_column
             table_name = quote(table)
             pk_name = quote(pk_column)
             field_name = quote(encrypted_column)
+            context_names = ", ".join(quote(name) for name in column.context_columns)
             last_pk = None
             while True:
                 where = f"{field_name} IS NOT NULL AND {field_name} <> %s"
@@ -289,7 +391,8 @@ class Command(BaseCommand):
                 params.append(1_000)
                 with connection.cursor() as cursor:
                     cursor.execute(
-                        f"SELECT {pk_name}, {field_name} FROM {table_name} "  # noqa: S608 - fixed allowlist
+                        f"SELECT {pk_name}, {field_name}, {context_names} "  # noqa: S608 - fixed allowlist
+                        f"FROM {table_name} "
                         f"WHERE {where} ORDER BY {pk_name} LIMIT %s",
                         params,
                     )
@@ -297,11 +400,12 @@ class Command(BaseCommand):
                 if not rows:
                     break
                 errors = []
-                for row_pk, envelope in rows:
+                for row in rows:
+                    row_pk, envelope, *raw_context = row
                     try:
-                        decrypt_text(envelope)
+                        decrypt_text(envelope, context=_encryption_context(column, raw_context))
                         validated += 1
-                        if _envelope_key_id(envelope) != primary_key_id:
+                        if not envelope.startswith(f"{FIELD_PREFIX}{primary_key_id}:"):
                             remaining += 1
                     except ValidationError as exc:
                         errors.append(f"{table}.{encrypted_column}[{row_pk!r}]: {exc.message}")

@@ -81,14 +81,17 @@ def load_release_schema_manifest():
         raise ReleaseSchemaError("release schema manifest PostgreSQL capabilities are invalid")
     constraints = postgresql.get("constraints")
     indexes = postgresql.get("indexes")
+    not_null = postgresql.get("not_null")
     column_types = postgresql.get("column_types")
-    for field, values in (("constraints", constraints), ("indexes", indexes)):
+    for field, values in (("constraints", constraints), ("indexes", indexes), ("not_null", not_null)):
         if not isinstance(values, dict) or list(values) != sorted(values):
             raise ReleaseSchemaError(f"release schema manifest PostgreSQL {field} are invalid")
         for relation, names in values.items():
             if relation not in normalized_relations:
                 raise ReleaseSchemaError(f"release schema manifest PostgreSQL {field} references an unknown relation")
-            _identifier_list(names, f"postgresql.{field}.{relation}")
+            normalized_names = _identifier_list(names, f"postgresql.{field}.{relation}")
+            if field == "not_null" and not set(normalized_names).issubset(normalized_relations[relation]):
+                raise ReleaseSchemaError("release schema manifest PostgreSQL not-null column is unavailable")
     if not isinstance(column_types, dict) or list(column_types) != sorted(column_types):
         raise ReleaseSchemaError("release schema manifest PostgreSQL column types are invalid")
     for relation, expected_types in column_types.items():
@@ -112,6 +115,7 @@ def load_release_schema_manifest():
         "relations": normalized_relations,
         "postgresql_constraints": {key: tuple(value) for key, value in constraints.items()},
         "postgresql_indexes": {key: tuple(value) for key, value in indexes.items()},
+        "postgresql_not_null": {key: tuple(value) for key, value in not_null.items()},
         "postgresql_column_types": column_types,
     }
 
@@ -175,7 +179,8 @@ def _check_postgresql_capabilities(database, manifest):
             """
             SELECT relation.relname,
                    attribute.attname,
-                   pg_catalog.format_type(attribute.atttypid, attribute.atttypmod)
+                   pg_catalog.format_type(attribute.atttypid, attribute.atttypmod),
+                   attribute.attnotnull
               FROM pg_catalog.pg_class relation
               JOIN pg_catalog.pg_namespace namespace ON namespace.oid = relation.relnamespace
               JOIN pg_catalog.pg_attribute attribute ON attribute.attrelid = relation.oid
@@ -187,8 +192,10 @@ def _check_postgresql_capabilities(database, manifest):
             [list(relations)],
         )
         observed_columns = {}
-        for relation, column, type_name in cursor.fetchall():
+        observed_not_null = {}
+        for relation, column, type_name, not_null in cursor.fetchall():
             observed_columns.setdefault(relation, {})[column] = type_name
+            observed_not_null.setdefault(relation, {})[column] = not_null
         for relation, required_columns in relations.items():
             if relation not in observed_columns:
                 raise ReleaseSchemaError(f"required schema relation is missing: {relation}")
@@ -201,6 +208,10 @@ def _check_postgresql_capabilities(database, manifest):
             for column, expected_type in expected_types.items():
                 if observed_columns[relation].get(column) != expected_type:
                     raise ReleaseSchemaError(f"required schema column type is invalid: {relation}.{column}")
+        for relation, expected_columns in manifest["postgresql_not_null"].items():
+            for column in expected_columns:
+                if observed_not_null.get(relation, {}).get(column) is not True:
+                    raise ReleaseSchemaError(f"required non-null schema column is missing: {relation}.{column}")
 
         cursor.execute(
             """

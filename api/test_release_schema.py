@@ -39,8 +39,8 @@ class ReleaseSchemaContractTests(TestCase):
         self.assertEqual(
             check_release_schema(),
             {
-                "migration_count": 49,
-                "schema_generation": "management-schema-0031-v1",
+                "migration_count": 50,
+                "schema_generation": "management-schema-0032-v1",
                 "schema_manifest_version": 1,
             },
         )
@@ -91,6 +91,16 @@ class ReleaseSchemaContractTests(TestCase):
                 check_release_schema()
             transaction.set_rollback(True)
         with transaction.atomic(), connection.cursor() as cursor:
+            cursor.execute("ALTER TABLE api_remotepeer DROP CONSTRAINT unique_peer_secret_context")
+            with self.assertRaisesMessage(ReleaseSchemaError, "unique_peer_secret_context"):
+                check_release_schema()
+            transaction.set_rollback(True)
+        with transaction.atomic(), connection.cursor() as cursor:
+            cursor.execute("ALTER TABLE api_remotepeer ALTER COLUMN secret_context DROP NOT NULL")
+            with self.assertRaisesMessage(ReleaseSchemaError, "api_remotepeer.secret_context"):
+                check_release_schema()
+            transaction.set_rollback(True)
+        with transaction.atomic(), connection.cursor() as cursor:
             cursor.execute("DROP INDEX device_owner_rid_idx")
             with self.assertRaisesMessage(ReleaseSchemaError, "device_owner_rid_idx"):
                 check_release_schema()
@@ -104,7 +114,7 @@ class ReleaseSchemaContractTests(TestCase):
     def test_management_command_reports_manifest_generation(self):
         output = StringIO()
         call_command("check_release_schema", stdout=output)
-        self.assertIn('"schema_generation": "management-schema-0031-v1"', output.getvalue())
+        self.assertIn('"schema_generation": "management-schema-0032-v1"', output.getvalue())
 
 
 class ReleaseSchemaManifestValidationTests(TestCase):
