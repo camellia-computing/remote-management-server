@@ -19,6 +19,7 @@ CONTROLLER = ROOT / "deploy" / "start-management-stack.sh"
 BOOTSTRAP = ROOT / "deploy" / "bootstrap-postgres-roles.sh"
 BACKUP = ROOT / "deploy" / "backup-postgres.sh"
 RESTORE = ROOT / "deploy" / "restore-postgres.sh"
+BACKUP_UNIT = ROOT / "deploy" / "systemd" / "camellia-remote-management-backup.service"
 INTEGRATION_SENTINEL = "ephemeral-database-will-be-mutated"
 
 
@@ -95,6 +96,24 @@ class DatabaseRoleContractTests(unittest.TestCase):
         self.assertIn("check_release_schema", restore)
         self.assertIn("migrate", restore)
         self.assertIn("database-probe", restore)
+
+    def test_backup_client_has_authoritative_container_resource_limits(self):
+        service = compose_service("database-backup")
+        for required in (
+            'cpus: "1.0"',
+            "cpu_shares: 256",
+            "mem_limit: 512m",
+            "mem_reservation: 256m",
+            "pids_limit: 64",
+            "oom_score_adj: 500",
+            "blkio_config:",
+            "weight: 100",
+        ):
+            self.assertIn(required, service)
+
+        unit = BACKUP_UNIT.read_text()
+        for required in ("CPUQuota=200%", "MemoryHigh=768M", "MemoryMax=1G", "TasksMax=256"):
+            self.assertIn(required, unit)
 
     def test_bootstrap_script_enforces_flags_ownership_acl_and_membership(self):
         script = BOOTSTRAP.read_text()

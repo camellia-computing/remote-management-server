@@ -22,6 +22,7 @@ operation_runner="${CAMELLIA_REMOTE_OPERATION_RUNNER:-$project_dir/deploy/run-co
 docker_binary="${CAMELLIA_REMOTE_DOCKER_BINARY:-$(command -v docker 2>/dev/null || true)}"
 backup_timeout_seconds="${CAMELLIA_REMOTE_BACKUP_OPERATION_TIMEOUT_SECONDS:-2700}"
 pg_dump_lock_timeout_seconds="${CAMELLIA_REMOTE_BACKUP_PG_DUMP_LOCK_TIMEOUT_SECONDS:-30}"
+backup_compression="${CAMELLIA_REMOTE_BACKUP_COMPRESSION-zstd:3}"
 run_stale_seconds="${CAMELLIA_REMOTE_BACKUP_RUN_STALE_SECONDS:-180}"
 run_heartbeat_seconds="${CAMELLIA_REMOTE_BACKUP_RUN_HEARTBEAT_SECONDS:-30}"
 backup_started_seconds=$SECONDS
@@ -42,6 +43,10 @@ done
 (( pg_dump_lock_timeout_seconds >= 1 && pg_dump_lock_timeout_seconds <= 300 )) ||
     die "CAMELLIA_REMOTE_BACKUP_PG_DUMP_LOCK_TIMEOUT_SECONDS must be between 1 and 300"
 (( pg_dump_lock_timeout_seconds < backup_timeout_seconds )) || die "pg_dump lock timeout must be shorter than backup timeout"
+case "$backup_compression" in
+    none | gzip:[1-6] | zstd:[1-9]) ;;
+    *) die "CAMELLIA_REMOTE_BACKUP_COMPRESSION must be none, gzip:1..6, or zstd:1..9" ;;
+esac
 (( run_heartbeat_seconds >= 10 && run_heartbeat_seconds <= 60 )) ||
     die "CAMELLIA_REMOTE_BACKUP_RUN_HEARTBEAT_SECONDS must be between 10 and 60"
 (( run_stale_seconds >= run_heartbeat_seconds * 3 && run_stale_seconds <= 3600 )) ||
@@ -90,6 +95,9 @@ if [[ "$(id -u)" -eq 0 ]]; then
 else
     [[ "$identity_owner" -eq "$(id -u)" ]] || die "backup verification identity must be owned by the invoking user"
 fi
+
+printf 'backup_policy compression=%s client=postgres-18 cpu_limit=1.0 memory_limit=512m pids_limit=64 blkio_weight=100\n' \
+    "$backup_compression" >&2
 
 [[ ! -L "$backup_dir" ]] || die "backup directory must not be a symlink"
 install -d -m 0700 "$backup_dir"
@@ -261,7 +269,7 @@ read -r recording_epoch_id recording_inventory_digest <<<"$checkpoint_values"
 update_phase exporting-database
 set -o pipefail
 run_backup_operation database backup-database database-backup \
-    pg_dump --format=custom --compress=9 --no-owner --no-acl \
+    pg_dump --format=custom --compress="$backup_compression" --no-owner --no-acl \
         --lock-wait-timeout="${pg_dump_lock_timeout_seconds}s" \
     | python3 "$envelope_helper" pack \
         --backup-id "$backup_id" \

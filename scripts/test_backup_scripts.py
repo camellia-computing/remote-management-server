@@ -181,6 +181,10 @@ class BackupScriptsTests(unittest.TestCase):
                     if "--lock-wait-timeout=30s" not in args:
                         print("pg_dump lock deadline is missing", file=sys.stderr)
                         raise SystemExit(52)
+                    compression = os.environ.get("CAMELLIA_REMOTE_BACKUP_COMPRESSION", "zstd:3")
+                    if f"--compress={compression}" not in args:
+                        print("pg_dump compression contract is missing", file=sys.stderr)
+                        raise SystemExit(54)
                     if mode == "pg_dump-fail":
                         print("pg_dump failed", file=sys.stderr)
                         raise SystemExit(42)
@@ -357,6 +361,12 @@ class BackupScriptsTests(unittest.TestCase):
         self.assertEqual(list(self.tmpdir.glob("camellia-restore-*")), [])
 
     def test_pg_dump_or_age_failure_leaves_no_artifact_and_lock_is_monitorable(self):
+        for invalid_compression in ("", "gzip", "gzip:0", "gzip:9", "zstd:0", "zstd:10", "lz4", "zstd:3 --no-acl"):
+            with self.subTest(invalid_compression=invalid_compression):
+                invalid = self.run_backup(CAMELLIA_REMOTE_BACKUP_COMPRESSION=invalid_compression)
+                self.assertNotEqual(invalid.returncode, 0)
+                self.assertIn("COMPRESSION", invalid.stderr)
+
         self.env_file.chmod(0o644)
         insecure_env = self.run_backup()
         self.assertNotEqual(insecure_env.returncode, 0)
@@ -476,25 +486,44 @@ class BackupScriptsTests(unittest.TestCase):
             recordings.write_bytes(f"old recordings {digit}".encode())
             created = subprocess.run(
                 [
-                    str(HELPER), "set-create",
-                    "--backup-id", backup_id,
-                    "--created-at", timestamp,
-                    "--deployment-id", "production-a",
-                    "--database-name", "camellia_remote",
-                    "--postgres-major", "18",
-                    "--key-id", "backup-v1",
-                    "--data-encryption-key-id", "data-v3",
-                    "--source-revision", "c" * 40,
-                    "--management-image", "ghcr.io/example/management@sha256:" + ("b" * 64),
-                    "--schema-generation", "management-schema-0032-v1",
-                    "--schema-manifest-version", "1",
-                    "--migration-count", "50",
-                    "--recording-epoch-id", "11111111-1111-4111-8111-111111111111",
-                    "--recording-inventory-digest", "a" * 64,
-                    "--database-artifact", str(database),
-                    "--recordings-artifact", str(recordings),
-                    "--verified-at", timestamp,
-                    "--completed-at", timestamp,
+                    str(HELPER),
+                    "set-create",
+                    "--backup-id",
+                    backup_id,
+                    "--created-at",
+                    timestamp,
+                    "--deployment-id",
+                    "production-a",
+                    "--database-name",
+                    "camellia_remote",
+                    "--postgres-major",
+                    "18",
+                    "--key-id",
+                    "backup-v1",
+                    "--data-encryption-key-id",
+                    "data-v3",
+                    "--source-revision",
+                    "c" * 40,
+                    "--management-image",
+                    "ghcr.io/example/management@sha256:" + ("b" * 64),
+                    "--schema-generation",
+                    "management-schema-0032-v1",
+                    "--schema-manifest-version",
+                    "1",
+                    "--migration-count",
+                    "50",
+                    "--recording-epoch-id",
+                    "11111111-1111-4111-8111-111111111111",
+                    "--recording-inventory-digest",
+                    "a" * 64,
+                    "--database-artifact",
+                    str(database),
+                    "--recordings-artifact",
+                    str(recordings),
+                    "--verified-at",
+                    timestamp,
+                    "--completed-at",
+                    timestamp,
                 ],
                 check=True,
                 capture_output=True,
