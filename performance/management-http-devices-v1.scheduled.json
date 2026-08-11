@@ -1,0 +1,29 @@
+{
+  "max_relative_mad": 0.15,
+  "metrics": {
+    "query_count_per_request": {
+      "absolute_max": 20,
+      "absolute_min": 1,
+      "direction": "lower",
+      "max_regression_percent": 0,
+      "unit": "count"
+    },
+    "response_bytes": {
+      "absolute_max": 262144,
+      "absolute_min": 1,
+      "direction": "lower",
+      "max_regression_percent": 5,
+      "unit": "bytes"
+    },
+    "response_ms_mean": {
+      "absolute_max": 1000,
+      "absolute_min": 0.01,
+      "direction": "lower",
+      "max_regression_percent": 15,
+      "unit": "ms"
+    }
+  },
+  "min_samples": 15,
+  "scenario": "management-http-devices-v1",
+  "schema": "camellia-performance-policy-v1"
+}

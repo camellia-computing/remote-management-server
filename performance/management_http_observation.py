@@ -11,28 +11,58 @@ import os
 import pathlib
 import sys
 import time
+from dataclasses import dataclass
+from urllib.parse import urlsplit, urlunsplit
 
 SCENARIO = "management-http-devices-v1"
 REQUESTS = 20
 SEED_DEVICES = 100
 
 
-def _configure(output: pathlib.Path) -> pathlib.Path:
+@dataclass(frozen=True)
+class DatabaseHandle:
+    sqlite_path: pathlib.Path | None = None
+    postgres_admin_url: str | None = None
+    postgres_database: str | None = None
+
+
+def _prepare_postgres(output: pathlib.Path, raw_url: str) -> DatabaseHandle:
+    parsed = urlsplit(raw_url)
+    if (
+        parsed.scheme not in {"postgres", "postgresql"}
+        or parsed.hostname != "127.0.0.1"
+        or parsed.port is None
+        or not 55600 <= parsed.port <= 55699
+        or parsed.username is None
+        or parsed.password is None
+        or parsed.path != "/postgres"
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise RuntimeError(
+            "CAMELLIA_PERFORMANCE_DATABASE_URL must target PostgreSQL on 127.0.0.1:55600..55699/postgres"
+        )
+    database = "camellia_perf_" + hashlib.sha256(str(output).encode("utf-8")).hexdigest()[:16]
+    admin_url = urlunsplit((parsed.scheme, parsed.netloc, "/postgres", "", ""))
+    database_url = urlunsplit((parsed.scheme, parsed.netloc, f"/{database}", "", ""))
+    import psycopg
+    from psycopg import sql
+
+    with psycopg.connect(admin_url, autocommit=True) as connection:
+        connection.execute(sql.SQL("CREATE DATABASE {}").format(sql.Identifier(database)))
+    os.environ["CAMELLIA_REMOTE_DATABASE_URL"] = database_url
+    os.environ["CAMELLIA_REMOTE_DATABASE_SSLMODE"] = "disable"
+    return DatabaseHandle(postgres_admin_url=admin_url, postgres_database=database)
+
+
+def _configure(output: pathlib.Path) -> DatabaseHandle:
     if not output.is_absolute():
         raise RuntimeError("performance observation path must be absolute")
-    forbidden = (
-        "CAMELLIA_REMOTE_DATABASE_URL",
-        "CAMELLIA_REMOTE_DATABASE_HOST",
-        "CAMELLIA_REMOTE_DATABASE_NAME",
-        "CAMELLIA_REMOTE_DATABASE_USER",
-        "CAMELLIA_REMOTE_DATABASE_PASSWORD",
-    )
-    configured = [name for name in forbidden if os.environ.get(name)]
+    configured = sorted(name for name in os.environ if name.startswith("CAMELLIA_REMOTE_DATABASE_"))
     if configured:
-        raise RuntimeError("management performance smoke refuses PostgreSQL settings: " + ",".join(configured))
-    database = output.with_name("management-performance.sqlite3")
-    if database.exists() or database.is_symlink():
-        raise RuntimeError("performance database path already exists")
+        raise RuntimeError(
+            "management performance observation refuses production database settings: " + ",".join(configured)
+        )
     os.environ["DJANGO_SETTINGS_MODULE"] = "camellia_remote_management.settings"
     os.environ["CAMELLIA_REMOTE_DEBUG"] = "true"
     os.environ["CAMELLIA_REMOTE_SECRET_KEY"] = hashlib.sha256(
@@ -41,8 +71,14 @@ def _configure(output: pathlib.Path) -> pathlib.Path:
     os.environ["CAMELLIA_REMOTE_ALLOWED_HOSTS"] = "testserver"
     os.environ["CAMELLIA_REMOTE_CSRF_TRUSTED_ORIGINS"] = "http://testserver"
     os.environ["CAMELLIA_REMOTE_RATE_LIMIT_ENABLED"] = "false"
+    performance_url = os.environ.get("CAMELLIA_PERFORMANCE_DATABASE_URL", "").strip()
+    if performance_url:
+        return _prepare_postgres(output, performance_url)
+    database = output.with_name("management-performance.sqlite3")
+    if database.exists() or database.is_symlink():
+        raise RuntimeError("performance database path already exists")
     os.environ["CAMELLIA_REMOTE_SQLITE_DB_PATH"] = str(database)
-    return database
+    return DatabaseHandle(sqlite_path=database)
 
 
 def _seed() -> tuple[str, int]:
@@ -84,7 +120,7 @@ def _seed() -> tuple[str, int]:
     return raw_token, user.pk
 
 
-def _observe(raw_token: str) -> dict[str, float]:
+def _observe(raw_token: str, work_seconds: int | None) -> dict[str, float]:
     from django.db import connection
     from django.test import Client
     from django.test.utils import CaptureQueriesContext
@@ -100,8 +136,10 @@ def _observe(raw_token: str) -> dict[str, float]:
 
     last_size = 0
     started = time.perf_counter_ns()
+    deadline = started + work_seconds * 1_000_000_000 if work_seconds is not None else None
+    request_count = 0
     with CaptureQueriesContext(connection) as captured:
-        for _ in range(REQUESTS):
+        while request_count < REQUESTS or (deadline is not None and time.perf_counter_ns() < deadline):
             response = client.get("/api/devices", query, **headers)
             if response.status_code != 200:
                 raise RuntimeError(f"device-list request failed with {response.status_code}")
@@ -109,12 +147,22 @@ def _observe(raw_token: str) -> dict[str, float]:
             if len(payload.get("data", ())) != 10:
                 raise RuntimeError("device-list response changed semantics")
             last_size = len(response.content)
+            request_count += 1
     elapsed_ns = time.perf_counter_ns() - started
     return {
-        "query_count_per_request": len(captured) / REQUESTS,
+        "query_count_per_request": len(captured) / request_count,
         "response_bytes": float(last_size),
-        "response_ms_mean": elapsed_ns / REQUESTS / 1_000_000,
+        "response_ms_mean": elapsed_ns / request_count / 1_000_000,
     }
+
+
+def _work_seconds() -> int | None:
+    raw = os.environ.get("CAMELLIA_PERFORMANCE_WORK_SECONDS")
+    if raw is None:
+        return None
+    if not raw.isascii() or not raw.isdigit() or len(raw) > 2 or str(int(raw)) != raw or not 1 <= int(raw) <= 60:
+        raise RuntimeError("CAMELLIA_PERFORMANCE_WORK_SECONDS must be a canonical integer in 1..60")
+    return int(raw)
 
 
 def _write(output: pathlib.Path, metrics: dict[str, float]) -> None:
@@ -155,6 +203,7 @@ def main() -> int:
     if not raw_output:
         raise RuntimeError("CAMELLIA_PERFORMANCE_OBSERVATION_FILE is required")
     output = pathlib.Path(raw_output)
+    work_seconds = _work_seconds()
     database = _configure(output)
     repository = pathlib.Path(__file__).resolve().parents[1]
     sys.path.insert(0, str(repository))
@@ -164,13 +213,27 @@ def main() -> int:
     from django.core.management import call_command
     from django.db import connections
 
-    django.setup()
-    call_command("migrate", interactive=False, verbosity=0)
-    raw_token, _user_id = _seed()
-    metrics = _observe(raw_token)
-    _write(output, metrics)
-    connections.close_all()
-    database.unlink(missing_ok=True)
+    django_ready = False
+    try:
+        django.setup()
+        django_ready = True
+        call_command("migrate", interactive=False, verbosity=0)
+        raw_token, _user_id = _seed()
+        metrics = _observe(raw_token, work_seconds)
+        _write(output, metrics)
+    finally:
+        if django_ready:
+            connections.close_all()
+        if database.sqlite_path is not None:
+            database.sqlite_path.unlink(missing_ok=True)
+        if database.postgres_admin_url and database.postgres_database:
+            import psycopg
+            from psycopg import sql
+
+            with psycopg.connect(database.postgres_admin_url, autocommit=True) as connection:
+                connection.execute(
+                    sql.SQL("DROP DATABASE {} WITH (FORCE)").format(sql.Identifier(database.postgres_database))
+                )
     return 0
 
 
