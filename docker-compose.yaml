@@ -26,6 +26,7 @@ x-application: &application
     CAMELLIA_REMOTE_DATABASE_KEEPALIVES_COUNT: ${CAMELLIA_REMOTE_DATABASE_KEEPALIVES_COUNT:-3}
     CAMELLIA_REMOTE_DATABASE_TCP_USER_TIMEOUT_MS: ${CAMELLIA_REMOTE_DATABASE_TCP_USER_TIMEOUT_MS:-30000}
     CAMELLIA_REMOTE_DATABASE_OPERATION_PROFILE: ${CAMELLIA_REMOTE_DATABASE_OPERATION_PROFILE:-RUNTIME}
+    CAMELLIA_REMOTE_RELEASE_REVISION: ${CAMELLIA_REMOTE_RELEASE_REVISION:?Pin the exact released source revision}
     CAMELLIA_REMOTE_DATABASE_RUNTIME_STATEMENT_TIMEOUT_MS: ${CAMELLIA_REMOTE_DATABASE_RUNTIME_STATEMENT_TIMEOUT_MS:-45000}
     CAMELLIA_REMOTE_DATABASE_RUNTIME_LOCK_TIMEOUT_MS: ${CAMELLIA_REMOTE_DATABASE_RUNTIME_LOCK_TIMEOUT_MS:-5000}
     CAMELLIA_REMOTE_DATABASE_RUNTIME_IDLE_TRANSACTION_TIMEOUT_MS: ${CAMELLIA_REMOTE_DATABASE_RUNTIME_IDLE_TRANSACTION_TIMEOUT_MS:-15000}
@@ -216,6 +217,17 @@ services:
     <<: *database-client
     profiles:
       - database-operations
+    # These limits are attached to the pg_dump/pg_restore process by Docker's
+    # container cgroup. Host-side systemd priority on the Docker CLI cannot
+    # constrain a process launched by the Docker daemon.
+    cpus: "1.0"
+    cpu_shares: 256
+    mem_limit: 512m
+    mem_reservation: 256m
+    pids_limit: 64
+    oom_score_adj: 500
+    blkio_config:
+      weight: 100
     environment:
       PGHOST: ${CAMELLIA_REMOTE_DATABASE_HOST:-postgres}
       PGPORT: ${CAMELLIA_REMOTE_DATABASE_PORT:-5432}

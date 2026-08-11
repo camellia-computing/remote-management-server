@@ -385,6 +385,26 @@ class RecordingUploadStateMachineTests(TestCase):
 
         bundle = BytesIO()
         recording_inventory.export_backup(epoch.backup_id, bundle)
+        verified_epoch = recording_inventory.verify_backup(
+            epoch.backup_id,
+            str(epoch.epoch_id),
+            epoch.inventory_digest,
+            BytesIO(bundle.getvalue()),
+        )
+        self.assertEqual(verified_epoch.state, RecordingBackupEpoch.STATE_READY)
+        corrupted_bundle = bytearray(bundle.getvalue())
+        corrupted_bundle[-2] ^= 1
+        with self.assertRaises(recording_inventory.RecordingInventoryError):
+            recording_inventory.verify_backup(
+                epoch.backup_id,
+                str(epoch.epoch_id),
+                epoch.inventory_digest,
+                BytesIO(corrupted_bundle),
+            )
+        self.assertEqual(
+            RecordingBackupControl.objects.get(singleton=1).active_epoch_id,
+            epoch.epoch_id,
+        )
         published.unlink()
         recording_uploads_dir = published.parent
         recording_inventory.restore_backup(
