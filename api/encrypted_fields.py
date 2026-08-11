@@ -10,6 +10,7 @@ from collections.abc import Iterable, Mapping
 from django.conf import settings
 from django.core import checks
 from django.core.exceptions import FieldDoesNotExist, ImproperlyConfigured, ObjectDoesNotExist, ValidationError
+from django.core.serializers.base import SerializationError
 from django.db import models
 from django.db.models.query_utils import DeferredAttribute
 from nacl.exceptions import CryptoError
@@ -295,6 +296,16 @@ class EncryptedTextField(models.TextField):
                 return value
             return decrypt_text(value)
         return value
+
+    def value_to_string(self, obj):
+        # Django's logical serializers read the descriptor value, which is
+        # necessarily plaintext after instance-aware authentication. There is
+        # no safe generic fixture representation for a context-bound envelope:
+        # plaintext leaks credentials, while raw ciphertext would either be
+        # double-encrypted by loaddata or detached from its row authority.
+        raise SerializationError(
+            "EncryptedTextField cannot be written to a logical fixture; use the authenticated physical backup set"
+        )
 
     def pre_save(self, model_instance, add):
         value = getattr(model_instance, self.attname)
