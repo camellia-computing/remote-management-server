@@ -378,6 +378,7 @@ jobs:
       - name: Django checks
         run: |
           uv run python scripts/test_deployment_gate.py
+          uv run python manage.py test api.test_migration_compatibility --verbosity 1
           uv run python manage.py check
           uv run python manage.py makemigrations --check --dry-run
 
