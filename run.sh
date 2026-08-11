@@ -54,7 +54,7 @@ require_integer_range CAMELLIA_REMOTE_GUNICORN_MAX_REQUESTS_JITTER "$MAX_REQUEST
 
 case "${CAMELLIA_REMOTE_RUN_MIGRATIONS:-false}" in
     1|true|TRUE|yes|YES)
-        python manage.py migrate_with_lease --noinput
+        CAMELLIA_REMOTE_DATABASE_OPERATION_PROFILE=MIGRATION python manage.py migrate_with_lease --noinput
         ;;
     0|false|FALSE|no|NO)
         ;;

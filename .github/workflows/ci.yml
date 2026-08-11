@@ -228,6 +228,8 @@ jobs:
             deploy/bootstrap-postgres-roles.sh \
             deploy/management-maintenance-guard.sh \
             deploy/management-maintenance.sh \
+            deploy/run-cleanup.sh \
+            deploy/run-compose-operation.sh \
             deploy/restore-postgres.sh \
             deploy/start-management-stack.sh \
             run.sh \
@@ -235,6 +237,7 @@ jobs:
             scripts/web_client_revision.sh
           python3 scripts/test_backup_envelope.py
           python3 scripts/test_backup_scripts.py
+          python3 scripts/test_compose_operation_runner.py
           python3 scripts/test_database_roles.py
           python3 scripts/test_deployment_gate.py
           python3 scripts/test_systemd_maintenance.py

@@ -8,6 +8,7 @@ env_file="/etc/camellia-remote-management/management.env"
 runtime_dir="/run/camellia-remote-management"
 lease_file="$runtime_dir/maintenance.lease"
 docker_binary="/usr/bin/docker"
+operation_runner="$project_dir/deploy/run-compose-operation.sh"
 
 die() {
     echo "stack start error: $*" >&2
@@ -15,7 +16,7 @@ die() {
 }
 
 usage() {
-    echo "usage: $0 [--project-dir ABSOLUTE_PATH] [--env-file ABSOLUTE_PATH] [--runtime-dir ABSOLUTE_PATH] [--lease-file ABSOLUTE_PATH] [--docker-binary ABSOLUTE_PATH]" >&2
+    echo "usage: $0 [--project-dir ABSOLUTE_PATH] [--env-file ABSOLUTE_PATH] [--runtime-dir ABSOLUTE_PATH] [--lease-file ABSOLUTE_PATH] [--docker-binary ABSOLUTE_PATH] [--operation-runner ABSOLUTE_PATH]" >&2
     exit 2
 }
 
@@ -71,11 +72,16 @@ while [[ $# -gt 0 ]]; do
             docker_binary="$2"
             shift 2
             ;;
+        --operation-runner)
+            [[ $# -ge 2 ]] || usage
+            operation_runner="$2"
+            shift 2
+            ;;
         *) usage ;;
     esac
 done
 
-[[ "$project_dir" = /* && "$env_file" = /* && "$runtime_dir" = /* && "$lease_file" = /* ]] ||
+[[ "$project_dir" = /* && "$env_file" = /* && "$runtime_dir" = /* && "$lease_file" = /* && "$operation_runner" = /* ]] ||
     die "deployment paths must be absolute"
 [[ "$lease_file" == "$runtime_dir/maintenance.lease" ]] ||
     die "maintenance lease must be the protected runtime-directory lease"
@@ -90,16 +96,20 @@ bootstrap_script="$project_dir/deploy/bootstrap-postgres-roles.sh"
     die "database role bootstrap script is missing, symlinked, or unreadable"
 [[ -f "$env_file" && ! -L "$env_file" && -r "$env_file" ]] ||
     die "management environment file is missing, symlinked, or unreadable"
+[[ -f "$operation_runner" && ! -L "$operation_runner" && -x "$operation_runner" ]] ||
+    die "compose operation runner is missing, symlinked, or not executable"
 
 require_canonical_path "$docker_binary" "docker binary"
 require_canonical_path "$project_dir" "project directory"
 require_canonical_path "$project_dir/docker-compose.yaml" "docker compose file"
 require_canonical_path "$bootstrap_script" "database role bootstrap script"
 require_canonical_path "$env_file" "management environment file"
+require_canonical_path "$operation_runner" "compose operation runner"
 require_owned_path "$docker_binary" "docker binary"
 require_owned_path "$project_dir" "project directory"
 require_owned_path "$project_dir/docker-compose.yaml" "docker compose file"
 require_owned_path "$bootstrap_script" "database role bootstrap script"
+require_owned_path "$operation_runner" "compose operation runner"
 
 env_mode="$(stat -c '%a' -- "$env_file" 2>/dev/null)" || die "cannot inspect management environment permissions"
 env_owner="$(stat -c '%u' -- "$env_file" 2>/dev/null)" || die "cannot inspect management environment owner"
@@ -144,6 +154,25 @@ fi
 assert_no_maintenance_lease
 
 compose=("$docker_binary" compose --env-file "$env_file" -f "$project_dir/docker-compose.yaml")
+operation_seed="$(date -u +%Y%m%dt%H%M%Sz)-$$"
+operation_counter=0
+
+run_operation() {
+    local operation_kind="$1"
+    local operation_timeout="$2"
+    local operation_service="$3"
+    shift 3
+    operation_counter=$((operation_counter + 1))
+    "$operation_runner" \
+        --project-dir "$project_dir" \
+        --env-file "$env_file" \
+        --docker-binary "$docker_binary" \
+        --operation-id "${operation_seed}-${operation_counter}" \
+        --operation-kind "$operation_kind" \
+        --service "$operation_service" \
+        --timeout-seconds "$operation_timeout" \
+        -- "$@"
+}
 "${compose[@]}" --profile database-operations config --quiet
 
 # No old application generation may remain online while migration runs.
@@ -160,14 +189,14 @@ fi
 # limited probe role exists. Start PostgreSQL without waiting, converge roles,
 # then require the authenticated healthcheck before migration.
 "${compose[@]}" up --detach postgres
-"${compose[@]}" run --rm --no-deps -T database-bootstrap
+run_operation database-bootstrap 300 database-bootstrap
 "${compose[@]}" up --detach --wait postgres
-"${compose[@]}" run --rm --no-deps migrate
+run_operation migration 2160 migrate
 # Migrations create new objects as the migration owner. Re-run convergence to
 # validate ownership/default ACLs and make current grants explicit before the
 # runtime credential is allowed online.
-"${compose[@]}" run --rm --no-deps -T database-bootstrap
-"${compose[@]}" run --rm --no-deps -T database-probe
+run_operation database-bootstrap 300 database-bootstrap
+run_operation database-probe 30 database-probe
 assert_no_maintenance_lease
 "${compose[@]}" up --detach --wait --no-deps management
 

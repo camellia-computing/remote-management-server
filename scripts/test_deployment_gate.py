@@ -15,6 +15,7 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 STACK_UNIT = ROOT / "deploy" / "systemd" / "camellia-remote-management-stack.service"
 CONTROLLER = ROOT / "deploy" / "start-management-stack.sh"
 MAINTENANCE = ROOT / "deploy" / "management-maintenance.sh"
+OPERATION_RUNNER = ROOT / "deploy" / "run-compose-operation.sh"
 
 
 def compose_service(name):
@@ -55,6 +56,10 @@ def deployment_fixture(root):
                     raise SystemExit(42)
                 if os.environ.get("FAKE_MANAGEMENT_RUNNING") == "1":
                     print("management")
+            if args[:2] == ["container", "inspect"]:
+                raise SystemExit(1)
+            if args[:2] == ["container", "ls"]:
+                raise SystemExit(0)
             if "run" in args and args[-1] == "migrate" and os.environ.get("FAKE_MIGRATION_FAIL") == "1":
                 raise SystemExit(41)
             raise SystemExit(0)
@@ -74,6 +79,8 @@ def deployment_fixture(root):
         str(runtime),
         "--lease-file",
         str(runtime / "maintenance.lease"),
+        "--operation-runner",
+        str(OPERATION_RUNNER),
     ]
     env = os.environ | {"FAKE_DOCKER_CALLS": str(calls)}
     return command, env, calls, runtime, env_file

@@ -66,11 +66,19 @@ class DatabaseRoleContractTests(unittest.TestCase):
 
     def test_controller_converges_and_verifies_roles_around_migration(self):
         controller = CONTROLLER.read_text()
-        first = controller.index("database-bootstrap")
-        migration = controller.index("migrate", first)
-        second = controller.index("database-bootstrap", first + len("database-bootstrap"))
-        probe = controller.index("database-probe", second)
-        application = controller.index("management", probe)
+        bootstrap_calls = [
+            match.start()
+            for match in re.finditer(
+                r"^run_operation database-bootstrap 300 database-bootstrap$",
+                controller,
+                re.MULTILINE,
+            )
+        ]
+        self.assertEqual(len(bootstrap_calls), 2)
+        first, second = bootstrap_calls
+        migration = controller.index("run_operation migration 2160 migrate", first)
+        probe = controller.index("run_operation database-probe 30 database-probe", second)
+        application = controller.index("up --detach --wait --no-deps management", probe)
         self.assertLess(first, migration)
         self.assertLess(migration, second)
         self.assertLess(second, probe)

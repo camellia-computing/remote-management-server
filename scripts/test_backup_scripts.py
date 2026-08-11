@@ -106,6 +106,8 @@ class BackupScriptsTests(unittest.TestCase):
                 mode = os.environ.get("FAKE_DOCKER_MODE", "ok")
                 epoch_id = "11111111-1111-4111-8111-111111111111"
                 inventory_digest = "a" * 64
+                if args[:2] == ["container", "ls"]:
+                    raise SystemExit(0)
                 if "recording_backup" in args:
                     operation = args[args.index("recording_backup") + 1]
                     if operation == "begin":
@@ -156,6 +158,9 @@ class BackupScriptsTests(unittest.TestCase):
                     print("180000")
                     raise SystemExit(0)
                 if "pg_dump" in args:
+                    if "--lock-wait-timeout=30s" not in args:
+                        print("pg_dump lock deadline is missing", file=sys.stderr)
+                        raise SystemExit(52)
                     if mode == "pg_dump-fail":
                         print("pg_dump failed", file=sys.stderr)
                         raise SystemExit(42)
@@ -192,6 +197,8 @@ class BackupScriptsTests(unittest.TestCase):
                 "CAMELLIA_REMOTE_ENV_FILE": str(self.env_file),
                 "CAMELLIA_REMOTE_BACKUP_DIR": str(self.backups),
                 "CAMELLIA_REMOTE_BACKUP_ENVELOPE_HELPER": str(HELPER),
+                "CAMELLIA_REMOTE_OPERATION_RUNNER": str(ROOT / "deploy" / "run-compose-operation.sh"),
+                "CAMELLIA_REMOTE_DOCKER_BINARY": str(self.fake_docker),
                 "CAMELLIA_REMOTE_BACKUP_AGE_BINARY": str(self.age),
                 "CAMELLIA_REMOTE_BACKUP_AGE_RECIPIENT": self.recipient,
                 "CAMELLIA_REMOTE_BACKUP_AGE_KEY_ID": "backup-v1",

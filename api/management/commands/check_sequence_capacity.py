@@ -4,6 +4,7 @@ from django.conf import settings
 from django.core.management.base import BaseCommand, CommandError
 from django.utils import timezone
 
+from api.database_deadlines import database_operation_budget
 from api.sequence_capacity import collect_sequence_samples, record_sequence_capacity
 from camellia_remote_management.observability import background_operation
 
@@ -23,7 +24,7 @@ class Command(BaseCommand):
         )
 
     def handle(self, *args, **options):
-        with background_operation("check_sequence_capacity"):
+        with background_operation("check_sequence_capacity"), database_operation_budget():
             sampled_at = timezone.now()
             report = record_sequence_capacity(
                 collect_sequence_samples(),

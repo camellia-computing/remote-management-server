@@ -5,6 +5,7 @@ from django.core.management.base import CommandError
 from django.core.management.commands.migrate import Command as DjangoMigrateCommand
 from django.db import connections
 
+from api.database_deadlines import database_operation_budget
 from api.migration_lease import (
     LOCK_TIMEOUT_EXIT_CODE,
     MigrationLeaseError,
@@ -41,25 +42,26 @@ class Command(DjangoMigrateCommand):
             )
         database = connections[options["database"]]
         try:
-            with migration_lease(
-                database,
-                timeout_seconds=options.pop("lock_timeout_seconds"),
-                actor=options.pop("actor"),
-                release_revision=options.pop("release_revision"),
-                output=self.stdout,
-            ):
-                # Django constructs its MigrationExecutor inside handle(). It
-                # therefore reads the ledger and rebuilds the plan only after
-                # this process becomes the lease holder.
-                result = super().handle(*args, **options)
-                if (
-                    options.get("app_label") is None
-                    and not options.get("plan")
-                    and not options.get("check_unapplied")
-                    and not options.get("prune")
+            with database_operation_budget(aliases=(options["database"],)):
+                with migration_lease(
+                    database,
+                    timeout_seconds=options.pop("lock_timeout_seconds"),
+                    actor=options.pop("actor"),
+                    release_revision=options.pop("release_revision"),
+                    output=self.stdout,
                 ):
-                    check_release_schema(using=options["database"])
-                return result
+                    # Django constructs its MigrationExecutor inside handle(). It
+                    # therefore reads the ledger and rebuilds the plan only after
+                    # this process becomes the lease holder.
+                    result = super().handle(*args, **options)
+                    if (
+                        options.get("app_label") is None
+                        and not options.get("plan")
+                        and not options.get("check_unapplied")
+                        and not options.get("prune")
+                    ):
+                        check_release_schema(using=options["database"])
+                    return result
         except MigrationLeaseTimeout as exc:
             raise CommandError(str(exc), returncode=LOCK_TIMEOUT_EXIT_CODE) from exc
         except (MigrationLeaseError, ReleaseSchemaError) as exc:

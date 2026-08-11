@@ -708,6 +708,81 @@ DATABASE_USER = os.environ.get("CAMELLIA_REMOTE_DATABASE_USER", "").strip()
 DATABASE_PASSWORD = os.environ.get("CAMELLIA_REMOTE_DATABASE_PASSWORD", "")
 SQLITE_DB_PATH = os.environ.get("CAMELLIA_REMOTE_SQLITE_DB_PATH", "").strip()
 MIGRATION_LOCK_TIMEOUT_SECONDS = env_int("CAMELLIA_REMOTE_MIGRATION_LOCK_TIMEOUT_SECONDS", 120, 1, 900)
+DATABASE_OPERATION_PROFILE = env_choice(
+    "CAMELLIA_REMOTE_DATABASE_OPERATION_PROFILE",
+    "RUNTIME",
+    {"RUNTIME", "MIGRATION", "CLEANUP", "BACKUP"},
+)
+_database_deadline_defaults = {
+    "RUNTIME": (45_000, 5_000, 15_000, 50_000),
+    "MIGRATION": (1_800_000, 300_000, 120_000, 2_100_000),
+    "CLEANUP": (180_000, 15_000, 30_000, 240_000),
+    "BACKUP": (2_400_000, 30_000, 60_000, 2_700_000),
+}
+_database_statement_default, _database_lock_default, _database_idle_default, _database_operation_default = (
+    _database_deadline_defaults[DATABASE_OPERATION_PROFILE]
+)
+_database_profile_prefix = f"CAMELLIA_REMOTE_DATABASE_{DATABASE_OPERATION_PROFILE}_"
+DATABASE_STATEMENT_TIMEOUT_MS = env_int(
+    f"{_database_profile_prefix}STATEMENT_TIMEOUT_MS",
+    _database_statement_default,
+    100,
+    3_600_000,
+)
+DATABASE_LOCK_TIMEOUT_MS = env_int(
+    f"{_database_profile_prefix}LOCK_TIMEOUT_MS",
+    _database_lock_default,
+    100,
+    900_000,
+)
+DATABASE_IDLE_TRANSACTION_TIMEOUT_MS = env_int(
+    f"{_database_profile_prefix}IDLE_TRANSACTION_TIMEOUT_MS",
+    _database_idle_default,
+    1_000,
+    900_000,
+)
+DATABASE_OPERATION_DEADLINE_MS = env_int(
+    f"{_database_profile_prefix}OPERATION_DEADLINE_MS",
+    _database_operation_default,
+    1_000,
+    3_900_000,
+)
+DATABASE_KEEPALIVES_IDLE_SECONDS = env_int(
+    "CAMELLIA_REMOTE_DATABASE_KEEPALIVES_IDLE_SECONDS",
+    10,
+    1,
+    300,
+)
+DATABASE_KEEPALIVES_INTERVAL_SECONDS = env_int(
+    "CAMELLIA_REMOTE_DATABASE_KEEPALIVES_INTERVAL_SECONDS",
+    5,
+    1,
+    60,
+)
+DATABASE_KEEPALIVES_COUNT = env_int(
+    "CAMELLIA_REMOTE_DATABASE_KEEPALIVES_COUNT",
+    3,
+    1,
+    20,
+)
+DATABASE_TCP_USER_TIMEOUT_MS = env_int(
+    "CAMELLIA_REMOTE_DATABASE_TCP_USER_TIMEOUT_MS",
+    30_000,
+    1_000,
+    300_000,
+)
+if DATABASE_LOCK_TIMEOUT_MS > DATABASE_STATEMENT_TIMEOUT_MS:
+    raise ImproperlyConfigured("database lock timeout must not exceed statement timeout")
+if DATABASE_STATEMENT_TIMEOUT_MS >= DATABASE_OPERATION_DEADLINE_MS:
+    raise ImproperlyConfigured("database statement timeout must be shorter than the operation deadline")
+if DATABASE_IDLE_TRANSACTION_TIMEOUT_MS >= DATABASE_OPERATION_DEADLINE_MS:
+    raise ImproperlyConfigured("database idle transaction timeout must be shorter than the operation deadline")
+if DATABASE_TCP_USER_TIMEOUT_MS >= DATABASE_OPERATION_DEADLINE_MS:
+    raise ImproperlyConfigured("database TCP user timeout must be shorter than the operation deadline")
+if (
+    DATABASE_KEEPALIVES_IDLE_SECONDS + DATABASE_KEEPALIVES_INTERVAL_SECONDS * DATABASE_KEEPALIVES_COUNT
+) * 1000 >= DATABASE_OPERATION_DEADLINE_MS:
+    raise ImproperlyConfigured("database keepalive failure detection must be shorter than the operation deadline")
 if SQLITE_DB_PATH and not Path(SQLITE_DB_PATH).is_absolute():
     raise ImproperlyConfigured("CAMELLIA_REMOTE_SQLITE_DB_PATH must be an absolute path")
 
@@ -729,6 +804,7 @@ INSTALLED_APPS = [
 
 MIDDLEWARE = [
     "api.middleware.SafeAccessLogMiddleware",
+    "api.middleware.DatabaseDeadlineMiddleware",
     "api.rate_limits.IngressRateLimitMiddleware",
     "django.middleware.security.SecurityMiddleware",
     "django.middleware.csp.ContentSecurityPolicyMiddleware",
@@ -826,7 +902,17 @@ def _database_tls_options(database_host):
 
     options = {
         "connect_timeout": env_int("CAMELLIA_REMOTE_DATABASE_CONNECT_TIMEOUT", 10, 1, 60),
+        "keepalives": 1,
+        "keepalives_count": DATABASE_KEEPALIVES_COUNT,
+        "keepalives_idle": DATABASE_KEEPALIVES_IDLE_SECONDS,
+        "keepalives_interval": DATABASE_KEEPALIVES_INTERVAL_SECONDS,
+        "options": (
+            f"-c statement_timeout={DATABASE_STATEMENT_TIMEOUT_MS} "
+            f"-c lock_timeout={DATABASE_LOCK_TIMEOUT_MS} "
+            f"-c idle_in_transaction_session_timeout={DATABASE_IDLE_TRANSACTION_TIMEOUT_MS}"
+        ),
         "sslmode": sslmode,
+        "tcp_user_timeout": DATABASE_TCP_USER_TIMEOUT_MS,
     }
     certificate_options = {
         "CAMELLIA_REMOTE_DATABASE_SSLROOTCERT": "sslrootcert",

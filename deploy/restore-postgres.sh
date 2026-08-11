@@ -12,6 +12,10 @@ deployment_id="${CAMELLIA_REMOTE_BACKUP_DEPLOYMENT_ID:-}"
 database_name="${CAMELLIA_REMOTE_DATABASE_NAME:-}"
 postgres_major_expected="${CAMELLIA_REMOTE_BACKUP_POSTGRES_MAJOR:-}"
 backup_key_id_expected="${CAMELLIA_REMOTE_BACKUP_AGE_KEY_ID:-}"
+operation_runner="${CAMELLIA_REMOTE_OPERATION_RUNNER:-$project_dir/deploy/run-compose-operation.sh}"
+docker_binary="${CAMELLIA_REMOTE_DOCKER_BINARY:-$(command -v docker 2>/dev/null || true)}"
+restore_timeout_seconds="${CAMELLIA_REMOTE_RESTORE_OPERATION_TIMEOUT_SECONDS:-3600}"
+restore_started_seconds=$SECONDS
 
 die() {
     echo "restore error: $*" >&2
@@ -29,6 +33,11 @@ backup_path="$1"
 [[ "$project_dir" = /* && "$env_file" = /* && "$envelope_helper" = /* ]] || die "restore paths must be absolute"
 [[ -f "$backup_path" && ! -L "$backup_path" && -r "$backup_path" ]] || die "backup is missing, unreadable, or a symlink"
 [[ -x "$age_binary" ]] || die "age binary is missing or not executable: $age_binary"
+[[ -x "$docker_binary" && ! -L "$docker_binary" ]] || die "docker binary is missing or unsafe"
+[[ -x "$operation_runner" && ! -L "$operation_runner" ]] || die "compose operation runner is missing or unsafe"
+[[ "$restore_timeout_seconds" =~ ^[0-9]+$ ]] || die "restore timeout must be a positive integer"
+(( restore_timeout_seconds >= 300 && restore_timeout_seconds <= 3900 )) ||
+    die "CAMELLIA_REMOTE_RESTORE_OPERATION_TIMEOUT_SECONDS must be between 300 and 3900"
 [[ -f "$envelope_helper" && ! -L "$envelope_helper" ]] || die "backup envelope helper is missing or a symlink"
 [[ -f "$env_file" && ! -L "$env_file" && -r "$env_file" ]] || die "management environment file is missing, symlinked, or unreadable: $env_file"
 env_mode="$(stat -c '%a' -- "$env_file" 2>/dev/null)" || die "cannot inspect management environment permissions"
@@ -91,7 +100,37 @@ recording_backup_path="$backup_parent/recordings-$expected_created_at-$expected_
     die "CAMELLIA_REMOTE_BACKUP_POSTGRES_MAJOR is required and invalid"
 [[ -n "$backup_key_id_expected" ]] || die "CAMELLIA_REMOTE_BACKUP_AGE_KEY_ID is required"
 
-compose=(docker compose --env-file "$env_file" -f "$project_dir/docker-compose.yaml")
+remaining_operation_seconds() {
+    local elapsed remaining
+    elapsed=$((SECONDS - restore_started_seconds))
+    remaining=$((restore_timeout_seconds - elapsed))
+    (( remaining > 0 )) || die "restore operation deadline exhausted"
+    printf '%s\n' "$remaining"
+}
+
+run_restore_operation() {
+    local suffix="$1"
+    local kind="$2"
+    local service="$3"
+    shift 3
+    local remaining
+    remaining="$(remaining_operation_seconds)"
+    local -a profile_environment=()
+    if [[ "$service" == "management" ]]; then
+        profile_environment=(--env CAMELLIA_REMOTE_DATABASE_OPERATION_PROFILE=BACKUP)
+    fi
+    "$operation_runner" \
+        --project-dir "$project_dir" \
+        --env-file "$env_file" \
+        --docker-binary "$docker_binary" \
+        --operation-id "${expected_backup_id}-${suffix}" \
+        --operation-kind "$kind" \
+        --service "$service" \
+        --timeout-seconds "$remaining" \
+        --env "PGAPPNAME=camellia-restore:${expected_backup_id:0:12}:${suffix}" \
+        "${profile_environment[@]}" \
+        -- "$@"
+}
 
 # age authenticates the complete ciphertext before the envelope helper or
 # pg_restore is allowed to run.  This short-lived file is mode 0600 and is
@@ -106,7 +145,13 @@ chmod 0600 "$database_envelope_temporary" "$recording_envelope_temporary"
 cleanup() {
     rm -f -- "$database_envelope_temporary" "$recording_envelope_temporary"
 }
-trap cleanup EXIT HUP INT TERM
+cancel_restore() {
+    trap - EXIT HUP INT TERM
+    cleanup
+    exit 130
+}
+trap cleanup EXIT
+trap cancel_restore HUP INT TERM
 
 set -o pipefail
 "$age_binary" --decrypt --identity "$identity_file" "$backup_path" >"$database_envelope_temporary"
@@ -141,8 +186,8 @@ read -r recording_epoch_id recording_inventory_digest <<<"$pair_values"
 # The authenticated artifact is restored only through the migration owner.
 # Bootstrap runs before and after restore so an old superuser-owned volume and
 # newly restored objects both converge to the same least-privilege boundary.
-"${compose[@]}" run --rm --no-deps -T database-bootstrap
-"${compose[@]}" run --rm --no-deps -T management python manage.py recording_backup restore-preflight
+run_restore_operation bootstrap-before restore-bootstrap database-bootstrap
+run_restore_operation preflight restore-recordings management python manage.py recording_backup restore-preflight
 python3 "$envelope_helper" unpack \
         --expect-backup-id "$expected_backup_id" \
         --expect-created-at "$expected_created_at" \
@@ -154,15 +199,15 @@ python3 "$envelope_helper" unpack \
         --expect-recording-epoch-id "$recording_epoch_id" \
         --expect-recording-inventory-digest "$recording_inventory_digest" \
     <"$database_envelope_temporary" \
-    | "${compose[@]}" run --rm --no-deps -T database-restore \
+    | run_restore_operation database restore-database database-restore \
         pg_restore --single-transaction --exit-on-error --format=custom --no-owner --no-acl
 set +o pipefail
-"${compose[@]}" run --rm --no-deps -T database-bootstrap
-"${compose[@]}" run --rm --no-deps migrate
-"${compose[@]}" run --rm --no-deps -T database-bootstrap
-"${compose[@]}" run --rm --no-deps -T management python manage.py check_release_schema >/dev/null || \
+run_restore_operation bootstrap-restored restore-bootstrap database-bootstrap
+run_restore_operation migration restore-migration migrate
+run_restore_operation bootstrap-migrated restore-bootstrap database-bootstrap
+run_restore_operation schema restore-validate management python manage.py check_release_schema >/dev/null || \
     die "restored schema does not match this release"
-"${compose[@]}" run --rm --no-deps -T management python manage.py check_username_identity >/dev/null || \
+run_restore_operation identity restore-validate management python manage.py check_username_identity >/dev/null || \
     die "restored username identity contract is invalid"
 set -o pipefail
 python3 "$envelope_helper" unpack \
@@ -176,11 +221,11 @@ python3 "$envelope_helper" unpack \
         --expect-recording-epoch-id "$recording_epoch_id" \
         --expect-recording-inventory-digest "$recording_inventory_digest" \
     <"$recording_envelope_temporary" \
-    | "${compose[@]}" run --rm --no-deps -T management python manage.py recording_backup restore \
+    | run_restore_operation recordings restore-recordings management python manage.py recording_backup restore \
         --backup-id "$expected_backup_id" \
         --epoch-id "$recording_epoch_id" \
         --inventory-digest "$recording_inventory_digest"
 set +o pipefail
-"${compose[@]}" run --rm --no-deps -T database-probe
+run_restore_operation probe restore-validate database-probe
 
 printf 'restored %s\n' "$backup_path"

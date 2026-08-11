@@ -136,7 +136,25 @@ def timeout_and_holder_takeover(database_url):
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
         )
-        time.sleep(0.75)
+        follower_deadline = time.monotonic() + 10
+        follower_waiting = False
+        while time.monotonic() < follower_deadline:
+            with killer.cursor() as cursor:
+                cursor.execute(
+                    "SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_stat_activity "
+                    "WHERE application_name LIKE 'camellia-migrate:%')"
+                )
+                follower_waiting = bool(cursor.fetchone()[0])
+            if follower_waiting:
+                break
+            time.sleep(0.05)
+        if not follower_waiting:
+            follower.terminate()
+            follower.communicate(timeout=10)
+            fail("takeover follower did not establish its migration lease session")
+        # The application name is set before the first advisory-lock attempt;
+        # allow that attempt and its immediate waiting event to complete.
+        time.sleep(0.3)
         with killer.cursor() as cursor:
             cursor.execute("SELECT pg_terminate_backend(%s)", [holder_pid])
             if cursor.fetchone()[0] is not True:
