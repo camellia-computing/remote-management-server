@@ -565,6 +565,16 @@ class RemoteDevice(models.Model):
                 fields=("owner", "-update_time", "rid"),
                 name="device_owner_updated_rid_idx",
             ),
+            models.Index(fields=("hostname",), name="device_hostname_idx"),
+            models.Index(fields=("username",), name="device_username_idx"),
+            GinIndex(
+                OpClass(Upper(Cast("hostname", models.TextField())), name="gin_trgm_ops"),
+                name="dev_host_search_trgm_idx",
+            ),
+            GinIndex(
+                OpClass(Upper(Cast("username", models.TextField())), name="gin_trgm_ops"),
+                name="dev_user_search_trgm_idx",
+            ),
         ]
 
     def effective_strategy(self):
@@ -1525,6 +1535,12 @@ class DeviceGroup(models.Model):
         ordering = ("name",)
         verbose_name = _("设备组")
         verbose_name_plural = _("设备组列表")
+        indexes = [
+            GinIndex(
+                OpClass(Upper(Cast("name", models.TextField())), name="gin_trgm_ops"),
+                name="dev_group_search_trgm_idx",
+            ),
+        ]
 
     def __str__(self):
         return self.name

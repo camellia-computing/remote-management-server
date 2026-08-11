@@ -39,8 +39,8 @@ class ReleaseSchemaContractTests(TestCase):
         self.assertEqual(
             check_release_schema(),
             {
-                "migration_count": 48,
-                "schema_generation": "management-schema-0030-v1",
+                "migration_count": 49,
+                "schema_generation": "management-schema-0031-v1",
                 "schema_manifest_version": 1,
             },
         )
@@ -95,11 +95,16 @@ class ReleaseSchemaContractTests(TestCase):
             with self.assertRaisesMessage(ReleaseSchemaError, "device_owner_rid_idx"):
                 check_release_schema()
             transaction.set_rollback(True)
+        with transaction.atomic(), connection.cursor() as cursor:
+            cursor.execute("DROP INDEX dev_host_search_trgm_idx")
+            with self.assertRaisesMessage(ReleaseSchemaError, "dev_host_search_trgm_idx"):
+                check_release_schema()
+            transaction.set_rollback(True)
 
     def test_management_command_reports_manifest_generation(self):
         output = StringIO()
         call_command("check_release_schema", stdout=output)
-        self.assertIn('"schema_generation": "management-schema-0030-v1"', output.getvalue())
+        self.assertIn('"schema_generation": "management-schema-0031-v1"', output.getvalue())
 
 
 class ReleaseSchemaManifestValidationTests(TestCase):

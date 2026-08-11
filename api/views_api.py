@@ -41,6 +41,11 @@ from api.address_book_authorization import (
     bump_locked_authorization_generation,
     lock_profile_access,
 )
+from api.control_filters import (
+    CONTROL_FILTER_CONTRACT_VERSION,
+    ControlFilterError,
+    apply_control_filter,
+)
 from api.credential_sessions import (
     CredentialGenerationExhausted,
     revoke_device_credentials,
@@ -5392,13 +5397,39 @@ def _paged_response(request, qs, serializer, default_page_size=100, *, paginatio
     )
 
 
-def _filter_text(qs, field, value):
-    value = str(value or "").strip()
-    if not value:
-        return qs
-    if "%" in value:
-        return qs.filter(**{f"{field}__icontains": value.replace("%", "")})
-    return qs.filter(**{field: value})
+def _filter_text(qs, field, value, *, parameter=None, allowed_modes=None):
+    return apply_control_filter(qs, field, value, parameter=parameter, allowed_modes=allowed_modes)
+
+
+def _request_filter_text(request, qs, field, parameter, *, allowed_modes=None):
+    values = request.GET.getlist(parameter)
+    if len(values) > 1:
+        raise ControlFilterError(parameter, "duplicate")
+    return _filter_text(
+        qs,
+        field,
+        values[0] if values else None,
+        parameter=parameter,
+        allowed_modes=allowed_modes,
+    )
+
+
+def _control_filter_error_response(request, error):
+    _log_event(
+        request,
+        "api_control_filter_rejected",
+        level="warning",
+        field=error.field,
+        reason=error.reason,
+    )
+    return json_error(
+        "invalid_control_filter",
+        "Invalid control-list filter",
+        status=400,
+        control_filter_contract_version=CONTROL_FILTER_CONTRACT_VERSION,
+        field=error.field,
+        reason=error.reason,
+    )
 
 
 def _require_admin_context(request, event):
@@ -5649,8 +5680,11 @@ def users(request):
     qs = UserProfile.objects.select_related("strategy").prefetch_related("groups").order_by("id")
     if not user.is_admin:
         qs = qs.filter(Q(id=user.id))
-    qs = _filter_text(qs, "username", request.GET.get("name"))
-    qs = _filter_text(qs, "groups__name", request.GET.get("group_name"))
+    try:
+        qs = _request_filter_text(request, qs, "username", "name")
+        qs = _request_filter_text(request, qs, "groups__name", "group_name")
+    except ControlFilterError as error:
+        return _control_filter_error_response(request, error)
     status = request.GET.get("status", "")
     if status == "1":
         qs = qs.filter(Q(is_active=True))
@@ -5919,21 +5953,23 @@ def devices(request):
     )
     if not user.is_admin:
         qs = qs.filter(Q(owner=user))
-    qs = _filter_text(qs, "rid", request.GET.get("id"))
-    qs = _filter_text(qs, "hostname", request.GET.get("device_name"))
-    qs = _filter_text(qs, "username", request.GET.get("device_username"))
-    qs = _filter_text(
-        qs,
-        "device_group__name",
-        request.GET.get("device_group_name"),
-    )
-    user_name = request.GET.get("user_name")
-    if user_name:
-        qs = _filter_text(qs, "owner__username", user_name)
-    group_name = request.GET.get("group_name")
-    if group_name:
-        lookup = "owner__groups__name__icontains" if "%" in group_name else "owner__groups__name"
-        qs = qs.filter(**{lookup: group_name.replace("%", "")}).distinct()
+    try:
+        qs = _request_filter_text(request, qs, "rid", "id", allowed_modes=frozenset(("exact",)))
+        qs = _request_filter_text(request, qs, "hostname", "device_name")
+        qs = _request_filter_text(request, qs, "username", "device_username")
+        qs = _request_filter_text(
+            request,
+            qs,
+            "device_group__name",
+            "device_group_name",
+        )
+        qs = _request_filter_text(request, qs, "owner__username", "user_name")
+        group_name = request.GET.get("group_name")
+        qs = _request_filter_text(request, qs, "owner__groups__name", "group_name")
+    except ControlFilterError as error:
+        return _control_filter_error_response(request, error)
+    if group_name and str(group_name).strip():
+        qs = qs.distinct()
     return _paged_response(request, qs, _serialize_device, pagination=pagination)
 
 
@@ -6426,7 +6462,10 @@ def device_groups(request):
     if error_response:
         return error_response
     qs = DeviceGroup.objects.select_related("strategy").order_by("name")
-    qs = _filter_text(qs, "name", request.GET.get("name"))
+    try:
+        qs = _request_filter_text(request, qs, "name", "name")
+    except ControlFilterError as error:
+        return _control_filter_error_response(request, error)
     return _paged_response(request, qs, _serialize_device_group, pagination=pagination)
 
 
