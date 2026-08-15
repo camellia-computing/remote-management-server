@@ -4,6 +4,46 @@ set -eu
 APP_DIR="/app"
 cd "$APP_DIR"
 
+REQUIRE_CGROUP_BUDGET="${CAMELLIA_REMOTE_REQUIRE_CGROUP_BUDGET:-false}"
+CGROUP_ROOT="${CAMELLIA_REMOTE_CGROUP_ROOT:-/sys/fs/cgroup}"
+
+validate_cgroup_budget() {
+    case "$REQUIRE_CGROUP_BUDGET" in
+        0|false|FALSE|no|NO)
+            return 0
+            ;;
+        1|true|TRUE|yes|YES)
+            ;;
+        *)
+            echo "CAMELLIA_REMOTE_REQUIRE_CGROUP_BUDGET must be true or false" >&2
+            exit 1
+            ;;
+    esac
+    if [ ! -r "$CGROUP_ROOT/memory.max" ] || [ ! -r "$CGROUP_ROOT/pids.max" ] || [ ! -r "$CGROUP_ROOT/cpu.max" ]; then
+        echo "finite cgroup v2 memory.max, pids.max and cpu.max are required" >&2
+        exit 1
+    fi
+    memory_max=$(cat "$CGROUP_ROOT/memory.max")
+    pids_max=$(cat "$CGROUP_ROOT/pids.max")
+    cpu_max=$(cat "$CGROUP_ROOT/cpu.max")
+    case "$memory_max" in
+        ''|max|*[!0-9]*) echo "cgroup memory.max must be finite" >&2; exit 1 ;;
+    esac
+    case "$pids_max" in
+        ''|max|*[!0-9]*) echo "cgroup pids.max must be finite" >&2; exit 1 ;;
+    esac
+    cpu_quota=${cpu_max%% *}
+    case "$cpu_quota" in
+        ''|max|*[!0-9]*) echo "cgroup cpu.max must be finite" >&2; exit 1 ;;
+    esac
+    if [ "$memory_max" -lt 268435456 ] || [ "$pids_max" -lt 64 ]; then
+        echo "cgroup memory.max/pids.max are below the supported safety floor" >&2
+        exit 1
+    fi
+}
+
+validate_cgroup_budget
+
 if [ "$#" -gt 0 ]; then
     exec "$@"
 fi
