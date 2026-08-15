@@ -64,6 +64,24 @@ def invoke(command, payload=b""):
     )
 
 
+def catalog_entry(generation, backup_id, previous_backup_id, completed_at):
+    stem = f"{completed_at}-{backup_id}"
+    return {
+        "backup_id": backup_id,
+        "completed_at": completed_at,
+        "created_at": completed_at,
+        "database": f"postgres-{stem}.dump.age",
+        "generation": generation,
+        "manifest": f"backup-set-{stem}.manifest.age",
+        "previous_backup_id": previous_backup_id,
+        "recordings": f"recordings-{stem}.bundle.age",
+    }
+
+
+def catalog_payload(entries):
+    return b"".join(json.dumps(entry, separators=(",", ":"), sort_keys=True).encode() + b"\n" for entry in entries)
+
+
 class BackupEnvelopeTests(unittest.TestCase):
     def test_new_id_is_128_bit_hex(self):
         result = invoke(["new-id"])
@@ -151,43 +169,74 @@ class BackupEnvelopeTests(unittest.TestCase):
             database.write_bytes(b"database ciphertext")
             recordings.write_bytes(b"recording ciphertext")
             context = [
-                "--backup-id", BACKUP_ID,
-                "--created-at", CREATED_AT,
-                "--deployment-id", "production-a",
-                "--database-name", "camellia_remote",
-                "--postgres-major", "18",
-                "--key-id", "backup-v1",
-                "--data-encryption-key-id", "data-v3",
-                "--source-revision", "b" * 40,
-                "--management-image", "ghcr.io/example/management@sha256:" + ("c" * 64),
-                "--schema-generation", "management-schema-0032-v1",
-                "--schema-manifest-version", "1",
-                "--migration-count", "50",
-                "--recording-epoch-id", EPOCH_ID,
-                "--recording-inventory-digest", INVENTORY_DIGEST,
-                "--database-artifact", str(database),
-                "--recordings-artifact", str(recordings),
+                "--backup-id",
+                BACKUP_ID,
+                "--created-at",
+                CREATED_AT,
+                "--deployment-id",
+                "production-a",
+                "--database-name",
+                "camellia_remote",
+                "--postgres-major",
+                "18",
+                "--key-id",
+                "backup-v1",
+                "--generation",
+                "1",
+                "--data-encryption-key-id",
+                "data-v3",
+                "--source-revision",
+                "b" * 40,
+                "--management-image",
+                "ghcr.io/example/management@sha256:" + ("c" * 64),
+                "--schema-generation",
+                "management-schema-0032-v1",
+                "--schema-manifest-version",
+                "1",
+                "--migration-count",
+                "50",
+                "--recording-epoch-id",
+                EPOCH_ID,
+                "--recording-inventory-digest",
+                INVENTORY_DIGEST,
+                "--database-artifact",
+                str(database),
+                "--recordings-artifact",
+                str(recordings),
             ]
             created = invoke(["set-create", *context, "--verified-at", CREATED_AT, "--completed-at", CREATED_AT])
             self.assertEqual(created.returncode, 0, created.stderr.decode())
             manifest = json.loads(created.stdout)
-            self.assertEqual(manifest["format"], "camellia-remote-backup-set-v1")
+            self.assertEqual(manifest["format"], "camellia-remote-backup-set-v2")
             self.assertEqual(manifest["artifacts"]["database"]["bytes"], len(b"database ciphertext"))
 
             verified = invoke(
                 [
                     "set-verify",
-                    "--expect-backup-id", BACKUP_ID,
-                    "--expect-created-at", CREATED_AT,
-                    "--expect-deployment-id", "production-a",
-                    "--expect-database-name", "camellia_remote",
-                    "--expect-postgres-major", "18",
-                    "--expect-key-id", "backup-v1",
-                    "--expect-data-encryption-key-id", "data-v3",
-                    "--expect-source-revision", "b" * 40,
-                    "--expect-management-image", "ghcr.io/example/management@sha256:" + ("c" * 64),
-                    "--database-artifact", str(database),
-                    "--recordings-artifact", str(recordings),
+                    "--expect-backup-id",
+                    BACKUP_ID,
+                    "--expect-created-at",
+                    CREATED_AT,
+                    "--expect-deployment-id",
+                    "production-a",
+                    "--expect-database-name",
+                    "camellia_remote",
+                    "--expect-postgres-major",
+                    "18",
+                    "--expect-key-id",
+                    "backup-v1",
+                    "--expect-generation",
+                    "1",
+                    "--expect-data-encryption-key-id",
+                    "data-v3",
+                    "--expect-source-revision",
+                    "b" * 40,
+                    "--expect-management-image",
+                    "ghcr.io/example/management@sha256:" + ("c" * 64),
+                    "--database-artifact",
+                    str(database),
+                    "--recordings-artifact",
+                    str(recordings),
                 ],
                 created.stdout,
             )
@@ -197,22 +246,102 @@ class BackupEnvelopeTests(unittest.TestCase):
             corrupted = invoke(
                 [
                     "set-verify",
-                    "--expect-backup-id", BACKUP_ID,
-                    "--expect-created-at", CREATED_AT,
-                    "--expect-deployment-id", "production-a",
-                    "--expect-database-name", "camellia_remote",
-                    "--expect-postgres-major", "18",
-                    "--expect-key-id", "backup-v1",
-                    "--expect-data-encryption-key-id", "data-v3",
-                    "--expect-source-revision", "b" * 40,
-                    "--expect-management-image", "ghcr.io/example/management@sha256:" + ("c" * 64),
-                    "--database-artifact", str(database),
-                    "--recordings-artifact", str(recordings),
+                    "--expect-backup-id",
+                    BACKUP_ID,
+                    "--expect-created-at",
+                    CREATED_AT,
+                    "--expect-deployment-id",
+                    "production-a",
+                    "--expect-database-name",
+                    "camellia_remote",
+                    "--expect-postgres-major",
+                    "18",
+                    "--expect-key-id",
+                    "backup-v1",
+                    "--expect-generation",
+                    "1",
+                    "--expect-data-encryption-key-id",
+                    "data-v3",
+                    "--expect-source-revision",
+                    "b" * 40,
+                    "--expect-management-image",
+                    "ghcr.io/example/management@sha256:" + ("c" * 64),
+                    "--database-artifact",
+                    str(database),
+                    "--recordings-artifact",
+                    str(recordings),
                 ],
                 created.stdout,
             )
             self.assertNotEqual(corrupted.returncode, 0)
             self.assertIn(b"digest", corrupted.stderr)
+
+    def test_generation_catalog_and_clock_aware_retention_are_fail_closed(self):
+        first_id = "1" * 32
+        second_id = "2" * 32
+        third_id = "3" * 32
+        first = catalog_entry(1, first_id, None, "20260810T000000Z")
+        second = catalog_entry(2, second_id, first_id, "20260811T000000Z")
+        stable_third = catalog_entry(3, third_id, second_id, "20260811T010000Z")
+
+        next_generation = invoke(
+            ["catalog-next", "--observed-manifests", "2", "--candidate-backup-id", third_id],
+            catalog_payload((second, first)),
+        )
+        self.assertEqual(next_generation.returncode, 0, next_generation.stderr.decode())
+        self.assertEqual(
+            json.loads(next_generation.stdout),
+            {"generation": 3, "previous_backup_id": second_id},
+        )
+
+        common = [
+            "retention-plan",
+            "--observed-manifests",
+            "3",
+            "--now",
+            "20260812T120000Z",
+            "--retention-hours",
+            "24",
+            "--minimum-count",
+            "2",
+            "--maximum-clock-step-seconds",
+            "7200",
+            "--maximum-deletions",
+            "10",
+            "--expect-latest-backup-id",
+            third_id,
+        ]
+        stable = invoke(common, catalog_payload((first, second, stable_third)))
+        self.assertEqual(stable.returncode, 0, stable.stderr.decode())
+        stable_plan = json.loads(stable.stdout)
+        self.assertEqual(stable_plan["status"], "retention-planned")
+        self.assertEqual([entry["generation"] for entry in stable_plan["delete"]], [1])
+
+        rollback_third = catalog_entry(3, third_id, second_id, "20260810T120000Z")
+        rollback = invoke(common, catalog_payload((first, second, rollback_third)))
+        self.assertEqual(rollback.returncode, 0, rollback.stderr.decode())
+        rollback_plan = json.loads(rollback.stdout)
+        self.assertEqual(rollback_plan["status"], "retention-skipped:clock-rollback")
+        self.assertEqual(rollback_plan["delete"], [])
+
+        broken = catalog_entry(4, third_id, first_id, "20260811T020000Z")
+        invalid_chain = invoke(
+            ["catalog-next", "--observed-manifests", "3", "--candidate-backup-id", "4" * 32],
+            catalog_payload((first, second, broken)),
+        )
+        self.assertNotEqual(invalid_chain.returncode, 0)
+
+        reused_id = invoke(
+            ["catalog-next", "--observed-manifests", "2", "--candidate-backup-id", first_id],
+            catalog_payload((first, second)),
+        )
+        self.assertNotEqual(reused_id.returncode, 0)
+
+        reused_retained_anchor = invoke(
+            ["catalog-next", "--observed-manifests", "2", "--candidate-backup-id", first_id],
+            catalog_payload((second, stable_third)),
+        )
+        self.assertNotEqual(reused_retained_anchor.returncode, 0)
 
     def test_run_state_is_canonical_and_stale_holder_is_monitorable(self):
         with tempfile.TemporaryDirectory(prefix="camellia-run-state-") as temporary:
@@ -220,15 +349,23 @@ class BackupEnvelopeTests(unittest.TestCase):
             created = invoke(
                 [
                     "run-create",
-                    "--path", str(state),
-                    "--run-id", BACKUP_ID,
-                    "--started-at", "20200101T000000Z",
-                    "--pid", "123",
-                    "--phase", "exporting-database",
+                    "--path",
+                    str(state),
+                    "--run-id",
+                    BACKUP_ID,
+                    "--started-at",
+                    "20200101T000000Z",
+                    "--pid",
+                    "123",
+                    "--phase",
+                    "exporting-database",
                 ]
             )
             self.assertEqual(created.returncode, 0, created.stderr.decode())
-            self.assertEqual(json.dumps(json.loads(state.read_bytes()), separators=(",", ":"), sort_keys=True).encode(), state.read_bytes())
+            self.assertEqual(
+                json.dumps(json.loads(state.read_bytes()), separators=(",", ":"), sort_keys=True).encode(),
+                state.read_bytes(),
+            )
             stale_state = json.loads(state.read_bytes())
             stale_state["heartbeat_at"] = "20200101T000000Z"
             state.write_text(json.dumps(stale_state, separators=(",", ":"), sort_keys=True))

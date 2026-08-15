@@ -11,6 +11,8 @@ age_binary="${CAMELLIA_REMOTE_BACKUP_AGE_BINARY:-/usr/bin/age}"
 identity_file="${CAMELLIA_REMOTE_BACKUP_AGE_IDENTITY_FILE:-}"
 retention_hours="${CAMELLIA_REMOTE_BACKUP_RETENTION_HOURS:-168}"
 retention_minimum_count="${CAMELLIA_REMOTE_BACKUP_RETENTION_MINIMUM_COUNT:-24}"
+retention_maximum_deletions="${CAMELLIA_REMOTE_BACKUP_RETENTION_MAXIMUM_DELETIONS:-1}"
+maximum_clock_step_seconds="${CAMELLIA_REMOTE_BACKUP_MAX_CLOCK_STEP_SECONDS:-7200}"
 recipient="${CAMELLIA_REMOTE_BACKUP_AGE_RECIPIENT:-}"
 backup_key_id="${CAMELLIA_REMOTE_BACKUP_AGE_KEY_ID:-}"
 data_encryption_key_id="${CAMELLIA_REMOTE_DATA_ENCRYPTION_KEY_ID:-}"
@@ -32,7 +34,11 @@ die() {
     exit 1
 }
 
-for integer_value in "$retention_hours" "$retention_minimum_count"; do
+for integer_value in \
+    "$retention_hours" \
+    "$retention_minimum_count" \
+    "$retention_maximum_deletions" \
+    "$maximum_clock_step_seconds"; do
     [[ "$integer_value" =~ ^[0-9]+$ ]] || die "backup retention values must be positive integers"
 done
 for timeout_value in "$backup_timeout_seconds" "$pg_dump_lock_timeout_seconds" "$run_stale_seconds" "$run_heartbeat_seconds"; do
@@ -56,6 +62,10 @@ if (( retention_hours < 24 )); then
 fi
 (( retention_minimum_count >= 2 && retention_minimum_count <= 1000 )) ||
     die "CAMELLIA_REMOTE_BACKUP_RETENTION_MINIMUM_COUNT must be between 2 and 1000"
+(( retention_maximum_deletions >= 1 && retention_maximum_deletions <= 100 )) ||
+    die "CAMELLIA_REMOTE_BACKUP_RETENTION_MAXIMUM_DELETIONS must be between 1 and 100"
+(( maximum_clock_step_seconds >= 60 && maximum_clock_step_seconds <= 604800 )) ||
+    die "CAMELLIA_REMOTE_BACKUP_MAX_CLOCK_STEP_SECONDS must be between 60 and 604800"
 [[ "$recipient" =~ ^age1[^[:space:]]{20,255}$ ]] || die "CAMELLIA_REMOTE_BACKUP_AGE_RECIPIENT must be an age1 recipient"
 [[ "$backup_key_id" =~ ^[a-z0-9][a-z0-9._-]{0,31}$ ]] || die "CAMELLIA_REMOTE_BACKUP_AGE_KEY_ID is invalid"
 [[ "$data_encryption_key_id" =~ ^[a-z0-9][a-z0-9._-]{0,31}$ ]] || \
@@ -106,6 +116,8 @@ chmod 0700 "$backup_dir"
 exec 9>"$backup_dir/.backup.lock"
 run_id="$(python3 "$envelope_helper" new-id)"
 timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
+[[ "$run_id" =~ ^[0-9a-f]{32}$ ]] || die "backup ID generator returned an invalid ID"
+[[ "$timestamp" =~ ^[0-9]{8}T[0-9]{6}Z$ ]] || die "backup clock returned an invalid timestamp"
 run_state="$backup_dir/.backup-run.json"
 if ! flock -n 9; then
     if holder_json="$(python3 "$envelope_helper" run-inspect --path "$run_state" --stale-seconds "$run_stale_seconds")"; then
@@ -124,17 +136,23 @@ if [[ -e "$run_state" || -L "$run_state" ]]; then
     printf '{"previous_holder":%s,"status":"recovered:orphan-run-state"}\n' "${orphan_json:-null}" >&2
 fi
 backup_id="$run_id"
-temporary="$backup_dir/.postgres-$timestamp-$backup_id.dump.age.tmp"
+work_dir="$backup_dir/.backup-$backup_id.work"
+mkdir -m 0700 -- "$work_dir" || die "backup work directory already exists"
+temporary="$work_dir/database.dump.age"
 destination="$backup_dir/postgres-$timestamp-$backup_id.dump.age"
-recording_temporary="$backup_dir/.recordings-$timestamp-$backup_id.bundle.age.tmp"
+recording_temporary="$work_dir/recordings.bundle.age"
 recording_destination="$backup_dir/recordings-$timestamp-$backup_id.bundle.age"
-manifest_temporary="$backup_dir/.backup-set-$timestamp-$backup_id.manifest.age.tmp"
+manifest_temporary="$work_dir/backup-set.manifest.age"
 manifest_destination="$backup_dir/backup-set-$timestamp-$backup_id.manifest.age"
-status_temporary="$backup_dir/.latest-verified-$backup_id.json.tmp"
+status_temporary="$work_dir/latest-verified.json"
 status_destination="$backup_dir/latest-verified.json"
-retention_catalog=""
+retention_catalog="$work_dir/retention-catalog.jsonl"
+retention_deletions="$work_dir/retention-deletions.txt"
 checkpoint_started=0
 backup_committed=0
+database_published=0
+recording_published=0
+manifest_published=0
 checkpoint_json=""
 heartbeat_pid=""
 
@@ -177,10 +195,17 @@ cleanup() {
         kill "$heartbeat_pid" >/dev/null 2>&1 || true
         wait "$heartbeat_pid" >/dev/null 2>&1 || true
     fi
-    rm -f -- "$temporary" "$recording_temporary" "$manifest_temporary" "$status_temporary"
-    [[ -z "$retention_catalog" ]] || rm -f -- "$retention_catalog"
+    rm -f -- \
+        "$temporary" \
+        "$recording_temporary" \
+        "$manifest_temporary" \
+        "$status_temporary" \
+        "$retention_catalog" \
+        "$retention_deletions"
     if (( status != 0 && backup_committed == 0 )); then
-        rm -f -- "$destination" "$recording_destination" "$manifest_destination"
+        (( database_published == 0 )) || rm -f -- "$destination"
+        (( recording_published == 0 )) || rm -f -- "$recording_destination"
+        (( manifest_published == 0 )) || rm -f -- "$manifest_destination"
         if (( checkpoint_started == 1 )); then
             "$operation_runner" \
                 --project-dir "$project_dir" \
@@ -196,10 +221,74 @@ cleanup() {
         fi
     fi
     python3 "$envelope_helper" run-clear --path "$run_state" --run-id "$run_id" >/dev/null 2>&1 || true
+    rmdir -- "$work_dir" >/dev/null 2>&1 || true
     exit "$status"
 }
 trap 'cleanup $?' EXIT
 trap 'cleanup 130' HUP INT TERM
+
+catalog_backup_sets() {
+    local retained_manifest retained_name retained_timestamp retained_id
+    local retained_database retained_recordings catalog_entry
+    observed_manifest_count=0
+    : >"$retention_catalog"
+    for retained_manifest in "$backup_dir"/backup-set-*.manifest.age; do
+        [[ -e "$retained_manifest" ]] || continue
+        observed_manifest_count=$((observed_manifest_count + 1))
+        retained_name="${retained_manifest##*/}"
+        if [[ ! "$retained_name" =~ ^backup-set-([0-9]{8}T[0-9]{6}Z)-([0-9a-f]{32})\.manifest\.age$ ]]; then
+            printf '{"status":"generation-preserved:invalid-name"}\n' >&2
+            continue
+        fi
+        retained_timestamp="${BASH_REMATCH[1]}"
+        retained_id="${BASH_REMATCH[2]}"
+        retained_database="$backup_dir/postgres-$retained_timestamp-$retained_id.dump.age"
+        retained_recordings="$backup_dir/recordings-$retained_timestamp-$retained_id.bundle.age"
+        if catalog_entry="$(
+            set -o pipefail
+            "$age_binary" --decrypt --identity "$identity_file" "$retained_manifest" \
+                | python3 "$envelope_helper" set-entry \
+                    --manifest-filename "$retained_name" \
+                    --database-artifact "$retained_database" \
+                    --recordings-artifact "$retained_recordings" \
+                    --expect-deployment-id "$deployment_id" \
+                    --expect-database-name "$database_name"
+        )"; then
+            printf '%s\n' "$catalog_entry" >>"$retention_catalog"
+        else
+            printf '{"manifest":"%s","status":"generation-preserved:invalid-set"}\n' "$retained_name" >&2
+        fi
+    done
+}
+
+catalog_backup_sets
+next_generation_json="$(
+    python3 "$envelope_helper" catalog-next \
+        --observed-manifests "$observed_manifest_count" \
+        --candidate-backup-id "$backup_id" <"$retention_catalog"
+)" || die "cannot establish the authenticated backup generation chain"
+next_generation_values="$(CAMELLIA_REMOTE_NEXT_GENERATION_JSON="$next_generation_json" python3 -c '
+import json, os
+value = json.loads(os.environ["CAMELLIA_REMOTE_NEXT_GENERATION_JSON"])
+if set(value) != {"generation", "previous_backup_id"}:
+    raise SystemExit(1)
+generation = value["generation"]
+previous = value["previous_backup_id"]
+if not isinstance(generation, int) or isinstance(generation, bool) or generation <= 0:
+    raise SystemExit(1)
+if previous is not None and (not isinstance(previous, str) or len(previous) != 32):
+    raise SystemExit(1)
+print(generation, previous if previous is not None else "-")
+')" || die "backup generation allocation is invalid"
+read -r backup_generation previous_backup_id <<<"$next_generation_values"
+generation_arguments=(--generation "$backup_generation")
+if [[ "$previous_backup_id" != "-" ]]; then
+    generation_arguments+=(--previous-backup-id "$previous_backup_id")
+fi
+printf '{"backup_id":"%s","generation":%s,"previous_backup_id":%s,"status":"generation:reserved"}\n' \
+    "$backup_id" \
+    "$backup_generation" \
+    "$([[ "$previous_backup_id" == "-" ]] && printf 'null' || printf '"%s"' "$previous_backup_id")" >&2
 
 python3 "$envelope_helper" run-create --path "$run_state" --run-id "$run_id" \
     --started-at "$timestamp" --pid "$$" --phase starting
@@ -302,8 +391,10 @@ set +o pipefail
 test -s "$temporary" || die "encrypted backup is empty"
 test -s "$recording_temporary" || die "encrypted recording backup is empty"
 ln -- "$recording_temporary" "$recording_destination" || die "recording backup destination already exists"
+recording_published=1
 rm -f -- "$recording_temporary"
 ln -- "$temporary" "$destination" || die "database backup destination already exists"
+database_published=1
 rm -f -- "$temporary"
 CAMELLIA_REMOTE_BACKUP_FSYNC_DIR="$backup_dir" python3 -c '
 import os
@@ -362,6 +453,7 @@ python3 "$envelope_helper" set-create \
         --database-name "$database_name" \
         --postgres-major "$postgres_major" \
         --key-id "$backup_key_id" \
+        "${generation_arguments[@]}" \
         --data-encryption-key-id "$data_encryption_key_id" \
         --source-revision "$source_revision" \
         --management-image "$management_image" \
@@ -378,6 +470,7 @@ python3 "$envelope_helper" set-create \
 set +o pipefail
 test -s "$manifest_temporary" || die "encrypted backup set manifest is empty"
 ln -- "$manifest_temporary" "$manifest_destination" || die "backup set manifest destination already exists"
+manifest_published=1
 rm -f -- "$manifest_temporary"
 CAMELLIA_REMOTE_BACKUP_FSYNC_DIR="$backup_dir" python3 -c '
 import os
@@ -400,6 +493,7 @@ set -o pipefail
         --expect-database-name "$database_name" \
         --expect-postgres-major "$postgres_major" \
         --expect-key-id "$backup_key_id" \
+        --expect-generation "$backup_generation" \
         --expect-data-encryption-key-id "$data_encryption_key_id" \
         --expect-source-revision "$source_revision" \
         --expect-management-image "$management_image" \
@@ -431,47 +525,53 @@ finally:
     os.close(fd)
 '
 
-# Retention accepts only complete, age-authenticated three-file generations.
-# It uses the manifest completion time and always protects the newest N sets;
-# legacy pairs and malformed/incomplete sets are preserved for investigation.
+# Retention accepts only the complete authenticated generation chain. It uses
+# generation order to protect the newest N sets, treats wall time only as an
+# additional age condition, and pauses deletion across detected clock steps.
 update_phase retention
-retention_catalog="$(mktemp "$backup_dir/.retention-$backup_id.XXXXXX")" || die "cannot create retention catalog"
-for retained_manifest in "$backup_dir"/backup-set-*.manifest.age; do
-    [[ -e "$retained_manifest" ]] || continue
-    retained_name="${retained_manifest##*/}"
-    if [[ ! "$retained_name" =~ ^backup-set-([0-9]{8}T[0-9]{6}Z)-([0-9a-f]{32})\.manifest\.age$ ]]; then
-        continue
-    fi
-    retained_timestamp="${BASH_REMATCH[1]}"
-    retained_id="${BASH_REMATCH[2]}"
-    retained_database="$backup_dir/postgres-$retained_timestamp-$retained_id.dump.age"
-    retained_recordings="$backup_dir/recordings-$retained_timestamp-$retained_id.bundle.age"
-    if retention_entry="$(
-        set -o pipefail
-        "$age_binary" --decrypt --identity "$identity_file" "$retained_manifest" \
-            | python3 "$envelope_helper" set-entry \
-                --manifest-filename "$retained_name" \
-                --database-artifact "$retained_database" \
-                --recordings-artifact "$retained_recordings"
-    )"; then
-        printf '%s\n' "$retention_entry" >>"$retention_catalog"
-    else
-        printf '{"manifest":"%s","status":"retention-preserved:invalid-set"}\n' "$retained_name" >&2
-    fi
-done
-sort -n -k1,1 -k2,2 -o "$retention_catalog" "$retention_catalog"
-valid_generation_count="$(wc -l <"$retention_catalog")"
-retention_cutoff_epoch="$(date -u -d "-$retention_hours hours" +%s)"
-while read -r retained_epoch retained_id retained_database_name retained_recordings_name retained_manifest_name; do
-    [[ -n "$retained_epoch" ]] || continue
-    (( retained_epoch < retention_cutoff_epoch )) || break
-    (( valid_generation_count > retention_minimum_count )) || break
+catalog_backup_sets
+retention_now="$(date -u +%Y%m%dT%H%M%SZ)"
+retention_plan="$(
+    python3 "$envelope_helper" retention-plan \
+        --observed-manifests "$observed_manifest_count" \
+        --now "$retention_now" \
+        --retention-hours "$retention_hours" \
+        --minimum-count "$retention_minimum_count" \
+        --maximum-clock-step-seconds "$maximum_clock_step_seconds" \
+        --maximum-deletions "$retention_maximum_deletions" \
+        --expect-latest-backup-id "$backup_id" <"$retention_catalog"
+)" || die "cannot establish a safe backup retention plan"
+printf '%s\n' "$retention_plan" >&2
+CAMELLIA_REMOTE_RETENTION_PLAN="$retention_plan" python3 -c '
+import json, os, re
+value = json.loads(os.environ["CAMELLIA_REMOTE_RETENTION_PLAN"])
+if set(value) != {
+    "clock_delta_seconds", "delete", "format", "latest_generation", "status", "valid_generation_count"
+} or value["format"] != "camellia-remote-backup-retention-plan-v1":
+    raise SystemExit(1)
+patterns = {
+    "database": re.compile(r"^postgres-([0-9]{8}T[0-9]{6}Z-[0-9a-f]{32})[.]dump[.]age$"),
+    "recordings": re.compile(r"^recordings-([0-9]{8}T[0-9]{6}Z-[0-9a-f]{32})[.]bundle[.]age$"),
+    "manifest": re.compile(r"^backup-set-([0-9]{8}T[0-9]{6}Z-[0-9a-f]{32})[.]manifest[.]age$"),
+}
+for entry in value["delete"]:
+    if set(entry) != {"backup_id", "database", "generation", "manifest", "recordings"}:
+        raise SystemExit(1)
+    matches = {name: patterns[name].fullmatch(entry[name]) for name in patterns}
+    if any(match is None for match in matches.values()):
+        raise SystemExit(1)
+    stems = {match.group(1) for match in matches.values()}
+    if len(stems) != 1 or not next(iter(stems)).endswith("-" + entry["backup_id"]):
+        raise SystemExit(1)
+    print(entry["database"], entry["recordings"], entry["manifest"])
+' >"$retention_deletions" || die "retention deletion list is invalid"
+while read -r retained_database_name retained_recordings_name retained_manifest_name; do
+    [[ -n "$retained_database_name" ]] || continue
     rm -f -- \
         "$backup_dir/$retained_database_name" \
         "$backup_dir/$retained_recordings_name" \
         "$backup_dir/$retained_manifest_name"
-    valid_generation_count=$((valid_generation_count - 1))
-done <"$retention_catalog"
+done <"$retention_deletions"
 CAMELLIA_REMOTE_BACKUP_FSYNC_DIR="$backup_dir" python3 -c '
 import os
 fd = os.open(os.environ["CAMELLIA_REMOTE_BACKUP_FSYNC_DIR"], os.O_RDONLY | os.O_DIRECTORY)

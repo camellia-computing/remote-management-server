@@ -7,6 +7,7 @@ custom-format-shaped canary and verifies the exact stream sent to pg_restore.
 """
 
 import fcntl
+import json
 import os
 import pathlib
 import re
@@ -267,6 +268,44 @@ class BackupScriptsTests(unittest.TestCase):
             capture_output=True,
         )
 
+    def fixed_backup_identity(self, timestamp, backup_id):
+        helper = self.root / "fixed-backup-envelope.py"
+        helper.write_text(
+            textwrap.dedent(
+                """
+                #!/usr/bin/env python3
+                import os, sys
+                if sys.argv[1:] == ["new-id"]:
+                    print(os.environ["FAKE_BACKUP_ID"])
+                    raise SystemExit(0)
+                os.execv(
+                    sys.executable,
+                    [sys.executable, os.environ["REAL_BACKUP_ENVELOPE_HELPER"], *sys.argv[1:]],
+                )
+                """
+            ).lstrip()
+        )
+        clock = self.fake_bin / "date"
+        clock.write_text(
+            textwrap.dedent(
+                """
+                #!/usr/bin/env python3
+                import os, sys
+                if sys.argv[1:] == ["-u", "+%Y%m%dT%H%M%SZ"] and "FAKE_BACKUP_TIMESTAMP" in os.environ:
+                    print(os.environ["FAKE_BACKUP_TIMESTAMP"])
+                    raise SystemExit(0)
+                os.execv("/usr/bin/date", ["/usr/bin/date", *sys.argv[1:]])
+                """
+            ).lstrip()
+        )
+        clock.chmod(0o755)
+        return {
+            "CAMELLIA_REMOTE_BACKUP_ENVELOPE_HELPER": str(helper),
+            "FAKE_BACKUP_ID": backup_id,
+            "FAKE_BACKUP_TIMESTAMP": timestamp,
+            "REAL_BACKUP_ENVELOPE_HELPER": str(HELPER),
+        }
+
     def test_encrypted_backup_restores_canary_without_plaintext_artifact(self):
         backup = self.run_backup()
         self.assertEqual(backup.returncode, 0, backup.stderr)
@@ -279,7 +318,7 @@ class BackupScriptsTests(unittest.TestCase):
         self.assertEqual(len(set_artifacts), 1)
         self.assertNotIn(b"PGDUMP-CANARY", artifact.read_bytes())
         self.assertNotIn(b"RECORDING-BUNDLE-CANARY", recording_artifacts[0].read_bytes())
-        self.assertNotIn(b"camellia-remote-backup-set-v1", set_artifacts[0].read_bytes())
+        self.assertNotIn(b"camellia-remote-backup-set-v2", set_artifacts[0].read_bytes())
         self.assertRegex(artifact.name, r"^postgres-[0-9]{8}T[0-9]{6}Z-[0-9a-f]{32}\.dump\.age$")
 
         restored = self.run_restore(artifact)
@@ -292,6 +331,15 @@ class BackupScriptsTests(unittest.TestCase):
         self.assertEqual(list(self.tmpdir.glob("camellia-restore-*")), [])
         receipts = list(self.restore_evidence.glob("restore-receipt-*.json.age"))
         self.assertEqual(len(receipts), 1)
+        receipt = subprocess.run(
+            [str(self.age), "--decrypt", "--identity", str(self.identity), str(receipts[0])],
+            check=True,
+            capture_output=True,
+        )
+        receipt_payload = json.loads(receipt.stdout)
+        self.assertEqual(receipt_payload["format"], "camellia-remote-restore-receipt-v2")
+        self.assertEqual(receipt_payload["generation"], 1)
+        self.assertEqual(receipt_payload["backup_id"], artifact.name.split("-")[-1].removesuffix(".dump.age"))
         self.assertTrue((self.restore_evidence / "latest-restore-verified.json").is_file())
 
         self.identity.chmod(0o644)
@@ -361,11 +409,25 @@ class BackupScriptsTests(unittest.TestCase):
         self.assertEqual(list(self.tmpdir.glob("camellia-restore-*")), [])
 
     def test_pg_dump_or_age_failure_leaves_no_artifact_and_lock_is_monitorable(self):
+        invalid_id = self.run_backup(**self.fixed_backup_identity("20260811T120000Z", "not-a-backup-id"))
+        self.assertNotEqual(invalid_id.returncode, 0)
+        self.assertIn("invalid ID", invalid_id.stderr)
+
         for invalid_compression in ("", "gzip", "gzip:0", "gzip:9", "zstd:0", "zstd:10", "lz4", "zstd:3 --no-acl"):
             with self.subTest(invalid_compression=invalid_compression):
                 invalid = self.run_backup(CAMELLIA_REMOTE_BACKUP_COMPRESSION=invalid_compression)
                 self.assertNotEqual(invalid.returncode, 0)
                 self.assertIn("COMPRESSION", invalid.stderr)
+        for variable, value in (
+            ("CAMELLIA_REMOTE_BACKUP_RETENTION_MAXIMUM_DELETIONS", "0"),
+            ("CAMELLIA_REMOTE_BACKUP_RETENTION_MAXIMUM_DELETIONS", "101"),
+            ("CAMELLIA_REMOTE_BACKUP_MAX_CLOCK_STEP_SECONDS", "59"),
+            ("CAMELLIA_REMOTE_BACKUP_MAX_CLOCK_STEP_SECONDS", "604801"),
+        ):
+            with self.subTest(variable=variable, value=value):
+                invalid = self.run_backup(**{variable: value})
+                self.assertNotEqual(invalid.returncode, 0)
+                self.assertIn(variable, invalid.stderr)
 
         self.env_file.chmod(0o644)
         insecure_env = self.run_backup()
@@ -434,6 +496,58 @@ class BackupScriptsTests(unittest.TestCase):
         self.assertNotEqual(stale_collision.returncode, 0)
         self.assertIn("failed:stale-holder", stale_collision.stderr)
 
+    def test_final_path_collision_never_removes_the_existing_recovery_point(self):
+        timestamp = "20260811T120000Z"
+        backup_id = "d" * 32
+        identity = self.fixed_backup_identity(timestamp, backup_id)
+        names = {
+            "database": f"postgres-{timestamp}-{backup_id}.dump.age",
+            "recordings": f"recordings-{timestamp}-{backup_id}.bundle.age",
+            "manifest": f"backup-set-{timestamp}-{backup_id}.manifest.age",
+        }
+        for component, collision_name in names.items():
+            with self.subTest(component=component):
+                shutil.rmtree(self.backups, ignore_errors=True)
+                self.backups.mkdir()
+                collision = self.backups / collision_name
+                sentinel = f"existing-{component}-recovery-point".encode()
+                collision.write_bytes(sentinel)
+
+                result = self.run_backup(**identity)
+
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(collision.read_bytes(), sentinel)
+                for other_component, other_name in names.items():
+                    if other_component != component:
+                        self.assertFalse((self.backups / other_name).exists())
+
+    def test_same_second_and_clock_rollback_keep_monotonic_generations(self):
+        first_id = "a" * 32
+        second_id = "b" * 32
+        third_id = "c" * 32
+        first = self.run_backup(**self.fixed_backup_identity("20260810T100000Z", first_id))
+        self.assertEqual(first.returncode, 0, first.stderr)
+        second = self.run_backup(**self.fixed_backup_identity("20260810T100000Z", second_id))
+        self.assertEqual(second.returncode, 0, second.stderr)
+        rollback = self.run_backup(**self.fixed_backup_identity("20260809T100000Z", third_id))
+        self.assertEqual(rollback.returncode, 0, rollback.stderr)
+        self.assertIn('"status":"retention-skipped:clock-rollback"', rollback.stderr)
+
+        self.assertEqual(len(list(self.backups.glob("postgres-*.dump.age"))), 3)
+        self.assertEqual(len(list(self.backups.glob("recordings-*.bundle.age"))), 3)
+        self.assertEqual(len(list(self.backups.glob("backup-set-*.manifest.age"))), 3)
+        status = json.loads((self.backups / "latest-verified.json").read_text())
+        self.assertEqual(status["format"], "camellia-remote-backup-status-v2")
+        self.assertEqual(status["backup_id"], third_id)
+        self.assertEqual(status["generation"], 3)
+        self.assertEqual(status["previous_backup_id"], second_id)
+
+        reused = self.run_backup(**self.fixed_backup_identity("20260811T100000Z", first_id))
+        self.assertNotEqual(reused.returncode, 0)
+        self.assertIn("already used", reused.stderr)
+        self.assertEqual(len(list(self.backups.glob("backup-set-*.manifest.age"))), 3)
+        self.assertEqual(json.loads((self.backups / "latest-verified.json").read_text()), status)
+
     def test_backup_and_restore_reject_invalid_username_identity(self):
         failed_backup = self.run_backup(FAKE_DOCKER_MODE="username-identity-fail")
         self.assertNotEqual(failed_backup.returncode, 0)
@@ -477,13 +591,16 @@ class BackupScriptsTests(unittest.TestCase):
         self.backups.mkdir()
         old_sets = []
         for hour, digit in enumerate(("1", "2", "3")):
-            timestamp = f"20260801T0{hour}0000Z"
+            timestamp = f"20260810T0{hour}0000Z"
             backup_id = digit * 32
             database = self.backups / f"postgres-{timestamp}-{backup_id}.dump.age"
             recordings = self.backups / f"recordings-{timestamp}-{backup_id}.bundle.age"
             manifest = self.backups / f"backup-set-{timestamp}-{backup_id}.manifest.age"
             database.write_bytes(f"old database {digit}".encode())
             recordings.write_bytes(f"old recordings {digit}".encode())
+            generation_arguments = ["--generation", str(hour + 1)]
+            if hour:
+                generation_arguments.extend(("--previous-backup-id", str(hour) * 32))
             created = subprocess.run(
                 [
                     str(HELPER),
@@ -500,6 +617,7 @@ class BackupScriptsTests(unittest.TestCase):
                     "18",
                     "--key-id",
                     "backup-v1",
+                    *generation_arguments,
                     "--data-encryption-key-id",
                     "data-v3",
                     "--source-revision",
@@ -536,10 +654,16 @@ class BackupScriptsTests(unittest.TestCase):
             self.assertEqual(encrypted.returncode, 0)
             old_sets.append((database, recordings, manifest))
 
-        unpaired_database = self.backups / f"postgres-20260801T030000Z-{'4' * 32}.dump.age"
+        unpaired_database = self.backups / f"postgres-20260810T030000Z-{'4' * 32}.dump.age"
         unpaired_database.write_bytes(b"unpaired legacy database")
 
-        result = self.run_backup(CAMELLIA_REMOTE_BACKUP_RETENTION_HOURS="24")
+        identity = self.fixed_backup_identity("20260811T100000Z", "e" * 32)
+        result = self.run_backup(
+            CAMELLIA_REMOTE_BACKUP_RETENTION_HOURS="24",
+            CAMELLIA_REMOTE_BACKUP_MAX_CLOCK_STEP_SECONDS="172800",
+            CAMELLIA_REMOTE_BACKUP_RETENTION_MAXIMUM_DELETIONS="2",
+            **identity,
+        )
         self.assertEqual(result.returncode, 0, result.stderr)
         for generation in old_sets[:2]:
             self.assertTrue(all(not path.exists() for path in generation))

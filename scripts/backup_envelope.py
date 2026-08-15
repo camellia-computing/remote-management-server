@@ -19,11 +19,14 @@ import uuid
 MAGIC = b"CAMELLIA-REMOTE-CONSISTENT-BACKUP\x00"
 FORMAT = "camellia-remote-consistent-backup-v2"
 MAX_MANIFEST_BYTES = 4096
-SET_FORMAT = "camellia-remote-backup-set-v1"
-STATUS_FORMAT = "camellia-remote-backup-status-v1"
-RESTORE_RECEIPT_FORMAT = "camellia-remote-restore-receipt-v1"
+SET_FORMAT = "camellia-remote-backup-set-v2"
+STATUS_FORMAT = "camellia-remote-backup-status-v2"
+RESTORE_RECEIPT_FORMAT = "camellia-remote-restore-receipt-v2"
 RUN_STATE_FORMAT = "camellia-remote-backup-run-v1"
 MAX_SET_MANIFEST_BYTES = 16384
+MAX_CATALOG_BYTES = 16 * 1024 * 1024
+MAX_CATALOG_ENTRIES = 10000
+MAX_GENERATION = (1 << 63) - 1
 BACKUP_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 CREATED_AT_RE = re.compile(r"^[0-9]{8}T[0-9]{6}Z$")
 DEPLOYMENT_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
@@ -109,7 +112,7 @@ def _validate_image(value):
 
 
 def _expected_artifact_names(manifest):
-    stem = f'{manifest["created_at"]}-{manifest["backup_id"]}'
+    stem = f"{manifest['created_at']}-{manifest['backup_id']}"
     return {
         "database": f"postgres-{stem}.dump.age",
         "recordings": f"recordings-{stem}.bundle.age",
@@ -139,10 +142,12 @@ def validate_set_manifest(manifest):
         "database_name",
         "deployment_id",
         "format",
+        "generation",
         "key_id",
         "management_image",
         "migration_count",
         "postgres_major",
+        "previous_backup_id",
         "recording_epoch_id",
         "recording_inventory_digest",
         "schema_generation",
@@ -158,6 +163,19 @@ def validate_set_manifest(manifest):
         raise EnvelopeError("backup set format is unsupported")
     if not isinstance(manifest["backup_id"], str) or not BACKUP_ID_RE.fullmatch(manifest["backup_id"]):
         raise EnvelopeError("backup_id is invalid")
+    generation = manifest["generation"]
+    if not isinstance(generation, int) or isinstance(generation, bool) or not 1 <= generation <= MAX_GENERATION:
+        raise EnvelopeError("backup generation is invalid")
+    previous_backup_id = manifest["previous_backup_id"]
+    if generation == 1:
+        if previous_backup_id is not None:
+            raise EnvelopeError("first backup generation cannot have a predecessor")
+    elif (
+        not isinstance(previous_backup_id, str)
+        or not BACKUP_ID_RE.fullmatch(previous_backup_id)
+        or previous_backup_id == manifest["backup_id"]
+    ):
+        raise EnvelopeError("backup predecessor is invalid")
     created = _parse_timestamp(manifest["created_at"], "created_at")
     started = _parse_timestamp(manifest["started_at"], "started_at")
     verified = _parse_timestamp(manifest["verified_at"], "verified_at")
@@ -169,9 +187,7 @@ def validate_set_manifest(manifest):
     if not isinstance(manifest["database_name"], str):
         raise EnvelopeError("database_name is invalid")
     _bounded_text(manifest["database_name"], "database_name", 63)
-    if not isinstance(manifest["postgres_major"], str) or not POSTGRES_MAJOR_RE.fullmatch(
-        manifest["postgres_major"]
-    ):
+    if not isinstance(manifest["postgres_major"], str) or not POSTGRES_MAJOR_RE.fullmatch(manifest["postgres_major"]):
         raise EnvelopeError("postgres_major is invalid")
     if not isinstance(manifest["key_id"], str) or not KEY_ID_RE.fullmatch(manifest["key_id"]):
         raise EnvelopeError("key_id is invalid")
@@ -278,10 +294,12 @@ def build_set_manifest(args):
             "database_name": args.database_name,
             "deployment_id": args.deployment_id,
             "format": SET_FORMAT,
+            "generation": args.generation,
             "key_id": args.key_id,
             "management_image": args.management_image,
             "migration_count": args.migration_count,
             "postgres_major": args.postgres_major,
+            "previous_backup_id": args.previous_backup_id,
             "recording_epoch_id": args.recording_epoch_id,
             "recording_inventory_digest": args.recording_inventory_digest,
             "schema_generation": args.schema_generation,
@@ -305,6 +323,7 @@ def verify_set_manifest(manifest, args, *, verify_digests=True):
         "database_name": args.expect_database_name,
         "data_encryption_key_id": args.expect_data_encryption_key_id,
         "deployment_id": args.expect_deployment_id,
+        "generation": args.expect_generation,
         "key_id": args.expect_key_id,
         "management_image": args.expect_management_image,
         "postgres_major": args.expect_postgres_major,
@@ -562,6 +581,8 @@ def _add_set_context_arguments(parser):
     parser.add_argument("--database-name", required=True)
     parser.add_argument("--postgres-major", required=True)
     parser.add_argument("--key-id", required=True)
+    parser.add_argument("--generation", required=True, type=int)
+    parser.add_argument("--previous-backup-id")
     parser.add_argument("--data-encryption-key-id", required=True)
     parser.add_argument("--source-revision", required=True)
     parser.add_argument("--management-image", required=True)
@@ -581,6 +602,7 @@ def _add_set_expectations(parser, *, required=True):
     parser.add_argument("--expect-database-name", required=required)
     parser.add_argument("--expect-postgres-major", required=required)
     parser.add_argument("--expect-key-id", required=required)
+    parser.add_argument("--expect-generation", type=int)
     parser.add_argument("--expect-data-encryption-key-id", required=required)
     parser.add_argument("--expect-source-revision", required=required)
     parser.add_argument("--expect-management-image", required=required)
@@ -617,6 +639,19 @@ def _parser():
     set_entry.add_argument("--manifest-filename", required=True)
     set_entry.add_argument("--database-artifact", required=True)
     set_entry.add_argument("--recordings-artifact", required=True)
+    set_entry.add_argument("--expect-deployment-id", required=True)
+    set_entry.add_argument("--expect-database-name", required=True)
+    catalog_next = subparsers.add_parser("catalog-next")
+    catalog_next.add_argument("--observed-manifests", required=True, type=int)
+    catalog_next.add_argument("--candidate-backup-id", required=True)
+    retention_plan = subparsers.add_parser("retention-plan")
+    retention_plan.add_argument("--observed-manifests", required=True, type=int)
+    retention_plan.add_argument("--now", required=True)
+    retention_plan.add_argument("--retention-hours", required=True, type=int)
+    retention_plan.add_argument("--minimum-count", required=True, type=int)
+    retention_plan.add_argument("--maximum-clock-step-seconds", required=True, type=int)
+    retention_plan.add_argument("--maximum-deletions", required=True, type=int)
+    retention_plan.add_argument("--expect-latest-backup-id", required=True)
     status = subparsers.add_parser("status")
     status.add_argument("--manifest-filename", required=True)
     status.add_argument("--recorded-at", required=True)
@@ -663,6 +698,182 @@ def paired_manifest(database_path, recordings_path):
     return {field: database[field] for field in sorted(common_fields)}
 
 
+def _catalog_entry(manifest):
+    names = _expected_artifact_names(manifest)
+    return {
+        "backup_id": manifest["backup_id"],
+        "completed_at": manifest["completed_at"],
+        "created_at": manifest["created_at"],
+        "database": names["database"],
+        "generation": manifest["generation"],
+        "manifest": names["manifest"],
+        "previous_backup_id": manifest["previous_backup_id"],
+        "recordings": names["recordings"],
+    }
+
+
+def _validate_catalog_entry(entry):
+    required = {
+        "backup_id",
+        "completed_at",
+        "created_at",
+        "database",
+        "generation",
+        "manifest",
+        "previous_backup_id",
+        "recordings",
+    }
+    if not isinstance(entry, dict) or set(entry) != required:
+        raise EnvelopeError("backup catalog entry fields are invalid")
+    backup_id = entry["backup_id"]
+    if not isinstance(backup_id, str) or not BACKUP_ID_RE.fullmatch(backup_id):
+        raise EnvelopeError("backup catalog ID is invalid")
+    generation = entry["generation"]
+    if not isinstance(generation, int) or isinstance(generation, bool) or not 1 <= generation <= MAX_GENERATION:
+        raise EnvelopeError("backup catalog generation is invalid")
+    previous_backup_id = entry["previous_backup_id"]
+    if generation == 1:
+        if previous_backup_id is not None:
+            raise EnvelopeError("first backup catalog generation cannot have a predecessor")
+    elif (
+        not isinstance(previous_backup_id, str)
+        or not BACKUP_ID_RE.fullmatch(previous_backup_id)
+        or previous_backup_id == backup_id
+    ):
+        raise EnvelopeError("backup catalog predecessor is invalid")
+    _parse_timestamp(entry["created_at"], "catalog created_at")
+    _parse_timestamp(entry["completed_at"], "catalog completed_at")
+    expected = _expected_artifact_names(entry)
+    for component in ("database", "manifest", "recordings"):
+        if entry[component] != expected[component]:
+            raise EnvelopeError(f"backup catalog {component} filename is invalid")
+    return entry
+
+
+def _read_catalog(input_stream, observed_manifests):
+    if (
+        not isinstance(observed_manifests, int)
+        or isinstance(observed_manifests, bool)
+        or not 0 <= observed_manifests <= MAX_CATALOG_ENTRIES
+    ):
+        raise EnvelopeError("observed backup manifest count is invalid")
+    encoded = input_stream.read(MAX_CATALOG_BYTES + 1)
+    if len(encoded) > MAX_CATALOG_BYTES:
+        raise EnvelopeError("backup catalog is too large")
+    lines = encoded.splitlines()
+    if len(lines) > MAX_CATALOG_ENTRIES or len(lines) != observed_manifests:
+        raise EnvelopeError("backup catalog does not cover every observed manifest")
+    entries = []
+    for line in lines:
+        if not line or len(line) > MAX_SET_MANIFEST_BYTES:
+            raise EnvelopeError("backup catalog entry size is invalid")
+        try:
+            entry = json.loads(line.decode("utf-8"), object_pairs_hook=_json_no_duplicates)
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise EnvelopeError("backup catalog JSON is invalid") from exc
+        if _canonical_json(entry) != line:
+            raise EnvelopeError("backup catalog entry is not canonical")
+        entries.append(_validate_catalog_entry(entry))
+    entries.sort(key=lambda entry: entry["generation"])
+    generations = [entry["generation"] for entry in entries]
+    backup_ids = [entry["backup_id"] for entry in entries]
+    if len(generations) != len(set(generations)) or len(backup_ids) != len(set(backup_ids)):
+        raise EnvelopeError("backup catalog contains a duplicate generation or ID")
+    if entries and entries[0]["generation"] > 1 and entries[0]["previous_backup_id"] in set(backup_ids):
+        raise EnvelopeError("backup catalog retained-chain anchor is invalid")
+    for previous, current in zip(entries[:-1], entries[1:], strict=True):
+        if current["generation"] != previous["generation"] + 1:
+            raise EnvelopeError("backup catalog generations are not contiguous")
+        if current["previous_backup_id"] != previous["backup_id"]:
+            raise EnvelopeError("backup catalog predecessor chain is invalid")
+    return entries
+
+
+def _catalog_next(entries, candidate_backup_id):
+    if not BACKUP_ID_RE.fullmatch(candidate_backup_id):
+        raise EnvelopeError("candidate backup ID is invalid")
+    retained_ids = {entry["backup_id"] for entry in entries}
+    if entries and entries[0]["generation"] > 1:
+        retained_ids.add(entries[0]["previous_backup_id"])
+    if candidate_backup_id in retained_ids:
+        raise EnvelopeError("candidate backup ID was already used")
+    if not entries:
+        return {"generation": 1, "previous_backup_id": None}
+    latest = entries[-1]
+    if latest["generation"] >= MAX_GENERATION:
+        raise EnvelopeError("backup generation is exhausted")
+    return {
+        "generation": latest["generation"] + 1,
+        "previous_backup_id": latest["backup_id"],
+    }
+
+
+def _retention_plan(entries, args):
+    if not entries or entries[-1]["backup_id"] != args.expect_latest_backup_id:
+        raise EnvelopeError("retention catalog does not end at the current backup")
+    if not 24 <= args.retention_hours <= 24 * 3650:
+        raise EnvelopeError("retention hours are invalid")
+    if not 2 <= args.minimum_count <= 1000:
+        raise EnvelopeError("retention minimum count is invalid")
+    if not 60 <= args.maximum_clock_step_seconds <= 7 * 24 * 3600:
+        raise EnvelopeError("maximum backup clock step is invalid")
+    if not 1 <= args.maximum_deletions <= 100:
+        raise EnvelopeError("maximum retention deletions are invalid")
+    now = _parse_timestamp(args.now, "retention now")
+    latest_completed = _parse_timestamp(entries[-1]["completed_at"], "latest completed_at")
+    clock_delta_seconds = None
+    status = "retention-preserved:policy"
+    if latest_completed > now:
+        status = "retention-skipped:clock-before-latest"
+    elif len(entries) > 1:
+        previous_completed = _parse_timestamp(entries[-2]["completed_at"], "previous completed_at")
+        clock_delta_seconds = int((latest_completed - previous_completed).total_seconds())
+        if clock_delta_seconds < 0:
+            status = "retention-skipped:clock-rollback"
+        elif clock_delta_seconds > args.maximum_clock_step_seconds:
+            status = "retention-skipped:clock-forward-step"
+    if status.startswith("retention-skipped:") or len(entries) <= args.minimum_count:
+        deletions = []
+    else:
+        cutoff = now - dt.timedelta(hours=args.retention_hours)
+        logical_completed = []
+        previous_logical = None
+        for entry in entries:
+            completed = _parse_timestamp(entry["completed_at"], "catalog completed_at")
+            logical = completed if previous_logical is None else max(previous_logical, completed)
+            logical_completed.append(logical)
+            previous_logical = logical
+        eligible = [
+            entry
+            for entry, completed in zip(
+                entries[: -args.minimum_count],
+                logical_completed[: -args.minimum_count],
+                strict=True,
+            )
+            if completed < cutoff
+        ]
+        deletions = eligible[: args.maximum_deletions]
+        if deletions:
+            status = "retention-planned"
+    return {
+        "clock_delta_seconds": clock_delta_seconds,
+        "delete": [
+            {
+                "backup_id": entry["backup_id"],
+                "database": entry["database"],
+                "generation": entry["generation"],
+                "manifest": entry["manifest"],
+                "recordings": entry["recordings"],
+            }
+            for entry in deletions
+        ],
+        "format": "camellia-remote-backup-retention-plan-v1",
+        "latest_generation": entries[-1]["generation"],
+        "status": status,
+        "valid_generation_count": len(entries),
+    }
+
+
 def _set_status(manifest, manifest_filename, recorded_at):
     if manifest_filename != _expected_artifact_names(manifest)["manifest"]:
         raise EnvelopeError("backup set manifest filename is invalid")
@@ -673,7 +884,9 @@ def _set_status(manifest, manifest_filename, recorded_at):
         "backup_id": manifest["backup_id"],
         "completed_at": manifest["completed_at"],
         "format": STATUS_FORMAT,
+        "generation": manifest["generation"],
         "manifest_filename": manifest_filename,
+        "previous_backup_id": manifest["previous_backup_id"],
         "recorded_at": recorded_at,
         "status": "verified",
     }
@@ -699,6 +912,7 @@ def _restore_receipt(manifest, args):
         "completed_at": args.completed_at,
         "database": "fully-restored",
         "format": RESTORE_RECEIPT_FORMAT,
+        "generation": manifest["generation"],
         "recordings": "fully-restored",
         "restore_started_at": args.restore_started_at,
         "restore_run_id": args.restore_run_id,
@@ -730,6 +944,10 @@ def main(argv=None):
         return 0
     if args.command == "set-entry":
         manifest = read_set_manifest(sys.stdin.buffer)
+        if manifest["deployment_id"] != args.expect_deployment_id:
+            raise EnvelopeError("backup set deployment does not match retention authority")
+        if manifest["database_name"] != args.expect_database_name:
+            raise EnvelopeError("backup set database does not match retention authority")
         if args.manifest_filename != _expected_artifact_names(manifest)["manifest"]:
             raise EnvelopeError("backup set manifest filename is invalid")
         names = _expected_artifact_names(manifest)
@@ -747,14 +965,15 @@ def main(argv=None):
                 or observed.st_size != manifest["artifacts"][component]["bytes"]
             ):
                 raise EnvelopeError(f"backup set {component} artifact size is invalid")
-        completed_epoch = int(_parse_timestamp(manifest["completed_at"], "completed_at").timestamp())
-        print(
-            completed_epoch,
-            manifest["backup_id"],
-            names["database"],
-            names["recordings"],
-            names["manifest"],
-        )
+        sys.stdout.buffer.write(_canonical_json(_catalog_entry(manifest)) + b"\n")
+        return 0
+    if args.command == "catalog-next":
+        entries = _read_catalog(sys.stdin.buffer, args.observed_manifests)
+        sys.stdout.buffer.write(_canonical_json(_catalog_next(entries, args.candidate_backup_id)) + b"\n")
+        return 0
+    if args.command == "retention-plan":
+        entries = _read_catalog(sys.stdin.buffer, args.observed_manifests)
+        sys.stdout.buffer.write(_canonical_json(_retention_plan(entries, args)) + b"\n")
         return 0
     if args.command == "status":
         manifest = read_set_manifest(sys.stdin.buffer)
