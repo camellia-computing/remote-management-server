@@ -7,6 +7,8 @@ from dataclasses import dataclass
 from django.conf import settings
 from django.db import connections
 
+from api.request_deadlines import current_request_budget
+
 _TIMEOUT_SQLSTATES = {
     "25P03": "idle_in_transaction_timeout",
     "55P03": "lock_timeout",
@@ -173,8 +175,12 @@ class _DeadlineExecutor:
 
 
 def configured_database_budget():
+    configured_deadline = time.monotonic() + (settings.DATABASE_OPERATION_DEADLINE_MS / 1000)
+    request_budget = current_request_budget()
+    if request_budget is not None:
+        configured_deadline = min(configured_deadline, request_budget.deadline)
     return DatabaseBudget(
-        deadline=time.monotonic() + (settings.DATABASE_OPERATION_DEADLINE_MS / 1000),
+        deadline=configured_deadline,
         idle_transaction_timeout_ms=settings.DATABASE_IDLE_TRANSACTION_TIMEOUT_MS,
         lock_timeout_ms=settings.DATABASE_LOCK_TIMEOUT_MS,
         operation_timeout_ms=settings.DATABASE_OPERATION_DEADLINE_MS,

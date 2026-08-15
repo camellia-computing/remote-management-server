@@ -19,6 +19,14 @@ from api.rate_limits import (
     rate_limit_backend_response,
     rate_limit_response,
 )
+from api.request_deadlines import (
+    DeadlineInputStream,
+    DeadlineStreamingIterator,
+    RequestDeadlineExceeded,
+    check_request_deadline,
+    install_request_budget,
+    reset_request_budget,
+)
 from api.request_utils import (
     STRICT_SHARE_JSON_ATTRIBUTE,
     InvalidJsonPayload,
@@ -59,6 +67,25 @@ def _is_sensitive_response_route(request):
     return bool(getattr(resolver_match.func, SENSITIVE_RESPONSE_MARKER, False))
 
 
+def _finish_access_response(request, response, context, started_ns):
+    context = finish_request_context(request, context)
+    apply_response_contract(request, response)
+    if _is_sensitive_response_route(request):
+        protect_sensitive_response(response)
+    response[REQUEST_ID_HEADER] = context.request_id
+    response[TRACEPARENT_HEADER] = context.traceparent
+    if context.event_id:
+        response[EVENT_ID_HEADER] = context.event_id
+    log_structured_event(
+        logger,
+        request,
+        "http_request_completed",
+        status=getattr(response, "status_code", 0),
+        duration_us=max((time.monotonic_ns() - started_ns) // 1_000, 0),
+    )
+    return response
+
+
 class SafeAccessLogMiddleware:
     """Attach server-generated request correlation and a route-pattern label."""
 
@@ -70,6 +97,11 @@ class SafeAccessLogMiddleware:
         started_ns = time.monotonic_ns()
         try:
             response = self.get_response(request)
+            if not response.streaming:
+                check_request_deadline()
+        except RequestDeadlineExceeded:
+            response = request_deadline_response(request)
+            return _finish_access_response(request, response, context, started_ns)
         except Exception as exc:
             finish_request_context(request, context)
             log_structured_event(
@@ -82,24 +114,44 @@ class SafeAccessLogMiddleware:
             )
             raise
         else:
-            context = finish_request_context(request, context)
-            apply_response_contract(request, response)
-            if _is_sensitive_response_route(request):
-                protect_sensitive_response(response)
-            response[REQUEST_ID_HEADER] = context.request_id
-            response[TRACEPARENT_HEADER] = context.traceparent
-            if context.event_id:
-                response[EVENT_ID_HEADER] = context.event_id
-            log_structured_event(
-                logger,
-                request,
-                "http_request_completed",
-                status=getattr(response, "status_code", 0),
-                duration_us=max((time.monotonic_ns() - started_ns) // 1_000, 0),
-            )
-            return response
+            return _finish_access_response(request, response, context, started_ns)
         finally:
             reset_request_context(token)
+
+
+class RequestDeadlineMiddleware:
+    """Install and enforce the single monotonic HTTP request budget.
+
+    This is cooperative by design: Python cannot safely kill an arbitrary
+    gthread while it may be committing a database mutation. Downstream I/O
+    must consume the remaining budget; once it is exhausted we fail closed with
+    an explicit ``result=unknown`` response and never return a late success.
+    """
+
+    def __init__(self, get_response):
+        self.get_response = get_response
+
+    def __call__(self, request):
+        budget, token = install_request_budget(settings.REQUEST_DEADLINE_SECONDS)
+        original_stream = getattr(request, "_stream", None)
+        if original_stream is not None:
+            request._stream = DeadlineInputStream(original_stream)
+        try:
+            try:
+                response = self.get_response(request)
+                if response.streaming:
+                    response.streaming_content = DeadlineStreamingIterator(response.streaming_content, budget)
+                elif not getattr(response, "_camellia_request_deadline", False):
+                    # A view that completed after its budget must not be
+                    # presented as a successful mutation.
+                    check_request_deadline()
+                return response
+            except RequestDeadlineExceeded:
+                return request_deadline_response(request)
+        finally:
+            if original_stream is not None:
+                request._stream = original_stream
+            reset_request_budget(token)
 
 
 class DatabaseDeadlineMiddleware:
@@ -153,6 +205,8 @@ class ApiExceptionMiddleware:
         return self.get_response(request)
 
     def process_exception(self, request, exception):
+        if isinstance(exception, RequestDeadlineExceeded):
+            return request_deadline_response(request)
         timeout_kind = database_timeout_kind(exception)
         if isinstance(exception, DatabaseOperationDeadlineExceeded) or timeout_kind:
             return database_timeout_response(request, timeout_kind or "operation_deadline")
@@ -204,4 +258,26 @@ def database_timeout_response(request, timeout_kind):
     )
     response["Retry-After"] = "1"
     response._camellia_database_timeout = True
+    return response
+
+
+def request_deadline_response(request):
+    """Return a bounded, typed response for an exhausted HTTP request budget."""
+
+    log_structured_event(
+        logger,
+        request,
+        "http_request_deadline_exceeded",
+        level="warning",
+    )
+    response = json_error(
+        "request_deadline_exceeded",
+        "Request deadline exceeded",
+        status=504,
+        retryable=True,
+        result="unknown",
+    )
+    # Keep retries bounded and avoid exposing the configured internal budget.
+    response["Retry-After"] = "1"
+    response._camellia_request_deadline = True
     return response

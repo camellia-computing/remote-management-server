@@ -15,6 +15,7 @@ from django.utils import timezone
 
 from api import ingestion_governance, recording_crypto, recording_inventory
 from api.models import RecordingUpload, RecordingUploadChunk
+from api.request_deadlines import check_request_deadline
 
 logger = logging.getLogger(__name__)
 
@@ -226,10 +227,12 @@ def _open_record_file(filepath, flags):
 def _write_all(fd, data):
     written = 0
     while written < len(data):
+        check_request_deadline()
         count = os.write(fd, data[written:])
         if count <= 0:
             raise OSError("Recording write did not make progress")
         written += count
+    check_request_deadline()
 
 
 def _state_payload(upload, *, queried_chunk_committed=None):
@@ -365,6 +368,7 @@ def _verify_recording_file(upload, path, data_key, *, include_ciphertext_digest=
             expected_storage_offset=upload.storage_offset,
             max_chunk_bytes=settings.RECORD_UPLOAD_MAX_CHUNK_BYTES,
             include_ciphertext_digest=include_ciphertext_digest,
+            deadline_check=check_request_deadline,
         )
     finally:
         os.close(fd)
@@ -538,10 +542,13 @@ def _commit_part(request, token, content_length):
     declared_length = _parse_nonnegative_int(request.GET.get("length", ""), "length")
     if declared_length != content_length:
         raise UploadRequestError("Invalid upload length")
+    check_request_deadline()
     data = request.body or b""
+    check_request_deadline()
     if len(data) != content_length:
         raise UploadRequestError("Incomplete upload body")
     digest = _parse_digest(request.GET.get("digest", ""))
+    check_request_deadline()
     if hashlib.sha256(data).hexdigest() != digest:
         raise UploadRequestError("Upload digest mismatch", status=409, code="digest_mismatch")
     upload_id = _parse_uuid(request.GET.get("upload_id", ""), "upload_id")
@@ -602,6 +609,7 @@ def _commit_part(request, token, content_length):
             data_key = _recording_data_key(upload)
             base_dir = _ensure_record_upload_dir(upload)
             with _record_file_lock(base_dir):
+                check_request_deadline()
                 stage_path = _stage_path(base_dir, upload.storage_object_id)
                 final_path = _final_path(base_dir, upload)
                 _reconcile_staging_file(upload, stage_path, final_path, data_key)
@@ -617,12 +625,16 @@ def _commit_part(request, token, content_length):
                 )
                 fd = _open_record_file(stage_path, os.O_RDWR)
                 try:
+                    check_request_deadline()
                     os.lseek(fd, upload.storage_offset, os.SEEK_SET)
                     _write_all(fd, record_frame)
                     _write_all(fd, record_ciphertext)
+                    check_request_deadline()
                     os.fsync(fd)
+                    check_request_deadline()
                 finally:
                     os.close(fd)
+                check_request_deadline()
                 RecordingUploadChunk.objects.create(
                     upload=upload,
                     chunk_id=chunk_id,
@@ -644,6 +656,7 @@ def _commit_part(request, token, content_length):
                         "updated_at",
                     )
                 )
+                check_request_deadline()
                 payload = _state_payload(upload)
         rollback = None
         return JsonResponse(payload)
@@ -697,6 +710,7 @@ def _finalize_upload(request, token, content_length):
             data_key = _recording_data_key(upload)
             base_dir = _ensure_record_upload_dir(upload)
             with _record_file_lock(base_dir):
+                check_request_deadline()
                 stage_path = _stage_path(base_dir, upload.storage_object_id)
                 final_path = _final_path(base_dir, upload)
                 stage_exists = os.path.lexists(stage_path)
@@ -725,6 +739,7 @@ def _finalize_upload(request, token, content_length):
                     data_key,
                     include_ciphertext_digest=True,
                 )
+                check_request_deadline()
                 if actual_size != final_size or actual_digest != final_digest:
                     raise UploadRequestError(
                         "Final recording digest mismatch",
@@ -737,9 +752,11 @@ def _finalize_upload(request, token, content_length):
                         raise OSError("Published recording inventory is inconsistent")
                     return JsonResponse(_state_payload(upload))
                 if stage_exists:
+                    check_request_deadline()
                     os.rename(stage_path, final_path)
                     _fsync_directory(os.path.dirname(stage_path))
                     _fsync_directory(base_dir)
+                    check_request_deadline()
                     moved = (final_path, stage_path)
                 upload.state = RecordingUpload.STATE_FINALIZED
                 upload.expected_size = final_size
@@ -764,6 +781,7 @@ def _finalize_upload(request, token, content_length):
                         "updated_at",
                     )
                 )
+                check_request_deadline()
                 payload = _state_payload(upload)
         moved = None
         return JsonResponse(payload)
@@ -809,6 +827,7 @@ def _abort_upload(request, token, content_length):
                 )
             else:
                 with _record_file_lock(base_dir):
+                    check_request_deadline()
                     stage_path = _stage_path(base_dir, upload.storage_object_id)
                     final_path = _final_path(base_dir, upload)
                     if os.path.lexists(final_path):
@@ -823,6 +842,7 @@ def _abort_upload(request, token, content_length):
                             raise OSError("Recording abort tomb already exists")
                         os.rename(stage_path, tomb_path)
                         _fsync_directory(os.path.dirname(stage_path))
+                        check_request_deadline()
                         moved = (tomb_path, stage_path)
                     elif not os.path.lexists(tomb_path):
                         if upload.committed_offset != 0 or upload.revision != 0:
@@ -836,6 +856,7 @@ def _abort_upload(request, token, content_length):
                         upload.committed_offset,
                     )
                     upload.save(update_fields=("state", "aborted_at", "heartbeat_at", "updated_at"))
+                    check_request_deadline()
                     payload = _state_payload(upload)
         moved = None
     except Exception as error:

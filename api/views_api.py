@@ -121,6 +121,7 @@ from api.policy_generation import (
 )
 from api.rate_limits import enforce_authenticated_rate_limit
 from api.release_schema import check_release_schema
+from api.request_deadlines import bounded_timeout, check_request_deadline
 from api.request_utils import InvalidJsonPayload, client_ip, load_json_body, load_json_object, load_json_text
 from api.response_contract import RESPONSE_SCHEMA_VERSION, empty_success, json_error, json_pending
 from api.tag_colors import normalize_tag_color
@@ -611,7 +612,7 @@ def _oidc_response_content_type(response):
 def _request_oidc_json(url, allowed_hosts, *, etag=""):
     if not _oidc_endpoint_allowed(url, allowed_hosts):
         raise ValueError("OIDC endpoint is outside the configured host allowlist")
-    timeout = getattr(settings, "OIDC_HTTP_TIMEOUT_SECONDS", 10)
+    timeout = bounded_timeout(getattr(settings, "OIDC_HTTP_TIMEOUT_SECONDS", 10))
     headers = {"Accept": "application/json, application/jwk-set+json"}
     if etag:
         headers["If-None-Match"] = etag
@@ -622,6 +623,7 @@ def _request_oidc_json(url, allowed_hosts, *, etag=""):
         stream=True,
         headers=headers,
     ) as response:
+        check_request_deadline()
         if response.status_code == 304:
             return None, etag, True
         response.raise_for_status()
@@ -641,9 +643,11 @@ def _request_oidc_json(url, allowed_hosts, *, etag=""):
                 raise ValueError("OIDC document is too large")
         body = bytearray()
         for chunk in response.iter_content(64 * 1024):
+            check_request_deadline()
             body.extend(chunk)
             if len(body) > OIDC_DOCUMENT_MAX_BYTES:
                 raise ValueError("OIDC document is too large")
+        check_request_deadline()
         response_etag = response.headers.get("ETag", "")
         if (
             not isinstance(response_etag, str)
@@ -673,7 +677,7 @@ def _clear_oidc_document_cache():
 def _cached_oidc_document(url, allowed_hosts, *, document_type, validator, force_refresh=False):
     allowed_hosts = tuple(sorted(frozenset(allowed_hosts)))
     cache_key = (document_type, url, allowed_hosts)
-    wait_timeout = getattr(settings, "OIDC_HTTP_TIMEOUT_SECONDS", 10) + 1
+    wait_timeout = bounded_timeout(getattr(settings, "OIDC_HTTP_TIMEOUT_SECONDS", 10) + 1)
     while True:
         now = time.monotonic()
         with _oidc_document_cache_lock:
@@ -690,6 +694,7 @@ def _cached_oidc_document(url, allowed_hosts, *, document_type, validator, force
                 leader = False
         if leader:
             break
+        check_request_deadline()
         if not inflight.event.wait(wait_timeout):
             with _oidc_document_cache_lock:
                 stale = _oidc_document_cache.get(cache_key)
@@ -791,7 +796,7 @@ def _oidc_client(provider, state=None):
         redirect_uri=provider["redirect_uri"],
         state=state,
         code_challenge_method="S256",
-        default_timeout=getattr(settings, "OIDC_HTTP_TIMEOUT_SECONDS", 10),
+        default_timeout=bounded_timeout(getattr(settings, "OIDC_HTTP_TIMEOUT_SECONDS", 10)),
     )
 
 
@@ -2344,6 +2349,7 @@ def oidc_callback(request):
             return HttpResponse("OIDC authorization was already consumed.", status=409)
         return HttpResponse("OIDC provider is not configured", status=400)
     try:
+        check_request_deadline()
         metadata = _oidc_metadata(
             provider["issuer"],
             provider["allowed_hosts"],
@@ -2355,7 +2361,9 @@ def oidc_callback(request):
             code_verifier=claim.code_verifier,
             allow_redirects=False,
         )
+        check_request_deadline()
         claims = _validate_oidc_id_token(token, metadata, provider, claim.nonce)
+        check_request_deadline()
         issuer = str(claims["iss"]).rstrip("/")
         user = _complete_oidc_callback_claim(claim, issuer, claims)
     except _OidcCallbackClaimLost:
