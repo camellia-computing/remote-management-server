@@ -339,13 +339,13 @@ jobs:
           upload-release-assets: false
       - name: Provenance
         id: provenance
-        uses: actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d # v4.2.1
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
         with:
           subject-name: ${{ needs.metadata.outputs.primary-image }}
           subject-digest: ${{ steps.build.outputs.digest }}
       - name: SBOM attestation
         id: sbom-attestation
-        uses: actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d # v4.2.1
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
         with:
           subject-name: ${{ needs.metadata.outputs.primary-image }}
           subject-digest: ${{ steps.build.outputs.digest }}
@@ -487,14 +487,14 @@ jobs:
           }
       - name: GHCR login
         if: ${{ needs.metadata.outputs.ghcr-image != '' }}
-        uses: docker/login-action@abd2ef45e78c5afb21d64d4ca52ee8550d9572c7 # v4.5.1
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
           registry: ghcr.io
           username: ${{ github.repository_owner }}
           password: ${{ github.token }}
       - name: Docker Hub login
         if: ${{ needs.metadata.outputs.dockerhub-image != '' }}
-        uses: docker/login-action@abd2ef45e78c5afb21d64d4ca52ee8550d9572c7 # v4.5.1
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
