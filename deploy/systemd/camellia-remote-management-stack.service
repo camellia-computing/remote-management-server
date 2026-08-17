@@ -3,17 +3,23 @@ Description=Camellia Remote Management OCI stack
 Requires=docker.service
 After=docker.service network-online.target
 Wants=network-online.target
+StartLimitIntervalSec=10min
+StartLimitBurst=4
 
 [Service]
-Type=oneshot
-RemainAfterExit=yes
+Type=notify
+NotifyAccess=main
 WorkingDirectory=/opt/camellia-remote-management
 EnvironmentFile=/etc/camellia-remote-management/management.env
-ExecStart=/opt/camellia-remote-management/start-management-stack.sh
-ExecStop=/opt/camellia-remote-management/deploy/stop-management-stack.sh
+ExecStart=/opt/camellia-remote-management/deploy/supervise-management-stack.sh
+ExecStop=/bin/kill -TERM $MAINPID
+ExecStopPost=/opt/camellia-remote-management/deploy/stop-management-stack.sh
 TimeoutStartSec=40min
 TimeoutStopSec=11min
 KillMode=control-group
+Restart=on-failure
+RestartSec=30s
+WatchdogSec=45s
 UMask=0077
 CapabilityBoundingSet=
 MemoryDenyWriteExecute=yes
