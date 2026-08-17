@@ -94,7 +94,12 @@ class DeploymentGateTests(unittest.TestCase):
         unit = STACK_UNIT.read_text()
         self.assertNotIn("ExecReload=", unit)
         self.assertNotIn("ExecStartPre=/usr/bin/docker", unit)
-        self.assertIn("ExecStart=/opt/camellia-remote-management/start-management-stack.sh", unit)
+        self.assertIn(
+            "ExecStart=/opt/camellia-remote-management/deploy/supervise-management-stack.sh",
+            unit,
+        )
+        self.assertIn("Type=notify", unit)
+        self.assertIn("WatchdogSec=45s", unit)
 
         management = compose_service("management")
         self.assertIn('restart: "no"', management)

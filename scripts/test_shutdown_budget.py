@@ -1,12 +1,10 @@
 #!/usr/bin/env python3
 """Regression tests for the single-source shutdown budget contract."""
 
-import os
 import pathlib
 import subprocess
 import tempfile
 import unittest
-
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 BUDGET = ROOT / "deploy" / "shutdown-budget.sh"
@@ -81,7 +79,8 @@ class ShutdownBudgetTests(unittest.TestCase):
         self.assertLess(run.index("shutdown-budget.sh"), run.index("exec gunicorn"))
 
         unit = STACK_UNIT.read_text()
-        self.assertIn("ExecStop=/opt/camellia-remote-management/deploy/stop-management-stack.sh", unit)
+        self.assertIn("ExecStop=/bin/kill -TERM $MAINPID", unit)
+        self.assertIn("ExecStopPost=/opt/camellia-remote-management/deploy/stop-management-stack.sh", unit)
         self.assertIn("TimeoutStopSec=11min", unit)
         self.assertIn("KillMode=control-group", unit)
         self.assertNotIn("TimeoutStopSec=2min", unit)
