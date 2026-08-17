@@ -5,7 +5,6 @@ import pathlib
 import re
 import unittest
 
-
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 COMPOSE = ROOT / "docker-compose.yaml"
 ENV_EXAMPLE = ROOT / ".env.example"
@@ -25,12 +24,12 @@ def service_block(name):
 
 class ResourceBudgetContractTests(unittest.TestCase):
     def test_runtime_services_have_independent_finite_resource_contracts(self):
-        for service in ("postgres", "migrate", "management", "database-backup"):
+        for service in ("postgres-data-bootstrap", "postgres", "migrate", "management", "database-backup"):
             block = service_block(service)
             with self.subTest(service=service):
                 for key in ("cpus:", "cpu_shares:", "mem_limit:", "mem_reservation:", "pids_limit:"):
                     self.assertIn(key, block)
-                if service != "database-backup":
+                if service not in ("postgres-data-bootstrap", "database-backup"):
                     self.assertIn("ulimits:", block)
         self.assertIn("ulimits:", COMPOSE.read_text().split("x-database-client:", 1)[1].split("services:", 1)[0])
         self.assertIn('CAMELLIA_REMOTE_REQUIRE_CGROUP_BUDGET: "true"', service_block("management"))

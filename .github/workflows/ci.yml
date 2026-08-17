@@ -240,6 +240,7 @@ jobs:
           python3 scripts/test_compose_operation_runner.py
           python3 scripts/test_database_roles.py
           python3 scripts/test_deployment_gate.py
+          python3 scripts/test_postgres_container_hardening.py
           python3 scripts/test_systemd_maintenance.py
           python3 .github/scripts/test_manage_release.py
           python3 .github/scripts/test_container_release_evidence.py
@@ -435,6 +436,8 @@ jobs:
     needs: [classify, metadata, web_client, quality]
     runs-on: ubuntu-24.04
     timeout-minutes: 30
+    env:
+      POSTGRES_HARDENING_PROJECT: camellia-remote-pg-${{ github.run_id }}-${{ github.run_attempt }}
     services:
       postgres:
         image: postgres:18-alpine@sha256:9a8afca54e7861fd90fab5fdf4c42477a6b1cb7d293595148e674e0a3181de15
@@ -492,6 +495,13 @@ jobs:
           ignore-unfixed: true
           exit-code: "1"
           timeout: 10m0s
+
+      - name: Verify production PostgreSQL container boundary
+        run: |
+          python3 scripts/test_postgres_container_hardening.py \
+            --effective \
+            --runtime \
+            --project-name "$POSTGRES_HARDENING_PROJECT"
 
       - name: Create smoke-test volumes
         run: |
@@ -618,8 +628,13 @@ jobs:
       - name: Clean up container resources
         if: always()
         run: |
+          status=0
+          python3 scripts/test_postgres_container_hardening.py \
+            --cleanup \
+            --project-name "$POSTGRES_HARDENING_PROJECT" || status=$?
           docker rm --force camellia-remote-management-ci 2>/dev/null || true
           docker volume rm camellia-remote-management-ci-records 2>/dev/null || true
+          exit "$status"
 
   performance_smoke:
     name: Management performance contract smoke

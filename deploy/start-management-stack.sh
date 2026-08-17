@@ -206,8 +206,16 @@ fi
 
 "${compose[@]}" rm --force --stop migrate
 # A fresh or converted volume cannot pass the probe healthcheck until the
-# limited probe role exists. Start PostgreSQL without waiting, converge roles,
-# then require the authenticated healthcheck before migration.
+# limited probe role exists.  If PostgreSQL is not already running, first run
+# the short-lived root-owned volume bootstrap; it has no network and only the
+# three capabilities needed to converge the PostgreSQL UID/GID.  Never mount
+# the volume for a chown job while the database is serving it.
+if ! running_services="$("${compose[@]}" ps --status running --services 2>/dev/null)"; then
+    die "cannot inspect running services before PostgreSQL volume bootstrap"
+fi
+if ! printf '%s\n' "$running_services" | grep -Fxq postgres; then
+    run_operation pgdata-bootstrap 120 postgres-data-bootstrap
+fi
 "${compose[@]}" up --detach postgres
 run_operation database-bootstrap 300 database-bootstrap
 "${compose[@]}" up --detach --wait postgres

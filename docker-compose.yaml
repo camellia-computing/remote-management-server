@@ -175,9 +175,59 @@ x-database-client: &database-client
     nproc: ${CAMELLIA_REMOTE_DATABASE_CLIENT_NPROC:-128}
 
 services:
+  postgres-data-bootstrap:
+    image: postgres:18-alpine@sha256:9a8afca54e7861fd90fab5fdf4c42477a6b1cb7d293595148e674e0a3181de15
+    pull_policy: always
+    profiles:
+      - database-operations
+    entrypoint: []
+    user: "0:0"
+    read_only: true
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - DAC_OVERRIDE
+      - FOWNER
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    volumes:
+      - postgres-data:/var/lib/postgresql
+    network_mode: none
+    restart: "no"
+    cpus: "0.25"
+    cpu_shares: 64
+    mem_limit: 64m
+    mem_reservation: 32m
+    pids_limit: 32
+    environment:
+      PGDATA: /var/lib/postgresql/18/docker
+    command:
+      - /bin/sh
+      - -ec
+      - >-
+        test -z "$(find /var/lib/postgresql -xdev -type l -print -quit)" &&
+        mkdir -p "$${PGDATA}" &&
+        find /var/lib/postgresql -xdev \( ! -user 70 -o ! -group 70 \)
+        -exec chown 70:70 {} + &&
+        ( test "$(stat -c %a "$${PGDATA}")" = 700 || chmod 700 "$${PGDATA}" )
+
   postgres:
     image: postgres:18-alpine@sha256:9a8afca54e7861fd90fab5fdf4c42477a6b1cb7d293595148e674e0a3181de15
+    pull_policy: always
+    user: "70:70"
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+      - /var/run/postgresql:size=16m,uid=70,gid=70,mode=775
     environment:
+      PGDATA: /var/lib/postgresql/18/docker
       POSTGRES_DB: ${CAMELLIA_REMOTE_DATABASE_NAME:-camellia_remote}
       POSTGRES_USER: ${CAMELLIA_REMOTE_DATABASE_BOOTSTRAP_USER:?Set the existing or new cluster bootstrap superuser}
       POSTGRES_PASSWORD: ${CAMELLIA_REMOTE_DATABASE_BOOTSTRAP_PASSWORD:?Set the bootstrap password}

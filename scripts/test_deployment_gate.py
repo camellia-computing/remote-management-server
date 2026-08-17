@@ -55,16 +55,23 @@ def deployment_fixture(root):
                 output.write(" ".join(sys.argv[1:]) + "\\n")
             args = sys.argv[1:]
             if "ps" in args:
-                if os.environ.get("FAKE_PS_FAIL") == "1":
+                ps_calls = sum(" ps " in f" {line} " for line in calls.read_text().splitlines())
+                fail_on_call = os.environ.get("FAKE_PS_FAIL_ON_CALL")
+                if os.environ.get("FAKE_PS_FAIL") == "1" or fail_on_call == str(ps_calls):
                     raise SystemExit(42)
                 if os.environ.get("FAKE_MANAGEMENT_RUNNING") == "1":
                     print("management")
+                if os.environ.get("FAKE_POSTGRES_RUNNING") == "1":
+                    print("postgres")
             if args[:2] == ["container", "inspect"]:
                 raise SystemExit(1)
             if args[:2] == ["container", "ls"]:
                 raise SystemExit(0)
-            if "run" in args and args[-1] == "migrate" and os.environ.get("FAKE_MIGRATION_FAIL") == "1":
-                raise SystemExit(41)
+            if "run" in args:
+                if args[-1] == "migrate" and os.environ.get("FAKE_MIGRATION_FAIL") == "1":
+                    raise SystemExit(41)
+                if args[-1] == "postgres-data-bootstrap" and os.environ.get("FAKE_PGDATA_BOOTSTRAP_FAIL") == "1":
+                    raise SystemExit(43)
             raise SystemExit(0)
             """
         ).lstrip()
@@ -150,6 +157,61 @@ class DeploymentGateTests(unittest.TestCase):
             failed_log = calls.read_text().splitlines()
             self.assertTrue(any(" run " in f" {line} " and line.endswith("migrate") for line in failed_log))
             self.assertFalse(any(" up " in f" {line} " and line.endswith("management") for line in failed_log))
+
+    def test_volume_bootstrap_is_exclusive_idempotent_and_precedes_postgres_start(self):
+        with tempfile.TemporaryDirectory(prefix="camellia-postgres-bootstrap-gate-") as temporary:
+            root = pathlib.Path(temporary)
+            command, env, calls, _runtime, _env_file = deployment_fixture(root)
+            fresh = subprocess.run(command, env=env, text=True, capture_output=True)
+            self.assertEqual(fresh.returncode, 0, fresh.stderr)
+            fresh_log = calls.read_text().splitlines()
+            bootstrap_index = next(
+                index for index, line in enumerate(fresh_log) if line.endswith("postgres-data-bootstrap")
+            )
+            postgres_start_index = next(
+                index for index, line in enumerate(fresh_log) if " up " in f" {line} " and line.endswith("postgres")
+            )
+            self.assertLess(bootstrap_index, postgres_start_index)
+            self.assertIn("io.camellia.remote.operation-kind=pgdata-bootstrap", fresh_log[bootstrap_index])
+
+            calls.write_text("")
+            running = subprocess.run(
+                command,
+                env=env | {"FAKE_POSTGRES_RUNNING": "1"},
+                text=True,
+                capture_output=True,
+            )
+            self.assertEqual(running.returncode, 0, running.stderr)
+            running_log = calls.read_text().splitlines()
+            self.assertFalse(any(line.endswith("postgres-data-bootstrap") for line in running_log))
+
+    def test_volume_bootstrap_inspection_and_failure_block_postgres_start(self):
+        with tempfile.TemporaryDirectory(prefix="camellia-postgres-bootstrap-failure-") as temporary:
+            root = pathlib.Path(temporary)
+            command, env, calls, _runtime, _env_file = deployment_fixture(root)
+            inspection_failure = subprocess.run(
+                command,
+                env=env | {"FAKE_PS_FAIL_ON_CALL": "2"},
+                text=True,
+                capture_output=True,
+            )
+            self.assertNotEqual(inspection_failure.returncode, 0)
+            self.assertIn("before PostgreSQL volume bootstrap", inspection_failure.stderr)
+            self.assertFalse(
+                any(" up " in f" {line} " and line.endswith("postgres") for line in calls.read_text().splitlines())
+            )
+
+            calls.write_text("")
+            bootstrap_failure = subprocess.run(
+                command,
+                env=env | {"FAKE_PGDATA_BOOTSTRAP_FAIL": "1"},
+                text=True,
+                capture_output=True,
+            )
+            self.assertNotEqual(bootstrap_failure.returncode, 0)
+            failure_log = calls.read_text().splitlines()
+            self.assertTrue(any(line.endswith("postgres-data-bootstrap") for line in failure_log))
+            self.assertFalse(any(" up " in f" {line} " and line.endswith("postgres") for line in failure_log))
 
     def test_controller_fails_closed_on_state_query_and_running_old_app(self):
         with tempfile.TemporaryDirectory(prefix="camellia-deployment-inspection-") as temporary:
