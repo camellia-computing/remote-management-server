@@ -116,6 +116,14 @@
         "api_recordingupload": ["secret_context"],
         "api_remotedevice": ["secret_context"],
         "api_remotepeer": ["secret_context"]
+      },
+      "runtime_dml": {
+        "sequences": {
+          "api_remotedevice_id_seq": ["SELECT", "UPDATE", "USAGE"]
+        },
+        "tables": {
+          "api_remotedevice": ["DELETE", "INSERT", "SELECT", "UPDATE"]
+        }
       }
     }
   }

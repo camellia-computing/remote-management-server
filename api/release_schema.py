@@ -45,6 +45,23 @@ def _identifier_list(value, field):
     return tuple(value)
 
 
+def _privilege_map(value, field, allowed):
+    if not isinstance(value, dict) or list(value) != sorted(value):
+        raise ReleaseSchemaError(f"release schema manifest {field} must be a sorted privilege map")
+    normalized = {}
+    for relation, privileges in value.items():
+        if not isinstance(relation, str) or not _IDENTIFIER.fullmatch(relation):
+            raise ReleaseSchemaError(f"release schema manifest {field} contains an invalid object")
+        if not isinstance(privileges, list) or not privileges or privileges != sorted(set(privileges)):
+            raise ReleaseSchemaError(f"release schema manifest {field}.{relation} must be sorted and unique")
+        if any(not isinstance(privilege, str) or privilege not in allowed for privilege in privileges):
+            raise ReleaseSchemaError(f"release schema manifest {field}.{relation} contains an invalid privilege")
+        normalized[relation] = tuple(privileges)
+    if not normalized:
+        raise ReleaseSchemaError(f"release schema manifest {field} must not be empty")
+    return normalized
+
+
 @functools.lru_cache(maxsize=1)
 def load_release_schema_manifest():
     try:
@@ -83,6 +100,7 @@ def load_release_schema_manifest():
     indexes = postgresql.get("indexes")
     not_null = postgresql.get("not_null")
     column_types = postgresql.get("column_types")
+    runtime_dml = postgresql.get("runtime_dml")
     for field, values in (("constraints", constraints), ("indexes", indexes), ("not_null", not_null)):
         if not isinstance(values, dict) or list(values) != sorted(values):
             raise ReleaseSchemaError(f"release schema manifest PostgreSQL {field} are invalid")
@@ -106,6 +124,20 @@ def load_release_schema_manifest():
                 or not re.fullmatch(r"[a-z0-9_ ()\[\]]{1,64}", type_name)
             ):
                 raise ReleaseSchemaError("release schema manifest contains an invalid PostgreSQL column type")
+    if not isinstance(runtime_dml, dict) or list(runtime_dml) != ["sequences", "tables"]:
+        raise ReleaseSchemaError("release schema manifest PostgreSQL runtime DML capabilities are invalid")
+    runtime_tables = _privilege_map(
+        runtime_dml.get("tables"),
+        "postgresql.runtime_dml.tables",
+        {"DELETE", "INSERT", "SELECT", "UPDATE"},
+    )
+    runtime_sequences = _privilege_map(
+        runtime_dml.get("sequences"),
+        "postgresql.runtime_dml.sequences",
+        {"SELECT", "UPDATE", "USAGE"},
+    )
+    if any(relation not in normalized_relations for relation in runtime_tables):
+        raise ReleaseSchemaError("release schema manifest runtime DML table is not a declared relation")
 
     return {
         "schema_version": 1,
@@ -117,6 +149,10 @@ def load_release_schema_manifest():
         "postgresql_indexes": {key: tuple(value) for key, value in indexes.items()},
         "postgresql_not_null": {key: tuple(value) for key, value in not_null.items()},
         "postgresql_column_types": column_types,
+        "postgresql_runtime_dml": {
+            "tables": runtime_tables,
+            "sequences": runtime_sequences,
+        },
     }
 
 
@@ -274,3 +310,106 @@ def check_release_schema(*, using="default"):
         "schema_generation": manifest["schema_generation"],
         "schema_manifest_version": manifest["schema_version"],
     }
+
+
+class RuntimeWriteCapabilityError(RuntimeError):
+    """The runtime credential cannot safely accept mutation traffic."""
+
+    def __init__(self, reason):
+        self.reason = reason
+        super().__init__(reason)
+
+
+def check_runtime_write_capability(*, using="default"):
+    """Verify the current runtime session can serve mutation routes.
+
+    PostgreSQL's recovery/read-only flags and explicit ACL checks provide a
+    no-WAL proof for the runtime role. A readiness request must not mutate a
+    business row merely to prove that the node is writable.
+    """
+
+    manifest = load_release_schema_manifest()
+    database = connections[using]
+    if database.vendor == "sqlite":
+        with database.cursor() as cursor:
+            cursor.execute("PRAGMA query_only")
+            row = cursor.fetchone()
+        if not row or int(row[0]) != 0:
+            raise RuntimeWriteCapabilityError("sqlite_query_only")
+        return {"vendor": "sqlite", "runtime_write": True}
+    if database.vendor != "postgresql":
+        raise RuntimeWriteCapabilityError("unsupported_database")
+
+    with database.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT current_setting('transaction_read_only'),
+                   current_setting('default_transaction_read_only'),
+                   pg_catalog.pg_is_in_recovery()
+            """
+        )
+        transaction_read_only, default_read_only, in_recovery = cursor.fetchone()
+        if transaction_read_only != "off":
+            raise RuntimeWriteCapabilityError("transaction_read_only")
+        if default_read_only != "off":
+            raise RuntimeWriteCapabilityError("default_transaction_read_only")
+        if in_recovery:
+            raise RuntimeWriteCapabilityError("primary_in_recovery")
+
+        for relation, privileges in manifest["postgresql_runtime_dml"]["tables"].items():
+            qualified_relation = f"public.{relation}"
+            for privilege in privileges:
+                cursor.execute(
+                    "SELECT pg_catalog.has_table_privilege(current_user, %s, %s)",
+                    [qualified_relation, privilege],
+                )
+                if cursor.fetchone()[0] is not True:
+                    raise RuntimeWriteCapabilityError(f"table_acl:{relation}:{privilege}")
+        for sequence, privileges in manifest["postgresql_runtime_dml"]["sequences"].items():
+            qualified_sequence = f"public.{sequence}"
+            for privilege in privileges:
+                cursor.execute(
+                    "SELECT pg_catalog.has_sequence_privilege(current_user, %s, %s)",
+                    [qualified_sequence, privilege],
+                )
+                if cursor.fetchone()[0] is not True:
+                    raise RuntimeWriteCapabilityError(f"sequence_acl:{sequence}:{privilege}")
+        cursor.execute(
+            """
+            SELECT relation.relname
+              FROM pg_catalog.pg_class relation
+              JOIN pg_catalog.pg_namespace namespace ON namespace.oid = relation.relnamespace
+             WHERE namespace.nspname = current_schema()
+               AND relation.relkind IN ('r', 'p')
+               AND relation.relname <> 'django_migrations'
+               AND (
+                   NOT pg_catalog.has_table_privilege(current_user, relation.oid, 'SELECT')
+                   OR NOT pg_catalog.has_table_privilege(current_user, relation.oid, 'INSERT')
+                   OR NOT pg_catalog.has_table_privilege(current_user, relation.oid, 'UPDATE')
+                   OR NOT pg_catalog.has_table_privilege(current_user, relation.oid, 'DELETE')
+               )
+             ORDER BY relation.relname
+            """
+        )
+        missing_table_privilege = cursor.fetchone()
+        if missing_table_privilege:
+            raise RuntimeWriteCapabilityError(f"table_acl:{missing_table_privilege[0]}")
+        cursor.execute(
+            """
+            SELECT sequence.relname
+              FROM pg_catalog.pg_class sequence
+              JOIN pg_catalog.pg_namespace namespace ON namespace.oid = sequence.relnamespace
+             WHERE namespace.nspname = current_schema()
+               AND sequence.relkind = 'S'
+               AND (
+                   NOT pg_catalog.has_sequence_privilege(current_user, sequence.oid, 'USAGE')
+                   OR NOT pg_catalog.has_sequence_privilege(current_user, sequence.oid, 'SELECT')
+                   OR NOT pg_catalog.has_sequence_privilege(current_user, sequence.oid, 'UPDATE')
+               )
+             ORDER BY sequence.relname
+            """
+        )
+        missing_sequence_privilege = cursor.fetchone()
+        if missing_sequence_privilege:
+            raise RuntimeWriteCapabilityError(f"sequence_acl:{missing_sequence_privilege[0]}")
+    return {"vendor": "postgresql", "runtime_write": True}

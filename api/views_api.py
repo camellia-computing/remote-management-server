@@ -120,7 +120,7 @@ from api.policy_generation import (
     normalize_policy_options,
 )
 from api.rate_limits import enforce_authenticated_rate_limit
-from api.release_schema import check_release_schema
+from api.release_schema import RuntimeWriteCapabilityError, check_release_schema, check_runtime_write_capability
 from api.request_deadlines import bounded_timeout, check_request_deadline
 from api.request_utils import InvalidJsonPayload, client_ip, load_json_body, load_json_object, load_json_text
 from api.response_contract import RESPONSE_SCHEMA_VERSION, empty_success, json_error, json_pending
@@ -1986,6 +1986,7 @@ def health_ready(request):
             cursor.execute("SELECT 1")
             cursor.fetchone()
         check_release_schema()
+        check_runtime_write_capability()
         check_username_identity(full=False)
         RemoteDevice.objects.order_by("pk").values_list("pk", flat=True).first()
         key_states = list(DataEncryptionKeyState.objects.order_by("key_id")[: settings.MAX_DATA_ENCRYPTION_KEYS + 1])
@@ -2005,6 +2006,9 @@ def health_ready(request):
         ):
             raise ValidationError("Data-encryption key inventory does not match this replica")
         ingestion_governance.check_recording_storage_capability()
+    except RuntimeWriteCapabilityError as exc:
+        logger.warning("readiness runtime capability failed reason=%s", exc.reason)
+        return JsonResponse({"status": "not_ready"}, status=503)
     except Exception as exc:  # noqa: BLE001 - readiness normalizes backend failures
         logger.warning("readiness database check failed: %s", type(exc).__name__)
         return JsonResponse({"status": "not_ready"}, status=503)
