@@ -6,6 +6,7 @@ cd "$APP_DIR"
 
 REQUIRE_CGROUP_BUDGET="${CAMELLIA_REMOTE_REQUIRE_CGROUP_BUDGET:-false}"
 CGROUP_ROOT="${CAMELLIA_REMOTE_CGROUP_ROOT:-/sys/fs/cgroup}"
+BUDGET_SCRIPT="$APP_DIR/deploy/shutdown-budget.sh"
 
 validate_cgroup_budget() {
     case "$REQUIRE_CGROUP_BUDGET" in
@@ -44,6 +45,15 @@ validate_cgroup_budget() {
 
 validate_cgroup_budget
 
+if [ ! -x "$BUDGET_SCRIPT" ]; then
+    echo "shutdown budget validator is missing or not executable" >&2
+    exit 1
+fi
+shutdown_budget_values=$("$BUDGET_SCRIPT" --values) || exit 1
+IFS=' ' read -r GRACEFUL_TIMEOUT _DOCKER_STOP_TIMEOUT _SYSTEMD_STOP_TIMEOUT <<EOF
+$shutdown_budget_values
+EOF
+
 if [ "$#" -gt 0 ]; then
     exec "$@"
 fi
@@ -53,7 +63,6 @@ HOST="${CAMELLIA_REMOTE_BIND_HOST:-0.0.0.0}"
 WORKERS="${CAMELLIA_REMOTE_GUNICORN_WORKERS:-2}"
 THREADS="${CAMELLIA_REMOTE_GUNICORN_THREADS:-2}"
 TIMEOUT="${CAMELLIA_REMOTE_GUNICORN_TIMEOUT_SECONDS:-75}"
-GRACEFUL_TIMEOUT="${CAMELLIA_REMOTE_GUNICORN_GRACEFUL_TIMEOUT_SECONDS:-30}"
 KEEP_ALIVE="${CAMELLIA_REMOTE_GUNICORN_KEEP_ALIVE_SECONDS:-5}"
 MAX_REQUESTS="${CAMELLIA_REMOTE_GUNICORN_MAX_REQUESTS:-1000}"
 MAX_REQUESTS_JITTER="${CAMELLIA_REMOTE_GUNICORN_MAX_REQUESTS_JITTER:-100}"

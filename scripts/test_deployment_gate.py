@@ -5,6 +5,7 @@ import fcntl
 import importlib.util
 import os
 import pathlib
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -36,6 +37,8 @@ def deployment_fixture(root):
     deploy = project / "deploy"
     deploy.mkdir()
     (deploy / "bootstrap-postgres-roles.sh").write_text("#!/bin/sh\nexit 0\n")
+    shutil.copy2(ROOT / "deploy" / "shutdown-budget.sh", deploy / "shutdown-budget.sh")
+    (deploy / "shutdown-budget.sh").chmod(0o755)
     env_file = root / "management.env"
     env_file.write_text("TEST=true\n")
     env_file.chmod(0o600)

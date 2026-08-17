@@ -56,6 +56,7 @@ WORKDIR /app
 
 COPY --from=builder /opt/venv /opt/venv
 COPY --chown=appuser:appuser manage.py run.sh ./
+COPY --chown=appuser:appuser deploy/shutdown-budget.sh ./deploy/shutdown-budget.sh
 COPY --chown=appuser:appuser web-client.lock ./
 COPY --chown=appuser:appuser api ./api
 COPY --chown=appuser:appuser locale ./locale
