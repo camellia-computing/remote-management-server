@@ -120,8 +120,11 @@ sudo install -m 0755 deploy/bootstrap-postgres-roles.sh /opt/camellia-remote-man
 sudo install -m 0755 deploy/run-compose-operation.sh /opt/camellia-remote-management/deploy/
 sudo install -m 0755 deploy/backup-postgres.sh /opt/camellia-remote-management/
 sudo install -m 0755 deploy/run-cleanup.sh /opt/camellia-remote-management/
+sudo install -m 0755 deploy/run-maintenance-backup.sh deploy/run-maintenance-cleanup.sh /opt/camellia-remote-management/deploy/
+sudo install -m 0755 deploy/check-maintenance-freshness.sh deploy/maintenance-ledger-notify.sh /opt/camellia-remote-management/deploy/
 sudo install -d -m 0755 /opt/camellia-remote-management/scripts
 sudo install -m 0755 scripts/backup_envelope.py /opt/camellia-remote-management/scripts/
+sudo install -m 0755 scripts/maintenance_ledger.py /opt/camellia-remote-management/scripts/
 sudo install -m 0755 deploy/restore-postgres.sh /opt/camellia-remote-management/
 sudo install -m 0755 deploy/management-maintenance-guard.sh /opt/camellia-remote-management/
 sudo install -m 0755 deploy/management-maintenance.sh /opt/camellia-remote-management/
@@ -132,6 +135,7 @@ sudo install -m 0755 deploy/stop-management-stack.sh /opt/camellia-remote-manage
 sudo install -m 0755 deploy/shutdown-budget.sh /opt/camellia-remote-management/deploy/
 sudo install -m 0600 .env.example /etc/camellia-remote-management/management.env
 sudo install -m 0644 deploy/systemd/*.service deploy/systemd/*.timer /etc/systemd/system/
+sudo install -d -m 0700 /var/lib/camellia-remote-management/maintenance
 sudo systemctl daemon-reload
 sudo systemctl enable --now camellia-remote-management-stack.service
 sudo systemctl enable --now camellia-remote-management-backup.timer
@@ -168,7 +172,9 @@ Compose 默认仅在同主机、不可从外部路由的 `backend` 网络内使�
 
 Kernel `flock`仍是单飞权威；holder metadata另记录run ID、start、phase和30秒heartbeat。正常竞争输出结构化`skipped:active-run`并返回75；超过有界heartbeat阈值的holder返回失败告警，无锁残留metadata明确记录`recovered:orphan-run-state`，不会伪装成本轮成功。任一创建/验证失败会删除本轮未完成三件套并abort epoch；SIGKILL/宿主掉电导致的残留冻结必须先调查artifact和holder状态，再显式运行`python manage.py recording_backup abort --backup-id ID`，不得直接改control row。
 
-backup/cleanup unit没有启动业务栈的权限：它们只在stack已经是`active`且不存在root-owned maintenance lease时运行；否则`ExecCondition`记录`skipped:not-running`或`skipped:maintenance`并退出，不会创建容器。所有bootstrap、migration、cleanup、backup和restore数据库动作都通过具名一次性container运行，容器标签绑定operation ID；宿主取消或内部deadline后先TERM、再按有界grace kill/remove，并确认该精确容器已经不存在，因此不再把`docker compose exec`客户端退出误认为远端Python/pg_dump已取消。cleanup的两个阶段各限5分钟，systemd总边界11分钟；backup内部45分钟且systemd总边界50分钟。仅停止stack不再可能被5分钟/hourly/Persistent timer反向解除，但正式维护仍必须显式停timer并保留lease。
+backup/cleanup unit没有启动业务栈的权限：wrapper先写入`scheduled`，再检查stack是否`active`及是否存在root-owned maintenance lease；不满足时写入`skipped:not-running`或`skipped:maintenance`并退出，不会创建容器。每个wrapper随后以systemd invocation ID作为不可重复operation ID，持久化`started`、有界heartbeat和唯一终态；backup active lock的exit 75保留为可告警skip。所有bootstrap、migration、cleanup、backup和restore数据库动作都通过具名一次性container运行，容器标签绑定operation ID；宿主取消或内部deadline后先TERM、再按有界grace kill/remove，并确认该精确容器已经不存在，因此不再把`docker compose exec`客户端退出误认为远端Python/pg_dump已取消。cleanup的两个阶段各限5分钟，systemd总边界11分钟；backup内部45分钟且systemd总边界50分钟。仅停止stack不再可能被5分钟/hourly/Persistent timer反向解除，但正式维护仍必须显式停timer并保留lease。
+
+运行账本位于root-only `/var/lib/camellia-remote-management/maintenance`：`maintenance-events.jsonl`是带摘要链的append-only事件文件，`latest-backup.json`和`latest-cleanup.json`只保存固定字段、计数、artifact generation与last verified success，不含环境变量、数据库URL、PII、密钥或artifact内容。账本写入或摘要提交失败会使维护任务失败；systemd的`OnFailure`模板只记录固定的`unit-failure`，不会递归启动stack或复制journal原文。外部监控应轮询：`sudo /opt/camellia-remote-management/deploy/check-maintenance-freshness.sh all`。机器JSON区分`never-run`、`running`、`healthy`、`stale`、`failed`、`skipped`、`unknown`和`clock-anomaly`；backup默认新鲜度预算90分钟（覆盖hourly timer抖动），cleanup默认15分钟（覆盖5分钟timer抖动）。非零返回必须告警，尤其是连续failure/skip、timer停止、heartbeat超期、backup generation不再推进、cleanup output长期追不上input；`last_success_at`不会被失败或skip推进。账本不是备份artifact本身，必须与备份目录独立复制和监控。
 
 数据库导出与全读验证固定运行在digest锁定的PostgreSQL 18 `database-backup`一次性客户端，不在在线PostgreSQL container内执行。该客户端的Docker cgroup硬限1 CPU、512 MiB memory和64 PIDs，并使用较低CPU/blkio权重与更高OOM分值；systemd的CPU/内存/任务上限只约束宿主侧age、pack和Docker控制进程，不能冒充container内`pg_dump`资源边界。custom archive默认使用`CAMELLIA_REMOTE_BACKUP_COMPRESSION=zstd:3`，只接受`none`、`gzip:1..6`或`zstd:1..9`；变更前必须以代表性数据同时测量dump wall/CPU/RSS/bytes、完整restore耗时和业务p95/p99，不能为了极小体积收益恢复gzip 7–9。资源硬上限触发OOM、deadline或RPO告警时应扩展backup窗口/受控replica或重新评估数据与压缩参数，不能移除cgroup让backup与在线数据库争用。
 

@@ -146,7 +146,7 @@ if [[ "$command" == "enter" ]]; then
     chown root:root "$lease_file"
 
     # The lease is created before stopping timers, so a concurrently queued
-    # operation is skipped by its ExecCondition instead of touching Docker.
+    # operation is accounted as skipped by its wrapper before touching Docker.
     "$systemctl_binary" stop "${timers[@]}"
     "$systemctl_binary" stop "${operation_units[@]}"
     "$systemctl_binary" stop "$stack_unit"

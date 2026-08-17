@@ -45,12 +45,19 @@ class SystemdMaintenanceTests(unittest.TestCase):
                 after = [value for key, value in unit if key == "After"]
                 self.assertTrue(any(STACK_UNIT in value.split() for value in after))
                 conditions = [value for key, value in directives(path, "Service") if key == "ExecCondition"]
-                self.assertEqual(conditions, ["/opt/camellia-remote-management/management-maintenance-guard.sh"])
+                self.assertEqual(conditions, [])
+                failure_targets = [value for key, value in unit if key == "OnFailure"]
+                self.assertEqual(
+                    failure_targets,
+                    ["camellia-remote-management-maintenance-failure@%n.service"],
+                )
+                state_directories = [value for key, value in directives(path, "Service") if key == "StateDirectory"]
+                self.assertEqual(state_directories, ["camellia-remote-management/maintenance"])
 
     def test_cleanup_samples_sequence_capacity_after_retention(self):
         cleanup = SYSTEMD / "camellia-remote-management-cleanup.service"
         commands = [value for key, value in directives(cleanup, "Service") if key == "ExecStart"]
-        self.assertEqual(commands, ["/opt/camellia-remote-management/run-cleanup.sh"])
+        self.assertEqual(commands, ["/opt/camellia-remote-management/deploy/run-maintenance-cleanup.sh"])
         runner = (ROOT / "deploy" / "run-cleanup.sh").read_text()
         purge = runner.index("python manage.py purge_expired_state")
         capacity = runner.index("python manage.py check_sequence_capacity --fail-level critical")
@@ -66,6 +73,21 @@ class SystemdMaintenanceTests(unittest.TestCase):
         self.assertEqual(backup["TimeoutStartSec"], "50min")
         self.assertNotIn("RuntimeMaxSec", backup, "RuntimeMaxSec is ignored for Type=oneshot")
         self.assertEqual(backup["KillMode"], "control-group")
+
+    def test_failure_notifier_is_not_recursive_and_freshness_is_installable(self):
+        failure = SYSTEMD / "camellia-remote-management-maintenance-failure@.service"
+        unit = dict(directives(failure, "Unit"))
+        self.assertNotIn("OnFailure", unit)
+        service = dict(directives(failure, "Service"))
+        self.assertEqual(
+            service["ExecStart"],
+            "/opt/camellia-remote-management/deploy/maintenance-ledger-notify.sh %i",
+        )
+        self.assertEqual(service["StateDirectoryMode"], "0700")
+        self.assertIn("/var/lib/camellia-remote-management/maintenance", service["ReadWritePaths"])
+        freshness = ROOT / "deploy" / "check-maintenance-freshness.sh"
+        self.assertTrue(freshness.exists())
+        self.assertTrue(freshness.stat().st_mode & stat.S_IXUSR)
 
     def test_guard_skips_inactive_stack_and_maintenance_without_starting_any_unit(self):
         with tempfile.TemporaryDirectory(prefix="camellia-maintenance-guard-") as temporary:

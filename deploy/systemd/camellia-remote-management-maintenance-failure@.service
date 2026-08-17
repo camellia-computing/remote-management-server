@@ -1,0 +1,33 @@
+[Unit]
+Description=Record Camellia Remote Management maintenance unit failure for %i
+
+[Service]
+Type=oneshot
+ExecStart=/opt/camellia-remote-management/deploy/maintenance-ledger-notify.sh %i
+User=root
+Group=root
+UMask=0077
+StateDirectory=camellia-remote-management/maintenance
+StateDirectoryMode=0700
+CapabilityBoundingSet=
+MemoryDenyWriteExecute=yes
+NoNewPrivileges=yes
+PrivateDevices=yes
+PrivateTmp=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/camellia-remote-management/maintenance
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+LockPersonality=yes
+ProcSubset=pid
+RestrictAddressFamilies=AF_UNIX
+RestrictNamespaces=yes
+SystemCallArchitectures=native
