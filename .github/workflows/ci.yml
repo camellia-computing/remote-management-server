@@ -251,6 +251,7 @@ jobs:
       - name: Validate deployment configuration
         env:
           CAMELLIA_REMOTE_MANAGEMENT_IMAGE: ghcr.io/example/management@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+          CAMELLIA_REMOTE_RELEASE_REVISION: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
           CAMELLIA_REMOTE_SECRET_KEY: ci-only-production-secret-key-with-sufficient-length-000
           CAMELLIA_REMOTE_DATA_ENCRYPTION_KEY_ID: ci-primary-v1
           CAMELLIA_REMOTE_DATA_ENCRYPTION_KEY: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
@@ -281,6 +282,7 @@ jobs:
           [[ "$CAMELLIA_REMOTE_BACKUP_AGE_KEY_ID" =~ ^[a-z0-9][a-z0-9._-]{0,31}$ ]]
           [[ "$CAMELLIA_REMOTE_BACKUP_DEPLOYMENT_ID" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]]
           [[ "$CAMELLIA_REMOTE_BACKUP_POSTGRES_MAJOR" =~ ^[1-9][0-9]{0,2}$ ]]
+          [[ "$CAMELLIA_REMOTE_RELEASE_REVISION" =~ ^([0-9a-f]{40}|[0-9a-f]{64})$ ]]
           systemd-analyze security --offline=yes deploy/systemd/*.service >/dev/null
           docker compose --profile database-operations --env-file /dev/null -f docker-compose.yaml config --quiet
 
@@ -378,6 +380,7 @@ jobs:
       - name: Django checks
         run: |
           uv run python scripts/test_deployment_gate.py
+          uv run python manage.py test api.test_migration_compatibility --verbosity 1
           uv run python manage.py check
           uv run python manage.py makemigrations --check --dry-run
 
@@ -618,6 +621,113 @@ jobs:
           docker rm --force camellia-remote-management-ci 2>/dev/null || true
           docker volume rm camellia-remote-management-ci-records 2>/dev/null || true
 
+  performance_smoke:
+    name: Management performance contract smoke
+    if: >-
+      (github.event_name == 'pull_request' && needs.classify.outputs.runtime == 'true') ||
+      github.event_name == 'push'
+    needs: classify
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout exact candidate
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: candidate
+          persist-credentials: false
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+
+      - name: Checkout exact control
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: control
+          persist-credentials: false
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
+
+      - name: Resolve exact shared contract
+        id: contract
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -t revisions < candidate/performance/contract.lock
+          [[ ${#revisions[@]} -eq 1 && "${revisions[0]}" =~ ^[0-9a-f]{40}$ ]]
+          echo "revision=${revisions[0]}" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout immutable performance contract
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ github.repository_owner }}/remote-protocol
+          path: performance-contract
+          persist-credentials: false
+          ref: ${{ steps.contract.outputs.revision }}
+
+      - name: Set up exact Python environments
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          version: "0.12.0"
+          enable-cache: true
+          cache-dependency-glob: |
+            candidate/uv.lock
+            control/uv.lock
+
+      - name: Validate shared contract and prepare exact dependencies
+        run: |
+          python3 -m unittest -v tools.test_performance_contract
+          uv sync --project ../candidate --locked --all-groups
+          uv sync --project ../control --locked --all-groups
+        working-directory: performance-contract
+
+      - name: Compare authenticated HTTP and database observations
+        env:
+          CANDIDATE_REVISION: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+          CONTROL_REVISION: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
+          PERFORMANCE_ITERATIONS: ${{ github.event_name == 'pull_request' && '5' || '15' }}
+          PERFORMANCE_POLICY: ${{ github.event_name == 'pull_request' && 'performance/management-http-devices-v1.json' || 'performance/management-http-devices-v1.scheduled.json' }}
+          PERFORMANCE_TIER: ${{ github.event_name == 'pull_request' && 'pr-smoke' || 'scheduled' }}
+          PERFORMANCE_WORK_SECONDS: ${{ github.event_name == 'push' && '5' || '' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          install -d -m 0755 control/performance
+          install -m 0755 \
+            candidate/performance/management_http_observation.py \
+            control/performance/management_http_observation.py
+          if [[ -n "$PERFORMANCE_WORK_SECONDS" ]]; then
+            export CAMELLIA_PERFORMANCE_WORK_SECONDS="$PERFORMANCE_WORK_SECONDS"
+          else
+            unset CAMELLIA_PERFORMANCE_WORK_SECONDS
+          fi
+          python3 performance-contract/tools/performance_contract.py collect-pair \
+            --repository remote-management-server \
+            --control-revision "$CONTROL_REVISION" \
+            --candidate-revision "$CANDIDATE_REVISION" \
+            --scenario management-http-devices-v1 \
+            --tier "$PERFORMANCE_TIER" \
+            --runner-class github-ubuntu-24.04-x64 \
+            --toolchain python-3.14-django-6 \
+            --iterations "$PERFORMANCE_ITERATIONS" --warmups 1 --timeout-seconds 60 \
+            --control-output "$RUNNER_TEMP/management-control-performance.json" \
+            --candidate-output "$RUNNER_TEMP/management-candidate-performance.json" \
+            -- control/.venv/bin/python control/performance/management_http_observation.py \
+            ::: candidate/.venv/bin/python candidate/performance/management_http_observation.py
+          python3 performance-contract/tools/performance_contract.py compare \
+            "$RUNNER_TEMP/management-control-performance.json" \
+            "$RUNNER_TEMP/management-candidate-performance.json" \
+            "candidate/$PERFORMANCE_POLICY" \
+            --output "$RUNNER_TEMP/management-performance-comparison.json"
+
+      - name: Upload bounded performance evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: management-performance-${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+          path: |
+            ${{ runner.temp }}/management-control-performance.json
+            ${{ runner.temp }}/management-candidate-performance.json
+            ${{ runner.temp }}/management-performance-comparison.json
+          if-no-files-found: error
+          retention-days: 14
+
   required:
     name: CI / Required
     if: always()
@@ -630,6 +740,7 @@ jobs:
       - web_client
       - quality
       - container
+      - performance_smoke
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
@@ -655,6 +766,7 @@ jobs:
           WEB_CLIENT_RESULT: ${{ needs.web_client.result }}
           QUALITY_RESULT: ${{ needs.quality.result }}
           CONTAINER_RESULT: ${{ needs.container.result }}
+          PERFORMANCE_SMOKE_RESULT: ${{ needs.performance_smoke.result }}
         run: |
           failure=false
           require_success() {
@@ -681,6 +793,14 @@ jobs:
           fi
           if [[ "$RELEASE_DEPENDENCY_REQUIRED" == "true" ]]; then
             require_success "exact completed client Release" "$RELEASE_DEPENDENCY_RESULT"
+          fi
+          if [[ "$EVENT_NAME" == "pull_request" && "$RUNTIME_REQUIRED" == "true" ]]; then
+            require_success "Management performance contract smoke" "$PERFORMANCE_SMOKE_RESULT"
+          elif [[ "$EVENT_NAME" == "push" ]]; then
+            require_success "Management performance contract smoke" "$PERFORMANCE_SMOKE_RESULT"
+          elif [[ "$PERFORMANCE_SMOKE_RESULT" != "skipped" ]]; then
+            echo "Management performance smoke must be skipped outside runtime pull requests and main pushes, got: $PERFORMANCE_SMOKE_RESULT" >&2
+            failure=true
           fi
           if [[ "$failure" == "true" ]]; then
             exit 1

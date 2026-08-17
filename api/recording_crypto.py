@@ -148,6 +148,7 @@ def verify_recording_fd(
     expected_storage_offset,
     max_chunk_bytes,
     include_ciphertext_digest=False,
+    deadline_check=None,
 ):
     """Authenticate a recording and return its plaintext size and SHA-256.
 
@@ -178,6 +179,8 @@ def verify_recording_fd(
     next_revision = 1
 
     for receipt in receipts:
+        if deadline_check is not None:
+            deadline_check()
         if next_revision > expected_revision:
             raise RecordingFormatError("Recording ciphertext format is invalid")
         revision = receipt.revision
@@ -232,6 +235,8 @@ def verify_recording_fd(
         full_digest.update(payload)
         plaintext_size += length
         next_revision += 1
+        if deadline_check is not None:
+            deadline_check()
 
     if next_revision - 1 != expected_revision:
         raise RecordingFormatError("Recording ciphertext format is invalid")

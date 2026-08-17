@@ -8,7 +8,8 @@ env_file="/etc/camellia-remote-management/management.env"
 runtime_dir="/run/camellia-remote-management"
 lease_file="$runtime_dir/maintenance.lease"
 docker_binary="/usr/bin/docker"
-operation_runner="$project_dir/deploy/run-compose-operation.sh"
+operation_runner=""
+budget_script=""
 
 die() {
     echo "stack start error: $*" >&2
@@ -16,7 +17,7 @@ die() {
 }
 
 usage() {
-    echo "usage: $0 [--project-dir ABSOLUTE_PATH] [--env-file ABSOLUTE_PATH] [--runtime-dir ABSOLUTE_PATH] [--lease-file ABSOLUTE_PATH] [--docker-binary ABSOLUTE_PATH] [--operation-runner ABSOLUTE_PATH]" >&2
+    echo "usage: $0 [--project-dir ABSOLUTE_PATH] [--env-file ABSOLUTE_PATH] [--runtime-dir ABSOLUTE_PATH] [--lease-file ABSOLUTE_PATH] [--docker-binary ABSOLUTE_PATH] [--operation-runner ABSOLUTE_PATH] [--budget-script ABSOLUTE_PATH]" >&2
     exit 2
 }
 
@@ -77,11 +78,23 @@ while [[ $# -gt 0 ]]; do
             operation_runner="$2"
             shift 2
             ;;
+        --budget-script)
+            [[ $# -ge 2 ]] || usage
+            budget_script="$2"
+            shift 2
+            ;;
         *) usage ;;
     esac
 done
 
-[[ "$project_dir" = /* && "$env_file" = /* && "$runtime_dir" = /* && "$lease_file" = /* && "$operation_runner" = /* ]] ||
+if [[ -z "$operation_runner" ]]; then
+    operation_runner="$project_dir/deploy/run-compose-operation.sh"
+fi
+if [[ -z "$budget_script" ]]; then
+    budget_script="$project_dir/deploy/shutdown-budget.sh"
+fi
+
+[[ "$project_dir" = /* && "$env_file" = /* && "$runtime_dir" = /* && "$lease_file" = /* && "$operation_runner" = /* && "$budget_script" = /* ]] ||
     die "deployment paths must be absolute"
 [[ "$lease_file" == "$runtime_dir/maintenance.lease" ]] ||
     die "maintenance lease must be the protected runtime-directory lease"
@@ -98,6 +111,8 @@ bootstrap_script="$project_dir/deploy/bootstrap-postgres-roles.sh"
     die "management environment file is missing, symlinked, or unreadable"
 [[ -f "$operation_runner" && ! -L "$operation_runner" && -x "$operation_runner" ]] ||
     die "compose operation runner is missing, symlinked, or not executable"
+[[ -f "$budget_script" && ! -L "$budget_script" && -x "$budget_script" ]] ||
+    die "shutdown budget script is missing, symlinked, or not executable"
 
 require_canonical_path "$docker_binary" "docker binary"
 require_canonical_path "$project_dir" "project directory"
@@ -105,11 +120,13 @@ require_canonical_path "$project_dir/docker-compose.yaml" "docker compose file"
 require_canonical_path "$bootstrap_script" "database role bootstrap script"
 require_canonical_path "$env_file" "management environment file"
 require_canonical_path "$operation_runner" "compose operation runner"
+require_canonical_path "$budget_script" "shutdown budget script"
 require_owned_path "$docker_binary" "docker binary"
 require_owned_path "$project_dir" "project directory"
 require_owned_path "$project_dir/docker-compose.yaml" "docker compose file"
 require_owned_path "$bootstrap_script" "database role bootstrap script"
 require_owned_path "$operation_runner" "compose operation runner"
+require_owned_path "$budget_script" "shutdown budget script"
 
 env_mode="$(stat -c '%a' -- "$env_file" 2>/dev/null)" || die "cannot inspect management environment permissions"
 env_owner="$(stat -c '%u' -- "$env_file" 2>/dev/null)" || die "cannot inspect management environment owner"
@@ -154,6 +171,9 @@ fi
 assert_no_maintenance_lease
 
 compose=("$docker_binary" compose --env-file "$env_file" -f "$project_dir/docker-compose.yaml")
+read -r _graceful docker_stop _systemd < <("$budget_script" --env-file "$env_file" --values) ||
+    die "shutdown budget validation failed"
+export CAMELLIA_REMOTE_DOCKER_STOP_GRACE_PERIOD_SECONDS="$docker_stop"
 operation_seed="$(date -u +%Y%m%dt%H%M%Sz)-$$"
 operation_counter=0
 
@@ -176,7 +196,7 @@ run_operation() {
 "${compose[@]}" --profile database-operations config --quiet
 
 # No old application generation may remain online while migration runs.
-"${compose[@]}" stop --timeout 45 management
+"${compose[@]}" stop --timeout "$docker_stop" management
 if ! running_services="$("${compose[@]}" ps --status running --services)"; then
     die "cannot inspect running services"
 fi

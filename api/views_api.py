@@ -41,6 +41,11 @@ from api.address_book_authorization import (
     bump_locked_authorization_generation,
     lock_profile_access,
 )
+from api.control_filters import (
+    CONTROL_FILTER_CONTRACT_VERSION,
+    ControlFilterError,
+    apply_control_filter,
+)
 from api.credential_sessions import (
     CredentialGenerationExhausted,
     revoke_device_credentials,
@@ -116,6 +121,7 @@ from api.policy_generation import (
 )
 from api.rate_limits import enforce_authenticated_rate_limit
 from api.release_schema import check_release_schema
+from api.request_deadlines import bounded_timeout, check_request_deadline
 from api.request_utils import InvalidJsonPayload, client_ip, load_json_body, load_json_object, load_json_text
 from api.response_contract import RESPONSE_SCHEMA_VERSION, empty_success, json_error, json_pending
 from api.tag_colors import normalize_tag_color
@@ -606,7 +612,7 @@ def _oidc_response_content_type(response):
 def _request_oidc_json(url, allowed_hosts, *, etag=""):
     if not _oidc_endpoint_allowed(url, allowed_hosts):
         raise ValueError("OIDC endpoint is outside the configured host allowlist")
-    timeout = getattr(settings, "OIDC_HTTP_TIMEOUT_SECONDS", 10)
+    timeout = bounded_timeout(getattr(settings, "OIDC_HTTP_TIMEOUT_SECONDS", 10))
     headers = {"Accept": "application/json, application/jwk-set+json"}
     if etag:
         headers["If-None-Match"] = etag
@@ -617,6 +623,7 @@ def _request_oidc_json(url, allowed_hosts, *, etag=""):
         stream=True,
         headers=headers,
     ) as response:
+        check_request_deadline()
         if response.status_code == 304:
             return None, etag, True
         response.raise_for_status()
@@ -636,9 +643,11 @@ def _request_oidc_json(url, allowed_hosts, *, etag=""):
                 raise ValueError("OIDC document is too large")
         body = bytearray()
         for chunk in response.iter_content(64 * 1024):
+            check_request_deadline()
             body.extend(chunk)
             if len(body) > OIDC_DOCUMENT_MAX_BYTES:
                 raise ValueError("OIDC document is too large")
+        check_request_deadline()
         response_etag = response.headers.get("ETag", "")
         if (
             not isinstance(response_etag, str)
@@ -668,7 +677,7 @@ def _clear_oidc_document_cache():
 def _cached_oidc_document(url, allowed_hosts, *, document_type, validator, force_refresh=False):
     allowed_hosts = tuple(sorted(frozenset(allowed_hosts)))
     cache_key = (document_type, url, allowed_hosts)
-    wait_timeout = getattr(settings, "OIDC_HTTP_TIMEOUT_SECONDS", 10) + 1
+    wait_timeout = bounded_timeout(getattr(settings, "OIDC_HTTP_TIMEOUT_SECONDS", 10) + 1)
     while True:
         now = time.monotonic()
         with _oidc_document_cache_lock:
@@ -685,6 +694,7 @@ def _cached_oidc_document(url, allowed_hosts, *, document_type, validator, force
                 leader = False
         if leader:
             break
+        check_request_deadline()
         if not inflight.event.wait(wait_timeout):
             with _oidc_document_cache_lock:
                 stale = _oidc_document_cache.get(cache_key)
@@ -786,7 +796,7 @@ def _oidc_client(provider, state=None):
         redirect_uri=provider["redirect_uri"],
         state=state,
         code_challenge_method="S256",
-        default_timeout=getattr(settings, "OIDC_HTTP_TIMEOUT_SECONDS", 10),
+        default_timeout=bounded_timeout(getattr(settings, "OIDC_HTTP_TIMEOUT_SECONDS", 10)),
     )
 
 
@@ -2339,6 +2349,7 @@ def oidc_callback(request):
             return HttpResponse("OIDC authorization was already consumed.", status=409)
         return HttpResponse("OIDC provider is not configured", status=400)
     try:
+        check_request_deadline()
         metadata = _oidc_metadata(
             provider["issuer"],
             provider["allowed_hosts"],
@@ -2350,7 +2361,9 @@ def oidc_callback(request):
             code_verifier=claim.code_verifier,
             allow_redirects=False,
         )
+        check_request_deadline()
         claims = _validate_oidc_id_token(token, metadata, provider, claim.nonce)
+        check_request_deadline()
         issuer = str(claims["iss"]).rstrip("/")
         user = _complete_oidc_callback_claim(claim, issuer, claims)
     except _OidcCallbackClaimLost:
@@ -5392,13 +5405,39 @@ def _paged_response(request, qs, serializer, default_page_size=100, *, paginatio
     )
 
 
-def _filter_text(qs, field, value):
-    value = str(value or "").strip()
-    if not value:
-        return qs
-    if "%" in value:
-        return qs.filter(**{f"{field}__icontains": value.replace("%", "")})
-    return qs.filter(**{field: value})
+def _filter_text(qs, field, value, *, parameter=None, allowed_modes=None):
+    return apply_control_filter(qs, field, value, parameter=parameter, allowed_modes=allowed_modes)
+
+
+def _request_filter_text(request, qs, field, parameter, *, allowed_modes=None):
+    values = request.GET.getlist(parameter)
+    if len(values) > 1:
+        raise ControlFilterError(parameter, "duplicate")
+    return _filter_text(
+        qs,
+        field,
+        values[0] if values else None,
+        parameter=parameter,
+        allowed_modes=allowed_modes,
+    )
+
+
+def _control_filter_error_response(request, error):
+    _log_event(
+        request,
+        "api_control_filter_rejected",
+        level="warning",
+        field=error.field,
+        reason=error.reason,
+    )
+    return json_error(
+        "invalid_control_filter",
+        "Invalid control-list filter",
+        status=400,
+        control_filter_contract_version=CONTROL_FILTER_CONTRACT_VERSION,
+        field=error.field,
+        reason=error.reason,
+    )
 
 
 def _require_admin_context(request, event):
@@ -5649,8 +5688,11 @@ def users(request):
     qs = UserProfile.objects.select_related("strategy").prefetch_related("groups").order_by("id")
     if not user.is_admin:
         qs = qs.filter(Q(id=user.id))
-    qs = _filter_text(qs, "username", request.GET.get("name"))
-    qs = _filter_text(qs, "groups__name", request.GET.get("group_name"))
+    try:
+        qs = _request_filter_text(request, qs, "username", "name")
+        qs = _request_filter_text(request, qs, "groups__name", "group_name")
+    except ControlFilterError as error:
+        return _control_filter_error_response(request, error)
     status = request.GET.get("status", "")
     if status == "1":
         qs = qs.filter(Q(is_active=True))
@@ -5919,21 +5961,23 @@ def devices(request):
     )
     if not user.is_admin:
         qs = qs.filter(Q(owner=user))
-    qs = _filter_text(qs, "rid", request.GET.get("id"))
-    qs = _filter_text(qs, "hostname", request.GET.get("device_name"))
-    qs = _filter_text(qs, "username", request.GET.get("device_username"))
-    qs = _filter_text(
-        qs,
-        "device_group__name",
-        request.GET.get("device_group_name"),
-    )
-    user_name = request.GET.get("user_name")
-    if user_name:
-        qs = _filter_text(qs, "owner__username", user_name)
-    group_name = request.GET.get("group_name")
-    if group_name:
-        lookup = "owner__groups__name__icontains" if "%" in group_name else "owner__groups__name"
-        qs = qs.filter(**{lookup: group_name.replace("%", "")}).distinct()
+    try:
+        qs = _request_filter_text(request, qs, "rid", "id", allowed_modes=frozenset(("exact",)))
+        qs = _request_filter_text(request, qs, "hostname", "device_name")
+        qs = _request_filter_text(request, qs, "username", "device_username")
+        qs = _request_filter_text(
+            request,
+            qs,
+            "device_group__name",
+            "device_group_name",
+        )
+        qs = _request_filter_text(request, qs, "owner__username", "user_name")
+        group_name = request.GET.get("group_name")
+        qs = _request_filter_text(request, qs, "owner__groups__name", "group_name")
+    except ControlFilterError as error:
+        return _control_filter_error_response(request, error)
+    if group_name and str(group_name).strip():
+        qs = qs.distinct()
     return _paged_response(request, qs, _serialize_device, pagination=pagination)
 
 
@@ -6426,7 +6470,10 @@ def device_groups(request):
     if error_response:
         return error_response
     qs = DeviceGroup.objects.select_related("strategy").order_by("name")
-    qs = _filter_text(qs, "name", request.GET.get("name"))
+    try:
+        qs = _request_filter_text(request, qs, "name", "name")
+    except ControlFilterError as error:
+        return _control_filter_error_response(request, error)
     return _paged_response(request, qs, _serialize_device_group, pagination=pagination)
 
 

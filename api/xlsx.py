@@ -10,6 +10,8 @@ from django.http import FileResponse, HttpResponse
 from openpyxl import Workbook
 from openpyxl.writer.excel import ExcelWriter
 
+from api.request_deadlines import check_request_deadline, current_request_budget
+
 XLSX_CONTENT_TYPE = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 
 
@@ -27,6 +29,7 @@ class _BudgetedWorkbookTarget:
 
     def write(self, data):
         if self.enforce_budget:
+            check_request_deadline()
             if monotonic() > self.deadline:
                 raise SpreadsheetBudgetExceeded("spreadsheet deadline exceeded")
             next_size = self.bytes_written + len(data)
@@ -110,6 +113,10 @@ def bounded_xlsx_file_response(
     spool_memory_bytes,
 ):
     deadline = monotonic() + deadline_seconds
+    request_budget = current_request_budget()
+    if request_budget is not None:
+        deadline = min(deadline, request_budget.deadline)
+    check_request_deadline()
     target = SpooledTemporaryFile(max_size=spool_memory_bytes, mode="w+b")
     workbook = Workbook(write_only=True)
     sheet = None
@@ -120,6 +127,7 @@ def bounded_xlsx_file_response(
         sheet.append([spreadsheet_safe_value(value) for value in headers])
         row_count = 0
         for row in rows:
+            check_request_deadline()
             if row_count >= max_rows:
                 raise SpreadsheetBudgetExceeded("spreadsheet row budget exceeded")
             if monotonic() > deadline:
@@ -133,6 +141,7 @@ def bounded_xlsx_file_response(
             deadline=deadline,
         )
         _save_budgeted_workbook(workbook, budgeted_target)
+        check_request_deadline()
         if monotonic() > deadline:
             raise SpreadsheetBudgetExceeded("spreadsheet deadline exceeded")
         response_bytes = target.tell()

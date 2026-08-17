@@ -411,6 +411,16 @@ if not DEBUG and not DEVICE_VERIFICATION_TOKEN:
 
 OIDC_PROVIDERS = {}
 OIDC_HTTP_TIMEOUT_SECONDS = env_int("CAMELLIA_REMOTE_OIDC_HTTP_TIMEOUT_SECONDS", 10, 2, 60)
+REQUEST_DEADLINE_SECONDS = env_int(
+    "CAMELLIA_REMOTE_REQUEST_DEADLINE_SECONDS",
+    65,
+    5,
+    590,
+)
+if REQUEST_DEADLINE_SECONDS < OIDC_HTTP_TIMEOUT_SECONDS * 4 + 15:
+    raise ImproperlyConfigured(
+        "CAMELLIA_REMOTE_REQUEST_DEADLINE_SECONDS must cover discovery, token, JWKS, and key-rotation refresh deadlines"
+    )
 OIDC_CALLBACK_CLAIM_LEASE_SECONDS = env_int(
     "CAMELLIA_REMOTE_OIDC_CALLBACK_CLAIM_LEASE_SECONDS",
     max(60, OIDC_HTTP_TIMEOUT_SECONDS * 4 + 15),
@@ -783,6 +793,8 @@ if (
     DATABASE_KEEPALIVES_IDLE_SECONDS + DATABASE_KEEPALIVES_INTERVAL_SECONDS * DATABASE_KEEPALIVES_COUNT
 ) * 1000 >= DATABASE_OPERATION_DEADLINE_MS:
     raise ImproperlyConfigured("database keepalive failure detection must be shorter than the operation deadline")
+if DATABASE_OPERATION_PROFILE == "RUNTIME" and REQUEST_DEADLINE_SECONDS * 1000 <= DATABASE_OPERATION_DEADLINE_MS:
+    raise ImproperlyConfigured("HTTP request deadline must exceed the runtime database operation deadline")
 if SQLITE_DB_PATH and not Path(SQLITE_DB_PATH).is_absolute():
     raise ImproperlyConfigured("CAMELLIA_REMOTE_SQLITE_DB_PATH must be an absolute path")
 
@@ -803,6 +815,7 @@ INSTALLED_APPS = [
 ]
 
 MIDDLEWARE = [
+    "api.middleware.RequestDeadlineMiddleware",
     "api.middleware.SafeAccessLogMiddleware",
     "api.middleware.DatabaseDeadlineMiddleware",
     "api.rate_limits.IngressRateLimitMiddleware",

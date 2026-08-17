@@ -23,6 +23,7 @@ ALARM_TYPES = (0, 1, 2, 6, 7, 8, 9)
 POLICY_ASSIGNMENT_FIELDS = frozenset(
     ("owner", "owner_id", "device_group", "device_group_id", "strategy", "strategy_id")
 )
+DEVICE_SECRET_CONTEXT_FIELDS = frozenset(("deployment_generation", "owner", "owner_id", "rid", "uuid"))
 POLICY_CONTENT_FIELDS = frozenset(("config_options", "enabled"))
 
 
@@ -39,6 +40,8 @@ class RemoteDeviceQuerySet(models.QuerySet):
     def update(self, **kwargs):
         if "policy_generation" in kwargs:
             raise ValueError("policy_generation is managed internally")
+        if DEVICE_SECRET_CONTEXT_FIELDS.intersection(kwargs):
+            kwargs.setdefault("address_book_password", "")
         if not POLICY_ASSIGNMENT_FIELDS.intersection(kwargs):
             return super().update(**kwargs)
         from api.policy_generation import bump_device_policy_generations
@@ -340,6 +343,7 @@ class RemotePeer(models.Model):
         related_name="peers",
         verbose_name=_("地址簿"),
     )
+    secret_context = models.UUIDField(default=uuid.uuid4, editable=False)
     rid = models.CharField(verbose_name=_("客户端ID"), max_length=16)
     username = models.CharField(verbose_name=_("系统用户名"), max_length=100, blank=True, default="")
     hostname = models.CharField(verbose_name=_("操作系统名"), max_length=100, blank=True, default="")
@@ -353,9 +357,21 @@ class RemotePeer(models.Model):
         through="RemotePeerTagMembership",
         through_fields=("peer", "tag"),
     )
-    rhash = EncryptedTextField(verbose_name=_("设备链接密码"), max_length=256, blank=True, default="")
+    rhash = EncryptedTextField(
+        verbose_name=_("设备链接密码"),
+        max_length=256,
+        blank=True,
+        default="",
+        context_fields=("secret_context", "profile_id", "rid"),
+    )
     note = models.TextField(verbose_name=_("备注"), blank=True, default="")
-    password = EncryptedTextField(verbose_name=_("共享密码"), max_length=60, blank=True, default="")
+    password = EncryptedTextField(
+        verbose_name=_("共享密码"),
+        max_length=60,
+        blank=True,
+        default="",
+        context_fields=("secret_context", "profile_id", "rid"),
+    )
     device_group_name = models.CharField(verbose_name=_("设备组"), max_length=60, blank=True, default="")
     login_name = models.CharField(verbose_name=_("登录账号"), max_length=60, blank=True, default="")
     same_server = models.BooleanField(verbose_name=_("同服务器"), default=False)
@@ -365,6 +381,10 @@ class RemotePeer(models.Model):
         verbose_name = _("客户端")
         verbose_name_plural = _("客户端列表")
         constraints = [
+            models.UniqueConstraint(
+                fields=["secret_context"],
+                name="unique_peer_secret_context",
+            ),
             models.UniqueConstraint(
                 fields=["profile", "rid"],
                 name="unique_peer_per_address_book",
@@ -498,6 +518,7 @@ class RemoteDevice(models.Model):
     objects = RemoteDeviceQuerySet.as_manager()
 
     rid = models.CharField(verbose_name=_("客户端ID"), max_length=16, unique=True)
+    secret_context = models.UUIDField(default=uuid.uuid4, editable=False)
     cpu = models.CharField(verbose_name="CPU", max_length=100)
     hostname = models.CharField(verbose_name=_("主机名"), max_length=100)
     memory = models.CharField(verbose_name=_("内存"), max_length=100)
@@ -543,7 +564,13 @@ class RemoteDevice(models.Model):
     address_book_name = models.CharField(verbose_name=_("地址簿名称"), max_length=60, blank=True, default="")
     address_book_tag = models.CharField(verbose_name=_("地址簿标签"), max_length=60, blank=True, default="")
     address_book_alias = models.CharField(verbose_name=_("地址簿别名"), max_length=60, blank=True, default="")
-    address_book_password = EncryptedTextField(verbose_name=_("地址簿密码"), max_length=128, blank=True, default="")
+    address_book_password = EncryptedTextField(
+        verbose_name=_("地址簿密码"),
+        max_length=128,
+        blank=True,
+        default="",
+        context_fields=("secret_context", "deployment_generation", "owner_id", "rid", "uuid"),
+    )
     address_book_note = models.TextField(verbose_name=_("地址簿备注"), blank=True, default="")
     is_active = models.BooleanField(verbose_name=_("是否启用"), default=True)
     create_time = models.DateTimeField(verbose_name=_("设备注册时间"), auto_now_add=True)
@@ -557,6 +584,12 @@ class RemoteDevice(models.Model):
         ordering = ("-rid",)
         verbose_name = _("设备")
         verbose_name_plural = _("设备列表")
+        constraints = [
+            models.UniqueConstraint(
+                fields=["secret_context"],
+                name="unique_device_secret_context",
+            ),
+        ]
         indexes = [
             models.Index(fields=("owner", "rid"), name="device_owner_rid_idx"),
             models.Index(fields=("owner", "is_active", "rid"), name="device_owner_active_rid_idx"),
@@ -564,6 +597,16 @@ class RemoteDevice(models.Model):
             models.Index(
                 fields=("owner", "-update_time", "rid"),
                 name="device_owner_updated_rid_idx",
+            ),
+            models.Index(fields=("hostname",), name="device_hostname_idx"),
+            models.Index(fields=("username",), name="device_username_idx"),
+            GinIndex(
+                OpClass(Upper(Cast("hostname", models.TextField())), name="gin_trgm_ops"),
+                name="dev_host_search_trgm_idx",
+            ),
+            GinIndex(
+                OpClass(Upper(Cast("username", models.TextField())), name="gin_trgm_ops"),
+                name="dev_user_search_trgm_idx",
             ),
         ]
 
@@ -581,9 +624,11 @@ class RemoteDevice(models.Model):
             self.policy_generation = 0
             return super().save(*args, **kwargs)
         update_fields = kwargs.get("update_fields")
-        if update_fields is not None and not (POLICY_ASSIGNMENT_FIELDS | {"policy_generation"}).intersection(
-            update_fields
-        ):
+        policy_fields_touched = update_fields is None or bool(
+            (POLICY_ASSIGNMENT_FIELDS | {"policy_generation"}).intersection(update_fields)
+        )
+        secret_context_touched = update_fields is None or bool(DEVICE_SECRET_CONTEXT_FIELDS.intersection(update_fields))
+        if not policy_fields_touched and not secret_context_touched:
             return super().save(*args, **kwargs)
         database = kwargs.get("using") or router.db_for_write(type(self), instance=self)
         from api.policy_generation import bump_device_policy_generations
@@ -596,6 +641,9 @@ class RemoteDevice(models.Model):
                 .filter(pk=self.pk)
                 .values(
                     "owner_id",
+                    "rid",
+                    "uuid",
+                    "deployment_generation",
                     "device_group_id",
                     "strategy_id",
                     "policy_generation",
@@ -605,6 +653,15 @@ class RemoteDevice(models.Model):
             if previous is None:
                 return super().save(*args, **kwargs)
             self.policy_generation = previous["policy_generation"]
+            secret_context_changed = secret_context_touched and any(
+                previous[field] != getattr(self, field)
+                for field in ("owner_id", "rid", "uuid", "deployment_generation")
+            )
+            if secret_context_changed:
+                self.address_book_password = ""
+                if update_fields is not None:
+                    update_fields = tuple(dict.fromkeys((*update_fields, "address_book_password")))
+                    kwargs["update_fields"] = update_fields
             result = super().save(*args, **kwargs)
             assignment_fields = {
                 "owner_id": {"owner", "owner_id"},
@@ -1525,6 +1582,12 @@ class DeviceGroup(models.Model):
         ordering = ("name",)
         verbose_name = _("设备组")
         verbose_name_plural = _("设备组列表")
+        indexes = [
+            GinIndex(
+                OpClass(Upper(Cast("name", models.TextField())), name="gin_trgm_ops"),
+                name="dev_group_search_trgm_idx",
+            ),
+        ]
 
     def __str__(self):
         return self.name
@@ -1573,12 +1636,19 @@ class DeviceGroup(models.Model):
 
 class AddressBookProfile(models.Model):
     guid = models.CharField(verbose_name=_("地址簿GUID"), max_length=60, unique=True)
+    secret_context = models.UUIDField(default=uuid.uuid4, editable=False)
     name = models.CharField(verbose_name=_("地址簿名称"), max_length=60)
     owner = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="address_book_profiles")
     note = models.TextField(verbose_name=_("备注"), blank=True, default="")
     rule = models.IntegerField(verbose_name=_("共享权限"), default=1)
     info = models.JSONField(verbose_name=_("扩展信息"), blank=True, default=dict)
-    default_password = EncryptedTextField(verbose_name=_("默认共享密码"), max_length=60, blank=True, default="")
+    default_password = EncryptedTextField(
+        verbose_name=_("默认共享密码"),
+        max_length=60,
+        blank=True,
+        default="",
+        context_fields=("secret_context", "guid"),
+    )
     authorization_generation = models.PositiveBigIntegerField(default=0, editable=False)
     created_at = models.DateTimeField(verbose_name=_("创建时间"), default=timezone.now)
     updated_at = models.DateTimeField(verbose_name=_("更新时间"), auto_now=True)
@@ -1588,6 +1658,10 @@ class AddressBookProfile(models.Model):
         verbose_name = _("地址簿")
         verbose_name_plural = _("地址簿列表")
         constraints = [
+            models.UniqueConstraint(
+                fields=["secret_context"],
+                name="unique_ab_profile_secret_context",
+            ),
             models.UniqueConstraint(
                 fields=["owner", "name"],
                 name="unique_address_book_name_per_owner",
@@ -1928,6 +2002,7 @@ class OidcPendingAuth(models.Model):
     STATUS_ERROR = "error"
 
     state = models.CharField(verbose_name="State", max_length=64, primary_key=True)
+    secret_context = models.UUIDField(default=uuid.uuid4, editable=False)
     poll_code_hash = models.CharField(
         verbose_name="Poll Code Hash",
         max_length=64,
@@ -1948,8 +2023,16 @@ class OidcPendingAuth(models.Model):
         default=dict,
     )
     device_proof = models.JSONField(blank=True, default=dict)
-    nonce = EncryptedTextField(verbose_name="OIDC Nonce", max_length=64)
-    code_verifier = EncryptedTextField(verbose_name="PKCE Code Verifier", max_length=128)
+    nonce = EncryptedTextField(
+        verbose_name="OIDC Nonce",
+        max_length=64,
+        context_fields=("secret_context", "state", "provider"),
+    )
+    code_verifier = EncryptedTextField(
+        verbose_name="PKCE Code Verifier",
+        max_length=128,
+        context_fields=("secret_context", "state", "provider"),
+    )
     status = models.CharField(verbose_name="Status", max_length=16, default=STATUS_PENDING, db_index=True)
     error_code = models.CharField(verbose_name="Error Code", max_length=64, blank=True, default="")
     callback_claim_owner = models.UUIDField(null=True, blank=True, editable=False)
@@ -1969,6 +2052,10 @@ class OidcPendingAuth(models.Model):
         verbose_name = _("OIDC待处理授权")
         verbose_name_plural = _("OIDC待处理授权列表")
         constraints = [
+            models.UniqueConstraint(
+                fields=["secret_context"],
+                name="unique_oidc_secret_context",
+            ),
             models.CheckConstraint(
                 condition=models.Q(
                     status__in=(
@@ -2145,6 +2232,7 @@ class RecordingUpload(models.Model):
     )
 
     upload_id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    secret_context = models.UUIDField(default=uuid.uuid4, editable=False)
     create_id = models.UUIDField(editable=False)
     device = models.ForeignKey(
         RemoteDevice,
@@ -2166,7 +2254,18 @@ class RecordingUpload(models.Model):
     state = models.CharField(max_length=12, choices=STATE_CHOICES, default=STATE_ACTIVE, editable=False)
     encryption_version = models.PositiveSmallIntegerField(editable=False)
     data_key_kek_id = models.CharField(max_length=32, editable=False)
-    encrypted_data_key = EncryptedTextField(max_length=44, editable=False)
+    encrypted_data_key = EncryptedTextField(
+        max_length=44,
+        editable=False,
+        context_fields=(
+            "secret_context",
+            "upload_id",
+            "device_id_at_create",
+            "owner_id_at_create",
+            "deployment_generation",
+            "storage_object_id",
+        ),
+    )
     committed_offset = models.PositiveBigIntegerField(default=0, editable=False)
     storage_offset = models.PositiveBigIntegerField(editable=False)
     ciphertext_size = models.PositiveBigIntegerField(null=True, blank=True, editable=False)
@@ -2186,6 +2285,10 @@ class RecordingUpload(models.Model):
     class Meta:
         ordering = ("created_at", "upload_id")
         constraints = [
+            models.UniqueConstraint(
+                fields=("secret_context",),
+                name="unique_recording_secret_context",
+            ),
             models.UniqueConstraint(
                 fields=("device", "create_id"),
                 name="unique_recording_create_id",

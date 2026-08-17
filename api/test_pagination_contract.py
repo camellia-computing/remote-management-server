@@ -67,14 +67,16 @@ class PaginationContractTests(ApiTestMixin, TestCase):
         self.assertEqual(
             response.json(),
             {
-                "error": "Invalid pagination",
                 "code": "invalid_pagination",
+                "message": "Invalid pagination",
                 "pagination_contract_version": PAGINATION_CONTRACT_VERSION,
                 "field": field,
                 "limits": {
                     "max_page_size": MAX_PAGE_SIZE,
                     "max_offset": MAX_PAGE_OFFSET,
                 },
+                "response_schema_version": 1,
+                "retryable": False,
             },
         )
         self.assertLessEqual(len(response.content), 320)

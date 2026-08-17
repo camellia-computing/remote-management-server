@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "schema_generation": "management-schema-0030-v1",
+  "schema_generation": "management-schema-0032-v1",
   "migrations": [
     ["admin", "0001_initial"],
     ["admin", "0002_logentry_remove_auto_add"],
@@ -35,6 +35,8 @@
     ["api", "0028_address_book_rule_target_authority"],
     ["api", "0029_strategy_config_options_authority"],
     ["api", "0030_bigint_primary_key_capacity"],
+    ["api", "0031_control_filter_indexes"],
+    ["api", "0032_context_bound_encrypted_fields"],
     ["auth", "0001_initial"],
     ["auth", "0002_alter_permission_name_max_length"],
     ["auth", "0003_alter_user_email_max_length"],
@@ -53,32 +55,47 @@
   ],
   "leaf_migrations": [
     ["admin", "0003_logentry_add_action_flag_choices"],
-    ["api", "0030_bigint_primary_key_capacity"],
+    ["api", "0032_context_bound_encrypted_fields"],
     ["auth", "0012_alter_user_first_name_max_length"],
     ["contenttypes", "0002_remove_content_type_name"],
     ["sessions", "0001_initial"]
   ],
   "capabilities": {
     "relations": {
+      "api_addressbookprofile": ["guid", "id", "secret_context"],
       "api_addressbookrule": ["group_id", "id", "is_everyone", "profile_id", "user_id"],
       "api_connectionauditevent": ["id", "payload_digest", "reporter_sequence"],
-      "api_remotedevice": ["deployment_generation", "id", "owner_id", "policy_generation", "rid"],
+      "api_devicegroup": ["id", "name"],
+      "api_oidcpendingauth": ["secret_context", "state"],
+      "api_recordingupload": ["secret_context", "upload_id"],
+      "api_remotedevice": ["deployment_generation", "id", "owner_id", "policy_generation", "rid", "secret_context"],
+      "api_remotepeer": ["id", "profile_id", "rid", "secret_context"],
       "api_remotepeer_tags": ["id", "profile_id", "remotepeer_id", "remotetag_id"],
       "api_sequencecapacitystate": ["last_value", "sampled_at", "sequence_name"],
       "api_sharelink_peers": ["id", "owner_id", "profile_id", "remotepeer_id", "sharelink_id"],
       "api_strategyprofile": ["config_options", "id", "name"],
       "api_userprofile": ["id", "username", "username_canonical"],
+      "auth_group": ["id", "name"],
       "django_migrations": ["app", "applied", "id", "name"]
     },
     "postgresql": {
       "column_types": {
-        "api_remotedevice": {"id": "bigint"},
+        "api_addressbookprofile": {"secret_context": "uuid"},
+        "api_oidcpendingauth": {"secret_context": "uuid"},
+        "api_recordingupload": {"secret_context": "uuid"},
+        "api_remotedevice": {"id": "bigint", "secret_context": "uuid"},
+        "api_remotepeer": {"secret_context": "uuid"},
         "api_remotepeer_tags": {"id": "bigint", "profile_id": "bigint", "remotepeer_id": "bigint", "remotetag_id": "bigint"},
         "api_sharelink_peers": {"id": "bigint", "owner_id": "bigint", "profile_id": "bigint", "remotepeer_id": "bigint", "sharelink_id": "bigint"},
         "api_userprofile": {"id": "bigint"}
       },
       "constraints": {
+        "api_addressbookprofile": ["unique_ab_profile_secret_context"],
         "api_connectionauditevent": ["positive_audit_reporter_sequence"],
+        "api_oidcpendingauth": ["unique_oidc_secret_context"],
+        "api_recordingupload": ["unique_recording_secret_context"],
+        "api_remotedevice": ["unique_device_secret_context"],
+        "api_remotepeer": ["unique_peer_secret_context"],
         "api_remotepeer_tags": ["peer_tag_peer_profile_fk", "peer_tag_tag_profile_fk"],
         "api_sharelink_peers": ["share_peer_link_owner_fk", "share_peer_peer_profile_fk", "share_peer_profile_owner_fk"],
         "api_strategyprofile": ["valid_strategy_config_options_v1"],
@@ -87,9 +104,18 @@
       "indexes": {
         "api_addressbookrule": ["unique_ab_rule_profile_everyone", "unique_ab_rule_profile_group", "unique_ab_rule_profile_user"],
         "api_connectionauditevent": ["unique_audit_reporter_sequence"],
-        "api_remotedevice": ["device_active_rid_idx", "device_owner_active_rid_idx", "device_owner_rid_idx", "device_owner_updated_rid_idx"],
+        "api_devicegroup": ["dev_group_search_trgm_idx"],
+        "api_remotedevice": ["dev_host_search_trgm_idx", "dev_user_search_trgm_idx", "device_active_rid_idx", "device_hostname_idx", "device_owner_active_rid_idx", "device_owner_rid_idx", "device_owner_updated_rid_idx", "device_username_idx"],
         "api_remotepeer_tags": ["peer_tag_profile_idx"],
-        "api_sharelink_peers": ["share_peer_scope_idx"]
+        "api_sharelink_peers": ["share_peer_scope_idx"],
+        "auth_group": ["auth_group_search_trgm_idx"]
+      },
+      "not_null": {
+        "api_addressbookprofile": ["secret_context"],
+        "api_oidcpendingauth": ["secret_context"],
+        "api_recordingupload": ["secret_context"],
+        "api_remotedevice": ["secret_context"],
+        "api_remotepeer": ["secret_context"]
       }
     }
   }
