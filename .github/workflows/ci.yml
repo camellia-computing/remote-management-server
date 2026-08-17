@@ -241,6 +241,8 @@ jobs:
           python3 scripts/test_database_roles.py
           python3 scripts/test_deployment_gate.py
           python3 scripts/test_postgres_container_hardening.py
+          python3 scripts/test_production_compose.py
+          python3 scripts/test_production_compose.py --systemd-contract
           python3 scripts/test_systemd_maintenance.py
           python3 .github/scripts/test_manage_release.py
           python3 .github/scripts/test_container_release_evidence.py
@@ -438,21 +440,7 @@ jobs:
     timeout-minutes: 30
     env:
       POSTGRES_HARDENING_PROJECT: camellia-remote-pg-${{ github.run_id }}-${{ github.run_attempt }}
-    services:
-      postgres:
-        image: postgres:18-alpine@sha256:9a8afca54e7861fd90fab5fdf4c42477a6b1cb7d293595148e674e0a3181de15
-        env:
-          POSTGRES_DB: camellia_remote_container_ci
-          POSTGRES_USER: camellia_remote_container_ci
-          POSTGRES_PASSWORD: ci-postgres-password
-          POSTGRES_INITDB_ARGS: --encoding=UTF8 --locale-provider=builtin --builtin-locale=C.UTF-8
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd "pg_isready -U camellia_remote_container_ci -d camellia_remote_container_ci"
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 12
+      PRODUCTION_COMPOSE_PROJECT: camellia-remote-management-${{ github.run_id }}-${{ github.run_attempt }}
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -503,127 +491,43 @@ jobs:
             --runtime \
             --project-name "$POSTGRES_HARDENING_PROJECT"
 
-      - name: Create smoke-test volumes
+      - name: Prepare production Compose integration
         run: |
-          docker volume create camellia-remote-management-ci-records
+          set -euo pipefail
+          python3 scripts/test_production_compose.py \
+            --prepare-env \
+            --env-file "$RUNNER_TEMP/production-compose.env" \
+            --image camellia-remote-management-server:ci \
+            --revision "$GITHUB_SHA"
+          cat > "$RUNNER_TEMP/docker-wrapper" <<'EOF'
+          #!/bin/sh
+          exec /usr/bin/docker "$@"
+          EOF
+          chmod 0755 "$RUNNER_TEMP/docker-wrapper"
+          mkdir -p "$RUNNER_TEMP/production-compose-run"
 
-      - name: Bootstrap least-privilege container database roles
-        run: |
-          docker run --rm \
-            --network host \
-            --entrypoint /bin/sh \
-            -v "$PWD/deploy/bootstrap-postgres-roles.sh:/bootstrap-postgres-roles.sh:ro" \
-            -e PGHOST=127.0.0.1 \
-            -e PGPORT=5432 \
-            -e PGDATABASE=camellia_remote_container_ci \
-            -e PGUSER=camellia_remote_container_ci \
-            -e PGPASSWORD=ci-postgres-password \
-            -e CAMELLIA_REMOTE_DATABASE_MIGRATION_USER=container_ci_migration \
-            -e CAMELLIA_REMOTE_DATABASE_MIGRATION_PASSWORD=ci-migration-password-02 \
-            -e CAMELLIA_REMOTE_DATABASE_RUNTIME_USER=container_ci_runtime \
-            -e CAMELLIA_REMOTE_DATABASE_RUNTIME_PASSWORD=ci-runtime-password-03 \
-            -e CAMELLIA_REMOTE_DATABASE_BACKUP_USER=container_ci_backup \
-            -e CAMELLIA_REMOTE_DATABASE_BACKUP_PASSWORD=ci-backup-password-04 \
-            -e CAMELLIA_REMOTE_DATABASE_PROBE_USER=container_ci_probe \
-            -e CAMELLIA_REMOTE_DATABASE_PROBE_PASSWORD=ci-probe-password-05 \
-            postgres:18-alpine@sha256:9a8afca54e7861fd90fab5fdf4c42477a6b1cb7d293595148e674e0a3181de15 \
-            /bootstrap-postgres-roles.sh
+      - name: Verify isolated systemd contract
+        run: python3 scripts/test_production_compose.py --systemd-contract
 
-      - name: Migrate container database
+      - name: Run production Compose lifecycle
         run: |
-          docker run --rm \
-            --network host \
-            -e CAMELLIA_REMOTE_DEBUG=false \
-            -e CAMELLIA_REMOTE_SECRET_KEY=ci-only-production-secret-key-with-sufficient-length-000 \
-            -e CAMELLIA_REMOTE_DATA_ENCRYPTION_KEY_ID=ci-primary-v1 \
-            -e CAMELLIA_REMOTE_DATA_ENCRYPTION_KEY=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA= \
-            -e CAMELLIA_REMOTE_DATA_ENCRYPTION_V1_KEY_ID=ci-primary-v1 \
-            -e CAMELLIA_REMOTE_DEVICE_VERIFICATION_TOKEN=ci-device-verification-token-with-sufficient-length \
-            -e CAMELLIA_REMOTE_DATABASE_URL=postgres://container_ci_migration:ci-migration-password-02@127.0.0.1:5432/camellia_remote_container_ci \
-            -e CAMELLIA_REMOTE_DATABASE_SSLMODE=disable \
-            -e CAMELLIA_REMOTE_ALLOWED_HOSTS=127.0.0.1,localhost \
-            -e CAMELLIA_REMOTE_CSRF_TRUSTED_ORIGINS=https://api.example.test \
-            -e CAMELLIA_REMOTE_API_SERVER=https://api.example.test \
-            -e CAMELLIA_REMOTE_ID_SERVER=wss://remote.example.test:443 \
-            -e CAMELLIA_REMOTE_RS_PUB_KEY=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA= \
-            -e CAMELLIA_REMOTE_SECURE_TLS=true \
-            -v camellia-remote-management-ci-records:/app/records \
-            camellia-remote-management-server:ci \
-            python manage.py migrate_with_lease --noinput --actor ci-container
+          python3 scripts/test_production_compose.py \
+            --run \
+            --project-dir "$GITHUB_WORKSPACE" \
+            --env-file "$RUNNER_TEMP/production-compose.env" \
+            --project-name "$PRODUCTION_COMPOSE_PROJECT" \
+            --runtime-dir "$RUNNER_TEMP/production-compose-run" \
+            --docker "$RUNNER_TEMP/docker-wrapper" \
+            --evidence "$RUNNER_TEMP/production-compose-evidence.json"
 
-      - name: Converge post-migration ACLs and reject runtime DDL
-        run: |
-          docker run --rm \
-            --network host \
-            --entrypoint /bin/sh \
-            -v "$PWD/deploy/bootstrap-postgres-roles.sh:/bootstrap-postgres-roles.sh:ro" \
-            -e PGHOST=127.0.0.1 \
-            -e PGPORT=5432 \
-            -e PGDATABASE=camellia_remote_container_ci \
-            -e PGUSER=camellia_remote_container_ci \
-            -e PGPASSWORD=ci-postgres-password \
-            -e CAMELLIA_REMOTE_DATABASE_MIGRATION_USER=container_ci_migration \
-            -e CAMELLIA_REMOTE_DATABASE_MIGRATION_PASSWORD=ci-migration-password-02 \
-            -e CAMELLIA_REMOTE_DATABASE_RUNTIME_USER=container_ci_runtime \
-            -e CAMELLIA_REMOTE_DATABASE_RUNTIME_PASSWORD=ci-runtime-password-03 \
-            -e CAMELLIA_REMOTE_DATABASE_BACKUP_USER=container_ci_backup \
-            -e CAMELLIA_REMOTE_DATABASE_BACKUP_PASSWORD=ci-backup-password-04 \
-            -e CAMELLIA_REMOTE_DATABASE_PROBE_USER=container_ci_probe \
-            -e CAMELLIA_REMOTE_DATABASE_PROBE_PASSWORD=ci-probe-password-05 \
-            postgres:18-alpine@sha256:9a8afca54e7861fd90fab5fdf4c42477a6b1cb7d293595148e674e0a3181de15 \
-            /bootstrap-postgres-roles.sh
-          if docker run --rm \
-            --network host \
-            -e PGHOST=127.0.0.1 \
-            -e PGPORT=5432 \
-            -e PGDATABASE=camellia_remote_container_ci \
-            -e PGUSER=container_ci_runtime \
-            -e PGPASSWORD=ci-runtime-password-03 \
-            postgres:18-alpine@sha256:9a8afca54e7861fd90fab5fdf4c42477a6b1cb7d293595148e674e0a3181de15 \
-            psql --no-psqlrc --set=ON_ERROR_STOP=1 \
-              --command 'CREATE TABLE public.runtime_must_not_create_tables(id integer)'; then
-            echo "runtime database role unexpectedly created a table" >&2
-            exit 1
-          fi
-
-      - name: Start hardened container
-        run: |
-          docker run -d \
-            --name camellia-remote-management-ci \
-            --network host \
-            --read-only \
-            --tmpfs /tmp:size=128m,mode=1777 \
-            --cap-drop ALL \
-            --security-opt no-new-privileges:true \
-            -e CAMELLIA_REMOTE_DEBUG=false \
-            -e CAMELLIA_REMOTE_SECRET_KEY=ci-only-production-secret-key-with-sufficient-length-000 \
-            -e CAMELLIA_REMOTE_DATA_ENCRYPTION_KEY_ID=ci-primary-v1 \
-            -e CAMELLIA_REMOTE_DATA_ENCRYPTION_KEY=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA= \
-            -e CAMELLIA_REMOTE_DATA_ENCRYPTION_V1_KEY_ID=ci-primary-v1 \
-            -e CAMELLIA_REMOTE_DEVICE_VERIFICATION_TOKEN=ci-device-verification-token-with-sufficient-length \
-            -e CAMELLIA_REMOTE_DATABASE_URL=postgres://container_ci_runtime:ci-runtime-password-03@127.0.0.1:5432/camellia_remote_container_ci \
-            -e CAMELLIA_REMOTE_DATABASE_SSLMODE=disable \
-            -e CAMELLIA_REMOTE_ALLOWED_HOSTS=127.0.0.1,localhost \
-            -e CAMELLIA_REMOTE_CSRF_TRUSTED_ORIGINS=https://api.example.test \
-            -e CAMELLIA_REMOTE_API_SERVER=https://api.example.test \
-            -e CAMELLIA_REMOTE_ID_SERVER=wss://remote.example.test:443 \
-            -e CAMELLIA_REMOTE_RS_PUB_KEY=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA= \
-            -e CAMELLIA_REMOTE_SECURE_TLS=true \
-            -e CAMELLIA_REMOTE_GUNICORN_WORKERS=1 \
-            -v camellia-remote-management-ci-records:/app/records \
-            camellia-remote-management-server:ci
-
-      - name: Verify container readiness
-        run: |
-          for _attempt in $(seq 1 30); do
-            if docker exec camellia-remote-management-ci python -c \
-              'import json, urllib.request; request = urllib.request.Request("http://127.0.0.1:21114/health/ready", headers={"X-Forwarded-Proto": "https"}); response = urllib.request.urlopen(request, timeout=2); assert response.status == 200 and json.load(response)["status"] == "ready"'; then
-              exit 0
-            fi
-            sleep 1
-          done
-          docker logs camellia-remote-management-ci
-          exit 1
+      - name: Upload deployment evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: production-compose-${{ github.sha }}
+          path: ${{ runner.temp }}/production-compose-evidence.json
+          if-no-files-found: warn
+          retention-days: 14
 
       - name: Clean up container resources
         if: always()
@@ -632,8 +536,10 @@ jobs:
           python3 scripts/test_postgres_container_hardening.py \
             --cleanup \
             --project-name "$POSTGRES_HARDENING_PROJECT" || status=$?
-          docker rm --force camellia-remote-management-ci 2>/dev/null || true
-          docker volume rm camellia-remote-management-ci-records 2>/dev/null || true
+          python3 scripts/test_production_compose.py \
+            --cleanup \
+            --project-name "$PRODUCTION_COMPOSE_PROJECT" \
+            --docker "${RUNNER_TEMP}/docker-wrapper" || status=$?
           exit "$status"
 
   performance_smoke:
