@@ -208,6 +208,15 @@ jobs:
           bash .github/scripts/tests/test_verify_release_image.sh
           bash -n .github/scripts/publish-container-release.sh
 
+      - name: Validate Remote system preflight inputs
+        env:
+          REMOTE_REPOSITORY_MAP: ${{ vars.REMOTE_REPOSITORY_MAP }}
+        run: |
+          python3 scripts/test_remote_system_contract.py
+          python3 scripts/remote_system_contract.py \
+            --repository-map "$REMOTE_REPOSITORY_MAP" \
+            --current-repository "$GITHUB_REPOSITORY"
+
       - name: Validate deployment configuration
         env:
           CAMELLIA_REMOTE_MANAGEMENT_IMAGE: ghcr.io/example/management@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa

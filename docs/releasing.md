@@ -85,3 +85,25 @@ permission; the trusted authorization command performs only reads. Exact CI
 run lookups use the separate job token constrained to Contents, Actions, and
 pull-request read. Repository metadata scripts receive neither token, and no
 token receives Actions or Workflows write permission.
+
+## Four-repository system eligibility
+
+Management CI validates the complete `REMOTE_REPOSITORY_MAP`, the exact
+`web-client.lock` commit and the immutable PostgreSQL/Management image shape as
+a local preflight. This is necessary but not sufficient for a Remote release.
+
+Release eligibility additionally requires one successful organization-owned
+Remote system harness manifest for the exact Protocol, Server, Client and
+Management commits. The manifest must bind both service image digests, the
+Client Web/controller artifacts, both consumer Protocol gitlinks and the
+Management Web lock. It must cover authentication/device verification, direct
+and forced-relay sessions, first frame/input, file/clipboard/audit, reconnect
+and shutdown according to the smoke or exhaustive tier. A green single-repo
+Required job or a candidate-supplied scenario report cannot replace this
+manifest.
+
+The harness uses a unique Compose project, network, volume and credential
+namespace for every run and retains only bounded, redacted evidence for seven
+days. Cleanup is required even after cancellation. Docker/Compose and the
+authorized Win11 host/controller adapter are platform prerequisites; an
+unavailable runtime is a release block, never a skipped success.
