@@ -1,5 +1,10 @@
 import hashlib
-import unicodedata
+import unicodedata as _stdlib_unicode_data
+
+try:
+    import unicodedata2 as _backport_unicode_data
+except ImportError:
+    _backport_unicode_data = None
 
 from django.db import migrations, models
 
@@ -8,17 +13,23 @@ MAX_USERNAME_LENGTH = 50
 MAX_CANONICAL_BYTES = 1024
 MAX_REPORTED_ERRORS = 20
 
+_UNICODE_DATA = (
+    _stdlib_unicode_data
+    if _stdlib_unicode_data.unidata_version == EXPECTED_UNICODE_DATA_VERSION
+    else _backport_unicode_data or _stdlib_unicode_data
+)
+
 
 def _username_identity(value):
-    if unicodedata.unidata_version != EXPECTED_UNICODE_DATA_VERSION:
+    if _UNICODE_DATA.unidata_version != EXPECTED_UNICODE_DATA_VERSION:
         raise RuntimeError(
             "username canonical migration requires Unicode data "
-            f"{EXPECTED_UNICODE_DATA_VERSION}, found {unicodedata.unidata_version}"
+            f"{EXPECTED_UNICODE_DATA_VERSION}, found {_UNICODE_DATA.unidata_version}"
         )
-    normalized = unicodedata.normalize("NFKC", str(value or "").strip())
+    normalized = _UNICODE_DATA.normalize("NFKC", str(value or "").strip())
     if not normalized or len(normalized) > MAX_USERNAME_LENGTH:
         raise ValueError("invalid normalized username")
-    canonical = unicodedata.normalize("NFKC", normalized.casefold()).encode("utf-8")
+    canonical = _UNICODE_DATA.normalize("NFKC", normalized.casefold()).encode("utf-8")
     if not canonical or len(canonical) > MAX_CANONICAL_BYTES:
         raise ValueError("invalid canonical username")
     return normalized, canonical

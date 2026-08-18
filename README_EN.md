@@ -6,7 +6,7 @@ The service listens on port 21114 behind a TLS reverse proxy. Keep PostgreSQL an
 
 ## Development
 
-Use Python 3.14, uv 0.12.0, and PostgreSQL 18. Username identity v1 is pinned to Python 3.14's Unicode 16.0.0 data; other Unicode data versions fail closed. For an isolated SQLite development run:
+The primary quality gate uses Python 3.14 and the supported lower bound is Python 3.13, with uv 0.12.0 and PostgreSQL 18. Username identity v1 is pinned to Unicode 16.0.0: Python 3.14 uses the standard library and Python 3.13 uses the exact `unicodedata2==16.0.0` lock. Missing or different Unicode data versions fail closed during migration and startup checks. For an isolated SQLite development run:
 
 ```bash
 uv sync --locked --all-groups

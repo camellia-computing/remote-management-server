@@ -5,6 +5,7 @@ import threading
 from unittest.mock import patch
 
 from django.contrib.auth.models import Group
+from django.core.exceptions import ValidationError
 from django.db import IntegrityError, close_old_connections, connections
 from django.test import Client, TestCase, TransactionTestCase, override_settings, skipUnlessDBFeature
 
@@ -61,13 +62,11 @@ class UserCreateIntegrityClassificationTests(TestCase):
         response = self.create_user("STRASSE-RACE")
 
         self.assertEqual(response.status_code, 409, response.content)
-        self.assertEqual(
-            response.json(),
-            {
-                "error": "User already exists",
-                "code": "username_conflict",
-            },
-        )
+        self.assertEqual(response.json()["code"], "username_conflict")
+        self.assertEqual(response.json()["message"], "User already exists")
+        self.assertEqual(response.json()["response_schema_version"], 1)
+        self.assertFalse(response.json()["retryable"])
+        self.assertNotIn("error", response.json())
 
     def test_unknown_user_insert_integrity_error_remains_a_server_error(self):
         with patch.object(
@@ -80,6 +79,19 @@ class UserCreateIntegrityClassificationTests(TestCase):
         self.assertEqual(response.status_code, 500, response.content)
         self.assertNotIn(b"User already exists", response.content)
         self.assertFalse(UserProfile.objects.by_username("unrelated-user-integrity").exists())
+
+    def test_candidate_validation_failure_is_a_client_error_without_partial_user(self):
+        with patch.object(
+            UserProfile,
+            "full_clean",
+            side_effect=ValidationError("sensitive candidate detail"),
+        ):
+            response = self.create_user("invalid-candidate-user")
+
+        self.assertEqual(response.status_code, 400, response.content)
+        self.assertEqual(response.json()["code"], "http_400_api_users")
+        self.assertNotIn(b"sensitive candidate detail", response.content)
+        self.assertFalse(UserProfile.objects.by_username("invalid-candidate-user").exists())
 
     def test_group_create_integrity_error_is_not_reported_as_a_username_conflict(self):
         with patch.object(

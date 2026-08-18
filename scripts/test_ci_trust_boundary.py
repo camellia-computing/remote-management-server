@@ -60,8 +60,8 @@ class RequiredContractTests(unittest.TestCase):
 
     def test_container_if_false_is_rejected(self):
         changed = self.workflow.replace(
-            "if: needs.classify.outputs.runtime == 'true'\n    needs: [classify, metadata, web_client, quality]",
-            "if: false\n    needs: [classify, metadata, web_client, quality]",
+            "if: needs.classify.outputs.runtime == 'true'\n    needs: [classify, metadata, web_client, quality, quality_python313, quality_sqlite]",
+            "if: false\n    needs: [classify, metadata, web_client, quality, quality_python313, quality_sqlite]",
             1,
         )
         with self.assertRaises(TrustPolicyError):
@@ -74,6 +74,35 @@ class RequiredContractTests(unittest.TestCase):
 
     def test_quality_needs_classifier_and_web_client(self):
         changed = self.workflow.replace("needs: [classify, web_client]", "needs: [web_client]", 1)
+        with self.assertRaises(TrustPolicyError):
+            validate_ci_workflow(changed)
+
+    def test_required_observes_lower_bound_and_sqlite_results(self):
+        self.assertIn("QUALITY_PYTHON313_RESULT", self.workflow)
+        self.assertIn("QUALITY_SQLITE_RESULT", self.workflow)
+        self.assertIn('require_success "Python 3.13 lower-bound quality"', self.workflow)
+        self.assertIn('require_success "SQLite debug equivalence"', self.workflow)
+
+    def test_missing_sqlite_result_is_rejected(self):
+        changed = self.workflow.replace("QUALITY_SQLITE_RESULT", "SQLITE_RESULT")
+        with self.assertRaises(TrustPolicyError):
+            validate_ci_workflow(changed)
+
+    def test_required_cannot_stop_enforcing_new_matrix_results(self):
+        for command in (
+            'require_success "Python 3.13 lower-bound quality" "$QUALITY_PYTHON313_RESULT"',
+            'require_success "SQLite debug equivalence" "$QUALITY_SQLITE_RESULT"',
+        ):
+            with self.subTest(command=command), self.assertRaises(TrustPolicyError):
+                validate_ci_workflow(self.workflow.replace(command, "", 1))
+
+    def test_coverage_execution_chain_cannot_be_removed(self):
+        changed = self.workflow.replace("uv run coverage run --branch -m pytest --create-db", "uv run pytest --create-db", 1)
+        with self.assertRaises(TrustPolicyError):
+            validate_ci_workflow(changed)
+
+    def test_lower_bound_runtime_cannot_drift_to_python_314(self):
+        changed = self.workflow.replace('python-version: "3.13"', 'python-version: "3.14"', 1)
         with self.assertRaises(TrustPolicyError):
             validate_ci_workflow(changed)
 

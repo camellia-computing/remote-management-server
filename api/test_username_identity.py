@@ -97,7 +97,7 @@ class UsernameIdentityTests(TestCase):
             content_type="application/json",
             HTTP_AUTHORIZATION=f"Bearer {user_token}",
         )
-        self.assertEqual(device_update.status_code, 200, device_update.content)
+        self.assertEqual(device_update.status_code, 204, device_update.content)
 
         front_response = self.client.post(
             "/api/user_action?action=login",
@@ -179,6 +179,23 @@ class UsernameIdentityTests(TestCase):
         user = UserProfile.objects.get(username_canonical=b"newuser")
         self.assertEqual(user.username, "NewUser")
 
+    @override_settings(ALLOW_REGISTRATION=True)
+    def test_front_registration_classifies_a_storage_identity_conflict(self):
+        with patch.object(
+            UserProfile.objects,
+            "create_user",
+            side_effect=IntegrityError("sensitive storage constraint"),
+        ):
+            response = self.client.post(
+                "/api/user_action?action=register",
+                {"user": "storage-race", "pwd": self.password, "repassword": self.password},
+            )
+
+        self.assertEqual(response.status_code, 409, response.content)
+        self.assertEqual(response.json()["code"], "http_409_api_user_action")
+        self.assertNotIn(b"sensitive storage constraint", response.content)
+        self.assertFalse(UserProfile.objects.by_username("storage-race").exists())
+
     def test_oidc_allocator_never_returns_a_canonical_collision(self):
         claims = {"preferred_username": "äSTER", "sub": "subject-a"}
         allocated = _oidc_local_username(claims, "https://issuer.example", "subject-a")
@@ -224,6 +241,17 @@ class UsernameIdentityTests(TestCase):
                 [canonical_username_key(self.user.username), self.user.pk],
             )
         call_command("check_username_identity", verbosity=0)
+
+    def test_full_identity_check_classifies_unusable_stored_usernames(self):
+        with (
+            patch("api.username_identity.canonical_username_key", side_effect=ValueError("sensitive username")),
+            self.assertRaises(UsernameIdentityError) as captured,
+        ):
+            check_username_identity(full=True)
+
+        self.assertIn(f"id={self.user.pk}:invalid", str(captured.exception))
+        self.assertNotIn("sensitive username", str(captured.exception))
+        self.assertNotIn(self.user.username, str(captured.exception))
 
     def test_database_authority_rejects_a_null_canonical_key(self):
         with self.assertRaises(IntegrityError), transaction.atomic(), connection.cursor() as cursor:

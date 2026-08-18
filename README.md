@@ -11,7 +11,7 @@ Camellia Remote 的生产管理平面：提供账号与设备管理、地址簿�
 
 ## 本地开发
 
-日常开发和 CI 使用 Python 3.14、uv 0.12.0 和 PostgreSQL 18。Username identity v1固定使用Python 3.14内置的Unicode 16.0.0数据；其他Python/Unicode数据版本会在迁移或启动检查时fail closed。仅快速开发时可使用 SQLite：
+主质量门禁使用 Python 3.14，支持下界为 Python 3.13，统一使用 uv 0.12.0 和 PostgreSQL 18。Username identity v1 固定使用 Unicode 16.0.0 数据：Python 3.14 使用标准库，Python 3.13 使用精确锁定的 `unicodedata2==16.0.0`；缺失或其他 Unicode 数据版本会在迁移或启动检查时 fail closed。仅快速开发时可使用 SQLite：
 
 ```bash
 uv sync --locked --all-groups

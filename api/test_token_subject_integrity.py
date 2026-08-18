@@ -105,12 +105,15 @@ class TokenSubjectIntegrityTests(TestCase):
         device = RemoteDevice.objects.get(rid="800000013")
 
         with patch("api.views_api._revoke_device_tokens", side_effect=RuntimeError("injected cleanup failure")):
-            with self.assertRaisesRegex(RuntimeError, "injected cleanup failure"):
-                self.post_json(
-                    f"/api/devices/{device.pk}/assign",
-                    {"type": "user_name", "value": self.bob.username},
-                    token=admin_token,
-                )
+            failed = self.post_json(
+                f"/api/devices/{device.pk}/assign",
+                {"type": "user_name", "value": self.bob.username},
+                token=admin_token,
+            )
+        self.assertEqual(failed.status_code, 500, failed.content)
+        self.assertEqual(failed.json()["code"], "internal_server_error")
+        self.assertTrue(failed.json()["retryable"])
+        self.assertNotIn(b"injected cleanup failure", failed.content)
 
         device.refresh_from_db()
         self.assertEqual(device.owner_id, self.alice.pk)
@@ -125,8 +128,11 @@ class TokenSubjectIntegrityTests(TestCase):
         device = RemoteDevice.objects.get(rid="800000014")
 
         with patch("api.views_api._revoke_device_tokens", side_effect=RuntimeError("injected cleanup failure")):
-            with self.assertRaisesRegex(RuntimeError, "injected cleanup failure"):
-                self.post_json(f"/api/devices/{device.pk}/disable", {}, token=admin_token)
+            failed = self.post_json(f"/api/devices/{device.pk}/disable", {}, token=admin_token)
+        self.assertEqual(failed.status_code, 500, failed.content)
+        self.assertEqual(failed.json()["code"], "internal_server_error")
+        self.assertTrue(failed.json()["retryable"])
+        self.assertNotIn(b"injected cleanup failure", failed.content)
 
         device.refresh_from_db()
         self.assertTrue(device.is_active)

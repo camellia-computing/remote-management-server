@@ -27,6 +27,8 @@ REQUIRED_JOB_IDS = (
     "automation",
     "web_client",
     "quality",
+    "quality_python313",
+    "quality_sqlite",
     "container",
     "performance_smoke",
 )
@@ -35,7 +37,9 @@ JOB_NEEDS = {
     "dependency_review": {"classify"},
     "web_client": {"classify", "metadata"},
     "quality": {"classify", "web_client"},
-    "container": {"classify", "metadata", "web_client", "quality"},
+    "quality_python313": {"classify", "web_client"},
+    "quality_sqlite": {"classify", "web_client"},
+    "container": {"classify", "metadata", "web_client", "quality", "quality_python313", "quality_sqlite"},
     "performance_smoke": {"classify"},
 }
 JOB_GUARDS = {
@@ -43,6 +47,8 @@ JOB_GUARDS = {
     "dependency_review": "needs.classify.outputs.dependencies == 'true'",
     "web_client": "needs.classify.outputs.runtime == 'true'",
     "quality": "needs.classify.outputs.runtime == 'true'",
+    "quality_python313": "needs.classify.outputs.runtime == 'true'",
+    "quality_sqlite": "needs.classify.outputs.runtime == 'true'",
     "container": "needs.classify.outputs.runtime == 'true'",
 }
 TRUST_WORKFLOW = pathlib.PurePosixPath(".github/workflows/ci-trust.yml")
@@ -50,6 +56,7 @@ CI_WORKFLOW = pathlib.PurePosixPath(".github/workflows/ci.yml")
 TRUSTED_POLICY_FILES = (
     pathlib.PurePosixPath(".github/scripts/classify-changes.sh"),
     pathlib.PurePosixPath(".github/scripts/ci_trust_policy.py"),
+    pathlib.PurePosixPath(".github/scripts/ci_coverage_contract.py"),
 )
 RESERVED_TRUST_NAMES = ("CI Trust Boundary", "CI Trust / Required")
 
@@ -155,10 +162,12 @@ def validate_ci_workflow(text: str) -> None:
         "AUTOMATION_RESULT",
         "WEB_CLIENT_RESULT",
         "QUALITY_RESULT",
+        "QUALITY_PYTHON313_RESULT",
+        "QUALITY_SQLITE_RESULT",
         "CONTAINER_RESULT",
         "PERFORMANCE_SMOKE_RESULT",
     ):
-        if result_name not in required:
+        if not re.search(rf"\b{re.escape(result_name)}\b", required):
             raise TrustPolicyError(f"required gate does not observe {result_name}")
     for job_id, guard in JOB_GUARDS.items():
         block = _block(text, job_id)
@@ -184,8 +193,44 @@ def validate_ci_workflow(text: str) -> None:
         raise TrustPolicyError("required gate does not require the container suite")
     if 'require_success "Python and Django quality" "$QUALITY_RESULT"' not in required:
         raise TrustPolicyError("required gate does not require quality")
+    if 'require_success "Python 3.13 lower-bound quality" "$QUALITY_PYTHON313_RESULT"' not in required:
+        raise TrustPolicyError("required gate does not require the Python 3.13 lower bound")
+    if 'require_success "SQLite debug equivalence" "$QUALITY_SQLITE_RESULT"' not in required:
+        raise TrustPolicyError("required gate does not require SQLite equivalence")
     if 'if [[ "$result" != "success" ]]' not in required:
         raise TrustPolicyError("required gate must fail closed for failure, cancelled, or skipped jobs")
+    quality = _block(text, "quality")
+    for marker in (
+        "fetch-depth: 0",
+        'python-version: "3.14"',
+        "uv run coverage run --branch -m pytest --create-db",
+        "uv run coverage report",
+        'uv run coverage xml -o "$RUNNER_TEMP/coverage.xml"',
+        'COVERAGE_BASE_SHA="$(git rev-parse',
+        "uv run python .github/scripts/ci_coverage_contract.py",
+        '--base "$COVERAGE_BASE_SHA"',
+        '--head "$COVERAGE_HEAD_SHA"',
+    ):
+        if marker not in quality:
+            raise TrustPolicyError(f"quality gate lost coverage contract marker: {marker}")
+    lower_bound = _block(text, "quality_python313")
+    for marker in (
+        'python-version: "3.13"',
+        "actions/download-artifact@",
+        "uv run python -m compileall api webui2 camellia_remote_management scripts",
+        "uv run pytest --create-db",
+    ):
+        if marker not in lower_bound:
+            raise TrustPolicyError(f"Python 3.13 gate lost matrix marker: {marker}")
+    sqlite = _block(text, "quality_sqlite")
+    for marker in (
+        'CAMELLIA_REMOTE_DEBUG: "true"',
+        'python-version: "3.14"',
+        "actions/download-artifact@",
+        "uv run pytest --create-db",
+    ):
+        if marker not in sqlite:
+            raise TrustPolicyError(f"SQLite gate lost matrix marker: {marker}")
 
 
 def validate_workflow_safety(

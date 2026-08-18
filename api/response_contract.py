@@ -220,7 +220,7 @@ def apply_response_contract(request, response):
     if not streaming and "application/json" in content_type and status not in _NO_BODY_STATUSES:
         try:
             payload = json.loads(response.content.decode("utf-8"))
-        except UnicodeDecodeError, TypeError, ValueError:
+        except (UnicodeDecodeError, TypeError, ValueError):
             payload = None
 
     if (

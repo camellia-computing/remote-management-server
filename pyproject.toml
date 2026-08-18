@@ -3,7 +3,7 @@ name = "camellia-remote-management-server"
 version = "1.0.0"
 description = "Production management API and web console for Camellia Remote"
 readme = "README.md"
-requires-python = ">=3.14,<3.15"
+requires-python = ">=3.13,<3.15"
 license = "AGPL-3.0-only"
 authors = [{ name = "Camellia Computing" }]
 dependencies = [
@@ -15,10 +15,12 @@ dependencies = [
   "requests>=2.32,<3",
   "pynacl>=1.6,<2",
   "psycopg[binary]>=3.3,<4",
+  "unicodedata2==16.0.0; python_version < '3.14'",
 ]
 
 [dependency-groups]
 dev = [
+  "defusedxml>=0.7.1,<1",
   "ruff>=0.16,<0.17",
   "pytest>=9,<10",
   "pytest-django>=4.12,<5",
@@ -32,7 +34,7 @@ package = false
 required-version = ">=0.11.8,<0.13"
 
 [tool.ruff]
-target-version = "py314"
+target-version = "py313"
 line-length = 120
 extend-exclude = [
   "static",
@@ -45,6 +47,7 @@ select = ["E", "F", "B", "BLE", "C4", "I", "PIE", "RUF059", "S", "UP"]
 ignore = ["E501"]
 
 [tool.ruff.lint.per-file-ignores]
+".github/scripts/ci_coverage_contract.py" = ["S603", "S607"]
 "api/migrations/*" = ["I", "S"]
 "api/tests.py" = ["S105", "S106"]
 "api/test_shared_profile_credentials.py" = ["S105", "S106"]
@@ -62,9 +65,11 @@ python_files = ["tests.py", "test_*.py", "*_tests.py"]
 addopts = "--strict-markers --reuse-db"
 
 [tool.coverage.run]
+branch = true
 source = ["api", "webui2", "camellia_remote_management"]
 omit = [
   "*/migrations/*",
+  "*/test_*.py",
   "*/tests.py",
   "api/front_locale.py",
   "camellia_remote_management/asgi.py",
@@ -72,7 +77,17 @@ omit = [
 ]
 
 [tool.coverage.report]
-fail_under = 45
+# Branch-aware total floor is evidence-backed by the current 73.3% production baseline;
+# critical module and changed-line floors are enforced by ci_coverage_contract.
+fail_under = 70
+omit = [
+  "*/migrations/*",
+  "*/test_*.py",
+  "*/tests.py",
+  "api/front_locale.py",
+  "camellia_remote_management/asgi.py",
+  "camellia_remote_management/wsgi.py",
+]
 precision = 1
 skip_covered = true
 show_missing = true
