@@ -40,60 +40,7 @@ jobs:
           PUSH_BASE_SHA: ${{ github.event.before }}
           PUSH_HEAD_SHA: ${{ github.sha }}
         run: |
-          runtime=false
-          automation=false
-          dependencies=false
-
-          if [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
-            runtime=true
-            automation=true
-          else
-            if [[ "$EVENT_NAME" == "pull_request" ]]; then
-              base="$PR_BASE_SHA"
-              head="$PR_HEAD_SHA"
-            else
-              base="$PUSH_BASE_SHA"
-              head="$PUSH_HEAD_SHA"
-            fi
-            if [[ "$base" =~ ^0+$ ]]; then
-              base="$(git hash-object -t tree /dev/null)"
-            fi
-
-            changed_paths="$RUNNER_TEMP/api-changed-paths"
-            git diff --name-only -z "$base" "$head" > "$changed_paths"
-            while IFS= read -r -d '' path; do
-              case "$path" in
-                README.md|README_EN.md|docs/*|LICENSE|LICENSE.*|.github/ISSUE_TEMPLATE/*|.github/workflows/*|.github/dependabot.yml|scripts/release_metadata.py|scripts/test_release_metadata.py)
-                  ;;
-                *)
-                  runtime=true
-                  ;;
-              esac
-              case "$path" in
-                .github/*|scripts/*|deploy/*|docker-compose*.yml|docker-compose*.yaml|run.sh|sync_web_client.sh)
-                  automation=true
-                  ;;
-              esac
-              case "$path" in
-                pyproject.toml|uv.lock|Dockerfile|docker-compose*.yml|docker-compose*.yaml|.github/dependabot.yml|.github/actions/*|.github/workflows/*)
-                  dependencies=true
-                  ;;
-              esac
-            done < "$changed_paths"
-          fi
-
-          {
-            echo "runtime=$runtime"
-            echo "automation=$automation"
-            echo "dependencies=$dependencies"
-          } >> "$GITHUB_OUTPUT"
-          {
-            echo "### Change classification"
-            echo
-            echo "- Runtime validation: \`$runtime\`"
-            echo "- Automation validation: \`$automation\`"
-            echo "- Dependency review: \`$dependencies\`"
-          } >> "$GITHUB_STEP_SUMMARY"
+          bash .github/scripts/classify-changes.sh
 
   metadata:
     name: Validate component version
@@ -243,6 +190,7 @@ jobs:
           python3 scripts/test_postgres_container_hardening.py
           python3 scripts/test_production_compose.py
           python3 scripts/test_production_compose.py --systemd-contract
+          python3 scripts/test_ci_trust_boundary.py
           python3 scripts/test_systemd_maintenance.py
           python3 .github/scripts/test_manage_release.py
           python3 .github/scripts/test_container_release_evidence.py

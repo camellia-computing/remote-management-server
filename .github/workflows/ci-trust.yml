@@ -1,0 +1,84 @@
+name: CI Trust Boundary
+
+on:
+  # This workflow is intentionally base-owned.  It is later pinned by the
+  # repository/org ruleset; pull_request_target loads this file from the base,
+  # never from the pull request head.
+  pull_request_target:
+  merge_group:
+
+permissions:
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: remote-management-ci-trust-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    name: CI Trust / Required
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Checkout immutable base policy
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ github.repository }}
+          ref: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.sha }}
+          path: trusted
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Checkout candidate as inert data
+        if: github.event_name == 'pull_request_target'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ github.event.pull_request.head.repo.full_name }}
+          ref: ${{ github.event.pull_request.head.sha }}
+          path: candidate
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Checkout merge-group candidate as inert data
+        if: github.event_name == 'merge_group'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ github.repository }}
+          ref: ${{ github.event.merge_group.head_sha || github.sha }}
+          path: candidate
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Read changed paths without executing candidate code
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.event.merge_group.head_sha || github.sha }}
+        run: |
+          set -euo pipefail
+          umask 077
+          if [[ "$EVENT_NAME" == "pull_request_target" ]]; then
+            gh api --paginate \
+              "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER/files?per_page=100" \
+              --jq '.[].filename' > "$RUNNER_TEMP/changed-paths"
+          else
+            git -C trusted fetch --no-tags --depth=1 origin "$HEAD_SHA"
+            git -C trusted diff --no-ext-diff --name-only "$BASE_SHA" "$HEAD_SHA" > "$RUNNER_TEMP/changed-paths"
+          fi
+          test -s "$RUNNER_TEMP/changed-paths"
+
+      - name: Verify candidate CI trust contract
+        run: |
+          set -euo pipefail
+          mapfile -t changed < "$RUNNER_TEMP/changed-paths"
+          args=()
+          for path in "${changed[@]}"; do
+            args+=(--changed-path "$path")
+          done
+          python3 trusted/.github/scripts/ci_trust_policy.py \
+            --base-dir trusted \
+            --candidate-dir candidate \
+            "${args[@]}"

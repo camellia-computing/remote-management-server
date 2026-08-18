@@ -18,6 +18,27 @@ uv run ruff check .
 uv run pytest
 ```
 
+## CI trust boundary
+
+`.github/workflows/ci-trust.yml` is a base-owned `pull_request_target`
+verifier. It executes only the frozen base copy of
+`.github/scripts/ci_trust_policy.py`; the candidate checkout is treated as
+inert data. The policy rejects removal of `web_client`, `quality`, `container`,
+or the `CI / Required` dependencies, failure/cancellation being treated as a
+skip, token permission expansion, a forged `CI Trust / Required` identity, and
+rewrites of the classifier/trust policy itself. Any workflow, reusable action,
+or CI policy-script change is classified into the complete Web, quality,
+container, deployment, and performance runtime suite. Only documentation-only
+changes may use the lightweight path.
+
+The trust workflow must first land on protected `main`, then be required by the
+repository ruleset as `CI Trust / Required`; a workflow-only PR must not be able
+to self-create its own trusted green check. This organization is currently on
+GitHub Free, so organization-level required workflows are unavailable. Until an
+upgrade, retain the base-owned verifier, dedicated workflow CODEOWNERS, at least
+two independent reviewers, and an expected-source ruleset entry; the candidate
+`CI / Required` check is never sufficient as the sole trust boundary.
+
 ## Production
 
 Copy `.env.example` to a mode-`0600` secret file and set every required value, especially `CAMELLIA_REMOTE_SECRET_KEY`, the stable lowercase `CAMELLIA_REMOTE_DATA_ENCRYPTION_KEY_ID`, its canonical 32-byte Base64 `CAMELLIA_REMOTE_DATA_ENCRYPTION_KEY`, `CAMELLIA_REMOTE_DATA_ENCRYPTION_V1_KEY_ID`, `CAMELLIA_REMOTE_DEVICE_VERIFICATION_TOKEN`, PostgreSQL connection parameters, explicit public HTTPS origins, WSS rendezvous endpoints with ports, and the canonical 32-byte Base64 `CAMELLIA_REMOTE_RS_PUB_KEY`. A non-Compose process uses either `CAMELLIA_REMOTE_DATABASE_URL` or the complete `HOST/PORT/NAME/USER/PASSWORD` settings, never both. Production Compose instead requires five distinct `BOOTSTRAP/MIGRATION/RUNTIME/BACKUP/PROBE_USER/PASSWORD` pairs; all usernames and passwords must differ, and every password is at least 16 characters. On the first upgrade of an existing volume, the bootstrap pair must name that cluster's current superuser. Keep it as root-only, audited break-glass material: it is passed only to PostgreSQL initialization and the one-shot bootstrap client, never to Management, migration, backup, or probe. Compose uses discrete parameters, so URL-reserved characters in strong passwords need no encoding. Production requires TLS. Invalid booleans, integers, log levels, and time zones stop startup rather than silently falling back. Never place secrets in images, Git, or shell history. Configure all OIDC values together. Unknown OIDC subjects are denied unless pre-bound in Django Admin. Auto-provisioning must be explicitly enabled with at least one exact verified-email domain or JSON claim allowlist; every configured claim is required, and policy-managed identities are rechecked on every login.

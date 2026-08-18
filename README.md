@@ -33,6 +33,23 @@ uv run pytest
 python scripts/test_release_metadata.py
 ```
 
+## CI 信任边界
+
+`.github/workflows/ci-trust.yml` 是只从目标分支 base 提交加载的
+`pull_request_target` 审查器。它只执行 base 中冻结的
+`.github/scripts/ci_trust_policy.py`，把候选 workflow 当作不可执行数据读取，
+并拒绝删除 `web_client`、`quality`、`container` 或 `CI / Required` 聚合依赖，
+拒绝把失败/取消伪装成 skipped、扩大 token 权限、伪造 `CI Trust / Required`，
+以及改写 classifier/trust policy 本身。任何 workflow、复用 action 或 CI policy
+脚本变更都会由 classifier 强制进入完整 Web、quality、container、deployment
+和 performance runtime suite；仅文档变更才可使用轻量路径。
+
+该 trust workflow 必须在受保护的 `main` 上先落地，再由仓库 ruleset 要求
+`CI Trust / Required`（workflow-only PR 不能依靠候选 workflow 自己创建同名绿灯）。
+组织目前为 GitHub Free，无法启用组织级 required workflow；在升级前必须同时
+保持 base-owned verifier、workflow 专属 CODEOWNER、至少两名独立审查人与
+ruleset 的 expected-source 配置，不能把候选 `CI / Required` 单独视为信任边界。
+
 `[tool.uv].required-version` 暂时允许 `>=0.11.8,<0.13`：截至
 2026-07-30，GitHub 托管的 Dependabot uv 更新器仍使用 0.11.8，精确要求
 0.12.0 会使自动依赖更新失败。CI 仍精确安装 0.12.0；托管更新器支持该版本后
