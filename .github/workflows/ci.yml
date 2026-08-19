@@ -195,6 +195,7 @@ jobs:
           python3 scripts/test_compose_operation_runner.py
           python3 scripts/test_database_roles.py
           python3 scripts/test_deployment_gate.py
+          python3 scripts/test_dynamic_boundary_policy.py
           python3 scripts/test_postgres_container_hardening.py
           python3 scripts/test_production_compose.py
           python3 scripts/test_production_compose.py --systemd-contract

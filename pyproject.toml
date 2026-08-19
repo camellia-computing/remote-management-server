@@ -25,6 +25,7 @@ dev = [
   "pytest>=9,<10",
   "pytest-django>=4.12,<5",
   "coverage>=7.15,<8",
+  "hypothesis>=6.138,<7",
 ]
 
 [tool.uv]
