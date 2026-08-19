@@ -48,6 +48,7 @@ from api.models import (
 )
 from api.policy_generation import InvalidManagedPolicy
 from api.tag_colors import normalize_tag_color, tag_color_css
+from api.test_support import reset_data_encryption_key_inventory
 from api.views_api import _audit_enum, _audit_uuid4, _json_value, _valid_ab_rule
 from api.views_front import _parse_rule
 from api.xlsx import spreadsheet_safe_value
@@ -2342,6 +2343,7 @@ class SensitiveIngestionTests(ApiTestMixin, TestCase):
 
 class OperationalEndpointTests(TestCase):
     def setUp(self):
+        reset_data_encryption_key_inventory()
         self.recording_root = tempfile.TemporaryDirectory()
         self.recording_settings = override_settings(
             RECORD_UPLOAD_ROOT=Path(self.recording_root.name),
@@ -2437,6 +2439,9 @@ class OperationalEndpointTests(TestCase):
 
 
 class DataEncryptionRotationTests(TestCase):
+    def setUp(self):
+        reset_data_encryption_key_inventory()
+
     def test_rotation_rewraps_recording_data_keys_before_retiring_the_old_kek(self):
         encoded_data_key = recording_crypto.encode_data_key(b"d" * recording_crypto.DATA_KEY_BYTES)
         storage_object_id = uuid.uuid4()
