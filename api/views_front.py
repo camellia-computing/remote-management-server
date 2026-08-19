@@ -164,7 +164,7 @@ def _load_ab_audit_cursor(value, search_term):
         audit_id = int(payload["id"])
         if not timezone.is_aware(created_at) or audit_id < 1:
             raise ValueError("invalid cursor boundary")
-    except KeyError, TypeError, ValueError, signing.BadSignature:
+    except (KeyError, TypeError, ValueError, signing.BadSignature):
         return None
     return payload["direction"], created_at, audit_id
 
@@ -315,7 +315,7 @@ def user_register(request):
             password=password1,
             is_active=True,
         )
-    except IntegrityError, ValidationError:
+    except (IntegrityError, ValidationError):
         result["msg"] = _("用户名已存在。")
         _log_event(request, "front_register_failed", level="warning", username=username, reason="username_exists")
         return JsonResponse(result, status=409)
@@ -521,7 +521,7 @@ def _ab_accessible_profiles(user, filter_q=None):
 def _parse_rule(value):
     try:
         rule = int(value)
-    except TypeError, ValueError:
+    except (TypeError, ValueError):
         return 1
     return rule if rule in (1, 2, 3) else 1
 

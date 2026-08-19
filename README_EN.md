@@ -6,7 +6,7 @@ The service listens on port 21114 behind a TLS reverse proxy. Keep PostgreSQL an
 
 ## Development
 
-Use Python 3.14, uv 0.12.0, and PostgreSQL 18. Username identity v1 is pinned to Python 3.14's Unicode 16.0.0 data; other Unicode data versions fail closed. For an isolated SQLite development run:
+The primary quality gate uses Python 3.14 and the supported lower bound is Python 3.13, with uv 0.12.0 and PostgreSQL 18. Username identity v1 is pinned to Unicode 16.0.0: Python 3.14 uses the standard library and Python 3.13 uses the exact `unicodedata2==16.0.0` lock. Missing or different Unicode data versions fail closed during migration and startup checks. For an isolated SQLite development run:
 
 ```bash
 uv sync --locked --all-groups
@@ -17,6 +17,27 @@ uv run ruff format --check .
 uv run ruff check .
 uv run pytest
 ```
+
+## CI trust boundary
+
+`.github/workflows/ci-trust.yml` is a base-owned `pull_request_target`
+verifier. It executes only the frozen base copy of
+`.github/scripts/ci_trust_policy.py`; the candidate checkout is treated as
+inert data. The policy rejects removal of `web_client`, `quality`, `container`,
+or the `CI / Required` dependencies, failure/cancellation being treated as a
+skip, token permission expansion, a forged `CI Trust / Required` identity, and
+rewrites of the classifier/trust policy itself. Any workflow, reusable action,
+or CI policy-script change is classified into the complete Web, quality,
+container, deployment, and performance runtime suite. Only documentation-only
+changes may use the lightweight path.
+
+The trust workflow must first land on protected `main`, then be required by the
+repository ruleset as `CI Trust / Required`; a workflow-only PR must not be able
+to self-create its own trusted green check. This organization is currently on
+GitHub Free, so organization-level required workflows are unavailable. Until an
+upgrade, retain the base-owned verifier, dedicated workflow CODEOWNERS, at least
+two independent reviewers, and an expected-source ruleset entry; the candidate
+`CI / Required` check is never sufficient as the sole trust boundary.
 
 ## Production
 
@@ -77,6 +98,8 @@ Recording ingestion accepts only upload protocol `version=2`; legacy `new/part/t
 Every `/api/record` POST requires exactly one valid decimal and accurate `Content-Length`, including an explicit `Content-Length: 0` for empty create, status, finalize, and abort bodies. Before storage admission or any filesystem/database mutation, Management rejects Transfer-Encoding/chunked with 400, a missing or empty length with 411, an invalid or ambiguous length with 400, and a length above the configured chunk limit with 413. The query length must still exactly match both the transport length and bytes actually read. The production TLS edge must buffer HTTP/1.1 chunked or HTTP/2 DATA within the hard `CAMELLIA_REMOTE_RECORD_UPLOAD_MAX_CHUNK_BYTES` limit, remove Transfer-Encoding, and emit exactly one accurate Content-Length; if it cannot establish that boundary, it must reject the request before proxying instead of streaming it to Gunicorn. Gunicorn must remain reachable only from the trusted internal edge. Its duplicate-CL and CL+TE parser rejection is defense in depth, not a replacement for the edge contract. The current Client sends fixed `Bytes`/`Vec` bodies, for which reqwest emits an accurate Content-Length, so no legacy transport mode is retained.
 
 Install `docker-compose.yaml`, `deploy/bootstrap-postgres-roles.sh`, `deploy/run-compose-operation.sh`, `deploy/backup-postgres.sh`, `deploy/run-cleanup.sh`, `deploy/run-maintenance-backup.sh`, `deploy/run-maintenance-cleanup.sh`, `deploy/check-maintenance-freshness.sh`, `deploy/maintenance-ledger-notify.sh`, `deploy/restore-postgres.sh`, `deploy/management-maintenance-guard.sh`, `deploy/management-maintenance.sh`, `deploy/start-management-stack.sh`, `deploy/check-management-health.sh`, `deploy/supervise-management-stack.sh`, `deploy/stop-management-stack.sh`, `deploy/shutdown-budget.sh`, `scripts/backup_envelope.py`, `scripts/maintenance_ledger.py`, and `deploy/systemd/*` as documented in the Chinese README. Pin `CAMELLIA_REMOTE_MANAGEMENT_IMAGE` to a published `sha256` digest. The systemd stack has no online reload entry point. `CAMELLIA_REMOTE_GUNICORN_GRACEFUL_TIMEOUT_SECONDS` is the only tunable application drain window; `deploy/shutdown-budget.sh` derives Docker grace as `G+15s` and validates the fixed 660-second systemd outer budget. Compose `stop_grace_period`, the controller's `docker compose stop`, and systemd `ExecStopPost` all use that validated result, and any drift fails closed before Gunicorn binds or Docker mutates the stack. Every start uses a single-flight controller that stops the old Management container, starts PostgreSQL without waiting for the not-yet-created probe role, and uses the bootstrap superuser to converge role flags, memberships, database/schema/object ownership, current ACLs, and migration-owner default ACLs in one advisory-locked transaction. It then requires an authenticated probe and runs `migrate_with_lease` only as the migration owner. That command holds the fixed `CAMELLIA` PostgreSQL session advisory lock around the complete Django plan, reports the release revision, actor, operation ID, holder backend, and a five-second wait heartbeat, and exits 75 after the bounded `CAMELLIA_REMOTE_MIGRATION_LOCK_TIMEOUT_SECONDS` deadline. PostgreSQL releases the lease if the holder connection disappears; a follower constructs a fresh executor and plan only after it acquires the lease. The controller converges and probes again, and starts Management with only the runtime DML credential and `restart: no`. Runtime never owns the database, schema, or tables and remains `NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS`; its access to `django_migrations` is read-only so it cannot forge the schema ledger. `check_release_schema` compares the exact migration set and leaves plus critical table, column, type, validated-constraint, and ready-index capabilities against the versioned release manifest before Gunicorn binds. `/health/ready` continuously applies the same fail-closed contract, so missing, extra, forked, or physically drifted schema is not ready. Backup is read-only and probe has no public-schema or business-table access. Deployment and maintenance enter/leave share a protected deployment lock, and an active maintenance lease rejects startup before Docker is invoked. Docker Engine or a container restart therefore cannot bring Management up without the migration and role gate. Rotate a limited-role password by changing the protected environment file and running the controller while offline; convergence invalidates the old password. Application failure must alert and enter this controlled start path instead of using an Engine restart policy.
+
+Production keeps `CAMELLIA_REMOTE_MANAGEMENT_PULL_POLICY=always` so the signed release digest is resolved from the configured registry. The isolated CI lifecycle sets it to `never` only for the just-built, non-published local image while exercising the same production Compose file; never copy that override into production.
 
 The bundled PostgreSQL 18 service separates volume initialization from its long-lived privilege boundary. When PostgreSQL is not running, the controller first invokes the networkless `postgres-data-bootstrap` one-shot. It has a read-only rootfs, drops all defaults, adds only `CHOWN`, `DAC_OVERRIDE`, and `FOWNER`, rejects symlinks in the volume, and converges the fixed PG18 directory and existing volume contents to numeric `70:70`. The chown job is never mounted while PostgreSQL is serving. The long-lived `postgres` process is `70:70` from entrypoint start, has a read-only rootfs, `CapEff=0`, and no-new-privileges, and may write only PGDATA, `/tmp`, `/var/run/postgresql`, and Docker-managed `/dev/shm`. It publishes no host port and remains on the internal backend network. The UID/GID and `PGDATA=/var/lib/postgresql/18/docker` are fixed image/volume contracts, with no legacy-layout or configurable-UID shim. A future image major, UID, or data-layout change requires a separate offline migration with complete restore and crash-recovery evidence; never recursively chown a live volume.
 

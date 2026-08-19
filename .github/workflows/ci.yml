@@ -40,60 +40,7 @@ jobs:
           PUSH_BASE_SHA: ${{ github.event.before }}
           PUSH_HEAD_SHA: ${{ github.sha }}
         run: |
-          runtime=false
-          automation=false
-          dependencies=false
-
-          if [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
-            runtime=true
-            automation=true
-          else
-            if [[ "$EVENT_NAME" == "pull_request" ]]; then
-              base="$PR_BASE_SHA"
-              head="$PR_HEAD_SHA"
-            else
-              base="$PUSH_BASE_SHA"
-              head="$PUSH_HEAD_SHA"
-            fi
-            if [[ "$base" =~ ^0+$ ]]; then
-              base="$(git hash-object -t tree /dev/null)"
-            fi
-
-            changed_paths="$RUNNER_TEMP/api-changed-paths"
-            git diff --name-only -z "$base" "$head" > "$changed_paths"
-            while IFS= read -r -d '' path; do
-              case "$path" in
-                README.md|README_EN.md|docs/*|LICENSE|LICENSE.*|.github/ISSUE_TEMPLATE/*|.github/workflows/*|.github/dependabot.yml|scripts/release_metadata.py|scripts/test_release_metadata.py)
-                  ;;
-                *)
-                  runtime=true
-                  ;;
-              esac
-              case "$path" in
-                .github/*|scripts/*|deploy/*|docker-compose*.yml|docker-compose*.yaml|run.sh|sync_web_client.sh)
-                  automation=true
-                  ;;
-              esac
-              case "$path" in
-                pyproject.toml|uv.lock|Dockerfile|docker-compose*.yml|docker-compose*.yaml|.github/dependabot.yml|.github/actions/*|.github/workflows/*)
-                  dependencies=true
-                  ;;
-              esac
-            done < "$changed_paths"
-          fi
-
-          {
-            echo "runtime=$runtime"
-            echo "automation=$automation"
-            echo "dependencies=$dependencies"
-          } >> "$GITHUB_OUTPUT"
-          {
-            echo "### Change classification"
-            echo
-            echo "- Runtime validation: \`$runtime\`"
-            echo "- Automation validation: \`$automation\`"
-            echo "- Dependency review: \`$dependencies\`"
-          } >> "$GITHUB_STEP_SUMMARY"
+          bash .github/scripts/classify-changes.sh
 
   metadata:
     name: Validate component version
@@ -203,6 +150,14 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Set up uv for policy contract tests
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          version: "0.12.0"
+          python-version: "3.14"
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
       - name: Audit workflow security
         uses: zizmorcore/zizmor-action@6fc4b006235f201fdab3722e17240ab420d580e5 # v0.6.1
         with:
@@ -240,7 +195,12 @@ jobs:
           python3 scripts/test_compose_operation_runner.py
           python3 scripts/test_database_roles.py
           python3 scripts/test_deployment_gate.py
+          python3 scripts/test_dynamic_boundary_policy.py
           python3 scripts/test_postgres_container_hardening.py
+          python3 scripts/test_production_compose.py
+          python3 scripts/test_production_compose.py --systemd-contract
+          python3 scripts/test_ci_trust_boundary.py
+          uv run --locked python scripts/test_coverage_contract.py
           python3 scripts/test_systemd_maintenance.py
           python3 .github/scripts/test_manage_release.py
           python3 .github/scripts/test_container_release_evidence.py
@@ -248,6 +208,15 @@ jobs:
           bash .github/scripts/tests/test_resolve_container_registries.sh
           bash .github/scripts/tests/test_verify_release_image.sh
           bash -n .github/scripts/publish-container-release.sh
+
+      - name: Validate Remote system preflight inputs
+        env:
+          REMOTE_REPOSITORY_MAP: ${{ vars.REMOTE_REPOSITORY_MAP }}
+        run: |
+          python3 scripts/test_remote_system_contract.py
+          python3 scripts/remote_system_contract.py \
+            --repository-map "$REMOTE_REPOSITORY_MAP" \
+            --current-repository "$GITHUB_REPOSITORY"
 
       - name: Validate deployment configuration
         env:
@@ -352,6 +321,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          fetch-depth: 0
           persist-credentials: false
 
       - name: Download Web runtime
@@ -364,6 +334,7 @@ jobs:
         uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
         with:
           version: "0.12.0"
+          python-version: "3.14"
           enable-cache: true
           cache-dependency-glob: uv.lock
 
@@ -426,33 +397,141 @@ jobs:
           uv run python scripts/test_database_roles.py
 
       - name: Tests
+        env:
+          COVERAGE_BASE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
+          COVERAGE_HEAD_SHA: ${{ github.sha }}
         run: |
-          uv run coverage run -m pytest --create-db
+          if [[ ! "$COVERAGE_BASE_SHA" =~ ^[0-9a-f]{40}$ || "$COVERAGE_BASE_SHA" == "0000000000000000000000000000000000000000" ]]; then
+            COVERAGE_BASE_SHA="$(git rev-parse "${COVERAGE_HEAD_SHA}^")"
+          fi
+          uv run coverage run --branch -m pytest --create-db
           uv run coverage report
+          uv run coverage xml -o "$RUNNER_TEMP/coverage.xml"
+          uv run python .github/scripts/ci_coverage_contract.py \
+            --coverage-xml "$RUNNER_TEMP/coverage.xml" \
+            --base "$COVERAGE_BASE_SHA" \
+            --head "$COVERAGE_HEAD_SHA"
 
-  container:
-    name: Container smoke test
+      - name: Upload coverage evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: management-coverage-${{ github.sha }}
+          path: ${{ runner.temp }}/coverage.xml
+          if-no-files-found: warn
+          retention-days: 14
+
+  quality_sqlite:
+    name: SQLite debug equivalence
     if: needs.classify.outputs.runtime == 'true'
-    needs: [classify, metadata, web_client, quality]
+    needs: [classify, web_client]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      CAMELLIA_REMOTE_DEBUG: "true"
+      CAMELLIA_REMOTE_SECRET_KEY: ci-only-sqlite-secret-key
+      CAMELLIA_REMOTE_ALLOWED_HOSTS: "127.0.0.1,localhost"
+      CAMELLIA_REMOTE_CSRF_TRUSTED_ORIGINS: "http://127.0.0.1:21114"
+      CAMELLIA_REMOTE_DEVICE_VERIFICATION_TOKEN: ci-device-verification-token-with-sufficient-length
+      CAMELLIA_REMOTE_RECORD_VOLUME_RESERVE_BYTES: "0"
+      CAMELLIA_REMOTE_RECORD_VOLUME_RESERVE_INODES: "0"
+      CAMELLIA_REMOTE_RATE_LIMIT_ENABLED: "true"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Download Web runtime
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: camellia-remote-web-${{ needs.web_client.outputs.revision }}
+          path: static/web_client
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          version: "0.12.0"
+          python-version: "3.14"
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Install dependencies
+        run: uv sync --locked --all-groups
+
+      - name: Static analysis
+        run: |
+          uv run python -m compileall api webui2 camellia_remote_management scripts
+          uv run ruff check api webui2 camellia_remote_management scripts
+
+      - name: Run SQLite debug matrix
+        env:
+          CAMELLIA_REMOTE_SQLITE_DB_PATH: ${{ runner.temp }}/camellia-remote-debug.sqlite3
+          CAMELLIA_REMOTE_RECORD_UPLOAD_ROOT: ${{ runner.temp }}/camellia-remote-records
+        run: uv run pytest --create-db
+
+  quality_python313:
+    name: Python 3.13 lower-bound quality
+    if: needs.classify.outputs.runtime == 'true'
+    needs: [classify, web_client]
     runs-on: ubuntu-24.04
     timeout-minutes: 30
-    env:
-      POSTGRES_HARDENING_PROJECT: camellia-remote-pg-${{ github.run_id }}-${{ github.run_attempt }}
     services:
       postgres:
         image: postgres:18-alpine@sha256:9a8afca54e7861fd90fab5fdf4c42477a6b1cb7d293595148e674e0a3181de15
         env:
-          POSTGRES_DB: camellia_remote_container_ci
-          POSTGRES_USER: camellia_remote_container_ci
+          POSTGRES_DB: camellia_remote_ci
+          POSTGRES_USER: camellia_remote_ci
           POSTGRES_PASSWORD: ci-postgres-password
           POSTGRES_INITDB_ARGS: --encoding=UTF8 --locale-provider=builtin --builtin-locale=C.UTF-8
         ports:
           - 5432:5432
         options: >-
-          --health-cmd "pg_isready -U camellia_remote_container_ci -d camellia_remote_container_ci"
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 12
+          --health-cmd "pg_isready -U camellia_remote_ci -d camellia_remote_ci"
+          --health-interval 5s --health-timeout 5s --health-retries 12
+    env:
+      CAMELLIA_REMOTE_DEBUG: "true"
+      CAMELLIA_REMOTE_SECRET_KEY: ci-only-python313-secret-key
+      CAMELLIA_REMOTE_ALLOWED_HOSTS: "127.0.0.1,localhost"
+      CAMELLIA_REMOTE_CSRF_TRUSTED_ORIGINS: "http://127.0.0.1:21114"
+      CAMELLIA_REMOTE_DATABASE_URL: postgres://camellia_remote_ci:ci-postgres-password@127.0.0.1:5432/camellia_remote_ci
+      CAMELLIA_REMOTE_DATABASE_SSLMODE: disable
+      CAMELLIA_REMOTE_DEVICE_VERIFICATION_TOKEN: ci-device-verification-token-with-sufficient-length
+      CAMELLIA_REMOTE_RECORD_VOLUME_RESERVE_BYTES: "0"
+      CAMELLIA_REMOTE_RECORD_VOLUME_RESERVE_INODES: "0"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Download Web runtime
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: camellia-remote-web-${{ needs.web_client.outputs.revision }}
+          path: static/web_client
+      - name: Set up uv
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          version: "0.12.0"
+          python-version: "3.13"
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+      - name: Install dependencies
+        run: uv sync --locked --all-groups
+      - name: Verify Python 3.13 syntax floor
+        run: uv run python -m compileall api webui2 camellia_remote_management scripts
+      - name: Run Python 3.13 matrix
+        run: uv run pytest --create-db
+
+  container:
+    name: Container smoke test
+    if: needs.classify.outputs.runtime == 'true'
+    needs: [classify, metadata, web_client, quality, quality_python313, quality_sqlite]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      POSTGRES_HARDENING_PROJECT: camellia-remote-pg-${{ github.run_id }}-${{ github.run_attempt }}
+      PRODUCTION_COMPOSE_PROJECT: camellia-remote-management-${{ github.run_id }}-${{ github.run_attempt }}
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -503,127 +582,43 @@ jobs:
             --runtime \
             --project-name "$POSTGRES_HARDENING_PROJECT"
 
-      - name: Create smoke-test volumes
+      - name: Prepare production Compose integration
         run: |
-          docker volume create camellia-remote-management-ci-records
+          set -euo pipefail
+          python3 scripts/test_production_compose.py \
+            --prepare-env \
+            --env-file "$RUNNER_TEMP/production-compose.env" \
+            --image camellia-remote-management-server:ci \
+            --revision "$GITHUB_SHA"
+          cat > "$RUNNER_TEMP/docker-wrapper" <<'EOF'
+          #!/bin/sh
+          exec /usr/bin/docker "$@"
+          EOF
+          chmod 0755 "$RUNNER_TEMP/docker-wrapper"
+          mkdir -p "$RUNNER_TEMP/production-compose-run"
 
-      - name: Bootstrap least-privilege container database roles
-        run: |
-          docker run --rm \
-            --network host \
-            --entrypoint /bin/sh \
-            -v "$PWD/deploy/bootstrap-postgres-roles.sh:/bootstrap-postgres-roles.sh:ro" \
-            -e PGHOST=127.0.0.1 \
-            -e PGPORT=5432 \
-            -e PGDATABASE=camellia_remote_container_ci \
-            -e PGUSER=camellia_remote_container_ci \
-            -e PGPASSWORD=ci-postgres-password \
-            -e CAMELLIA_REMOTE_DATABASE_MIGRATION_USER=container_ci_migration \
-            -e CAMELLIA_REMOTE_DATABASE_MIGRATION_PASSWORD=ci-migration-password-02 \
-            -e CAMELLIA_REMOTE_DATABASE_RUNTIME_USER=container_ci_runtime \
-            -e CAMELLIA_REMOTE_DATABASE_RUNTIME_PASSWORD=ci-runtime-password-03 \
-            -e CAMELLIA_REMOTE_DATABASE_BACKUP_USER=container_ci_backup \
-            -e CAMELLIA_REMOTE_DATABASE_BACKUP_PASSWORD=ci-backup-password-04 \
-            -e CAMELLIA_REMOTE_DATABASE_PROBE_USER=container_ci_probe \
-            -e CAMELLIA_REMOTE_DATABASE_PROBE_PASSWORD=ci-probe-password-05 \
-            postgres:18-alpine@sha256:9a8afca54e7861fd90fab5fdf4c42477a6b1cb7d293595148e674e0a3181de15 \
-            /bootstrap-postgres-roles.sh
+      - name: Verify isolated systemd contract
+        run: python3 scripts/test_production_compose.py --systemd-contract
 
-      - name: Migrate container database
+      - name: Run production Compose lifecycle
         run: |
-          docker run --rm \
-            --network host \
-            -e CAMELLIA_REMOTE_DEBUG=false \
-            -e CAMELLIA_REMOTE_SECRET_KEY=ci-only-production-secret-key-with-sufficient-length-000 \
-            -e CAMELLIA_REMOTE_DATA_ENCRYPTION_KEY_ID=ci-primary-v1 \
-            -e CAMELLIA_REMOTE_DATA_ENCRYPTION_KEY=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA= \
-            -e CAMELLIA_REMOTE_DATA_ENCRYPTION_V1_KEY_ID=ci-primary-v1 \
-            -e CAMELLIA_REMOTE_DEVICE_VERIFICATION_TOKEN=ci-device-verification-token-with-sufficient-length \
-            -e CAMELLIA_REMOTE_DATABASE_URL=postgres://container_ci_migration:ci-migration-password-02@127.0.0.1:5432/camellia_remote_container_ci \
-            -e CAMELLIA_REMOTE_DATABASE_SSLMODE=disable \
-            -e CAMELLIA_REMOTE_ALLOWED_HOSTS=127.0.0.1,localhost \
-            -e CAMELLIA_REMOTE_CSRF_TRUSTED_ORIGINS=https://api.example.test \
-            -e CAMELLIA_REMOTE_API_SERVER=https://api.example.test \
-            -e CAMELLIA_REMOTE_ID_SERVER=wss://remote.example.test:443 \
-            -e CAMELLIA_REMOTE_RS_PUB_KEY=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA= \
-            -e CAMELLIA_REMOTE_SECURE_TLS=true \
-            -v camellia-remote-management-ci-records:/app/records \
-            camellia-remote-management-server:ci \
-            python manage.py migrate_with_lease --noinput --actor ci-container
+          python3 scripts/test_production_compose.py \
+            --run \
+            --project-dir "$GITHUB_WORKSPACE" \
+            --env-file "$RUNNER_TEMP/production-compose.env" \
+            --project-name "$PRODUCTION_COMPOSE_PROJECT" \
+            --runtime-dir "$RUNNER_TEMP/production-compose-run" \
+            --docker "$RUNNER_TEMP/docker-wrapper" \
+            --evidence "$RUNNER_TEMP/production-compose-evidence.json"
 
-      - name: Converge post-migration ACLs and reject runtime DDL
-        run: |
-          docker run --rm \
-            --network host \
-            --entrypoint /bin/sh \
-            -v "$PWD/deploy/bootstrap-postgres-roles.sh:/bootstrap-postgres-roles.sh:ro" \
-            -e PGHOST=127.0.0.1 \
-            -e PGPORT=5432 \
-            -e PGDATABASE=camellia_remote_container_ci \
-            -e PGUSER=camellia_remote_container_ci \
-            -e PGPASSWORD=ci-postgres-password \
-            -e CAMELLIA_REMOTE_DATABASE_MIGRATION_USER=container_ci_migration \
-            -e CAMELLIA_REMOTE_DATABASE_MIGRATION_PASSWORD=ci-migration-password-02 \
-            -e CAMELLIA_REMOTE_DATABASE_RUNTIME_USER=container_ci_runtime \
-            -e CAMELLIA_REMOTE_DATABASE_RUNTIME_PASSWORD=ci-runtime-password-03 \
-            -e CAMELLIA_REMOTE_DATABASE_BACKUP_USER=container_ci_backup \
-            -e CAMELLIA_REMOTE_DATABASE_BACKUP_PASSWORD=ci-backup-password-04 \
-            -e CAMELLIA_REMOTE_DATABASE_PROBE_USER=container_ci_probe \
-            -e CAMELLIA_REMOTE_DATABASE_PROBE_PASSWORD=ci-probe-password-05 \
-            postgres:18-alpine@sha256:9a8afca54e7861fd90fab5fdf4c42477a6b1cb7d293595148e674e0a3181de15 \
-            /bootstrap-postgres-roles.sh
-          if docker run --rm \
-            --network host \
-            -e PGHOST=127.0.0.1 \
-            -e PGPORT=5432 \
-            -e PGDATABASE=camellia_remote_container_ci \
-            -e PGUSER=container_ci_runtime \
-            -e PGPASSWORD=ci-runtime-password-03 \
-            postgres:18-alpine@sha256:9a8afca54e7861fd90fab5fdf4c42477a6b1cb7d293595148e674e0a3181de15 \
-            psql --no-psqlrc --set=ON_ERROR_STOP=1 \
-              --command 'CREATE TABLE public.runtime_must_not_create_tables(id integer)'; then
-            echo "runtime database role unexpectedly created a table" >&2
-            exit 1
-          fi
-
-      - name: Start hardened container
-        run: |
-          docker run -d \
-            --name camellia-remote-management-ci \
-            --network host \
-            --read-only \
-            --tmpfs /tmp:size=128m,mode=1777 \
-            --cap-drop ALL \
-            --security-opt no-new-privileges:true \
-            -e CAMELLIA_REMOTE_DEBUG=false \
-            -e CAMELLIA_REMOTE_SECRET_KEY=ci-only-production-secret-key-with-sufficient-length-000 \
-            -e CAMELLIA_REMOTE_DATA_ENCRYPTION_KEY_ID=ci-primary-v1 \
-            -e CAMELLIA_REMOTE_DATA_ENCRYPTION_KEY=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA= \
-            -e CAMELLIA_REMOTE_DATA_ENCRYPTION_V1_KEY_ID=ci-primary-v1 \
-            -e CAMELLIA_REMOTE_DEVICE_VERIFICATION_TOKEN=ci-device-verification-token-with-sufficient-length \
-            -e CAMELLIA_REMOTE_DATABASE_URL=postgres://container_ci_runtime:ci-runtime-password-03@127.0.0.1:5432/camellia_remote_container_ci \
-            -e CAMELLIA_REMOTE_DATABASE_SSLMODE=disable \
-            -e CAMELLIA_REMOTE_ALLOWED_HOSTS=127.0.0.1,localhost \
-            -e CAMELLIA_REMOTE_CSRF_TRUSTED_ORIGINS=https://api.example.test \
-            -e CAMELLIA_REMOTE_API_SERVER=https://api.example.test \
-            -e CAMELLIA_REMOTE_ID_SERVER=wss://remote.example.test:443 \
-            -e CAMELLIA_REMOTE_RS_PUB_KEY=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA= \
-            -e CAMELLIA_REMOTE_SECURE_TLS=true \
-            -e CAMELLIA_REMOTE_GUNICORN_WORKERS=1 \
-            -v camellia-remote-management-ci-records:/app/records \
-            camellia-remote-management-server:ci
-
-      - name: Verify container readiness
-        run: |
-          for _attempt in $(seq 1 30); do
-            if docker exec camellia-remote-management-ci python -c \
-              'import json, urllib.request; request = urllib.request.Request("http://127.0.0.1:21114/health/ready", headers={"X-Forwarded-Proto": "https"}); response = urllib.request.urlopen(request, timeout=2); assert response.status == 200 and json.load(response)["status"] == "ready"'; then
-              exit 0
-            fi
-            sleep 1
-          done
-          docker logs camellia-remote-management-ci
-          exit 1
+      - name: Upload deployment evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: production-compose-${{ github.sha }}
+          path: ${{ runner.temp }}/production-compose-evidence.json
+          if-no-files-found: warn
+          retention-days: 14
 
       - name: Clean up container resources
         if: always()
@@ -632,8 +627,10 @@ jobs:
           python3 scripts/test_postgres_container_hardening.py \
             --cleanup \
             --project-name "$POSTGRES_HARDENING_PROJECT" || status=$?
-          docker rm --force camellia-remote-management-ci 2>/dev/null || true
-          docker volume rm camellia-remote-management-ci-records 2>/dev/null || true
+          python3 scripts/test_production_compose.py \
+            --cleanup \
+            --project-name "$PRODUCTION_COMPOSE_PROJECT" \
+            --docker "${RUNNER_TEMP}/docker-wrapper" || status=$?
           exit "$status"
 
   performance_smoke:
@@ -754,6 +751,8 @@ jobs:
       - automation
       - web_client
       - quality
+      - quality_python313
+      - quality_sqlite
       - container
       - performance_smoke
     runs-on: ubuntu-24.04
@@ -780,6 +779,8 @@ jobs:
           AUTOMATION_RESULT: ${{ needs.automation.result }}
           WEB_CLIENT_RESULT: ${{ needs.web_client.result }}
           QUALITY_RESULT: ${{ needs.quality.result }}
+          QUALITY_PYTHON313_RESULT: ${{ needs.quality_python313.result }}
+          QUALITY_SQLITE_RESULT: ${{ needs.quality_sqlite.result }}
           CONTAINER_RESULT: ${{ needs.container.result }}
           PERFORMANCE_SMOKE_RESULT: ${{ needs.performance_smoke.result }}
         run: |
@@ -801,6 +802,8 @@ jobs:
           if [[ "$RUNTIME_REQUIRED" == "true" ]]; then
             require_success "Web client build" "$WEB_CLIENT_RESULT"
             require_success "Python and Django quality" "$QUALITY_RESULT"
+            require_success "Python 3.13 lower-bound quality" "$QUALITY_PYTHON313_RESULT"
+            require_success "SQLite debug equivalence" "$QUALITY_SQLITE_RESULT"
             require_success "container smoke test" "$CONTAINER_RESULT"
           fi
           if [[ "$EVENT_NAME" == "pull_request" && "$DEPENDENCIES_CHANGED" == "true" ]]; then

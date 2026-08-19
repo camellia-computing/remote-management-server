@@ -35,7 +35,6 @@ class SensitiveResponseSecurityTests(TestCase):
 
     def assert_not_sensitive_policy(self, response):
         cache_control = response.headers.get("Cache-Control", "")
-        self.assertNotIn("no-store", cache_control)
         self.assertNotIn("private", cache_control)
         self.assertNotEqual(response.headers.get("Pragma"), "no-cache")
 

@@ -11,6 +11,7 @@ from django.test.utils import CaptureQueriesContext
 from api.encrypted_fields import FIELD_PREFIX, UNBOUND_FIELD_PREFIX
 from api.migration_test_support import restore_latest_migration_state
 from api.models import AddressBookProfile, AddressBookShare, RemoteDevice, RemotePeer, UserProfile
+from api.test_support import reset_data_encryption_key_inventory
 from api.views_api import _issue_access_token
 
 TEST_STORAGES = {
@@ -22,6 +23,7 @@ TEST_STORAGES = {
 @override_settings(STORAGES=TEST_STORAGES)
 class SharedProfileCredentialTests(TestCase):
     def setUp(self):
+        reset_data_encryption_key_inventory()
         self.owner = UserProfile.objects.create_user(username="credential-owner", password="owner-pass")
         self.reader = UserProfile.objects.create_user(username="credential-reader", password="reader-pass")
         self.outsider = UserProfile.objects.create_user(username="credential-outsider", password="outsider-pass")

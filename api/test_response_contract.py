@@ -61,6 +61,17 @@ class ResponseContractUnitTests(SimpleTestCase):
         self.assertEqual(json.loads(html.content)["message"], "Request failed")
         self.assertNotIn("upstream error", html.content.decode())
 
+    def test_invalid_json_encoding_is_replaced_by_a_bounded_machine_error(self):
+        response = HttpResponse(b"\xff", status=400, content_type="application/json")
+
+        apply_response_contract(self.request("/api/example"), response)
+
+        body = json.loads(response.content)
+        self.assertEqual(body["code"], "http_400_route")
+        self.assertEqual(body["message"], "Request failed")
+        self.assertFalse(body["retryable"])
+        self.assertNotIn("\ufffd", response.content.decode())
+
     def test_error_details_are_bounded_and_non_credential_fields_only(self):
         response = JsonResponse(
             {

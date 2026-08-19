@@ -329,7 +329,7 @@ def _decode_canonical_base64(value, *, max_decoded_bytes):
         return None
     try:
         decoded = base64.b64decode(value, validate=True)
-    except binascii.Error, ValueError:
+    except (binascii.Error, ValueError):
         return None
     if not decoded or len(decoded) > max_decoded_bytes:
         return None
@@ -1015,7 +1015,7 @@ def _resolve_oidc_user(provider_name, issuer, claims, *, defer_policy_revocation
             if not defer_policy_revocation:
                 revoke_user_credentials((exc.user_id,))
             raise _OidcPolicyDenied(exc.user_id) from None
-        except IntegrityError, ValidationError:
+        except (IntegrityError, ValidationError):
             identity = OidcIdentity.objects.select_related("user").filter(issuer=issuer, subject=subject).first()
             if identity:
                 if identity.is_auto_provisioned and not auto_provision_allowed:
@@ -1249,7 +1249,7 @@ def _json_value(value, *, expected_type, max_bytes):
             separators=(",", ":"),
             allow_nan=False,
         ).encode()
-    except TypeError, ValueError:
+    except (TypeError, ValueError):
         return None
     return value if len(encoded) <= max_bytes else None
 
@@ -1519,7 +1519,7 @@ def _valid_ab_rule(value):
         return None
     try:
         rule = int(value)
-    except TypeError, ValueError:
+    except (TypeError, ValueError):
         return None
     return rule if rule in (1, 2, 3) else None
 
@@ -1785,7 +1785,7 @@ def login(request):
             request, "api_login_denied", level="warning", username=username, reason="device_identity_conflict", rid=rid
         )
         return JsonResponse({"error": "Device identity conflict"}, status=409)
-    except PermissionError, DeviceProofError:
+    except (PermissionError, DeviceProofError):
         _log_event(
             request, "api_login_denied", level="warning", username=username, reason="device_unavailable", rid=rid
         )
@@ -1863,7 +1863,7 @@ def sysinfo(request):
                 setattr(device, key, val)
             device.ip_address = client_ip
             device.save()
-    except DeviceIdentityConflict, IntegrityError:
+    except (DeviceIdentityConflict, IntegrityError):
         _log_event(request, "api_sysinfo_conflict", level="warning", username=user.username, rid=rid)
         return JsonResponse({"error": "Device identity conflict"}, status=409)
     _log_event(request, "api_sysinfo_updated", level="debug", username=user.username, rid=rid, uuid=device_uuid)
@@ -2149,10 +2149,10 @@ def oidc_auth_query(request):
                 DeviceProofChallenge.PURPOSE_OIDC,
             )
             _token, raw_token = _issue_access_token(user, device)
-        except DeviceIdentityConflict, IntegrityError:
+        except (DeviceIdentityConflict, IntegrityError):
             session.delete()
             return _oidc_poll_error_response("oidc_authorization_conflict", "OIDC authorization failed", status=409)
-        except PermissionError, DeviceProofError:
+        except (PermissionError, DeviceProofError):
             session.delete()
             return _oidc_poll_error_response("oidc_authorization_failed", "OIDC authorization failed", status=403)
         body = _auth_body(user, raw_token)
@@ -2530,7 +2530,7 @@ def devices_cli(request):
             reason="invalid_user_name",
         )
         return JsonResponse({"error": "Invalid user_name"}, status=400)
-    except DeviceIdentityConflict, IntegrityError:
+    except (DeviceIdentityConflict, IntegrityError):
         _log_event(request, "api_devices_cli_conflict", level="warning", username=user.username, rid=rid)
         return JsonResponse({"error": "Device identity conflict"}, status=409)
     _log_event(request, "api_devices_cli_updated", username=user.username, rid=rid)
@@ -3461,7 +3461,7 @@ def ab_tags(request, guid):
     for t in tags:
         try:
             color = int(t.tag_color)
-        except TypeError, ValueError:
+        except (TypeError, ValueError):
             color = 0
         data.append({"name": t.tag_name, "color": color})
     _log_event(request, "api_ab_tags", level="debug", username=user.username, guid=guid, total=len(data))
@@ -3909,7 +3909,7 @@ def _audit_enum(value, allowed):
         return None
     try:
         parsed = int(value)
-    except TypeError, ValueError:
+    except (TypeError, ValueError):
         return None
     return parsed if parsed in allowed else None
 
@@ -3919,7 +3919,7 @@ def _audit_uuid4(value):
         return None
     try:
         parsed = uuid.UUID(value)
-    except ValueError, AttributeError:
+    except (ValueError, AttributeError):
         return None
     return parsed if parsed.version == 4 and str(parsed) == value.lower() else None
 
@@ -4996,7 +4996,7 @@ def _audit_file(request):
                     reporter_sequence=reporter_sequence,
                     details=details,
                 )
-            except TypeError, ValueError:
+            except (TypeError, ValueError):
                 return JsonResponse({"error": "Invalid file audit"}, status=400)
             existing = _existing_audit_event(event_id)
             if existing:
@@ -5233,7 +5233,7 @@ def _audit_alarm(request):
                     reporter_sequence=reporter_sequence,
                     details=details,
                 )
-            except TypeError, ValueError:
+            except (TypeError, ValueError):
                 return JsonResponse({"error": "Invalid alarm information"}, status=400)
             existing = _existing_audit_event(event_id)
             if existing:
@@ -5652,7 +5652,7 @@ def users(request):
         try:
             candidate.set_password(password)
             candidate.full_clean(validate_unique=False)
-        except ValueError, ValidationError:
+        except (ValueError, ValidationError):
             return JsonResponse({"error": "Invalid user payload"}, status=400)
         try:
             password_validation.validate_password(password, user=candidate)
@@ -5667,7 +5667,7 @@ def users(request):
                         email=email,
                         note=note,
                     )
-            except IntegrityError, ValidationError:
+            except (IntegrityError, ValidationError):
                 if UserProfile.objects.by_username(username).exists():
                     return _username_conflict_response(request, admin_user, phase="insert")
                 raise

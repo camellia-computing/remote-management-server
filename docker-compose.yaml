@@ -2,7 +2,9 @@ name: camellia-remote-management
 
 x-application: &application
   image: ${CAMELLIA_REMOTE_MANAGEMENT_IMAGE:?Pin the released image by sha256 digest}
-  pull_policy: always
+  # Production keeps the default always policy. CI may set `never` only for
+  # the exact image loaded by the same job; the release image remains digest-pinned.
+  pull_policy: ${CAMELLIA_REMOTE_MANAGEMENT_PULL_POLICY:-always}
   environment: &application-environment
     TZ: ${CAMELLIA_REMOTE_TZ:-UTC}
     CAMELLIA_REMOTE_TIME_ZONE: ${CAMELLIA_REMOTE_TIME_ZONE:-UTC}

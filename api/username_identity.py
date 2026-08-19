@@ -1,5 +1,10 @@
 import hashlib
-import unicodedata
+import unicodedata as _stdlib_unicode_data
+
+try:
+    import unicodedata2 as _backport_unicode_data
+except ImportError:
+    _backport_unicode_data = None
 
 from django.db import connections
 
@@ -10,6 +15,12 @@ USERNAME_MAX_LENGTH = 50
 USERNAME_MAX_INPUT_LENGTH = 200
 USERNAME_CANONICAL_MAX_BYTES = 1024
 USERNAME_MIGRATION = "0026_username_canonical_identity"
+
+_UNICODE_DATA = (
+    _stdlib_unicode_data
+    if _stdlib_unicode_data.unidata_version == USERNAME_UNICODE_DATA_VERSION
+    else _backport_unicode_data or _stdlib_unicode_data
+)
 
 POSTGRES_ENCODING = "UTF8"
 POSTGRES_LOCALE_PROVIDER = "b"
@@ -24,10 +35,10 @@ class UsernameIdentityError(RuntimeError):
 
 
 def require_username_unicode_version():
-    if unicodedata.unidata_version != USERNAME_UNICODE_DATA_VERSION:
+    if _UNICODE_DATA.unidata_version != USERNAME_UNICODE_DATA_VERSION:
         raise UsernameIdentityError(
             "username canonicalization requires Unicode data "
-            f"{USERNAME_UNICODE_DATA_VERSION}, found {unicodedata.unidata_version}"
+            f"{USERNAME_UNICODE_DATA_VERSION}, found {_UNICODE_DATA.unidata_version}"
         )
 
 
@@ -35,7 +46,7 @@ def normalize_username(value):
     require_username_unicode_version()
     if not isinstance(value, str) or len(value) > USERNAME_MAX_INPUT_LENGTH:
         raise ValueError("username is not a bounded string")
-    normalized = unicodedata.normalize("NFKC", value.strip())
+    normalized = _UNICODE_DATA.normalize("NFKC", value.strip())
     if not normalized or len(normalized) > USERNAME_MAX_LENGTH:
         raise ValueError("username has an invalid normalized length")
     return normalized
@@ -43,7 +54,7 @@ def normalize_username(value):
 
 def canonical_username(value):
     normalized = normalize_username(value)
-    canonical = unicodedata.normalize("NFKC", normalized.casefold())
+    canonical = _UNICODE_DATA.normalize("NFKC", normalized.casefold())
     if not canonical:
         raise ValueError("username has an empty canonical form")
     return canonical
@@ -165,7 +176,7 @@ def check_username_identity(*, using="default", full=False):
     for user_id, username, stored_key in rows.iterator(chunk_size=1000):
         try:
             expected_key = canonical_username_key(username)
-        except UsernameIdentityError, ValueError:
+        except (UsernameIdentityError, ValueError):
             error_count += 1
             if len(errors) < MAX_IDENTITY_ERRORS:
                 errors.append(f"id={user_id}:invalid")

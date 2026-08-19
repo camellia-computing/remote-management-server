@@ -147,7 +147,7 @@ def _valid_policy_options(value):
             separators=(",", ":"),
             allow_nan=False,
         ).encode("utf-8")
-    except TypeError, ValueError, UnicodeEncodeError:
+    except (TypeError, ValueError, UnicodeEncodeError):
         return False
     return len(canonical) <= MAX_POLICY_OPTIONS_BYTES
 

@@ -327,6 +327,39 @@ class FileAuditLifecycleTests(ApiTestMixin, TestCase):
         self.assertEqual(event.payload_digest, accepted.json()["payload_digest"])
         self.assertEqual(event.acknowledgement, accepted.json())
 
+    def test_unrepresentable_evidence_is_rejected_without_partial_state(self):
+        connection = ConnLog.objects.get(guid=self.audit_session_id)
+        file_payload = self._file_payload(
+            transfer_id=str(uuid.uuid4()),
+            revision=1,
+            state="started",
+        )
+        alarm_payload = {
+            "version": 3,
+            "receipt_version": 1,
+            "event_id": str(uuid.uuid4()),
+            "reporter_sequence": connection.event_revision + 1,
+            "audit_session_id": self.audit_session_id,
+            "id": "111111111",
+            "uuid": self.host_uuid,
+            "typ": 9,
+            "conn_id": 7,
+            "info": {"message": "test alarm"},
+        }
+        before_events = ConnectionAuditEvent.objects.count()
+
+        with patch("api.views_api._audit_evidence_digest", side_effect=ValueError("sensitive evidence")):
+            file_response = self._post_file(file_payload)
+            alarm_response = self._post_json("/api/audit/alarm", alarm_payload, token=self.host_token)
+
+        self.assertEqual(file_response.status_code, 400, file_response.content)
+        self.assertEqual(alarm_response.status_code, 400, alarm_response.content)
+        self.assertNotIn(b"sensitive evidence", file_response.content)
+        self.assertNotIn(b"sensitive evidence", alarm_response.content)
+        self.assertEqual(ConnectionAuditEvent.objects.count(), before_events)
+        self.assertEqual(FileLog.objects.count(), 0)
+        self.assertEqual(AlarmLog.objects.count(), 0)
+
     def test_legacy_event_without_receipt_cannot_be_mistaken_for_a_durable_replay(self):
         connection = ConnLog.objects.get(guid=self.audit_session_id)
         legacy_event_id = uuid.uuid4()

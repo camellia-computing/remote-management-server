@@ -13,7 +13,7 @@ from django.contrib.auth.models import Group
 from django.core.exceptions import ImproperlyConfigured, ValidationError
 from django.core.management import call_command
 from django.core.management.base import CommandError
-from django.db import connection, transaction
+from django.db import IntegrityError, connection, transaction
 from django.test import SimpleTestCase, TestCase, override_settings
 from django.test.utils import CaptureQueriesContext
 from django.utils import timezone
@@ -48,6 +48,9 @@ from api.models import (
 )
 from api.policy_generation import InvalidManagedPolicy
 from api.tag_colors import normalize_tag_color, tag_color_css
+from api.test_support import reset_data_encryption_key_inventory
+from api.views_api import _audit_enum, _audit_uuid4, _json_value, _valid_ab_rule
+from api.views_front import _parse_rule
 from api.xlsx import spreadsheet_safe_value
 from camellia_remote_management import settings as project_settings
 from camellia_remote_management.settings import (
@@ -93,6 +96,13 @@ class UtilityContractTests(SimpleTestCase):
                 self.assertTrue(spreadsheet_safe_value(value).startswith("'"))
         self.assertEqual(spreadsheet_safe_value("ordinary text"), "ordinary text")
         self.assertEqual(spreadsheet_safe_value(42), 42)
+
+    def test_json_enum_uuid_and_rule_parsers_reject_unrepresentable_values(self):
+        self.assertIsNone(_json_value(float("nan"), expected_type=float, max_bytes=32))
+        self.assertIsNone(_valid_ab_rule(object()))
+        self.assertIsNone(_audit_enum(object(), {1, 2, 3}))
+        self.assertIsNone(_audit_uuid4("not-a-uuid"))
+        self.assertEqual(_parse_rule(object()), 1)
 
 
 class SettingsParserTests(SimpleTestCase):
@@ -344,7 +354,12 @@ class ApiContractTests(ApiTestMixin, TestCase):
                 )
 
                 self.assertEqual(response.status_code, 400, response.content)
-                self.assertEqual(response.json(), {"error": "Invalid JSON payload"})
+                body = response.json()
+                self.assertEqual(body["code"], "invalid_json_payload")
+                self.assertEqual(body["message"], "Invalid JSON payload")
+                self.assertEqual(body["response_schema_version"], 1)
+                self.assertFalse(body["retryable"])
+                self.assertNotIn("error", body)
 
     def test_routes_reject_unsupported_methods_with_allow_contracts(self):
         for path, method, allowed in (
@@ -381,7 +396,10 @@ class ApiContractTests(ApiTestMixin, TestCase):
             {"username": "alice", "password": "wrong", "id": "123456789", "uuid": DEFAULT_DEVICE_UUID},
         )
         self.assertEqual(response.status_code, 401)
-        self.assertIn("error", response.json())
+        self.assertEqual(response.json()["code"], "http_401_api_login")
+        self.assertTrue(response.json()["message"])
+        self.assertFalse(response.json()["retryable"])
+        self.assertNotIn("error", response.json())
         self.assertEqual(LoginAttempt.objects.filter(ip="127.0.0.1").count(), 1)
 
     def test_login_rejects_noncanonical_device_identity(self):
@@ -415,7 +433,9 @@ class ApiContractTests(ApiTestMixin, TestCase):
             {"username": "alice", "password": "alice-pass", "id": "123456789", "uuid": DEFAULT_DEVICE_UUID},
         )
         self.assertEqual(locked.status_code, 429)
-        self.assertIn("error", locked.json())
+        self.assertEqual(locked.json()["code"], "http_429_api_login")
+        self.assertTrue(locked.json()["retryable"])
+        self.assertNotIn("error", locked.json())
 
     def test_successful_login_clears_failures_and_stores_hashed_token(self):
         self._post_json(
@@ -487,6 +507,36 @@ class ApiContractTests(ApiTestMixin, TestCase):
         self.assertNotEqual(response.json()["access_token"], poll_code)
         self.assertFalse(OidcPendingAuth.objects.filter(state="test-state").exists())
 
+    def test_oidc_auth_query_consumes_terminal_device_claim_failures(self):
+        failures = (
+            (IntegrityError("sensitive identity constraint"), 409, "oidc_authorization_conflict"),
+            (PermissionError("sensitive device proof"), 403, "oidc_authorization_failed"),
+        )
+        for index, (failure, status, code) in enumerate(failures):
+            with self.subTest(status=status):
+                poll_code = f"terminal-poll-code-{index}"
+                session = OidcPendingAuth.objects.create(
+                    state=f"terminal-state-{index}",
+                    poll_code_hash=hashlib.sha256(poll_code.encode()).hexdigest(),
+                    provider="example",
+                    rid="123456789",
+                    device_uuid=DEFAULT_DEVICE_UUID,
+                    nonce="test-nonce",
+                    code_verifier="test-code-verifier",
+                    status=OidcPendingAuth.STATUS_DONE,
+                    authenticated_user=self.user,
+                )
+                with patch("api.views_api._claim_session_device", side_effect=failure):
+                    response = self._post_json(
+                        "/api/oidc/auth-query",
+                        {"code": poll_code, "id": "123456789", "uuid": DEFAULT_DEVICE_UUID},
+                    )
+
+                self.assertEqual(response.status_code, status, response.content)
+                self.assertEqual(response.json()["code"], code)
+                self.assertNotIn(b"sensitive", response.content)
+                self.assertFalse(OidcPendingAuth.objects.filter(pk=session.pk).exists())
+
     def test_telemetry_requires_the_token_bound_to_that_device(self):
         response = self._post_json(
             "/api/heartbeat",
@@ -522,6 +572,40 @@ class ApiContractTests(ApiTestMixin, TestCase):
             token=token,
         )
         self.assertEqual(heartbeat.status_code, 200, heartbeat.content)
+
+    def test_device_mutations_classify_identity_conflicts(self):
+        device = self._device(owner=self.user)
+        token = self._login("alice", "alice-pass")
+        requests = (
+            ("/api/sysinfo", {"id": device.rid, "uuid": device.uuid, "hostname": "new-host"}),
+            ("/api/devices/cli", {"id": device.rid, "uuid": device.uuid, "user_name": self.user.username}),
+        )
+        for path, payload in requests:
+            with (
+                self.subTest(path=path),
+                patch(
+                    "api.views_api._device_by_identity",
+                    side_effect=IntegrityError("sensitive identity constraint"),
+                ),
+            ):
+                response = self._post_json(path, payload, token=token)
+
+            self.assertEqual(response.status_code, 409, response.content)
+            self.assertNotIn(b"sensitive identity constraint", response.content)
+
+        device.refresh_from_db()
+        self.assertEqual(device.hostname, "desktop")
+
+    def test_address_book_tags_tolerate_an_unparseable_stored_color(self):
+        token = self._login("alice", "alice-pass")
+        profile = self._personal_profile(self.user)
+        tag = RemoteTag.objects.create(profile=profile, tag_name="invalid-color")
+        RemoteTag.objects.filter(pk=tag.pk).update(tag_color="not-an-integer")
+
+        response = self._post_json(f"/api/ab/tags/{profile.guid}", {}, token=token)
+
+        self.assertEqual(response.status_code, 200, response.content)
+        self.assertEqual(response.json(), [{"name": "invalid-color", "color": 0}])
 
     def test_address_book_peers_match_flutter_client_contract(self):
         token = self._login("alice", "alice-pass")
@@ -597,7 +681,7 @@ class ApiContractTests(ApiTestMixin, TestCase):
             token=token,
         )
 
-        self.assertEqual(renamed.status_code, 200, renamed.content)
+        self.assertEqual(renamed.status_code, 204, renamed.content)
         self.assertFalse(RemoteTag.objects.filter(profile=profile, tag_name="old").exists())
         self.assertEqual(
             list(peer.tags.values_list("tag_name", flat=True)),
@@ -623,7 +707,7 @@ class ApiContractTests(ApiTestMixin, TestCase):
             ["target"],
             token=token,
         )
-        self.assertEqual(deleted.status_code, 200, deleted.content)
+        self.assertEqual(deleted.status_code, 204, deleted.content)
         self.assertFalse(peer.tags.exists())
         self.assertFalse(RemoteTag.objects.filter(pk=target_tag.pk).exists())
 
@@ -1525,7 +1609,9 @@ class ApiContractTests(ApiTestMixin, TestCase):
             },
         )
         self.assertEqual(mismatch.status_code, 400, mismatch.content)
-        self.assertEqual(mismatch.json()["code"], 0)
+        self.assertEqual(mismatch.json()["code"], "http_400_api_user_action")
+        self.assertFalse(mismatch.json()["retryable"])
+        self.assertNotIn("error", mismatch.json())
         self.assertFalse(UserProfile.objects.filter(username="second-user").exists())
 
     @override_settings(PLUGIN_SIGNING_KEY="00" * 32)
@@ -1965,6 +2051,8 @@ class SensitiveIngestionTests(ApiTestMixin, TestCase):
                 RECORD_UPLOAD_MAX_CHUNK_BYTES=1024,
                 RECORD_UPLOAD_MAX_FILE_BYTES=2048,
                 DATA_UPLOAD_MAX_MEMORY_SIZE=1024,
+                RECORD_UPLOAD_VOLUME_RESERVE_BYTES=0,
+                RECORD_UPLOAD_VOLUME_RESERVE_INODES=0,
             ):
                 self.assertEqual(
                     self._raw_record(
@@ -2255,6 +2343,7 @@ class SensitiveIngestionTests(ApiTestMixin, TestCase):
 
 class OperationalEndpointTests(TestCase):
     def setUp(self):
+        reset_data_encryption_key_inventory()
         self.recording_root = tempfile.TemporaryDirectory()
         self.recording_settings = override_settings(
             RECORD_UPLOAD_ROOT=Path(self.recording_root.name),
@@ -2350,6 +2439,9 @@ class OperationalEndpointTests(TestCase):
 
 
 class DataEncryptionRotationTests(TestCase):
+    def setUp(self):
+        reset_data_encryption_key_inventory()
+
     def test_rotation_rewraps_recording_data_keys_before_retiring_the_old_kek(self):
         encoded_data_key = recording_crypto.encode_data_key(b"d" * recording_crypto.DATA_KEY_BYTES)
         storage_object_id = uuid.uuid4()

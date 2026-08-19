@@ -11,7 +11,7 @@ Camellia Remote 的生产管理平面：提供账号与设备管理、地址簿�
 
 ## 本地开发
 
-日常开发和 CI 使用 Python 3.14、uv 0.12.0 和 PostgreSQL 18。Username identity v1固定使用Python 3.14内置的Unicode 16.0.0数据；其他Python/Unicode数据版本会在迁移或启动检查时fail closed。仅快速开发时可使用 SQLite：
+主质量门禁使用 Python 3.14，支持下界为 Python 3.13，统一使用 uv 0.12.0 和 PostgreSQL 18。Username identity v1 固定使用 Unicode 16.0.0 数据：Python 3.14 使用标准库，Python 3.13 使用精确锁定的 `unicodedata2==16.0.0`；缺失或其他 Unicode 数据版本会在迁移或启动检查时 fail closed。仅快速开发时可使用 SQLite：
 
 ```bash
 uv sync --locked --all-groups
@@ -32,6 +32,23 @@ uv run python manage.py makemigrations --check --dry-run
 uv run pytest
 python scripts/test_release_metadata.py
 ```
+
+## CI 信任边界
+
+`.github/workflows/ci-trust.yml` 是只从目标分支 base 提交加载的
+`pull_request_target` 审查器。它只执行 base 中冻结的
+`.github/scripts/ci_trust_policy.py`，把候选 workflow 当作不可执行数据读取，
+并拒绝删除 `web_client`、`quality`、`container` 或 `CI / Required` 聚合依赖，
+拒绝把失败/取消伪装成 skipped、扩大 token 权限、伪造 `CI Trust / Required`，
+以及改写 classifier/trust policy 本身。任何 workflow、复用 action 或 CI policy
+脚本变更都会由 classifier 强制进入完整 Web、quality、container、deployment
+和 performance runtime suite；仅文档变更才可使用轻量路径。
+
+该 trust workflow 必须在受保护的 `main` 上先落地，再由仓库 ruleset 要求
+`CI Trust / Required`（workflow-only PR 不能依靠候选 workflow 自己创建同名绿灯）。
+组织目前为 GitHub Free，无法启用组织级 required workflow；在升级前必须同时
+保持 base-owned verifier、workflow 专属 CODEOWNER、至少两名独立审查人与
+ruleset 的 expected-source 配置，不能把候选 `CI / Required` 单独视为信任边界。
 
 `[tool.uv].required-version` 暂时允许 `>=0.11.8,<0.13`：截至
 2026-07-30，GitHub 托管的 Dependabot uv 更新器仍使用 0.11.8，精确要求
@@ -143,6 +160,8 @@ sudo systemctl enable --now camellia-remote-management-cleanup.timer
 ```
 
 生产环境应把 `CAMELLIA_REMOTE_MANAGEMENT_IMAGE` 固定为发布清单记录的 `ghcr.io/...@sha256:...`，不得使用浮动标签。systemd没有在线`reload`入口；升级必须使用显式stop/start或受审部署流程。`CAMELLIA_REMOTE_GUNICORN_GRACEFUL_TIMEOUT_SECONDS`是唯一可调的应用排空窗口；`deploy/shutdown-budget.sh`严格派生Docker `G+15s`并验证固定的systemd `660s`外层窗口。Compose的`stop_grace_period`、controller的`docker compose stop`和systemd的`ExecStopPost`都使用该校验结果，任何值漂移都会在Gunicorn绑定端口或Docker操作前fail closed，不能只增大systemd预算伪装成安全排空。每次stack start由单飞controller先停止旧Management，启动PostgreSQL但不等待尚未创建的probe，使用bootstrap superuser在advisory-lock事务内创建/收敛角色、ownership、membership、当前ACL与migration default ACL，再以probe执行真实`SELECT 1`健康检查。随后只用migration owner运行一次性`migrate_with_lease`：它以固定的`CAMELLIA` PostgreSQL session advisory lock在整个Django migration plan外建立数据库级单飞，输出release revision、actor、operation ID、holder backend和每5秒等待heartbeat；等待最长由`CAMELLIA_REMOTE_MIGRATION_LOCK_TIMEOUT_SECONDS`限制，超时以75退出。Holder连接消失时PostgreSQL自动释放锁，follower取得锁后才重新构造executor和migration plan。迁移完成后再次bootstrap验证新对象，最后用runtime DML credential启动`restart: no`应用。Runtime不是database/schema/table owner，且始终为`NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS`；`django_migrations`对runtime只读，不能伪造schema ledger。Backup只拥有业务读取能力，probe没有public schema或业务表权限。Controller与maintenance enter/leave共用root-owned deployment lock，maintenance lease存在时不会执行Docker命令。Engine或container restart不会自动拉起Management；任何直接启动仍会由`run.sh`的`check_release_schema`核对版本化manifest、精确migration set/leaf和关键table/column/type/validated constraint/ready index，再由`check_username_identity`检查canonical authority，任一失配都会在Gunicorn绑定端口前fail closed。`/health/ready`持续执行同一schema capability合同；ledger缺失、超前、分叉或关键schema对象漂移都返回not-ready。应用崩溃必须告警并进入受控stack start，不能用Docker自动restart绕过migration gate。
+
+生产环境应把`CAMELLIA_REMOTE_MANAGEMENT_PULL_POLICY`保持为`always`，只从配置registry解析签名release中的digest。隔离CI lifecycle为了运行同一production Compose但不发布临时镜像，才会把该值设为`never`并使用同一job刚构建的本地镜像，不能复制到生产。
 
 Compose内置PostgreSQL 18把卷初始化与长期运行权限明确分离。数据库未运行时，controller先执行无网络的`postgres-data-bootstrap`一次性任务；它使用只读rootfs、drop-all后仅恢复`CHOWN/DAC_OVERRIDE/FOWNER`三项能力，拒绝卷内symlink并把固定PG18目录和现有卷内容收敛到numeric `70:70`。正在运行的PostgreSQL绝不会同时挂载该chown任务。长期`postgres`进程从入口起即为`70:70`，rootfs只读、`CapEff=0`、启用no-new-privileges，只允许PGDATA volume、`/tmp`、`/var/run/postgresql`和Docker管理的`/dev/shm`写入；没有host port且仍只加入internal backend网络。这个UID/GID与`PGDATA=/var/lib/postgresql/18/docker`是固定镜像/volume合同，不提供历史layout或可调UID兼容层。更改镜像major、UID或数据layout必须通过独立的离线迁移、完整restore和crash-recovery验收，不能在服务中对在线volume递归chown。
 

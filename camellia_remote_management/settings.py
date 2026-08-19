@@ -116,7 +116,7 @@ def env_choice(name, default, choices):
 def canonical_base64_bytes(value, expected_size):
     try:
         decoded = base64.b64decode(value, validate=True)
-    except binascii.Error, ValueError:
+    except (binascii.Error, ValueError):
         return None
     if len(decoded) != expected_size or base64.b64encode(decoded).decode("ascii") != value:
         return None
