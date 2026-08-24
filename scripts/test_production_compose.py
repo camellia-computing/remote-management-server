@@ -16,6 +16,8 @@ import time
 import unittest
 import urllib.request
 
+import deployment_dependencies
+
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 COMPOSE = ROOT / "docker-compose.yaml"
 CONTROLLER = ROOT / "deploy" / "start-management-stack.sh"
@@ -117,6 +119,15 @@ def prepare_environment(path: pathlib.Path, image: str, revision: str) -> None:
     }
     path.write_text("".join(f"{key}={values[key]}\n" for key in sorted(values)))
     path.chmod(0o600)
+
+
+def environment_value(path: pathlib.Path, name: str) -> str:
+    prefix = f"{name}="
+    values = [
+        line.removeprefix(prefix) for line in path.read_text(encoding="utf-8").splitlines() if line.startswith(prefix)
+    ]
+    require(len(values) == 1 and values[0], f"Compose environment has no unique {name}")
+    return values[0]
 
 
 def project_resource_ids(docker: str, resource: str, project_name: str) -> list[str]:
@@ -257,16 +268,24 @@ def run_integration(
     runtime_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
     runtime_dir.chmod(0o700)
     compose_env = os.environ | {"COMPOSE_PROJECT_NAME": project_name}
+    source_revision = environment_value(env_file, "CAMELLIA_REMOTE_RELEASE_REVISION")
+    require(REVISION_PATTERN.fullmatch(source_revision) is not None, "Compose evidence release revision is invalid")
+    dependency_policy = deployment_dependencies.load_policy(ROOT)
+    database_image = dependency_policy["database"]["reference"]
     evidence: dict[str, object] = {
         "format": "camellia-remote-deployment-integration-v1",
+        "source_revision": source_revision,
+        "database_image": database_image,
         "project": project_name,
         "started_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "status": "running",
         "services": {},
     }
     error: Exception | None = None
     try:
         effective = assert_effective_config(docker, project_name, env_file)
         evidence["effective_services"] = sorted(effective["services"])
+        require(effective["services"]["postgres"]["image"] == database_image, "effective PostgreSQL image drifted")
         started = time.monotonic()
         controller = run(
             [
@@ -335,6 +354,7 @@ def run_integration(
     except INTEGRATION_ERRORS as exc:
         error = exc
         evidence["failure"] = type(exc).__name__
+        evidence["status"] = "failed"
     finally:
         cleanup_error: Exception | None = None
         try:
@@ -361,11 +381,16 @@ def run_integration(
             cleanup_project(docker, project_name)
         except INTEGRATION_ERRORS as exc:
             cleanup_error = cleanup_error or exc
+        if cleanup_error is None and (down is None or down.returncode != 0):
+            cleanup_error = RuntimeError("Compose down failed during integration cleanup")
+        if cleanup_error is not None:
+            evidence["failure"] = type(cleanup_error).__name__
+            evidence["status"] = "failed"
+        elif error is None:
+            evidence["status"] = "passed"
         evidence_path.write_text(json.dumps(evidence, sort_keys=True, indent=2) + "\n")
         evidence_path.chmod(0o600)
-        if cleanup_error is None:
-            require(down is not None and down.returncode == 0, "Compose down failed during integration cleanup")
-        else:
+        if cleanup_error is not None:
             raise RuntimeError("Compose cleanup failed") from cleanup_error
     if error is not None:
         raise RuntimeError("production Compose integration failed") from error
@@ -391,6 +416,13 @@ class ProductionComposeContractTests(unittest.TestCase):
         self.assertIn('require_success "container smoke test" "$CONTAINER_RESULT"', required)
         self.assertIn('require_success "Management performance contract smoke" "$PERFORMANCE_SMOKE_RESULT"', required)
         self.assertIn('if [[ "$result" != "success" ]]', required)
+
+    def test_runtime_evidence_binds_release_and_database_and_closes_status(self):
+        source = (ROOT / "scripts/test_production_compose.py").read_text(encoding="utf-8")
+        self.assertIn('environment_value(env_file, "CAMELLIA_REMOTE_RELEASE_REVISION")', source)
+        self.assertIn('dependency_policy["database"]["reference"]', source)
+        self.assertIn('evidence["status"] = "passed"', source)
+        self.assertIn('evidence["status"] = "failed"', source)
 
     def test_systemd_units_keep_machine_readable_lifecycle_and_failure_boundaries(self):
         stack = (SYSTEMD / "camellia-remote-management-stack.service").read_text()

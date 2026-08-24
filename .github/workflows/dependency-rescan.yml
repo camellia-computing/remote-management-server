@@ -1,0 +1,154 @@
+name: Production dependency rescan
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  attestations: read
+  contents: read
+
+concurrency:
+  group: remote-management-dependency-rescan
+  cancel-in-progress: false
+
+jobs:
+  inventory:
+    name: Inventory immutable deployment BOMs
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    outputs:
+      matrix: ${{ steps.inventory.outputs.matrix }}
+    steps:
+      - name: Checkout policy
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Download published Release evidence
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          install -d -m 0700 "$RUNNER_TEMP/release-inventory"
+          mapfile -t tags < <(gh api --paginate \
+            "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
+            --jq '.[] | select(.draft == false and .prerelease == false) | .tag_name')
+          for tag in "${tags[@]}"; do
+            [[ "$tag" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]
+            mapfile -t assets < <(gh release view "$tag" --repo "$GITHUB_REPOSITORY" \
+              --json assets --jq '.assets[].name')
+            required=(release-evidence.json deployment-bom.json DEPLOYMENT-BOM-ATTESTATION.intoto.jsonl)
+            complete=true
+            for name in "${required[@]}"; do
+              if ! printf '%s\n' "${assets[@]}" | grep -Fxq "$name"; then
+                complete=false
+              fi
+            done
+            [[ "$complete" == true ]] || continue
+            directory="$RUNNER_TEMP/release-inventory/$tag"
+            mkdir -m 700 "$directory"
+            gh release download "$tag" --repo "$GITHUB_REPOSITORY" \
+              --pattern release-evidence.json \
+              --pattern deployment-bom.json \
+              --pattern DEPLOYMENT-BOM-ATTESTATION.intoto.jsonl \
+              --dir "$directory" --clobber
+            python3 .github/scripts/validate-release-evidence.py \
+              "$directory/release-evidence.json"
+            gh attestation verify "$directory/deployment-bom.json" \
+              --repo "$GITHUB_REPOSITORY" \
+              --bundle "$directory/DEPLOYMENT-BOM-ATTESTATION.intoto.jsonl" \
+              --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/publish-release.yml" >/dev/null
+          done
+      - name: Build deduplicated rescan inventory
+        id: inventory
+        shell: bash
+        run: |
+          set -euo pipefail
+          generated_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          python3 scripts/deployment_dependencies.py inventory \
+            --release-root "$RUNNER_TEMP/release-inventory" \
+            --generated-at "$generated_at" \
+            --allow-empty \
+            --github-output "$GITHUB_OUTPUT" \
+            --output "$RUNNER_TEMP/deployment-rescan-inventory.json"
+      - name: Upload rescan inventory
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: deployment-rescan-inventory-${{ github.run_id }}
+          path: ${{ runner.temp }}/deployment-rescan-inventory.json
+          if-no-files-found: error
+          retention-days: 14
+
+  scan:
+    name: Rescan PostgreSQL ${{ matrix.digest }}
+    needs: inventory
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      AMD64_DIGEST: ${{ matrix.amd64 }}
+      ARM64_DIGEST: ${{ matrix.arm64 }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.inventory.outputs.matrix) }}
+    steps:
+      - name: Checkout policy
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Pull exact historical PostgreSQL child manifests
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/postgresql-rescan"
+          for architecture in amd64 arm64; do
+            if [[ "$architecture" == amd64 ]]; then
+              child_digest="$AMD64_DIGEST"
+            else
+              child_digest="$ARM64_DIGEST"
+            fi
+            image="postgres:18-alpine@$child_digest"
+            docker pull --platform "linux/$architecture" "$image"
+            docker save "$image" > "$RUNNER_TEMP/postgresql-rescan/postgres-$architecture.tar"
+          done
+      - name: Rescan historical PostgreSQL amd64 image
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          input: ${{ runner.temp }}/postgresql-rescan/postgres-amd64.tar
+          version: v0.72.0
+          scanners: vuln
+          vuln-type: os,library
+          severity: CRITICAL,HIGH
+          ignore-unfixed: false
+          format: json
+          output: ${{ runner.temp }}/postgresql-rescan/POSTGRESQL-amd64-VULNERABILITY-SCAN.json
+          exit-code: "0"
+          timeout: 10m0s
+      - name: Rescan historical PostgreSQL arm64 image
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          input: ${{ runner.temp }}/postgresql-rescan/postgres-arm64.tar
+          version: v0.72.0
+          scanners: vuln
+          vuln-type: os,library
+          severity: CRITICAL,HIGH
+          ignore-unfixed: false
+          format: json
+          output: ${{ runner.temp }}/postgresql-rescan/POSTGRESQL-arm64-VULNERABILITY-SCAN.json
+          exit-code: "0"
+          timeout: 10m0s
+      - name: Enforce historical PostgreSQL vulnerability policy
+        run: |
+          python3 scripts/deployment_dependencies.py validate-scan \
+            "$RUNNER_TEMP/postgresql-rescan/POSTGRESQL-amd64-VULNERABILITY-SCAN.json" \
+            "$RUNNER_TEMP/postgresql-rescan/POSTGRESQL-arm64-VULNERABILITY-SCAN.json"
+      - name: Upload bounded rescan evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: deployment-rescan-${{ matrix.id }}
+          path: |
+            ${{ runner.temp }}/postgresql-rescan/POSTGRESQL-amd64-VULNERABILITY-SCAN.json
+            ${{ runner.temp }}/postgresql-rescan/POSTGRESQL-arm64-VULNERABILITY-SCAN.json
+          if-no-files-found: warn
+          retention-days: 14

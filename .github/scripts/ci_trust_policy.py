@@ -53,6 +53,7 @@ JOB_GUARDS = {
 }
 TRUST_WORKFLOW = pathlib.PurePosixPath(".github/workflows/ci-trust.yml")
 CI_WORKFLOW = pathlib.PurePosixPath(".github/workflows/ci.yml")
+RESCAN_WORKFLOW = pathlib.PurePosixPath(".github/workflows/dependency-rescan.yml")
 TRUSTED_POLICY_FILES = (
     pathlib.PurePosixPath(".github/scripts/classify-changes.sh"),
     pathlib.PurePosixPath(".github/scripts/ci_trust_policy.py"),
@@ -85,6 +86,9 @@ def classify_paths(paths: Iterable[str]) -> dict[str, bool]:
             "sync_web_client.sh",
         }:
             automation = True
+        if path == "deployment-dependencies.json":
+            automation = True
+            dependencies = True
         if path in {"pyproject.toml", "uv.lock", "Dockerfile", ".github/dependabot.yml"} or path.startswith(
             ("docker-compose", ".github/actions/", ".github/workflows/")
         ):
@@ -184,6 +188,8 @@ def validate_ci_workflow(text: str) -> None:
         "zizmorcore/zizmor-action@",
         "github.com/rhysd/actionlint/cmd/actionlint@v1.7.12",
         "shellcheck",
+        "python3 scripts/test_deployment_dependencies.py",
+        "python3 scripts/deployment_dependencies.py validate-policy",
     ):
         if marker not in automation:
             raise TrustPolicyError(f"automation gate lost {marker}")
@@ -231,6 +237,18 @@ def validate_ci_workflow(text: str) -> None:
     ):
         if marker not in sqlite:
             raise TrustPolicyError(f"SQLite gate lost matrix marker: {marker}")
+    container = _block(text, "container")
+    for marker in (
+        "aquasecurity/trivy-action@",
+        "version: v0.72.0",
+        "ignore-unfixed: false",
+        "postgresql-scans",
+        "POSTGRESQL-amd64-VULNERABILITY-SCAN.json",
+        "POSTGRESQL-arm64-VULNERABILITY-SCAN.json",
+        "scripts/deployment_dependencies.py validate-scan",
+    ):
+        if marker not in container:
+            raise TrustPolicyError(f"container gate lost PostgreSQL dependency marker: {marker}")
 
 
 def validate_workflow_safety(
@@ -254,6 +272,29 @@ def validate_workflow_safety(
             continue
         if not re.search(r"@[0-9a-f]{40}(?:\s|$)", stripped):
             raise TrustPolicyError(f"un-pinned action in {path}: {stripped}")
+
+
+def validate_rescan_workflow(text: str) -> None:
+    """Require the scheduled rescan to use immutable release evidence and a bounded scan."""
+
+    for marker in (
+        'cron: "17 3 * * *"',
+        "workflow_dispatch:",
+        "gh release download",
+        "release-evidence.json",
+        ".github/scripts/validate-release-evidence.py",
+        "deployment-bom.json",
+        "DEPLOYMENT-BOM-ATTESTATION.intoto.jsonl",
+        "gh attestation verify",
+        "python3 scripts/deployment_dependencies.py inventory",
+        "fail-fast: false",
+        "version: v0.72.0",
+        "ignore-unfixed: false",
+        "matrix.amd64",
+        "matrix.arm64",
+    ):
+        if marker not in text:
+            raise TrustPolicyError(f"dependency rescan lost required marker: {marker}")
 
 
 def verify_candidate(base_dir: pathlib.Path, candidate_dir: pathlib.Path, changed_paths: Iterable[str]) -> None:
@@ -289,6 +330,8 @@ def verify_candidate(base_dir: pathlib.Path, candidate_dir: pathlib.Path, change
             workflow.read_text(encoding="utf-8"),
             allowed_permission_writes=allowed_writes,
         )
+        if relative == RESCAN_WORKFLOW:
+            validate_rescan_workflow(workflow.read_text(encoding="utf-8"))
     ci_path = candidate_dir / CI_WORKFLOW
     if not ci_path.is_file():
         raise TrustPolicyError("candidate CI workflow is missing")
