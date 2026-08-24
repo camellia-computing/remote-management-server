@@ -135,4 +135,14 @@ configured GHCR/Docker Hub targets, signs and publicly reads back all evidence,
 and completes an immutable GitHub Release. Deployments use digests; `latest` is
 only reconciled discovery metadata.
 
+`deployment-dependencies.json` also pins the production PostgreSQL parent
+digest, amd64/arm64 children, Trivy 0.72.0, vulnerability-database freshness,
+and rejection of every HIGH/CRITICAL finding including unfixed findings.
+Management release-evidence schema v2 binds per-platform scans/SPDX documents,
+the exact Compose lifecycle and Client Web commit, and an attested
+`deployment-bom.json`. A daily rescan maps immutable historical BOMs back to
+their database digests. Affected tags are never moved; replace the policy
+digest and publish a new release within 24 hours for CRITICAL or 72 hours for
+HIGH findings.
+
 This repository is licensed under GNU AGPL-3.0-only. See `SOURCE_PROVENANCE.json`, `NOTICE`, and `SECURITY.md`.

@@ -205,6 +205,8 @@ jobs:
           python3 .github/scripts/test_manage_release.py
           python3 .github/scripts/test_container_release_evidence.py
           python3 .github/scripts/test_resolve_remote_client_release.py
+          python3 scripts/test_deployment_dependencies.py
+          python3 scripts/deployment_dependencies.py validate-policy
           bash .github/scripts/tests/test_resolve_container_registries.sh
           bash .github/scripts/tests/test_verify_release_image.sh
           bash -n .github/scripts/publish-container-release.sh
@@ -575,12 +577,77 @@ jobs:
           exit-code: "1"
           timeout: 10m0s
 
+      - name: Prepare exact production PostgreSQL images
+        env:
+          POSTGRES_SCAN_ROOT: ${{ runner.temp }}/postgresql-scans
+        run: |
+          set -euo pipefail
+          mkdir -p "$POSTGRES_SCAN_ROOT"
+          database_reference="$(python3 -c 'import json; print(json.load(open("deployment-dependencies.json"))["database"]["reference"])')"
+          for architecture in amd64 arm64; do
+            image="${database_reference%@*}@$(python3 - "$architecture" <<'PY'
+          import json
+          import subprocess
+          import sys
+
+          architecture = sys.argv[1]
+          reference = json.load(open("deployment-dependencies.json"))["database"]["reference"]
+          raw = subprocess.check_output(["docker", "buildx", "imagetools", "inspect", "--raw", reference], text=True)
+          document = json.loads(raw)
+          matches = [
+              item["digest"]
+              for item in document["manifests"]
+              if item.get("platform") == {"os": "linux", "architecture": architecture}
+          ]
+          if len(matches) != 1:
+              raise SystemExit(f"expected one linux/{architecture} PostgreSQL manifest")
+          print(matches[0], end="")
+          PY
+          )"
+            docker pull --platform "linux/$architecture" "$image"
+            docker save "$image" > "$POSTGRES_SCAN_ROOT/postgres-$architecture.tar"
+          done
+
       - name: Verify production PostgreSQL container boundary
         run: |
           python3 scripts/test_postgres_container_hardening.py \
             --effective \
             --runtime \
             --project-name "$POSTGRES_HARDENING_PROJECT"
+
+      - name: Scan production PostgreSQL amd64 image
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          input: ${{ runner.temp }}/postgresql-scans/postgres-amd64.tar
+          version: v0.72.0
+          scanners: vuln
+          vuln-type: os,library
+          severity: CRITICAL,HIGH
+          ignore-unfixed: false
+          format: json
+          output: ${{ runner.temp }}/postgresql-scans/POSTGRESQL-amd64-VULNERABILITY-SCAN.json
+          exit-code: "0"
+          timeout: 10m0s
+
+      - name: Scan production PostgreSQL arm64 image
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          input: ${{ runner.temp }}/postgresql-scans/postgres-arm64.tar
+          version: v0.72.0
+          scanners: vuln
+          vuln-type: os,library
+          severity: CRITICAL,HIGH
+          ignore-unfixed: false
+          format: json
+          output: ${{ runner.temp }}/postgresql-scans/POSTGRESQL-arm64-VULNERABILITY-SCAN.json
+          exit-code: "0"
+          timeout: 10m0s
+
+      - name: Enforce production PostgreSQL vulnerability policy
+        run: |
+          python3 scripts/deployment_dependencies.py validate-scan \
+            "$RUNNER_TEMP/postgresql-scans/POSTGRESQL-amd64-VULNERABILITY-SCAN.json" \
+            "$RUNNER_TEMP/postgresql-scans/POSTGRESQL-arm64-VULNERABILITY-SCAN.json"
 
       - name: Prepare production Compose integration
         run: |
@@ -616,7 +683,9 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: production-compose-${{ github.sha }}
-          path: ${{ runner.temp }}/production-compose-evidence.json
+          path: |
+            ${{ runner.temp }}/production-compose-evidence.json
+            ${{ runner.temp }}/postgresql-scans
           if-no-files-found: warn
           retention-days: 14
 

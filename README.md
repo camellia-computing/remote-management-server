@@ -226,6 +226,13 @@ Management 提交的精确成功 CI Web 产物。Release App 通过受审
 `release/next` PR 生成版本和标签；冻结多架构 OCI、扫描、SBOM、
 provenance 与依赖证据全部成功后才进入 `release` 环境。GHCR 与
 Docker Hub 按映射逐项发布或跳过，所有已配置目标使用同一摘要。
+`deployment-dependencies.json`同时锁定生产PostgreSQL parent digest、
+amd64/arm64 child manifest、Trivy 0.72.0、漏洞库新鲜度及
+HIGH/CRITICAL（包括无修复版本）拒绝策略。正式Management Release的
+schema v2证据会包含逐平台扫描/SPDX、精确Compose生命周期证据、Client
+Web提交及经GitHub attestation的`deployment-bom.json`。每日rescan按BOM
+把历史版本映射回不可变数据库digest；命中漏洞时不得移动旧tag，必须在
+CRITICAL 24小时/HIGH 72小时SLA内更新policy digest并发布替代版本。
 GitHub Release 的全部资产会签名并公开回读。`latest` 只指向最高的
 已完成稳定版，部署仍必须使用摘要。完整状态机见
 [发布规范](docs/releasing.md)。

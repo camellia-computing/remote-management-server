@@ -19,6 +19,7 @@ TrustPolicyError = ci_trust_policy.TrustPolicyError
 classify_paths = ci_trust_policy.classify_paths
 validate_ci_workflow = ci_trust_policy.validate_ci_workflow
 validate_workflow_safety = ci_trust_policy.validate_workflow_safety
+validate_rescan_workflow = ci_trust_policy.validate_rescan_workflow
 verify_candidate = ci_trust_policy.verify_candidate
 
 
@@ -32,6 +33,12 @@ class ChangeClassificationTests(unittest.TestCase):
     def test_required_action_and_policy_script_are_runtime(self):
         self.assertTrue(classify_paths([".github/actions/build-web-client/action.yml"])["runtime"])
         self.assertTrue(classify_paths([".github/scripts/ci_trust_policy.py"])["runtime"])
+
+    def test_deployment_policy_requires_automation_and_dependency_gates(self):
+        self.assertEqual(
+            classify_paths(["deployment-dependencies.json"]),
+            {"runtime": True, "automation": True, "dependencies": True},
+        )
 
     def test_documentation_only_keeps_runtime_suite_optional(self):
         self.assertEqual(
@@ -97,7 +104,9 @@ class RequiredContractTests(unittest.TestCase):
                 validate_ci_workflow(self.workflow.replace(command, "", 1))
 
     def test_coverage_execution_chain_cannot_be_removed(self):
-        changed = self.workflow.replace("uv run coverage run --branch -m pytest --create-db", "uv run pytest --create-db", 1)
+        changed = self.workflow.replace(
+            "uv run coverage run --branch -m pytest --create-db", "uv run pytest --create-db", 1
+        )
         with self.assertRaises(TrustPolicyError):
             validate_ci_workflow(changed)
 
@@ -180,6 +189,17 @@ class CandidateBoundaryTests(unittest.TestCase):
             (candidate / ".github/workflows/ci.yml").write_text(candidate_ci, encoding="utf-8")
             with self.assertRaises(TrustPolicyError):
                 verify_candidate(base, candidate, [".github/workflows/ci.yml"])
+
+    def test_dependency_rescan_workflow_keeps_immutable_bom_and_scan_contract(self):
+        workflow = (ROOT / ".github/workflows/dependency-rescan.yml").read_text(encoding="utf-8")
+        validate_rescan_workflow(workflow)
+        with self.assertRaises(TrustPolicyError):
+            validate_rescan_workflow(workflow.replace("ignore-unfixed: false", "ignore-unfixed: true"))
+
+    def test_dependency_rescan_validates_complete_release_evidence(self):
+        workflow = (ROOT / ".github/workflows/dependency-rescan.yml").read_text(encoding="utf-8")
+        with self.assertRaises(TrustPolicyError):
+            validate_rescan_workflow(workflow.replace(".github/scripts/validate-release-evidence.py", "missing.py"))
 
 
 if __name__ == "__main__":

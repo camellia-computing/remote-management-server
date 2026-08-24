@@ -8,11 +8,10 @@ import hashlib
 import importlib.util
 import json
 import re
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from types import ModuleType
 from typing import Any
-
 
 POLICY_REVISION = "2026-07-31.1"
 SIGNING_REGISTRY_REVISION = "2026-07-31.1"
@@ -20,7 +19,7 @@ COMMIT = re.compile(r"^[0-9a-f]{40}$")
 DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
 LOGICAL_ID = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 SEMVER = re.compile(r"^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$")
-FROZEN_KEYS = {
+BASE_FROZEN_KEYS = {
     "schema_version",
     "repository",
     "image",
@@ -34,6 +33,7 @@ FROZEN_KEYS = {
     "sbom",
     "provenance",
 }
+FROZEN_KEYS = BASE_FROZEN_KEYS | {"deployment"}
 
 
 def unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -98,19 +98,24 @@ def validate_dependencies(value: Any) -> list[dict[str, Any]]:
         version = item.get("version")
         if version is not None and not SEMVER.fullmatch(str(version)):
             raise ValueError("dependency version must be stable SemVer or null")
-        identities.append(
-            (item["repository"], str(item.get("relation", "")), item["commit"])
-        )
+        identities.append((item["repository"], str(item.get("relation", "")), item["commit"]))
     if identities != sorted(set(identities)):
         raise ValueError("dependencies must be sorted and unique")
     return value
 
 
 def validate_frozen(value: Any) -> dict[str, Any]:
-    if not isinstance(value, dict) or set(value) != FROZEN_KEYS:
+    if not isinstance(value, dict):
         raise ValueError("frozen container evidence has unexpected fields")
-    if value["schema_version"] != 1:
-        raise ValueError("frozen evidence schema_version must be 1")
+    schema_version = value.get("schema_version")
+    if schema_version == 1:
+        if set(value) != BASE_FROZEN_KEYS or value.get("repository") == "remote-management":
+            raise ValueError("schema v1 frozen evidence has unexpected fields or repository")
+    elif schema_version == 2:
+        if set(value) != FROZEN_KEYS or value.get("repository") != "remote-management":
+            raise ValueError("schema v2 frozen evidence is reserved for Management")
+    else:
+        raise ValueError("frozen evidence schema_version must be 1 or 2")
     if not LOGICAL_ID.fullmatch(str(value.get("repository", ""))):
         raise ValueError("frozen repository must be a logical ID")
     if not LOGICAL_ID.fullmatch(str(value.get("image", ""))):
@@ -173,6 +178,23 @@ def validate_frozen(value: Any) -> dict[str, Any]:
             or not re.fullmatch(r"^[0-9a-f]{64}$", str(item.get("sha256", "")))
         ):
             raise ValueError(f"frozen {name} reference is invalid")
+    if schema_version == 2:
+        deployment = value.get("deployment")
+        if not isinstance(deployment, dict) or set(deployment) != {"bom", "attestation"}:
+            raise ValueError("frozen deployment evidence has unexpected fields")
+        expected_names = {
+            "bom": "deployment-bom.json",
+            "attestation": "DEPLOYMENT-BOM-ATTESTATION.intoto.jsonl",
+        }
+        for name, expected_name in expected_names.items():
+            item = deployment.get(name)
+            if (
+                not isinstance(item, dict)
+                or set(item) != {"name", "sha256"}
+                or item.get("name") != expected_name
+                or not re.fullmatch(r"^[0-9a-f]{64}$", str(item.get("sha256", "")))
+            ):
+                raise ValueError(f"frozen deployment {name} reference is invalid")
     return value
 
 
@@ -199,38 +221,41 @@ def freeze(args: argparse.Namespace) -> dict[str, Any]:
             }
         )
     platforms.sort(key=lambda item: (item["platform"], item["architecture"]))
-    dependencies = (
-        load_json(args.dependencies, "dependencies")
-        if args.dependencies is not None
-        else []
-    )
-    generated_at = args.generated_at or datetime.now(timezone.utc).isoformat(
-        timespec="seconds"
-    ).replace("+00:00", "Z")
-    return validate_frozen(
-        {
-            "schema_version": 1,
-            "repository": args.repository,
-            "image": args.image,
-            "version": args.version,
-            "source": {
-                "commit": args.commit,
-                "ref": f"refs/tags/v{args.version}",
-                "validation_run_id": args.validation_run_id,
-            },
-            "generated_at": generated_at,
-            "policy": {
-                "repository_policy_revision": POLICY_REVISION,
-                "signing_registry_revision": SIGNING_REGISTRY_REVISION,
-                "exceptions": [],
-            },
-            "dependencies": validate_dependencies(dependencies),
-            "digest": args.digest,
-            "platforms": platforms,
-            "sbom": evidence_file(args.sbom),
-            "provenance": evidence_file(args.provenance),
+    dependencies = load_json(args.dependencies, "dependencies") if args.dependencies is not None else []
+    generated_at = args.generated_at or datetime.now(UTC).isoformat(timespec="seconds").replace("+00:00", "Z")
+    deployment_paths = (args.deployment_bom, args.deployment_attestation)
+    if args.repository == "remote-management" and any(path is None for path in deployment_paths):
+        raise ValueError("Management release evidence requires deployment BOM and attestation")
+    if args.repository != "remote-management" and any(path is not None for path in deployment_paths):
+        raise ValueError("deployment evidence is valid only for remote-management")
+    value = {
+        "schema_version": 2 if args.repository == "remote-management" else 1,
+        "repository": args.repository,
+        "image": args.image,
+        "version": args.version,
+        "source": {
+            "commit": args.commit,
+            "ref": f"refs/tags/v{args.version}",
+            "validation_run_id": args.validation_run_id,
+        },
+        "generated_at": generated_at,
+        "policy": {
+            "repository_policy_revision": POLICY_REVISION,
+            "signing_registry_revision": SIGNING_REGISTRY_REVISION,
+            "exceptions": [],
+        },
+        "dependencies": validate_dependencies(dependencies),
+        "digest": args.digest,
+        "platforms": platforms,
+        "sbom": evidence_file(args.sbom),
+        "provenance": evidence_file(args.provenance),
+    }
+    if args.repository == "remote-management":
+        value["deployment"] = {
+            "bom": evidence_file(args.deployment_bom),
+            "attestation": evidence_file(args.deployment_attestation),
         }
-    )
+    return validate_frozen(value)
 
 
 def finalize(args: argparse.Namespace) -> dict[str, Any]:
@@ -239,12 +264,11 @@ def finalize(args: argparse.Namespace) -> dict[str, Any]:
     if (
         not isinstance(registries, list)
         or len(registries) != 2
-        or [item.get("name") for item in registries if isinstance(item, dict)]
-        != ["dockerhub", "ghcr"]
+        or [item.get("name") for item in registries if isinstance(item, dict)] != ["dockerhub", "ghcr"]
     ):
         raise ValueError("registry results must cover Docker Hub and GHCR in order")
     value = {
-        "schema_version": 1,
+        "schema_version": frozen["schema_version"],
         "repository": frozen["repository"],
         "version": frozen["version"],
         "source": frozen["source"],
@@ -264,6 +288,8 @@ def finalize(args: argparse.Namespace) -> dict[str, Any]:
             }
         ],
     }
+    if frozen["schema_version"] == 2:
+        value["deployment"] = frozen["deployment"]
     load_validator().validate_release_evidence(value)
     return value
 
@@ -288,6 +314,8 @@ def parser() -> argparse.ArgumentParser:
     freeze_parser.add_argument("--sbom", required=True, type=Path)
     freeze_parser.add_argument("--provenance", required=True, type=Path)
     freeze_parser.add_argument("--dependencies", type=Path)
+    freeze_parser.add_argument("--deployment-bom", type=Path)
+    freeze_parser.add_argument("--deployment-attestation", type=Path)
     freeze_parser.add_argument("--generated-at")
     freeze_parser.add_argument("--output", required=True, type=Path)
     freeze_parser.set_defaults(handler=freeze)
