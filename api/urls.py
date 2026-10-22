@@ -3,6 +3,7 @@ from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.http import require_http_methods
 
 from api import views_api, views_front
+from api.replayable_mutations import replayable_stateless_api
 from api.response_contract import (
     RESPONSE_MODE_BROWSER,
     RESPONSE_MODE_BROWSER_JSON_POST,
@@ -50,7 +51,19 @@ def credential_browser_view(view, *methods):
     return credential_response(browser_view(view, *methods))
 
 
+def credential_hybrid_read_api(view):
+    """A no-store JSON GET authenticated by bearer token or browser session."""
+
+    wrapped = credential_response(require_http_methods(("GET",))(view))
+    setattr(wrapped, RESPONSE_MODE_MARKER, RESPONSE_MODE_JSON)
+    return wrapped
+
+
 urlpatterns = [
+    url(
+        r"^management-operations/(?P<operation_id>[^/]+)$",
+        credential_hybrid_read_api(views_api.management_operation_receipt),
+    ),
     url(r"^login-options$", stateless_api(views_api.login_options, "GET")),
     url(r"^oidc/auth$", credential_stateless_api(views_api.oidc_auth, "POST")),
     url(r"^oidc/auth-query$", credential_stateless_api(views_api.oidc_auth_query, "POST")),
@@ -80,15 +93,15 @@ urlpatterns = [
     url(r"^ab/shared$", stateless_api(views_api.ab_shared_delete, "DELETE")),
     url(r"^ab/peers$", credential_stateless_api(views_api.ab_peers, "POST")),
     url(r"^ab/tags/(?P<guid>[^/]+)$", stateless_api(views_api.ab_tags, "POST")),
-    url(r"^ab/peer/add/(?P<guid>[^/]+)$", stateless_api(views_api.ab_peer_add, "POST")),
-    url(r"^ab/peer/update/(?P<guid>[^/]+)$", stateless_api(views_api.ab_peer_update, "PUT")),
-    url(r"^ab/peer/(?P<guid>[^/]+)$", stateless_api(views_api.ab_peer_delete, "DELETE")),
-    url(r"^ab/tag/add/(?P<guid>[^/]+)$", stateless_api(views_api.ab_tag_add, "POST")),
-    url(r"^ab/tag/rename/(?P<guid>[^/]+)$", stateless_api(views_api.ab_tag_rename, "PUT")),
-    url(r"^ab/tag/update/(?P<guid>[^/]+)$", stateless_api(views_api.ab_tag_update, "PUT")),
-    url(r"^ab/tag/(?P<guid>[^/]+)$", stateless_api(views_api.ab_tag_delete, "DELETE")),
-    url(r"^ab/rules$", stateless_api(views_api.ab_rules, "GET", "DELETE")),
-    url(r"^ab/rule$", stateless_api(views_api.ab_rule, "POST", "PATCH")),
+    url(r"^ab/peer/add/(?P<guid>[^/]+)$", replayable_stateless_api(views_api.ab_peer_add, "address_book_peer_add", "POST")),
+    url(r"^ab/peer/update/(?P<guid>[^/]+)$", replayable_stateless_api(views_api.ab_peer_update, "address_book_peer_update", "PUT")),
+    url(r"^ab/peer/(?P<guid>[^/]+)$", replayable_stateless_api(views_api.ab_peer_delete, "address_book_peer_delete", "DELETE")),
+    url(r"^ab/tag/add/(?P<guid>[^/]+)$", replayable_stateless_api(views_api.ab_tag_add, "address_book_tag_add", "POST")),
+    url(r"^ab/tag/rename/(?P<guid>[^/]+)$", replayable_stateless_api(views_api.ab_tag_rename, "address_book_tag_rename", "PUT")),
+    url(r"^ab/tag/update/(?P<guid>[^/]+)$", replayable_stateless_api(views_api.ab_tag_update, "address_book_tag_update", "PUT")),
+    url(r"^ab/tag/(?P<guid>[^/]+)$", replayable_stateless_api(views_api.ab_tag_delete, "address_book_tag_delete", "DELETE")),
+    url(r"^ab/rules$", replayable_stateless_api(views_api.ab_rules, "address_book_rule_delete", "GET", "DELETE")),
+    url(r"^ab/rule$", replayable_stateless_api(views_api.ab_rule, "address_book_rule_mutation", "POST", "PATCH")),
     url(r"^device-group/accessible$", stateless_api(views_api.device_group_accessible, "GET")),
     url(r"^device-groups$", stateless_api(views_api.device_groups, "GET", "POST")),
     url(

@@ -38,6 +38,8 @@ def _validated_strategy_config_options(value):
 
 class RemoteDeviceQuerySet(models.QuerySet):
     def update(self, **kwargs):
+        if "mutation_generation" in kwargs:
+            raise ValueError("mutation_generation is managed internally")
         if "policy_generation" in kwargs:
             raise ValueError("policy_generation is managed internally")
         if DEVICE_SECRET_CONTEXT_FIELDS.intersection(kwargs):
@@ -57,6 +59,8 @@ class RemoteDeviceQuerySet(models.QuerySet):
 
 class StrategyProfileQuerySet(models.QuerySet):
     def update(self, **kwargs):
+        if "mutation_generation" in kwargs:
+            raise ValueError("mutation_generation is managed internally")
         config_options = kwargs.get("config_options")
         if "config_options" in kwargs and not hasattr(config_options, "resolve_expression"):
             kwargs["config_options"] = _validated_strategy_config_options(config_options)
@@ -108,6 +112,8 @@ class StrategyProfileQuerySet(models.QuerySet):
 
 class DeviceGroupQuerySet(models.QuerySet):
     def update(self, **kwargs):
+        if "mutation_generation" in kwargs:
+            raise ValueError("mutation_generation is managed internally")
         if not {"strategy", "strategy_id"}.intersection(kwargs):
             return super().update(**kwargs)
         from api.policy_generation import (
@@ -204,6 +210,12 @@ class ManagementBatchOperation(models.Model):
     request_digest = models.CharField(max_length=64, editable=False)
     status_code = models.PositiveSmallIntegerField(editable=False)
     response = models.JSONField(editable=False)
+    secret_response = EncryptedTextField(
+        blank=True,
+        context_fields=("operation_id", "actor_id", "operation"),
+        default="",
+        editable=False,
+    )
     created_at = models.DateTimeField(auto_now_add=True, db_index=True)
 
     class Meta:
@@ -534,6 +546,7 @@ class RemoteDevice(models.Model):
     )
     deployment_generation = models.PositiveBigIntegerField(default=0, editable=False)
     policy_generation = models.PositiveBigIntegerField(default=0, editable=False)
+    mutation_generation = models.PositiveBigIntegerField(default=0, editable=False)
     username = models.CharField(verbose_name=_("系统用户名"), max_length=100, blank=True)
     version = models.CharField(verbose_name=_("客户端版本"), max_length=100)
     ip_address = models.GenericIPAddressField(
@@ -622,8 +635,11 @@ class RemoteDevice(models.Model):
     def save(self, *args, **kwargs):
         if not self.pk:
             self.policy_generation = 0
+            self.mutation_generation = 0
             return super().save(*args, **kwargs)
         update_fields = kwargs.get("update_fields")
+        if update_fields is not None and "mutation_generation" in update_fields:
+            raise ValueError("mutation_generation is managed internally")
         policy_fields_touched = update_fields is None or bool(
             (POLICY_ASSIGNMENT_FIELDS | {"policy_generation"}).intersection(update_fields)
         )
@@ -647,12 +663,14 @@ class RemoteDevice(models.Model):
                     "device_group_id",
                     "strategy_id",
                     "policy_generation",
+                    "mutation_generation",
                 )
                 .first()
             )
             if previous is None:
                 return super().save(*args, **kwargs)
             self.policy_generation = previous["policy_generation"]
+            self.mutation_generation = previous["mutation_generation"]
             secret_context_changed = secret_context_touched and any(
                 previous[field] != getattr(self, field)
                 for field in ("owner_id", "rid", "uuid", "deployment_generation")
@@ -1492,6 +1510,7 @@ class StrategyProfile(models.Model):
     name = models.CharField(verbose_name=_("策略名称"), max_length=60, unique=True)
     config_options = models.JSONField(verbose_name=_("配置项"), blank=True, default=dict)
     enabled = models.BooleanField(verbose_name=_("是否启用"), default=True)
+    mutation_generation = models.PositiveBigIntegerField(default=0, editable=False)
     updated_at = models.DateTimeField(verbose_name=_("更新时间"), auto_now=True)
 
     class Meta:
@@ -1508,9 +1527,14 @@ class StrategyProfile(models.Model):
 
     def save(self, *args, **kwargs):
         update_fields = kwargs.get("update_fields")
+        if update_fields is not None and "mutation_generation" in update_fields:
+            raise ValueError("mutation_generation is managed internally")
         if update_fields is None or "config_options" in update_fields:
             self.config_options = _validated_strategy_config_options(self.config_options)
-        if not self.pk or (update_fields is not None and not POLICY_CONTENT_FIELDS.intersection(update_fields)):
+        if not self.pk:
+            self.mutation_generation = 0
+            return super().save(*args, **kwargs)
+        if update_fields is not None and not POLICY_CONTENT_FIELDS.intersection(update_fields):
             return super().save(*args, **kwargs)
         database = kwargs.get("using") or router.db_for_write(type(self), instance=self)
         from api.policy_generation import (
@@ -1524,9 +1548,11 @@ class StrategyProfile(models.Model):
                 ._base_manager.using(database)
                 .select_for_update()
                 .filter(pk=self.pk)
-                .values("config_options", "enabled")
+                .values("config_options", "enabled", "mutation_generation")
                 .first()
             )
+            if previous is not None:
+                self.mutation_generation = previous["mutation_generation"]
             result = super().save(*args, **kwargs)
             changed_fields = (
                 POLICY_CONTENT_FIELDS if update_fields is None else POLICY_CONTENT_FIELDS.intersection(update_fields)
@@ -1576,6 +1602,7 @@ class DeviceGroup(models.Model):
         verbose_name=_("策略"),
     )
     created_at = models.DateTimeField(verbose_name=_("创建时间"), default=timezone.now)
+    mutation_generation = models.PositiveBigIntegerField(default=0, editable=False)
     updated_at = models.DateTimeField(verbose_name=_("更新时间"), auto_now=True)
 
     class Meta:
@@ -1593,8 +1620,13 @@ class DeviceGroup(models.Model):
         return self.name
 
     def save(self, *args, **kwargs):
+        if not self.pk:
+            self.mutation_generation = 0
+            return super().save(*args, **kwargs)
         update_fields = kwargs.get("update_fields")
-        if not self.pk or (update_fields is not None and not {"strategy", "strategy_id"}.intersection(update_fields)):
+        if update_fields is not None and "mutation_generation" in update_fields:
+            raise ValueError("mutation_generation is managed internally")
+        if update_fields is not None and not {"strategy", "strategy_id"}.intersection(update_fields):
             return super().save(*args, **kwargs)
         database = kwargs.get("using") or router.db_for_write(type(self), instance=self)
         from api.policy_generation import (
@@ -1603,14 +1635,17 @@ class DeviceGroup(models.Model):
         )
 
         with transaction.atomic(using=database):
-            previous_strategy_id = (
+            previous = (
                 type(self)
                 ._base_manager.using(database)
                 .select_for_update()
                 .filter(pk=self.pk)
-                .values_list("strategy_id", flat=True)
+                .values("strategy_id", "mutation_generation")
                 .first()
             )
+            previous_strategy_id = previous["strategy_id"] if previous else None
+            if previous is not None:
+                self.mutation_generation = previous["mutation_generation"]
             result = super().save(*args, **kwargs)
             if previous_strategy_id != self.strategy_id:
                 device_ids = device_ids_affected_by_groups((self.pk,), using=database)

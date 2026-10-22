@@ -29,9 +29,17 @@ from api.address_book_authorization import (
 )
 from api.audit_expressions import audit_cursor_boundary
 from api.audit_queries import AUDIT_SEARCH_MAX_LENGTH, AUDIT_SEARCH_MIN_LENGTH, filter_address_book_audits
+from api.browser_mutations import replayable_address_book_form
 from api.device_inventory import DeviceInventory, InventoryPageSource
 from api.formatting import format_bytes
+from api.identifiers import InvalidIdentifier
 from api.login_admission import REGISTER_SCOPE, complete_login_success, reserve_login_attempt
+from api.management_operations import (
+    ManagementMutation,
+    ManagementOperationConflict,
+    execute_management_operation,
+    parse_operation_id,
+)
 from api.models import (
     AddressBookProfile,
     AddressBookRule,
@@ -82,6 +90,29 @@ def _filename_stamp():
 
 def _client_ip(request):
     return client_ip(request)
+
+
+def _state040_operation_id(request):
+    value = request.META.get("HTTP_IDEMPOTENCY_KEY") or request.POST.get("idempotency_key")
+    if not value or not str(value).strip():
+        raise InvalidIdentifier("A canonical Idempotency-Key UUID is required")
+    return parse_operation_id(str(value))
+
+
+def _browser_expected_generation(request):
+    value = str(request.POST.get("expected_generation", "")).strip()
+    if not value:
+        raise ValueError("Resource generation is required")
+    if not value.isascii() or not value.isdigit():
+        raise ValueError("Invalid resource generation")
+    return int(value)
+
+
+def _browser_management_operation(**kwargs):
+    try:
+        return execute_management_operation(**kwargs)
+    except ManagementOperationConflict:
+        return None
 
 
 def _log_event(request, event, level="info", **extra):
@@ -651,6 +682,7 @@ def _upsert_tag(user, profile, name, color):
         if tag:
             tag.tag_color = color
             tag.save(update_fields=["tag_color"])
+            bump_locked_authorization_generation(profile)
             return True
         if (
             RemoteTag.objects.filter(
@@ -664,6 +696,7 @@ def _upsert_tag(user, profile, name, color):
             tag_name=name,
             tag_color=color,
         )
+        bump_locked_authorization_generation(profile)
         return True
 
 
@@ -723,6 +756,7 @@ def _rename_tag(user, profile, old, new):
         else:
             old_tag.tag_name = new
             old_tag.save(update_fields=["tag_name"])
+        bump_locked_authorization_generation(profile)
     return True
 
 
@@ -735,6 +769,8 @@ def _delete_tag(user, profile, name):
             profile=profile,
             tag_name=name,
         ).delete()[0]
+        if deleted:
+            bump_locked_authorization_generation(profile)
     return deleted > 0
 
 
@@ -878,6 +914,7 @@ def _collect_global_rules(filter_q=None, allowed_guids=None):
                 "target_name": share.user.username if share.user else "-",
                 "rule": share.rule,
                 "rule_label": _rule_label(share.rule),
+                "authorization_generation": profile.authorization_generation,
             }
         )
     rule_rows = AddressBookRule.objects.select_related("profile", "user", "group", "profile__owner").exclude(
@@ -902,6 +939,7 @@ def _collect_global_rules(filter_q=None, allowed_guids=None):
                 "target_name": target_name if target_name else "-",
                 "rule": rule.rule,
                 "rule_label": _rule_label(rule.rule),
+                "authorization_generation": profile.authorization_generation,
             }
         )
     if filter_q:
@@ -1116,6 +1154,140 @@ def _share_message(request, title, message, status=200):
     )
 
 
+def _accept_share_link(request, token_hash):
+    with transaction.atomic():
+        link = (
+            ShareLink.objects.select_for_update(of=("self",))
+            .select_related("creator")
+            .filter(shash=token_hash)
+            .first()
+        )
+        if not link or link.is_used or link.is_expired or link.expires_at <= timezone.now():
+            if link and not link.is_used:
+                link.is_expired = True
+                link.save(update_fields=["is_expired"])
+            return ManagementMutation(
+                status_code=404,
+                body={"code": "share_link_unavailable", "title": "错误", "message": "分享链接不存在或已失效。"},
+                applied={"share_links": 0},
+                result_state={"error": "share_link_unavailable"},
+            )
+        if request.user.id == link.creator_id:
+            return ManagementMutation(
+                status_code=403,
+                body={"code": "share_link_self_accept", "title": "错误", "message": "不能领取自己创建的分享链接。"},
+                applied={"share_links": 0},
+                result_state={"error": "share_link_self_accept"},
+            )
+        peer_count = link.peers.count()
+        if not 1 <= peer_count <= MAX_SHARE_PEERS:
+            link.is_expired = True
+            link.save(update_fields=["is_expired"])
+            return ManagementMutation(
+                status_code=400,
+                body={"code": "share_link_invalid", "title": "错误", "message": "分享链接内容无效。"},
+                applied={"share_links": 0},
+                result_state={"error": "share_link_invalid"},
+            )
+        source_peers = list(
+            link.peers.filter(profile__owner_id=link.creator_id)
+            .prefetch_related(
+                Prefetch(
+                    "tags",
+                    queryset=RemoteTag.objects.order_by("tag_name"),
+                    to_attr="ordered_tags",
+                )
+            )
+            .order_by("pk")
+        )
+        if len(source_peers) != peer_count:
+            link.is_expired = True
+            link.save(update_fields=["is_expired"])
+            return ManagementMutation(
+                status_code=400,
+                body={"code": "share_link_invalid", "title": "错误", "message": "分享链接内容无效。"},
+                applied={"share_links": 0},
+                result_state={"error": "share_link_scope_invalid"},
+            )
+        personal_profile = _ensure_personal_profile(request.user)
+        personal_profile, personal_owner, personal_rule = lock_profile_access(request.user, personal_profile.pk)
+        if (
+            not personal_profile
+            or not personal_owner
+            or not _can_write_rule(personal_rule)
+            or personal_profile.guid != _personal_guid(request.user)
+        ):
+            return ManagementMutation(
+                status_code=403,
+                body={"code": "share_recipient_changed", "title": "错误", "message": "地址簿授权已变更。"},
+                applied={"share_links": 0},
+                result_state={"error": "recipient_authorization_changed"},
+            )
+        existing_ids = set(
+            RemotePeer.objects.filter(
+                profile=personal_profile,
+                rid__in=[peer.rid for peer in source_peers],
+            ).values_list("rid", flat=True)
+        )
+        sources_to_import = [peer for peer in source_peers if peer.rid not in existing_ids]
+        recipient_peer_count = RemotePeer.objects.filter(profile=personal_profile).count()
+        if recipient_peer_count + len(sources_to_import) > MAX_AB_PEERS:
+            return ManagementMutation(
+                status_code=409,
+                body={"code": "share_recipient_peer_limit", "title": "错误", "message": "个人地址簿设备数量已达到上限。"},
+                applied={"share_links": 0},
+                result_state={"error": "recipient_peer_limit"},
+            )
+        source_tag_names = list(
+            dict.fromkeys(tag_name for peer in sources_to_import for tag_name in _peer_tag_list(peer))
+        )
+        recipient_tags = _resolve_profile_tags(personal_profile, source_tag_names)
+        if recipient_tags is None:
+            return ManagementMutation(
+                status_code=409,
+                body={"code": "share_recipient_tag_limit", "title": "错误", "message": "个人地址簿标签数量已达到上限。"},
+                applied={"share_links": 0},
+                result_state={"error": "recipient_tag_limit"},
+            )
+        tags_by_name = {tag.tag_name: tag for tag in recipient_tags}
+        imports = []
+        for source in sources_to_import:
+            peer = RemotePeer.objects.create(
+                profile=personal_profile,
+                rid=source.rid,
+                username=source.username,
+                hostname=source.hostname,
+                alias=source.alias,
+                platform=source.platform,
+                rhash=source.rhash,
+                note=source.note,
+                password="",
+                device_group_name=source.device_group_name,
+                login_name=source.login_name,
+                same_server=source.same_server,
+            )
+            peer.tags.set([tags_by_name[name] for name in _peer_tag_list(source)])
+            imports.append(peer)
+        if imports:
+            bump_locked_authorization_generation(personal_profile)
+        link.is_used = True
+        link.used_at = timezone.now()
+        link.used_by = request.user
+        link.save(update_fields=["is_used", "used_at", "used_by"])
+        imported = len(imports)
+        return ManagementMutation(
+            status_code=200,
+            body={
+                "code": 1,
+                "title": "成功",
+                "message": f"已获取 {imported} 台设备；已存在的设备不会被覆盖。",
+                "imported": imported,
+            },
+            applied={"share_links": 1},
+            result_state={"share_hash": link.shash, "recipient": request.user.pk, "imported": imported},
+        )
+
+
 @login_required(login_url="/api/user_action?action=login")
 def share(request, share_token=None):
     is_admin = getattr(request.user, "is_admin", False)
@@ -1154,123 +1326,56 @@ def share(request, share_token=None):
                     "peer_count": peer_count,
                     "expires_at": link.expires_at,
                     "share_token": share_token,
+                    "operation_id": str(uuid.uuid4()),
                     "u": request.user,
                     "nav_active": "share",
                 },
             )
-        with transaction.atomic():
-            link = (
-                ShareLink.objects.select_for_update(of=("self",))
-                .select_related("creator")
-                .filter(shash=token_hash)
-                .first()
+        try:
+            operation_id = _state040_operation_id(request)
+        except InvalidIdentifier:
+            return _share_message(request, "错误", "操作标识无效。", status=400)
+        try:
+            result = execute_management_operation(
+                actor=request.user,
+                operation_id=operation_id,
+                operation="share_link_accept",
+                request_document={
+                    "operation": "share_link_accept",
+                    "share_hash": token_hash,
+                    "recipient": request.user.pk,
+                },
+                requested={"share_links": 1},
+                mutation=lambda: _accept_share_link(request, token_hash),
             )
-            if not link or link.is_used or link.is_expired or link.expires_at <= timezone.now():
-                if link and not link.is_used:
-                    link.is_expired = True
-                    link.save(update_fields=["is_expired"])
-                return _share_message(request, "错误", "分享链接不存在或已失效。", status=404)
-            if request.user.id == link.creator_id:
-                return _share_message(request, "错误", "不能领取自己创建的分享链接。", status=403)
-            peer_count = link.peers.count()
-            if not 1 <= peer_count <= MAX_SHARE_PEERS:
-                link.is_expired = True
-                link.save(update_fields=["is_expired"])
-                return _share_message(request, "错误", "分享链接内容无效。", status=400)
-            source_peers = list(
-                link.peers.filter(
-                    profile__owner_id=link.creator_id,
-                )
-                .prefetch_related(
-                    Prefetch(
-                        "tags",
-                        queryset=RemoteTag.objects.order_by("tag_name"),
-                        to_attr="ordered_tags",
-                    )
-                )
-                .order_by("pk")
+        except ManagementOperationConflict:
+            return _share_message(request, "错误", "操作标识已用于其他请求。", status=409)
+        body = result.body
+        if result.status_code == 200:
+            _log_event(
+                request,
+                "front_share_accept",
+                username=request.user.username,
+                token_id=token_hash[:16],
+                imported=body.get("imported", 0),
+                operation_id=str(operation_id),
+                operation_generation=body.get("operation_generation"),
             )
-            if len(source_peers) != peer_count:
-                link.is_expired = True
-                link.save(update_fields=["is_expired"])
-                return _share_message(request, "错误", "分享链接内容无效。", status=400)
-            personal_profile = _ensure_personal_profile(request.user)
-            personal_profile, personal_owner, personal_rule = lock_profile_access(
-                request.user,
-                personal_profile.pk,
+        else:
+            _log_event(
+                request,
+                "front_share_accept_failed",
+                level="warning",
+                username=request.user.username,
+                token_id=token_hash[:16],
+                operation_id=str(operation_id),
+                status=result.status_code,
             )
-            if (
-                not personal_profile
-                or not personal_owner
-                or not _can_write_rule(personal_rule)
-                or personal_profile.guid != _personal_guid(request.user)
-            ):
-                return _share_message(request, "错误", "地址簿授权已变更。", status=403)
-            existing_ids = set(
-                RemotePeer.objects.filter(
-                    profile=personal_profile,
-                    rid__in=[peer.rid for peer in source_peers],
-                ).values_list("rid", flat=True)
-            )
-            sources_to_import = [peer for peer in source_peers if peer.rid not in existing_ids]
-            recipient_peer_count = RemotePeer.objects.filter(
-                profile=personal_profile,
-            ).count()
-            if recipient_peer_count + len(sources_to_import) > MAX_AB_PEERS:
-                return _share_message(
-                    request,
-                    "错误",
-                    "个人地址簿设备数量已达到上限。",
-                    status=409,
-                )
-            source_tag_names = list(
-                dict.fromkeys(tag_name for peer in sources_to_import for tag_name in _peer_tag_list(peer))
-            )
-            recipient_tags = _resolve_profile_tags(
-                personal_profile,
-                source_tag_names,
-            )
-            if recipient_tags is None:
-                return _share_message(
-                    request,
-                    "错误",
-                    "个人地址簿标签数量已达到上限。",
-                    status=409,
-                )
-            tags_by_name = {tag.tag_name: tag for tag in recipient_tags}
-            imports = []
-            for source in sources_to_import:
-                peer = RemotePeer.objects.create(
-                    profile=personal_profile,
-                    rid=source.rid,
-                    username=source.username,
-                    hostname=source.hostname,
-                    alias=source.alias,
-                    platform=source.platform,
-                    rhash=source.rhash,
-                    note=source.note,
-                    password="",
-                    device_group_name=source.device_group_name,
-                    login_name=source.login_name,
-                    same_server=source.same_server,
-                )
-                peer.tags.set([tags_by_name[name] for name in _peer_tag_list(source)])
-                imports.append(peer)
-            link.is_used = True
-            link.used_at = timezone.now()
-            link.used_by = request.user
-            link.save(update_fields=["is_used", "used_at", "used_by"])
-        _log_event(
-            request,
-            "front_share_accept",
-            username=request.user.username,
-            token_id=link.shash[:16],
-            imported=len(imports),
-        )
         return _share_message(
             request,
-            "成功",
-            f"已获取 {len(imports)} 台设备；已存在的设备不会被覆盖。",
+            body.get("title", "成功" if result.status_code == 200 else "错误"),
+            body.get("message", "分享链接处理失败。"),
+            status=result.status_code,
         )
 
     if is_admin:
@@ -1410,46 +1515,70 @@ def share(request, share_token=None):
         selected_peer_keys = list(selected_peers.order_by("pk").values_list("pk", flat=True))
         if len(selected_peer_keys) != len(selected_keys):
             return JsonResponse({"code": 0, "msg": _("设备选择无效。")}, status=400)
-        with transaction.atomic():
-            source_user = (
-                UserProfile.objects.select_for_update()
-                .filter(
-                    pk=share_uid,
-                    is_active=True,
-                )
-                .first()
-            )
-            if not source_user:
-                return JsonResponse(
-                    {"code": 0, "msg": _("设备归属用户不存在或已禁用。")},
-                    status=409,
-                )
-            if (
-                ShareLink.objects.filter(
-                    creator=source_user,
-                    is_used=False,
-                    is_expired=False,
-                    expires_at__gt=timezone.now(),
-                ).count()
-                >= MAX_ACTIVE_SHARE_LINKS
-            ):
-                return JsonResponse(
-                    {"code": 0, "msg": _("有效分享链接数量已达到上限。")},
-                    status=429,
-                )
-            raw_token = secrets.token_urlsafe(32)
-            sharelink = ShareLink.objects.create(
-                creator=source_user,
-                shash=_share_token_hash(raw_token),
-                token_prefix=raw_token[:8],
-            )
-            sharelink.peers.set(selected_peer_keys)
-        _log_event(request, "front_share_create", username=request.user.username, count=len(selected_peer_keys))
+        try:
+            operation_id = _state040_operation_id(request)
+        except InvalidIdentifier:
+            return JsonResponse({"code": 0, "msg": _("Invalid Idempotency-Key")}, status=400)
 
-        return JsonResponse({"code": 1, "token": raw_token, "expires_at": sharelink.expires_at.isoformat()})
+        def mutate():
+            with transaction.atomic():
+                source_user = UserProfile.objects.select_for_update().filter(pk=share_uid, is_active=True).first()
+                if not source_user:
+                    return ManagementMutation(
+                        status_code=409,
+                        body={"code": "share_source_unavailable", "message": _("设备归属用户不存在或已禁用。")},
+                        applied={"share_links": 0},
+                        result_state={"error": "source_unavailable"},
+                    )
+                if (
+                    ShareLink.objects.filter(
+                        creator=source_user,
+                        is_used=False,
+                        is_expired=False,
+                        expires_at__gt=timezone.now(),
+                    ).count()
+                    >= MAX_ACTIVE_SHARE_LINKS
+                ):
+                    return ManagementMutation(
+                        status_code=429,
+                        body={"code": "share_link_limit", "message": _("有效分享链接数量已达到上限。")},
+                        applied={"share_links": 0},
+                        result_state={"error": "share_link_limit"},
+                    )
+                raw_token = secrets.token_urlsafe(32)
+                sharelink = ShareLink.objects.create(
+                    creator=source_user,
+                    shash=_share_token_hash(raw_token),
+                    token_prefix=raw_token[:8],
+                )
+                sharelink.peers.set(selected_peer_keys)
+                body = {"code": 1, "token": raw_token, "expires_at": sharelink.expires_at.isoformat()}
+                return ManagementMutation(
+                    status_code=200,
+                    body=body,
+                    applied={"share_links": 1},
+                    result_state={"share_hash": sharelink.shash, "peer_count": len(selected_peer_keys)},
+                )
+
+        try:
+            result = execute_management_operation(
+                actor=request.user,
+                operation_id=operation_id,
+                operation="share_link_create",
+                request_document={"operation": "share_link_create", "peers": selected_peer_keys, "source": share_uid},
+                requested={"share_links": 1},
+                mutation=mutate,
+                sensitive_response=True,
+            )
+        except ManagementOperationConflict:
+            return JsonResponse({"code": 0, "msg": _("Operation identifier conflict")}, status=409)
+        body = result.body
+        _log_event(request, "front_share_create", username=request.user.username, count=len(selected_peer_keys))
+        return JsonResponse(body, status=result.status_code)
 
 
 @login_required(login_url="/api/user_action?action=login")
+@replayable_address_book_form("ab_manage")
 def ab_manage(request):
     u = _get_current_user(request)
     if not u:
@@ -1590,6 +1719,7 @@ def ab_manage(request):
                 "name": s.user.username if s.user else "-",
                 "rule": s.rule,
                 "rule_label": _rule_label(s.rule),
+                "authorization_generation": profile.authorization_generation,
             }
             for s in shares
         ]
@@ -1600,6 +1730,7 @@ def ab_manage(request):
                     "name": r.user.username if r.user else "-",
                     "rule": r.rule,
                     "rule_label": _rule_label(r.rule),
+                    "authorization_generation": profile.authorization_generation,
                 }
             )
         user_entries.sort(key=lambda x: x["name"])
@@ -1610,6 +1741,7 @@ def ab_manage(request):
                 "name": r.group.name if r.group else "-",
                 "rule": r.rule,
                 "rule_label": _rule_label(r.rule),
+                "authorization_generation": profile.authorization_generation,
             }
             for r in group_rules
         ]
@@ -1624,6 +1756,7 @@ def ab_manage(request):
                     "guid": everyone_rule.guid,
                     "rule": everyone_rule.rule,
                     "rule_label": _rule_label(everyone_rule.rule),
+                    "authorization_generation": profile.authorization_generation,
                 }
                 if everyone_rule
                 else None,
@@ -1695,17 +1828,68 @@ def ab_books(request):
                     messages.error(request, _("目标用户不存在。"))
                     return HttpResponseRedirect("/api/ab_books")
             try:
-                profile = AddressBookProfile.objects.create(
-                    guid=uuid.uuid4().hex,
-                    name=name,
-                    owner=owner,
-                    rule=3,
-                    note=note,
+                operation_id = _state040_operation_id(request)
+            except InvalidIdentifier:
+                messages.error(request, _("操作标识无效，请刷新页面后重试。"))
+                return HttpResponseRedirect("/api/ab_books")
+
+            def mutate_create():
+                try:
+                    profile = AddressBookProfile.objects.create(
+                        guid=uuid.uuid4().hex,
+                        name=name,
+                        owner=owner,
+                        rule=3,
+                        note=note,
+                    )
+                except IntegrityError:
+                    return ManagementMutation(
+                        status_code=409,
+                        body={"error": "Address book already exists"},
+                        applied={"profiles": 0},
+                        result_state={"error": "profile_exists"},
+                    )
+                return ManagementMutation(
+                    status_code=200,
+                    body={
+                        "result": "OK",
+                        "guid": str(profile.guid),
+                        "mutation_generation": profile.authorization_generation,
+                    },
+                    applied={"profiles": 1},
+                    result_state={
+                        "guid": str(profile.guid),
+                        "generation": profile.authorization_generation,
+                    },
                 )
-            except IntegrityError:
+
+            result = _browser_management_operation(
+                actor=u,
+                operation_id=operation_id,
+                operation="browser_address_book_create",
+                request_document={
+                    "operation": "browser_address_book_create",
+                    "name": name,
+                    "note": note,
+                    "owner": owner_key,
+                },
+                requested={"profiles": 1},
+                mutation=mutate_create,
+            )
+            if result is None:
+                messages.error(request, _("操作标识已被其他请求使用。"))
+                return HttpResponseRedirect("/api/ab_books")
+            if result.status_code != 200:
                 messages.error(request, _("地址簿名称已存在。"))
                 return HttpResponseRedirect("/api/ab_books")
-            _log_event(request, "front_ab_book_create", username=u.username, guid=profile.guid, owner=owner.username)
+            _log_event(
+                request,
+                "front_ab_book_create",
+                username=u.username,
+                guid=result.body["guid"],
+                owner=owner.username,
+                operation_id=str(operation_id),
+            )
             messages.success(request, _("地址簿已创建。"))
             return HttpResponseRedirect("/api/ab_books")
 
@@ -1736,52 +1920,202 @@ def ab_books(request):
                 messages.error(request, _("地址簿名称或备注格式无效。"))
                 return HttpResponseRedirect("/api/ab_books")
             try:
-                with transaction.atomic():
-                    profile = _lock_profile_for_management(u, profile)
-                    if not profile:
-                        messages.error(request, _("授权已变更，操作未提交。"))
-                        return HttpResponseRedirect("/api/ab_books")
-                    if name != profile.name:
-                        if _is_reserved_ab_profile_name(name):
-                            messages.error(request, _("地址簿名称为保留名称。"))
-                            return HttpResponseRedirect("/api/ab_books")
-                        if (
-                            AddressBookProfile.objects.filter(Q(owner=profile.owner) & Q(name=name))
-                            .exclude(pk=profile.pk)
-                            .exists()
-                        ):
-                            messages.error(request, _("地址簿名称已存在。"))
-                            return HttpResponseRedirect("/api/ab_books")
-                        profile.name = name
-                    profile.note = note
-                    profile.save(update_fields=("name", "note", "updated_at"))
-            except IntegrityError:
-                messages.error(request, _("地址簿名称已存在。"))
+                operation_id = _state040_operation_id(request)
+                expected_generation = _browser_expected_generation(request)
+            except (InvalidIdentifier, ValueError):
+                messages.error(request, _("操作标识或资源版本无效，请刷新页面后重试。"))
                 return HttpResponseRedirect("/api/ab_books")
-            _log_event(request, "front_ab_book_update", username=u.username, guid=profile.guid)
+
+            def mutate_update():
+                try:
+                    with transaction.atomic():
+                        locked_profile = _lock_profile_for_management(u, profile)
+                        if not locked_profile:
+                            return ManagementMutation(
+                                status_code=403,
+                                body={"error": "Authorization changed"},
+                                applied={"profiles": 0},
+                                result_state={"error": "authorization_changed"},
+                            )
+                        if (
+                            expected_generation is not None
+                            and locked_profile.authorization_generation != expected_generation
+                        ):
+                            return ManagementMutation(
+                                status_code=409,
+                                body={
+                                    "error": "Resource changed",
+                                    "current_generation": locked_profile.authorization_generation,
+                                },
+                                applied={"profiles": 0},
+                                result_state={
+                                    "current_generation": locked_profile.authorization_generation
+                                },
+                            )
+                        if name != locked_profile.name:
+                            if _is_reserved_ab_profile_name(name):
+                                return ManagementMutation(
+                                    status_code=400,
+                                    body={"error": "Reserved name"},
+                                    applied={"profiles": 0},
+                                    result_state={"error": "reserved_name"},
+                                )
+                            if (
+                                AddressBookProfile.objects.filter(
+                                    Q(owner=locked_profile.owner) & Q(name=name)
+                                )
+                                .exclude(pk=locked_profile.pk)
+                                .exists()
+                            ):
+                                return ManagementMutation(
+                                    status_code=409,
+                                    body={"error": "Address book already exists"},
+                                    applied={"profiles": 0},
+                                    result_state={"error": "profile_exists"},
+                                )
+                            locked_profile.name = name
+                        locked_profile.note = note
+                        bump_locked_authorization_generation(locked_profile)
+                        locked_profile.save(update_fields=("name", "note", "updated_at"))
+                except IntegrityError:
+                    return ManagementMutation(
+                        status_code=409,
+                        body={"error": "Address book already exists"},
+                        applied={"profiles": 0},
+                        result_state={"error": "profile_exists"},
+                    )
+                return ManagementMutation(
+                    status_code=200,
+                    body={
+                        "result": "OK",
+                        "guid": str(locked_profile.guid),
+                        "mutation_generation": locked_profile.authorization_generation,
+                    },
+                    applied={"profiles": 1},
+                    result_state={
+                        "guid": str(locked_profile.guid),
+                        "generation": locked_profile.authorization_generation,
+                    },
+                )
+
+            result = _browser_management_operation(
+                actor=u,
+                operation_id=operation_id,
+                operation="browser_address_book_update",
+                request_document={
+                    "operation": "browser_address_book_update",
+                    "guid": str(guid),
+                    "name": name,
+                    "note": note,
+                    "expected_generation": expected_generation,
+                },
+                requested={"profiles": 1},
+                mutation=mutate_update,
+            )
+            if result is None:
+                messages.error(request, _("操作标识已被其他请求使用。"))
+                return HttpResponseRedirect("/api/ab_books")
+            if result.status_code != 200:
+                messages.error(request, _("地址簿已变化或名称冲突，请刷新页面后重试。"))
+                return HttpResponseRedirect("/api/ab_books")
+            _log_event(
+                request,
+                "front_ab_book_update",
+                username=u.username,
+                guid=result.body["guid"],
+                operation_id=str(operation_id),
+            )
             messages.success(request, _("地址簿已更新。"))
             return HttpResponseRedirect("/api/ab_books")
 
         if action == "delete_book":
             guid = request.POST.get("guid", "")
-            profile = AddressBookProfile.objects.filter(Q(guid=guid)).select_related("owner").first()
-            if not profile:
-                messages.error(request, _("地址簿不存在。"))
+            try:
+                operation_id = _state040_operation_id(request)
+                expected_generation = _browser_expected_generation(request)
+            except (InvalidIdentifier, ValueError):
+                messages.error(request, _("操作标识或资源版本无效，请刷新页面后重试。"))
                 return HttpResponseRedirect("/api/ab_books")
-            if _is_personal_guid(profile.guid):
+            profile = AddressBookProfile.objects.filter(Q(guid=guid)).select_related("owner").first()
+            if profile and _is_personal_guid(profile.guid):
                 messages.error(request, _("个人地址簿不可删除。"))
                 return HttpResponseRedirect("/api/ab_books")
-            if not u.is_admin and str(profile.owner_id) != str(u.id):
+            if profile and not u.is_admin and str(profile.owner_id) != str(u.id):
                 messages.error(request, _("无权限操作该地址簿。"))
                 return HttpResponseRedirect("/api/ab_books")
-            with transaction.atomic():
-                profile = _lock_profile_for_management(u, profile)
-                if not profile:
-                    messages.error(request, _("授权已变更，操作未提交。"))
-                    return HttpResponseRedirect("/api/ab_books")
-                profile._audit_actor = u
-                profile.delete()
-            _log_event(request, "front_ab_book_delete", username=u.username, guid=guid)
+
+            def mutate_delete():
+                with transaction.atomic():
+                    current = AddressBookProfile.objects.filter(guid=guid).first()
+                    if current is None:
+                        return ManagementMutation(
+                            status_code=404,
+                            body={"error": "Address book not found"},
+                            applied={"profiles": 0},
+                            result_state={"error": "profile_not_found"},
+                        )
+                    locked_profile = _lock_profile_for_management(u, current)
+                    if not locked_profile:
+                        return ManagementMutation(
+                            status_code=403,
+                            body={"error": "Authorization changed"},
+                            applied={"profiles": 0},
+                            result_state={"error": "authorization_changed"},
+                        )
+                    if (
+                        expected_generation is not None
+                        and locked_profile.authorization_generation != expected_generation
+                    ):
+                        return ManagementMutation(
+                            status_code=409,
+                            body={
+                                "error": "Resource changed",
+                                "current_generation": locked_profile.authorization_generation,
+                            },
+                            applied={"profiles": 0},
+                            result_state={
+                                "current_generation": locked_profile.authorization_generation
+                            },
+                        )
+                    deleted = {
+                        "guid": str(locked_profile.guid),
+                        "name": locked_profile.name,
+                        "generation": locked_profile.authorization_generation,
+                    }
+                    locked_profile._audit_actor = u
+                    locked_profile.delete()
+                return ManagementMutation(
+                    status_code=200,
+                    body={"result": "OK", "deleted": deleted},
+                    applied={"profiles": 1},
+                    result_state={"deleted": deleted},
+                )
+
+            result = _browser_management_operation(
+                actor=u,
+                operation_id=operation_id,
+                operation="browser_address_book_delete",
+                request_document={
+                    "operation": "browser_address_book_delete",
+                    "guid": str(guid),
+                    "expected_generation": expected_generation,
+                },
+                requested={"profiles": 1},
+                mutation=mutate_delete,
+            )
+            if result is None:
+                messages.error(request, _("操作标识已被其他请求使用。"))
+                return HttpResponseRedirect("/api/ab_books")
+            if result.status_code != 200:
+                messages.error(request, _("地址簿已变化，请刷新页面后重试。"))
+                return HttpResponseRedirect("/api/ab_books")
+            _log_event(
+                request,
+                "front_ab_book_delete",
+                username=u.username,
+                guid=guid,
+                operation_id=str(operation_id),
+            )
             messages.success(request, _("地址簿已删除。"))
             return HttpResponseRedirect("/api/ab_books")
 
@@ -1805,34 +2139,110 @@ def ab_books(request):
             if not new_owner:
                 messages.error(request, _("目标用户不存在。"))
                 return HttpResponseRedirect("/api/ab_books")
-            if str(profile.owner_id) != str(new_owner.id):
+            try:
+                operation_id = _state040_operation_id(request)
+                expected_generation = _browser_expected_generation(request)
+            except (InvalidIdentifier, ValueError):
+                messages.error(request, _("操作标识或资源版本无效，请刷新页面后重试。"))
+                return HttpResponseRedirect("/api/ab_books")
+
+            def mutate_transfer():
                 try:
                     with transaction.atomic():
-                        profile = _lock_profile_for_management(u, profile)
-                        if not profile:
-                            messages.error(request, _("授权已变更，操作未提交。"))
-                            return HttpResponseRedirect("/api/ab_books")
+                        locked_profile = _lock_profile_for_management(u, profile)
+                        if not locked_profile:
+                            return ManagementMutation(
+                                status_code=403,
+                                body={"error": "Authorization changed"},
+                                applied={"profiles": 0},
+                                result_state={"error": "authorization_changed"},
+                            )
+                        if (
+                            expected_generation is not None
+                            and locked_profile.authorization_generation != expected_generation
+                        ):
+                            return ManagementMutation(
+                                status_code=409,
+                                body={
+                                    "error": "Resource changed",
+                                    "current_generation": locked_profile.authorization_generation,
+                                },
+                                applied={"profiles": 0},
+                                result_state={
+                                    "current_generation": locked_profile.authorization_generation
+                                },
+                            )
                         if (
                             AddressBookProfile.objects.filter(
                                 owner=new_owner,
-                                name=profile.name,
+                                name=locked_profile.name,
                             )
-                            .exclude(pk=profile.pk)
+                            .exclude(pk=locked_profile.pk)
                             .exists()
                         ):
-                            messages.error(request, _("目标用户已有同名地址簿。"))
-                            return HttpResponseRedirect("/api/ab_books")
-                        profile.owner = new_owner
+                            return ManagementMutation(
+                                status_code=409,
+                                body={"error": "Owner already has this address book"},
+                                applied={"profiles": 0},
+                                result_state={"error": "owner_profile_conflict"},
+                            )
+                        changed = locked_profile.owner_id != new_owner.id
+                        locked_profile.owner = new_owner
                         AddressBookShare.objects.filter(
-                            profile=profile,
+                            profile=locked_profile,
                             user=new_owner,
                         ).delete()
-                        profile.save(update_fields=["owner", "updated_at"])
+                        if changed:
+                            locked_profile.save(update_fields=["owner", "updated_at"])
                 except IntegrityError:
-                    messages.error(request, _("目标用户已有同名地址簿。"))
-                    return HttpResponseRedirect("/api/ab_books")
+                    return ManagementMutation(
+                        status_code=409,
+                        body={"error": "Owner already has this address book"},
+                        applied={"profiles": 0},
+                        result_state={"error": "owner_profile_conflict"},
+                    )
+                return ManagementMutation(
+                    status_code=200,
+                    body={
+                        "result": "OK",
+                        "guid": str(locked_profile.guid),
+                        "owner": new_owner.username,
+                        "mutation_generation": locked_profile.authorization_generation,
+                    },
+                    applied={"profiles": 1},
+                    result_state={
+                        "guid": str(locked_profile.guid),
+                        "owner": str(new_owner.pk),
+                        "generation": locked_profile.authorization_generation,
+                    },
+                )
+
+            result = _browser_management_operation(
+                actor=u,
+                operation_id=operation_id,
+                operation="browser_address_book_transfer",
+                request_document={
+                    "operation": "browser_address_book_transfer",
+                    "guid": str(guid),
+                    "owner": target_key,
+                    "expected_generation": expected_generation,
+                },
+                requested={"profiles": 1},
+                mutation=mutate_transfer,
+            )
+            if result is None:
+                messages.error(request, _("操作标识已被其他请求使用。"))
+                return HttpResponseRedirect("/api/ab_books")
+            if result.status_code != 200:
+                messages.error(request, _("地址簿已变化或目标用户存在同名地址簿。"))
+                return HttpResponseRedirect("/api/ab_books")
             _log_event(
-                request, "front_ab_book_transfer", username=u.username, guid=profile.guid, owner=new_owner.username
+                request,
+                "front_ab_book_transfer",
+                username=u.username,
+                guid=result.body["guid"],
+                owner=new_owner.username,
+                operation_id=str(operation_id),
             )
             messages.success(request, _("地址簿已更新。"))
             return HttpResponseRedirect("/api/ab_books")
@@ -1856,6 +2266,9 @@ def ab_books(request):
                 "access_label": _rule_label(access_rule) if access_rule else _("无权限"),
                 "can_manage": u.is_admin or str(profile.owner_id) == str(u.id),
                 "can_edit": can_edit,
+                "update_operation_id": str(uuid.uuid4()),
+                "delete_operation_id": str(uuid.uuid4()),
+                "transfer_operation_id": str(uuid.uuid4()),
             }
         )
 
@@ -1866,6 +2279,7 @@ def ab_books(request):
         {
             "u": u,
             "profiles": profiles,
+            "create_operation_id": str(uuid.uuid4()),
             "filter_q": filter_q,
             "nav_active": "ab_books",
         },
@@ -1935,6 +2349,7 @@ def ab_books_export(request):
 
 
 @login_required(login_url="/api/user_action?action=login")
+@replayable_address_book_form("ab_book")
 def ab_book(request):
     u = _get_current_user(request)
     if not u:
@@ -2012,6 +2427,8 @@ def ab_book(request):
                     for peer in peers:
                         peer.tags.set([tags_by_name[name] for name in tags_by_peer[peer.pk]])
                     updated = len(peers)
+                    if updated:
+                        bump_locked_authorization_generation(profile)
                 _log_event(
                     request, "front_ab_bulk_tag", username=u.username, guid=profile.guid, action=action, count=updated
                 )
@@ -2036,6 +2453,8 @@ def ab_book(request):
                         profile=profile,
                         rid__in=peer_ids,
                     ).update(note=note_value)
+                    if updated:
+                        bump_locked_authorization_generation(profile)
                 _log_event(request, "front_ab_bulk_note", username=u.username, guid=profile.guid, count=updated)
                 messages.success(request, _("已批量更新 %(count)s 台设备备注。") % {"count": updated})
                 return HttpResponseRedirect(f"/api/ab_book?guid={profile.guid}")
@@ -2052,6 +2471,8 @@ def ab_book(request):
                     )
                     deleted = locked_peers.count()
                     locked_peers.delete()
+                    if deleted:
+                        bump_locked_authorization_generation(profile)
                 _log_event(request, "front_ab_bulk_delete", username=u.username, guid=profile.guid, count=deleted)
                 messages.success(request, _("已批量删除 %(count)s 台设备。") % {"count": deleted})
                 return HttpResponseRedirect(f"/api/ab_book?guid={profile.guid}")
@@ -2177,6 +2598,7 @@ def ab_book(request):
                     event = "front_ab_peer_add"
                     success_message = _("设备已新增。")
                 peer.tags.set(resolved_tags)
+                bump_locked_authorization_generation(profile)
             _log_event(request, event, username=u.username, guid=profile.guid, rid=rid)
             messages.success(request, success_message)
             return HttpResponseRedirect(f"/api/ab_book?guid={profile.guid}")
@@ -2217,6 +2639,7 @@ def ab_book(request):
                     peer.password = peer_data["password"]
                 peer.save()
                 peer.tags.set(resolved_tags)
+                bump_locked_authorization_generation(profile)
             _log_event(request, "front_ab_peer_update", username=u.username, guid=profile.guid, rid=rid)
             messages.success(request, _("设备已更新。"))
             return HttpResponseRedirect(f"/api/ab_book?guid={profile.guid}")
@@ -2231,7 +2654,9 @@ def ab_book(request):
                 if not profile:
                     messages.error(request, _("授权已变更，操作未提交。"))
                     return HttpResponseRedirect(f"/api/ab_book?guid={guid}")
-                RemotePeer.objects.filter(profile=profile, rid=rid).delete()
+                deleted = RemotePeer.objects.filter(profile=profile, rid=rid).delete()[0]
+                if deleted:
+                    bump_locked_authorization_generation(profile)
             _log_event(request, "front_ab_peer_delete", username=u.username, guid=profile.guid, rid=rid)
             messages.success(request, _("设备已删除。"))
             return HttpResponseRedirect(f"/api/ab_book?guid={profile.guid}")
@@ -2366,6 +2791,7 @@ def ab_book_export(request):
 
 
 @login_required(login_url="/api/user_action?action=login")
+@replayable_address_book_form("tag_manage")
 def tag_manage(request):
     u = _get_current_user(request)
     if not u:
@@ -2481,6 +2907,7 @@ def tag_manage(request):
                 "profile_name": profile.name,
                 "owner": profile.owner.username if profile.owner else "-",
                 "can_edit": _can_write_rule(access_rule),
+                "authorization_generation": profile.authorization_generation,
             }
         )
 
@@ -2624,6 +3051,7 @@ def ab_dashboard(request):
 
 
 @login_required(login_url="/api/user_action?action=login")
+@replayable_address_book_form("ab_rules")
 def ab_rules(request):
     u = _get_current_user(request)
     if not u:
@@ -2683,6 +3111,14 @@ def ab_rules(request):
 
     try:
         rules = _collect_global_rules(filter_q)
+        rule_generation_map = json.dumps(
+            {
+                str(rule["profile_guid"]): rule["authorization_generation"]
+                for rule in rules
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
         rule_stats = _summarize_rules(rules)
         paginator = Paginator(rules, 20)
         page_number = request.GET.get("page")
@@ -2701,6 +3137,7 @@ def ab_rules(request):
             "page_obj": page_obj,
             "rule_stats": rule_stats,
             "filter_q": filter_q,
+            "rule_generation_map": rule_generation_map,
             "rule_choices": [
                 (1, _("只读")),
                 (2, _("读写")),

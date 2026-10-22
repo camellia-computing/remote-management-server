@@ -15,7 +15,8 @@
         "0001_initial.py",
         "0010_addressbookprofile_default_password.py",
         "0016_recording_encryption.py",
-        "0032_context_bound_encrypted_fields.py"
+        "0032_context_bound_encrypted_fields.py",
+        "0033_mutation_generations.py"
       ]
     },
     {

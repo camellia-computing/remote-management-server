@@ -89,6 +89,13 @@ ENCRYPTED_COLUMNS = (
             "storage_object_id",
         ),
     ),
+    EncryptedColumn(
+        "api_managementbatchoperation",
+        "generation",
+        "secret_response",
+        "api.ManagementBatchOperation",
+        ("operation_id", "actor_id", "operation"),
+    ),
 )
 MAX_REPORTED_ERRORS = 20
 

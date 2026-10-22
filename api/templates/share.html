@@ -104,7 +104,22 @@
   const tagsEl = document.getElementById('selected-tags');
   const searchEl = document.getElementById('peer-search');
   const messageEl = document.getElementById('share-message');
+  const createButton = document.getElementById('create');
   const baseUrl = window.location.origin + window.location.pathname.replace(/\/$/, '');
+  let pendingOperationId = null;
+  let requestInFlight = false;
+
+  const newOperationId = () => {
+    if (window.crypto && typeof window.crypto.randomUUID === 'function') {
+      return window.crypto.randomUUID();
+    }
+    const bytes = new Uint8Array(16);
+    window.crypto.getRandomValues(bytes);
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    const value = Array.from(bytes, (byte) => byte.toString(16).padStart(2, '0')).join('');
+    return value.slice(0, 8) + '-' + value.slice(8, 12) + '-' + value.slice(12, 16) + '-' + value.slice(16, 20) + '-' + value.slice(20);
+  };
 
   const renderList = () => {
     const keyword = (searchEl.value || '').toLowerCase();
@@ -119,6 +134,9 @@
         checkbox.value = peer.value;
         checkbox.checked = selected.has(peer.value);
         checkbox.addEventListener('change', () => {
+          if (!requestInFlight) {
+            pendingOperationId = null;
+          }
           if (checkbox.checked) {
             selected.add(peer.value);
           } else {
@@ -156,7 +174,10 @@
     return match ? decodeURIComponent(match[2]) : '';
   };
 
-  document.getElementById('create').addEventListener('click', async () => {
+  createButton.addEventListener('click', async () => {
+    if (requestInFlight) {
+      return;
+    }
     messageEl.style.display = 'none';
     if (selected.size === 0) {
       messageEl.textContent = '{{ "请选择至少一台设备。" | translate | escapejs }}';
@@ -171,18 +192,29 @@
 
     const formData = new URLSearchParams();
     formData.append('data', JSON.stringify(payload));
+    pendingOperationId = pendingOperationId || newOperationId();
+    window.camelliaMutationRecovery?.remember(pendingOperationId);
+    requestInFlight = true;
+    createButton.disabled = true;
 
     try {
       const resp = await fetch('/api/share', {
         method: 'POST',
         headers: {
           'X-CSRFToken': getCookie('csrftoken'),
+          'Idempotency-Key': pendingOperationId,
         },
         credentials: 'same-origin',
         body: formData,
       });
       const data = await resp.json();
-      if (resp.ok && data.code === 1 && data.token) {
+      const receiptMatches = data.management_operation_receipt_version === 1 &&
+        data.operation_id === pendingOperationId && data.operation === 'share_link_create';
+      if (receiptMatches) {
+        window.camelliaMutationRecovery?.forget(pendingOperationId);
+        pendingOperationId = null;
+      }
+      if (resp.ok && receiptMatches && data.code === 1 && data.token) {
         messageEl.textContent = '{{ "链接只显示一次，请立即复制：" | translate | escapejs }}' + ' ' + baseUrl + '/' + data.token;
         messageEl.className = 'notice is-success';
         messageEl.style.display = 'block';
@@ -190,7 +222,7 @@
         renderList();
         renderTags();
       } else {
-        messageEl.textContent = data.msg || '{{ "请求失败，请稍后重试。" | translate | escapejs }}';
+        messageEl.textContent = data.message || '{{ "请求失败，请稍后重试。" | translate | escapejs }}';
         messageEl.className = 'notice is-warning';
         messageEl.style.display = 'block';
       }
@@ -198,6 +230,9 @@
       messageEl.textContent = '{{ "网络异常，请稍后重试。" | translate | escapejs }}';
       messageEl.className = 'notice is-warning';
       messageEl.style.display = 'block';
+    } finally {
+      requestInFlight = false;
+      createButton.disabled = false;
     }
   });
 

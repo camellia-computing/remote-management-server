@@ -66,7 +66,7 @@ class MutationFieldContractTests(TestCase):
             version="test",
         )
 
-    def request(self, method, path, payload):
+    def request(self, method, path, payload, *, expected_generation=0):
         return self.client.generic(
             method,
             path,
@@ -74,6 +74,7 @@ class MutationFieldContractTests(TestCase):
             content_type="application/json",
             HTTP_AUTHORIZATION=f"Bearer {self.bearer}",
             HTTP_IDEMPOTENCY_KEY=str(uuid.uuid4()),
+            HTTP_IF_MATCH=f'"{expected_generation}"',
         )
 
     def assert_field_error(self, response, *, unknown=None, conflicting=None):
@@ -325,6 +326,8 @@ class MutationFieldContractTests(TestCase):
             data="true",
             content_type="application/json",
             HTTP_AUTHORIZATION=f"Bearer {self.bearer}",
+            HTTP_IDEMPOTENCY_KEY=str(uuid.uuid4()),
+            HTTP_IF_MATCH='"0"',
         )
         self.assertEqual(scalar.status_code, 200, scalar.content)
         self.assertTrue(scalar.json()["enabled"])
@@ -333,6 +336,7 @@ class MutationFieldContractTests(TestCase):
             "PUT",
             f"/api/strategies/{self.strategy.guid}/status",
             {"enabled": False},
+            expected_generation=1,
         )
         self.assertEqual(document.status_code, 200, document.content)
         self.assertFalse(document.json()["enabled"])

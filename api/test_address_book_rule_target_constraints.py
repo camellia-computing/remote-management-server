@@ -169,6 +169,7 @@ class AddressBookRuleTargetConstraintTests(TestCase):
         )
         token = _issue_access_token(self.owner, device)[1]
 
+        generation = 0
         for rule in (1, 3):
             group_response = self.client.post(
                 "/api/ab/rule",
@@ -181,13 +182,19 @@ class AddressBookRuleTargetConstraintTests(TestCase):
                 ),
                 content_type="application/json",
                 HTTP_AUTHORIZATION=f"Bearer {token}",
+                HTTP_IDEMPOTENCY_KEY=str(uuid.uuid4()),
+                HTTP_IF_MATCH=f'"{generation}"',
             )
+            generation += 1
             everyone_response = self.client.post(
                 "/api/ab/rule",
                 data=json.dumps({"guid": self.profile.guid, "rule": rule}),
                 content_type="application/json",
                 HTTP_AUTHORIZATION=f"Bearer {token}",
+                HTTP_IDEMPOTENCY_KEY=str(uuid.uuid4()),
+                HTTP_IF_MATCH=f'"{generation}"',
             )
+            generation += 1
             self.assertEqual(group_response.status_code, 200, group_response.content)
             self.assertEqual(everyone_response.status_code, 200, everyone_response.content)
 
@@ -206,6 +213,7 @@ class AddressBookRuleTargetConstraintTests(TestCase):
             name="Rule target web profile",
         )
         self.client.force_login(self.owner)
+        generation = 0
         for rule in (1, 2):
             group_response = self.client.post(
                 "/api/ab_manage",
@@ -214,16 +222,22 @@ class AddressBookRuleTargetConstraintTests(TestCase):
                     "profile_guid": web_profile.guid,
                     "group": self.group.name,
                     "rule": rule,
+                    "idempotency_key": str(uuid.uuid4()),
+                    "expected_generation": str(generation),
                 },
             )
+            generation += 1
             everyone_response = self.client.post(
                 "/api/ab_manage",
                 {
                     "action": "add_everyone_rule",
                     "profile_guid": web_profile.guid,
                     "rule": rule,
+                    "idempotency_key": str(uuid.uuid4()),
+                    "expected_generation": str(generation),
                 },
             )
+            generation += 1
             self.assertEqual(group_response.status_code, 302, group_response.content)
             self.assertEqual(everyone_response.status_code, 302, everyone_response.content)
 

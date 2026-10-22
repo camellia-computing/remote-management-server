@@ -236,9 +236,11 @@ class ApiTestMixin:
         )
         self.device_signing_keys = {}
 
-    def _post_json(self, path, payload, token=None):
+    def _post_json(self, path, payload, token=None, expected_generation=None):
         headers = self._auth_headers(token)
         headers["HTTP_IDEMPOTENCY_KEY"] = str(uuid.uuid4())
+        if expected_generation is not None:
+            headers["HTTP_IF_MATCH"] = f'"{expected_generation}"'
         return self.client.post(
             path,
             data=json.dumps(payload),
@@ -246,8 +248,11 @@ class ApiTestMixin:
             **headers,
         )
 
-    def _put_json(self, path, payload, token=None):
+    def _put_json(self, path, payload, token=None, expected_generation=None):
         headers = self._auth_headers(token)
+        headers["HTTP_IDEMPOTENCY_KEY"] = str(uuid.uuid4())
+        if expected_generation is not None:
+            headers["HTTP_IF_MATCH"] = f'"{expected_generation}"'
         return self.client.put(
             path,
             data=json.dumps(payload),
@@ -255,9 +260,11 @@ class ApiTestMixin:
             **headers,
         )
 
-    def _delete_json(self, path, payload=None, token=None):
+    def _delete_json(self, path, payload=None, token=None, expected_generation=None):
         headers = self._auth_headers(token)
         headers["HTTP_IDEMPOTENCY_KEY"] = str(uuid.uuid4())
+        if expected_generation is not None:
+            headers["HTTP_IF_MATCH"] = f'"{expected_generation}"'
         return self.client.delete(
             path,
             data=json.dumps(payload if payload is not None else {}),
@@ -679,9 +686,11 @@ class ApiContractTests(ApiTestMixin, TestCase):
             f"/api/ab/tag/rename/{profile.guid}",
             {"old": "old", "new": "target"},
             token=token,
+            expected_generation=0,
         )
 
-        self.assertEqual(renamed.status_code, 204, renamed.content)
+        self.assertEqual(renamed.status_code, 200, renamed.content)
+        self.assertEqual(renamed.json()["operation"], "address_book_tag_rename")
         self.assertFalse(RemoteTag.objects.filter(profile=profile, tag_name="old").exists())
         self.assertEqual(
             list(peer.tags.values_list("tag_name", flat=True)),
@@ -706,8 +715,11 @@ class ApiContractTests(ApiTestMixin, TestCase):
             f"/api/ab/tag/{profile.guid}",
             ["target"],
             token=token,
+            expected_generation=1,
         )
-        self.assertEqual(deleted.status_code, 204, deleted.content)
+        self.assertEqual(deleted.status_code, 200, deleted.content)
+        self.assertEqual(deleted.json()["operation"], "address_book_tag_delete")
+        self.assertEqual(deleted.json()["applied"], {"mutations": 1})
         self.assertFalse(peer.tags.exists())
         self.assertFalse(RemoteTag.objects.filter(pk=target_tag.pk).exists())
 
@@ -1054,7 +1066,12 @@ class ApiContractTests(ApiTestMixin, TestCase):
             ["ops"],
         )
 
-        disabled = self._post_json(f"/api/users/{user_guid}/disable", {}, token=admin_token)
+        disabled = self._post_json(
+            f"/api/users/{user_guid}/disable",
+            {},
+            token=admin_token,
+            expected_generation=0,
+        )
         self.assertEqual(disabled.status_code, 200, disabled.content)
         denied = self._post_json(
             "/api/login",
@@ -1069,7 +1086,12 @@ class ApiContractTests(ApiTestMixin, TestCase):
         # the login endpoint does not become an account-status oracle.
         self.assertEqual(denied.status_code, 401)
 
-        enabled = self._post_json(f"/api/users/{user_guid}/enable", {}, token=admin_token)
+        enabled = self._post_json(
+            f"/api/users/{user_guid}/enable",
+            {},
+            token=admin_token,
+            expected_generation=1,
+        )
         self.assertEqual(enabled.status_code, 200, enabled.content)
         self.assertTrue(enabled.json()["status"])
 
@@ -1222,6 +1244,7 @@ class ApiContractTests(ApiTestMixin, TestCase):
             f"/api/device-groups/{group_guid}",
             ["123456789"],
             token=admin_token,
+            expected_generation=0,
         )
         self.assertEqual(assigned_devices.status_code, 200, assigned_devices.content)
         self.assertEqual(assigned_devices.json()["updated"], 1)
@@ -1232,7 +1255,15 @@ class ApiContractTests(ApiTestMixin, TestCase):
         )
         assigned_strategy = self._post_json(
             "/api/strategies/assign",
-            {"strategy": str(strategy.guid), "groups": [group_guid]},
+            {
+                "strategy": str(strategy.guid),
+                "groups": [group_guid],
+                "expected_generations": {
+                    "devices": {},
+                    "users": {},
+                    "groups": {group_guid: 1},
+                },
+            },
             token=admin_token,
         )
         self.assertEqual(assigned_strategy.status_code, 200, assigned_strategy.content)
@@ -1263,6 +1294,7 @@ class ApiContractTests(ApiTestMixin, TestCase):
             f"/api/strategies/{strategy.guid}/status",
             {"enabled": False},
             token=admin_token,
+            expected_generation=0,
         )
         self.assertEqual(disabled.status_code, 200, disabled.content)
         self.assertFalse(disabled.json()["enabled"])
@@ -1326,6 +1358,7 @@ class ApiContractTests(ApiTestMixin, TestCase):
             f"/api/devices/{device.pk}/assign",
             {"type": "strategy_name", "value": ""},
             token=admin_token,
+            expected_generation=0,
         )
         self.assertEqual(cleared.status_code, 200, cleared.content)
         heartbeat = self._post_json(
@@ -1487,7 +1520,12 @@ class ApiContractTests(ApiTestMixin, TestCase):
             rid="900000001",
             uuid=device_uuid("admin-device"),
         )
-        disabled = self._post_json(f"/api/devices/{device.pk}/disable", {}, token=admin_token)
+        disabled = self._post_json(
+            f"/api/devices/{device.pk}/disable",
+            {},
+            token=admin_token,
+            expected_generation=0,
+        )
         self.assertEqual(disabled.status_code, 200, disabled.content)
         payload["public_key_hash"] = device.public_key_hash
         revoked = self._post_json(
@@ -1648,7 +1686,11 @@ class ApiContractTests(ApiTestMixin, TestCase):
         group = DeviceGroup.objects.create(name="ops")
         device = self._device(owner=self.user, device_group=group)
 
-        response = self._delete_json(f"/api/device-groups/{group.guid}", token=admin_token)
+        response = self._delete_json(
+            f"/api/device-groups/{group.guid}",
+            token=admin_token,
+            expected_generation=0,
+        )
         self.assertEqual(response.status_code, 200, response.content)
         device.refresh_from_db()
         self.assertIsNone(device.device_group_id)
@@ -1869,6 +1911,7 @@ class ApiContractTests(ApiTestMixin, TestCase):
         created = self.client.post(
             "/api/share",
             {"data": json.dumps([{"value": str(peer.pk), "title": "ignored"}])},
+            HTTP_IDEMPOTENCY_KEY=str(uuid.uuid4()),
         )
         self.assertEqual(created.status_code, 200, created.content)
         raw_token = created.json()["token"]
@@ -1893,7 +1936,10 @@ class ApiContractTests(ApiTestMixin, TestCase):
             ).exists()
         )
 
-        accepted = self.client.post(f"/api/share/{raw_token}")
+        accepted = self.client.post(
+            f"/api/share/{raw_token}",
+            {"idempotency_key": str(uuid.uuid4())},
+        )
         self.assertEqual(accepted.status_code, 200, accepted.content)
         link.refresh_from_db()
         self.assertTrue(link.is_used)
@@ -1907,7 +1953,10 @@ class ApiContractTests(ApiTestMixin, TestCase):
         self.assertEqual(imported_tag.tag_name, "studio")
         self.assertEqual(imported_tag.profile.owner, recipient)
 
-        replay = self.client.post(f"/api/share/{raw_token}")
+        replay = self.client.post(
+            f"/api/share/{raw_token}",
+            {"idempotency_key": str(uuid.uuid4())},
+        )
         self.assertEqual(replay.status_code, 404)
 
 

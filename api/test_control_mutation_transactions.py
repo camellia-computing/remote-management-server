@@ -56,8 +56,11 @@ class ControlMutationTransactionTests(TestCase):
             version="test",
         )
 
-    def _request(self, method, path, *, operation_id=None):
-        headers = {"HTTP_AUTHORIZATION": f"Bearer {self.bearer}"}
+    def _request(self, method, path, *, operation_id=None, expected_generation=0):
+        headers = {
+            "HTTP_AUTHORIZATION": f"Bearer {self.bearer}",
+            "HTTP_IF_MATCH": f'"{expected_generation}"',
+        }
         if operation_id is not None:
             headers["HTTP_IDEMPOTENCY_KEY"] = operation_id
         return getattr(self.client, method)(
@@ -190,25 +193,51 @@ class ControlMutationTransactionTests(TestCase):
 
         user_enable_id = str(uuid.uuid4())
         user_path = f"/api/users/{self.target.pk}/enable"
-        user_enabled = self._request("post", user_path, operation_id=user_enable_id)
+        user_enabled = self._request(
+            "post",
+            user_path,
+            operation_id=user_enable_id,
+            expected_generation=1,
+        )
         user_body = self._assert_receipt(
             user_enabled,
             "user_status_enable",
             user_enable_id,
             "users",
         )
-        self.assertEqual(self._request("post", user_path, operation_id=user_enable_id).json(), user_body)
+        self.assertEqual(
+            self._request(
+                "post",
+                user_path,
+                operation_id=user_enable_id,
+                expected_generation=1,
+            ).json(),
+            user_body,
+        )
 
         device_enable_id = str(uuid.uuid4())
         device_path = f"/api/devices/{self.target_device.pk}/enable"
-        device_enabled = self._request("post", device_path, operation_id=device_enable_id)
+        device_enabled = self._request(
+            "post",
+            device_path,
+            operation_id=device_enable_id,
+            expected_generation=1,
+        )
         device_body = self._assert_receipt(
             device_enabled,
             "device_status_enable",
             device_enable_id,
             "devices",
         )
-        self.assertEqual(self._request("post", device_path, operation_id=device_enable_id).json(), device_body)
+        self.assertEqual(
+            self._request(
+                "post",
+                device_path,
+                operation_id=device_enable_id,
+                expected_generation=1,
+            ).json(),
+            device_body,
+        )
 
         self.target.refresh_from_db()
         self.target_device.refresh_from_db()
@@ -422,6 +451,7 @@ class ControlMutationConcurrencyTests(TransactionTestCase):
                 content_type="application/json",
                 HTTP_AUTHORIZATION=f"Bearer {self.bearer}",
                 HTTP_IDEMPOTENCY_KEY=operation_id,
+                HTTP_IF_MATCH='"0"',
             )
         finally:
             connections.close_all()
@@ -436,6 +466,7 @@ class ControlMutationConcurrencyTests(TransactionTestCase):
                 content_type="application/json",
                 HTTP_AUTHORIZATION=f"Bearer {actor_bearer}",
                 HTTP_IDEMPOTENCY_KEY=operation_id,
+                HTTP_IF_MATCH='"0"',
             )
         finally:
             connections.close_all()

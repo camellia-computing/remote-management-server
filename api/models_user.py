@@ -50,6 +50,8 @@ class UserProfileQuerySet(models.QuerySet):
             _USERNAME_BULK_UPDATE.reset(token)
 
     def update(self, **kwargs):
+        if "mutation_generation" in kwargs:
+            raise ValueError("mutation_generation is managed internally")
         if "username_canonical" in kwargs and "username" not in kwargs:
             raise ValueError("username_canonical cannot be updated independently")
         if "username" in kwargs:
@@ -153,6 +155,7 @@ class UserProfile(AbstractBaseUser, PermissionsMixin):
     is_active = models.BooleanField(_("是否激活"), default=True)
     is_admin = models.BooleanField(_("是否管理员"), default=False)
     credential_generation = models.PositiveBigIntegerField(default=0, editable=False)
+    mutation_generation = models.PositiveBigIntegerField(default=0, editable=False)
 
     objects = MyUserManager()
 
@@ -197,6 +200,8 @@ class UserProfile(AbstractBaseUser, PermissionsMixin):
 
         self._sync_username_identity()
         update_fields = kwargs.get("update_fields")
+        if update_fields is not None and "mutation_generation" in update_fields:
+            raise ValueError("mutation_generation is managed internally")
         if update_fields is not None and {"username", "username_canonical"}.intersection(update_fields):
             kwargs["update_fields"] = tuple(dict.fromkeys((*update_fields, "username", "username_canonical")))
         if not self.pk:
@@ -213,12 +218,13 @@ class UserProfile(AbstractBaseUser, PermissionsMixin):
                 .objects.using(database)
                 .select_for_update()
                 .filter(pk=self.pk)
-                .values("credential_generation", "strategy_id")
+                .values("credential_generation", "mutation_generation", "strategy_id")
                 .first()
             )
             if current is None:
                 return super().save(*args, **kwargs)
             self.credential_generation = current["credential_generation"]
+            self.mutation_generation = current["mutation_generation"]
             result = super().save(*args, **kwargs)
             update_fields = kwargs.get("update_fields")
             strategy_may_change = update_fields is None or bool({"strategy", "strategy_id"}.intersection(update_fields))

@@ -3,18 +3,46 @@ import tempfile
 from io import StringIO
 from pathlib import Path
 
+from django.apps import apps
 from django.conf import settings
 from django.core.management import call_command
 from django.core.management.base import CommandError
 from django.db.migrations.recorder import MigrationRecorder
 from django.test import TestCase, TransactionTestCase, override_settings
 
-from api.encrypted_fields import key_fingerprint, verify_key_canary
+from api.encrypted_fields import EncryptedTextField, key_fingerprint, verify_key_canary
+from api.management.commands.rotate_data_encryption import ENCRYPTED_COLUMNS
 from api.models import DataEncryptionKeyState
 from api.test_support import reset_data_encryption_key_inventory
 
 
 class DataEncryptionKeyInventoryFixtureTests(TestCase):
+    def test_rotation_allowlist_covers_every_encrypted_model_field(self):
+        model_fields = {
+            (
+                model._meta.db_table,
+                model._meta.pk.column,
+                field.column,
+                model._meta.label,
+                tuple(field.context_fields),
+            )
+            for model in apps.get_app_config("api").get_models()
+            for field in model._meta.concrete_fields
+            if isinstance(field, EncryptedTextField)
+        }
+        rotation_fields = {
+            (
+                column.table,
+                column.pk_column,
+                column.encrypted_column,
+                column.model_label,
+                column.context_columns,
+            )
+            for column in ENCRYPTED_COLUMNS
+        }
+
+        self.assertEqual(rotation_fields, model_fields)
+
     def test_fixture_restores_an_empty_or_stale_inventory_idempotently(self):
         DataEncryptionKeyState.objects.all().delete()
         first = reset_data_encryption_key_inventory()

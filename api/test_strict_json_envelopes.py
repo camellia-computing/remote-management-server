@@ -59,6 +59,8 @@ class StrictJsonEnvelopeHttpTests(TestCase):
         return f"/api/strategies/{self.strategy.guid}/status"
 
     def put_strategy(self, body, content_type="application/json", **extra):
+        extra.setdefault("HTTP_IDEMPOTENCY_KEY", str(uuid.uuid4()))
+        extra.setdefault("HTTP_IF_MATCH", '"0"')
         return self.client.generic(
             "PUT",
             self.strategy_status_path,
@@ -244,11 +246,14 @@ class StrictJsonEnvelopeHttpTests(TestCase):
             f"/api/ab/peer/{profile.guid}",
             data=json.dumps(values),
             content_type="application/json",
+            HTTP_IDEMPOTENCY_KEY=str(uuid.uuid4()),
+            HTTP_IF_MATCH='"0"',
             **self.auth,
         )
 
-        self.assertEqual(response.status_code, 204, response.content[:1000])
-        self.assertEqual(response.content, b"")
+        self.assertEqual(response.status_code, 200, response.content[:1000])
+        self.assertEqual(response.json()["operation"], "address_book_peer_delete")
+        self.assertEqual(response.json()["applied"], {"mutations": 1})
 
     def test_alarm_embedded_json_uses_the_same_duplicate_and_depth_rules(self):
         raw_values = (
@@ -514,6 +519,7 @@ class StrictShareEnvelopeHttpTests(TestCase):
                 "data": json.dumps([{"value": str(self.peer_one.pk)}]),
             },
             HTTP_X_CSRFTOKEN=token,
+            HTTP_IDEMPOTENCY_KEY=str(uuid.uuid4()),
         )
 
         self.assertEqual(response.status_code, 200, response.content[:1000])
@@ -521,7 +527,11 @@ class StrictShareEnvelopeHttpTests(TestCase):
 
     def test_share_accepts_multipart_and_urlencoded_forms(self):
         first = json.dumps([{"value": str(self.peer_one.pk)}])
-        response = self.client.post("/api/share", data={"data": first})
+        response = self.client.post(
+            "/api/share",
+            data={"data": first},
+            HTTP_IDEMPOTENCY_KEY=str(uuid.uuid4()),
+        )
         self.assertEqual(response.status_code, 200, response.content[:1000])
 
         second = json.dumps([{"value": str(self.peer_two.pk)}])
@@ -530,6 +540,7 @@ class StrictShareEnvelopeHttpTests(TestCase):
             "/api/share",
             data=encoded,
             content_type="application/x-www-form-urlencoded",
+            HTTP_IDEMPOTENCY_KEY=str(uuid.uuid4()),
         )
         self.assertEqual(response.status_code, 200, response.content[:1000])
         self.assertEqual(ShareLink.objects.count(), 2)

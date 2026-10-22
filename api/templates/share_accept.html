@@ -26,6 +26,7 @@
     </div>
     <form method="post" action="/api/share/{{ share_token }}" style="margin-top: 16px;">
       {% csrf_token %}
+      <input type="hidden" name="idempotency_key" value="{{ operation_id }}">
       <button type="submit" class="btn btn-primary">{{ "确认领取" | translate }}</button>
       <a class="btn btn-ghost" href="/api/share">{{ "取消" | translate }}</a>
     </form>

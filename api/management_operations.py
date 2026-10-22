@@ -34,10 +34,17 @@ class ManagementOperationResult:
 
 def operation_id_from_request(request):
     value = request.META.get("HTTP_IDEMPOTENCY_KEY")
+    return parse_operation_id(value)
+
+
+def parse_operation_id(value):
     try:
-        return parse_uuid(value)
+        parsed = parse_uuid(value)
     except InvalidIdentifier as exc:
         raise InvalidIdentifier("A canonical Idempotency-Key UUID is required") from exc
+    if parsed.version != 4:
+        raise InvalidIdentifier("Idempotency-Key must be a random UUIDv4")
+    return parsed
 
 
 def canonical_document(value):
@@ -60,15 +67,38 @@ def document_digest(value):
 def _existing_result(existing, *, actor, operation, request_digest):
     if existing.actor_id != actor.pk or existing.operation != operation or existing.request_digest != request_digest:
         raise ManagementOperationConflict("Operation identifier is already in use")
+    response = existing.response
+    if existing.secret_response:
+        try:
+            response = json.loads(existing.secret_response)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("Stored sensitive operation receipt is invalid") from exc
     if (
-        not isinstance(existing.response, dict)
+        not isinstance(response, dict)
         or isinstance(existing.status_code, bool)
         or not 500 > existing.status_code >= 200
     ):
         raise RuntimeError("Stored management operation receipt is invalid")
     return ManagementOperationResult(
         status_code=existing.status_code,
-        body=existing.response,
+        body=response,
+    )
+
+
+def find_management_operation(*, actor, operation_id):
+    """Return one immutable receipt to its original actor for recovery."""
+
+    existing = ManagementBatchOperation.objects.filter(
+        operation_id=operation_id,
+        actor=actor,
+    ).first()
+    if existing is None:
+        return None
+    return _existing_result(
+        existing,
+        actor=actor,
+        operation=existing.operation,
+        request_digest=existing.request_digest,
     )
 
 
@@ -97,7 +127,10 @@ def execute_management_operation(
     request_document,
     requested,
     mutation,
+    sensitive_response=False,
 ):
+    if not isinstance(sensitive_response, bool):
+        raise ValueError("Management operation response sensitivity is invalid")
     if not isinstance(operation, str) or not operation or len(operation.encode("utf-8")) > MAX_OPERATION_NAME_BYTES:
         raise ValueError("Management operation name is invalid")
     if (
@@ -158,7 +191,9 @@ def execute_management_operation(
             "requested": requested,
             "applied": outcome.applied,
         }
-        if outcome.status_code >= 400:
+        if outcome.status_code < 400:
+            body.setdefault("result", "OK")
+        else:
             legacy_message = body.pop("error", None)
             body.pop("msg", None)
             code = body.get("code")
@@ -168,6 +203,16 @@ def execute_management_operation(
             body["message"] = str(message)[:256]
             body["retryable"] = bool(body.get("retryable", outcome.status_code in {408, 425, 429, 500, 502, 503, 504}))
         receipt.status_code = outcome.status_code
-        receipt.response = body
-        receipt.save(update_fields=("status_code", "response"))
+        if sensitive_response:
+            receipt.response = {
+                "sensitive_response": True,
+                "operation_id": str(operation_id),
+                "operation": operation,
+                "status_code": outcome.status_code,
+            }
+            receipt.secret_response = canonical_document(body).decode("utf-8")
+            receipt.save(update_fields=("status_code", "response", "secret_response"))
+        else:
+            receipt.response = body
+            receipt.save(update_fields=("status_code", "response"))
         return ManagementOperationResult(status_code=outcome.status_code, body=body)

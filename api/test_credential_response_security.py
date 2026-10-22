@@ -1,5 +1,6 @@
 import hashlib
 import json
+import uuid
 
 from django.http import JsonResponse
 from django.test import TestCase, override_settings
@@ -191,6 +192,7 @@ class CredentialResponseSecurityTests(TestCase):
         created = self.client.post(
             "/api/share",
             {"data": json.dumps([{"value": str(peer.pk), "title": "desktop"}])},
+            HTTP_IDEMPOTENCY_KEY=str(uuid.uuid4()),
         )
         self.assertEqual(created.status_code, 200, created.content)
         raw_token = created.json()["token"]
@@ -203,7 +205,10 @@ class CredentialResponseSecurityTests(TestCase):
         self.assertEqual(preview.status_code, 200, preview.content)
         self.assert_never_stored(preview)
 
-        accepted = self.client.post(f"/api/share/{raw_token}")
+        accepted = self.client.post(
+            f"/api/share/{raw_token}",
+            {"idempotency_key": str(uuid.uuid4())},
+        )
         self.assertEqual(accepted.status_code, 200, accepted.content)
         self.assert_never_stored(accepted)
 
@@ -222,6 +227,7 @@ class CredentialResponseSecurityTests(TestCase):
         rate_limited = self.client.post(
             "/api/share",
             {"data": json.dumps([{"value": str(peer.pk), "title": "desktop"}])},
+            HTTP_IDEMPOTENCY_KEY=str(uuid.uuid4()),
         )
         self.assertEqual(rate_limited.status_code, 429)
         self.assert_never_stored(rate_limited)

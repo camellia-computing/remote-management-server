@@ -1,4 +1,5 @@
 import json
+import uuid
 from unittest.mock import patch
 
 from django.contrib.auth.models import Group
@@ -53,6 +54,8 @@ class AddressBookAuditRetentionTests(TestCase):
             data=json.dumps(payload),
             content_type="application/json",
             HTTP_AUTHORIZATION=f"Bearer {self.token}",
+            HTTP_IDEMPOTENCY_KEY=str(uuid.uuid4()),
+            HTTP_IF_MATCH='"0"',
         )
 
     def delete_json(self, path, payload):
@@ -61,6 +64,8 @@ class AddressBookAuditRetentionTests(TestCase):
             data=json.dumps(payload),
             content_type="application/json",
             HTTP_AUTHORIZATION=f"Bearer {self.token}",
+            HTTP_IDEMPOTENCY_KEY=str(uuid.uuid4()),
+            HTTP_IF_MATCH='"0"',
         )
 
     def test_audit_snapshots_profile_and_accepts_max_group_name(self):
@@ -115,7 +120,12 @@ class AddressBookAuditRetentionTests(TestCase):
         self.client.force_login(self.owner)
         response = self.client.post(
             "/api/ab_books",
-            {"action": "delete_book", "guid": self.profile.guid},
+            {
+                "action": "delete_book",
+                "guid": self.profile.guid,
+                "idempotency_key": str(uuid.uuid4()),
+                "expected_generation": "0",
+            },
         )
 
         self.assertEqual(response.status_code, 302, response.content)

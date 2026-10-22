@@ -73,13 +73,18 @@ class ManagementIdentifierHttpTests(TestCase):
     def auth(self):
         return {"HTTP_AUTHORIZATION": f"Bearer {self.bearer}"}
 
-    def post_json(self, path, payload):
+    def post_json(self, path, payload, *, expected_generation=None):
+        headers = {
+            "HTTP_IDEMPOTENCY_KEY": str(uuid.uuid4()),
+            **self.auth,
+        }
+        if expected_generation is not None:
+            headers["HTTP_IF_MATCH"] = f'"{expected_generation}"'
         return self.client.post(
             path,
             data=json.dumps(payload),
             content_type="application/json",
-            HTTP_IDEMPOTENCY_KEY=str(uuid.uuid4()),
-            **self.auth,
+            **headers,
         )
 
     def put_json(self, path, payload):
@@ -141,6 +146,7 @@ class ManagementIdentifierHttpTests(TestCase):
                 data=json.dumps({}),
                 content_type="application/json",
                 HTTP_IDEMPOTENCY_KEY=str(uuid.uuid4()),
+                HTTP_IF_MATCH='"0"',
                 **self.auth,
             ),
             404,
@@ -151,6 +157,7 @@ class ManagementIdentifierHttpTests(TestCase):
                 data=json.dumps({}),
                 content_type="application/json",
                 HTTP_IDEMPOTENCY_KEY=str(uuid.uuid4()),
+                HTTP_IF_MATCH='"0"',
                 **self.auth,
             ),
             404,
@@ -299,13 +306,18 @@ class ManagementIdentifierHttpTests(TestCase):
             self.post_json(
                 f"/api/device-groups/{group_guid.upper()}",
                 [self.managed_device.rid],
+                expected_generation=0,
             ).status_code,
             200,
         )
         missing = str(uuid.UUID(int=0))
         self.assert_error(self.client.get(f"/api/strategies/{missing}", **self.auth), 404)
         self.assert_error(
-            self.post_json(f"/api/device-groups/{missing}", [self.managed_device.rid]),
+            self.post_json(
+                f"/api/device-groups/{missing}",
+                [self.managed_device.rid],
+                expected_generation=0,
+            ),
             404,
         )
 
@@ -389,6 +401,11 @@ class ManagementIdentifierHttpTests(TestCase):
             {
                 "strategy": str(self.strategy.guid).upper(),
                 "users": [str(self.target.pk)],
+                "expected_generations": {
+                    "devices": {},
+                    "users": {str(self.target.pk): 0},
+                    "groups": {},
+                },
             },
         )
         self.assertEqual(accepted.status_code, 200, accepted.content)

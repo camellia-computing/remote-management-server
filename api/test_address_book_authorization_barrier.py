@@ -2,6 +2,7 @@ import json
 import queue
 import threading
 import time
+import uuid
 from unittest.mock import patch
 
 from django.contrib import admin
@@ -80,6 +81,8 @@ class AddressBookAuthorizationBarrierTests(TestCase):
                 f"/api/ab/peer/update/{self.profile.guid}",
                 data=json.dumps({"id": self.peer.rid, "alias": "api-after-revoke"}),
                 content_type="application/json",
+                HTTP_IDEMPOTENCY_KEY=str(uuid.uuid4()),
+                HTTP_IF_MATCH='"0"',
                 **self._authorization(token),
             )
 
@@ -118,6 +121,8 @@ class AddressBookAuthorizationBarrierTests(TestCase):
                     "note": "",
                     "password": "",
                     "tags": "",
+                    "idempotency_key": str(uuid.uuid4()),
+                    "expected_generation": "0",
                 },
             )
 
@@ -146,6 +151,8 @@ class AddressBookAuthorizationBarrierTests(TestCase):
                 f"/api/ab/peer/update/{self.profile.guid}",
                 data=json.dumps({"id": self.peer.rid, "alias": "api-after-transfer"}),
                 content_type="application/json",
+                HTTP_IDEMPOTENCY_KEY=str(uuid.uuid4()),
+                HTTP_IF_MATCH='"0"',
                 **self._authorization(token),
             )
 
@@ -257,6 +264,8 @@ class AddressBookAuthorizationBarrierTests(TestCase):
             "/api/ab/rule",
             data=json.dumps({"guid": self.profile.guid, "user": self.writer.username, "rule": 2}),
             content_type="application/json",
+            HTTP_IDEMPOTENCY_KEY=str(uuid.uuid4()),
+            HTTP_IF_MATCH='"0"',
             **self._authorization(token),
         )
         self.assertEqual(added.status_code, 200, added.content)
@@ -272,6 +281,8 @@ class AddressBookAuthorizationBarrierTests(TestCase):
             "/api/ab/rule",
             data=json.dumps({"guid": rule_guid, "rule": 3}),
             content_type="application/json",
+            HTTP_IDEMPOTENCY_KEY=str(uuid.uuid4()),
+            HTTP_IF_MATCH='"1"',
             **self._authorization(token),
         )
         self.assertEqual(updated.status_code, 200, updated.content)
@@ -286,6 +297,8 @@ class AddressBookAuthorizationBarrierTests(TestCase):
             "/api/ab/rules",
             data=json.dumps([rule_guid]),
             content_type="application/json",
+            HTTP_IDEMPOTENCY_KEY=str(uuid.uuid4()),
+            HTTP_IF_MATCH='"2"',
             **self._authorization(token),
         )
         self.assertEqual(deleted.status_code, 200, deleted.content)
@@ -326,6 +339,8 @@ class AddressBookAuthorizationBarrierTests(TestCase):
             "/api/ab/shared/update/profile",
             data=json.dumps({"guid": self.profile.guid, "owner": self.new_owner.username}),
             content_type="application/json",
+            HTTP_IDEMPOTENCY_KEY=str(uuid.uuid4()),
+            HTTP_IF_MATCH=f'"{(1 << 63) - 1}"',
             **self._authorization(token),
         )
 

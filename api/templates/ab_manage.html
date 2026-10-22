@@ -74,7 +74,7 @@
 {% if profiles %}
   <div class="ab-manage-grid">
     {% for item in profiles %}
-      <section class="card ab-card">
+      <section class="card ab-card" data-address-book-generation="{{ item.profile.authorization_generation }}">
         <div class="ab-card-header">
           <div>
             <h3 class="ab-card-title">{{ item.profile.name }}</h3>
@@ -310,7 +310,7 @@
     </div>
     <div class="panel-grid">
       {% for entry in global_rules %}
-        <article class="item-card">
+        <article class="item-card" data-address-book-generation="{{ entry.authorization_generation }}">
           <div class="item-header">
             <div>
               <h3 class="item-title">{{ entry.profile_name }}</h3>

@@ -7,6 +7,7 @@ import uuid
 from io import StringIO
 from unittest.mock import patch
 
+from django.conf import settings
 from django.core.management import call_command
 from django.db import close_old_connections, connections, transaction
 from django.test import (
@@ -19,6 +20,7 @@ from django.test import (
 from django.utils import timezone
 
 from api import management_operations
+from api.encrypted_fields import FIELD_PREFIX
 from api.management_operations import document_digest, execute_management_operation
 from api.models import (
     DeviceGroup,
@@ -73,10 +75,41 @@ class ManagementBatchOperationTests(TestCase):
                     "peers": ["3"],
                     "users": ["7"],
                     "groups": [],
+                    "expected_generations": {
+                        "devices": {"3": 0},
+                        "users": {"7": 0},
+                        "groups": {},
+                    },
                 }
             ),
-            "b3d8410e88bab3094afb36a53805c627ac7464110657382d2865700c1ed1a8d3",
+            "26c6b44fa09cf1d964dfb7a78de7ca95e65628b04332176243de9f4213649721",
         )
+
+    def test_batch_target_inventory_supports_exact_identifiers_and_generations(self):
+        cases = (
+            (
+                f"/api/devices?guid={self.first_device.pk}",
+                str(self.first_device.pk),
+            ),
+            (
+                f"/api/users?guid={self.first_user.pk}",
+                str(self.first_user.pk),
+            ),
+            (
+                f"/api/device-groups?guid={self.first_group.guid}",
+                str(self.first_group.guid),
+            ),
+        )
+        for path, expected_guid in cases:
+            with self.subTest(path=path):
+                response = self.client.get(
+                    path,
+                    HTTP_AUTHORIZATION=f"Bearer {self.bearer}",
+                )
+                self.assertEqual(response.status_code, 200, response.content)
+                self.assertEqual(response.json()["total"], 1)
+                self.assertEqual(response.json()["data"][0]["guid"], expected_guid)
+                self.assertEqual(response.json()["data"][0]["mutation_generation"], 0)
 
     @staticmethod
     def _device(rid, label, owner):
@@ -93,21 +126,46 @@ class ManagementBatchOperationTests(TestCase):
             version="test",
         )
 
-    def _json_request(self, method, path, payload, *, operation_id=None):
+    def _json_request(
+        self,
+        method,
+        path,
+        payload,
+        *,
+        operation_id=None,
+        expected_generation=None,
+    ):
         operation_id = operation_id or str(uuid.uuid4())
+        headers = {
+            "HTTP_AUTHORIZATION": f"Bearer {self.bearer}",
+            "HTTP_IDEMPOTENCY_KEY": operation_id,
+        }
+        if expected_generation is not None:
+            headers["HTTP_IF_MATCH"] = f'"{expected_generation}"'
         return getattr(self.client, method)(
             path,
             data=json.dumps(payload),
             content_type="application/json",
-            HTTP_AUTHORIZATION=f"Bearer {self.bearer}",
-            HTTP_IDEMPOTENCY_KEY=operation_id,
+            **headers,
         )
 
-    def _post(self, path, payload, *, operation_id=None):
-        return self._json_request("post", path, payload, operation_id=operation_id)
+    def _post(self, path, payload, *, operation_id=None, expected_generation=None):
+        return self._json_request(
+            "post",
+            path,
+            payload,
+            operation_id=operation_id,
+            expected_generation=expected_generation,
+        )
 
-    def _delete(self, path, payload, *, operation_id=None):
-        return self._json_request("delete", path, payload, operation_id=operation_id)
+    def _delete(self, path, payload, *, operation_id=None, expected_generation=None):
+        return self._json_request(
+            "delete",
+            path,
+            payload,
+            operation_id=operation_id,
+            expected_generation=expected_generation,
+        )
 
     def assert_zero_application_conflict(self, response):
         self.assertEqual(response.status_code, 409, response.content)
@@ -136,13 +194,28 @@ class ManagementBatchOperationTests(TestCase):
         return body
 
     def test_strategy_assignment_rejects_mixed_targets_without_partial_mutation(self):
+        missing_group = str(uuid.uuid4())
         response = self._post(
             "/api/strategies/assign",
             {
                 "strategy": str(self.strategy.guid),
                 "peers": [str(self.first_device.pk), "2147483647"],
                 "users": [str(self.first_user.pk), "2147483647"],
-                "groups": [str(self.first_group.guid), str(uuid.uuid4())],
+                "groups": [str(self.first_group.guid), missing_group],
+                "expected_generations": {
+                    "devices": {
+                        str(self.first_device.pk): 0,
+                        "2147483647": 0,
+                    },
+                    "users": {
+                        str(self.first_user.pk): 0,
+                        "2147483647": 0,
+                    },
+                    "groups": {
+                        str(self.first_group.guid): 0,
+                        missing_group: 0,
+                    },
+                },
             },
         )
 
@@ -159,6 +232,7 @@ class ManagementBatchOperationTests(TestCase):
         added = self._post(
             f"/api/device-groups/{self.first_group.guid}",
             [self.first_device.rid, missing_rid],
+            expected_generation=0,
         )
         self.assert_zero_application_conflict(added)
         self.first_device.refresh_from_db()
@@ -169,6 +243,7 @@ class ManagementBatchOperationTests(TestCase):
         removed = self._delete(
             f"/api/device-groups/{self.first_group.guid}/devices",
             [self.first_device.rid, missing_rid],
+            expected_generation=0,
         )
         self.assert_zero_application_conflict(removed)
         self.first_device.refresh_from_db()
@@ -181,6 +256,7 @@ class ManagementBatchOperationTests(TestCase):
         response = self._delete(
             f"/api/device-groups/{self.first_group.guid}/devices",
             [self.first_device.rid, self.second_device.rid],
+            expected_generation=0,
         )
 
         self.assert_zero_application_conflict(response)
@@ -250,6 +326,11 @@ class ManagementBatchOperationTests(TestCase):
             "peers": [str(self.first_device.pk)],
             "users": [str(self.first_user.pk)],
             "groups": [str(self.first_group.guid)],
+            "expected_generations": {
+                "devices": {str(self.first_device.pk): 0},
+                "users": {str(self.first_user.pk): 0},
+                "groups": {str(self.first_group.guid): 0},
+            },
         }
 
         accepted = self._post("/api/strategies/assign", payload, operation_id=operation_id)
@@ -260,25 +341,143 @@ class ManagementBatchOperationTests(TestCase):
             {"devices": 1, "users": 1, "groups": 1},
         )
         self.first_device.refresh_from_db()
+        self.first_user.refresh_from_db()
+        self.first_group.refresh_from_db()
         first_generation = self.first_device.policy_generation
+        first_mutation_generations = (
+            self.first_device.mutation_generation,
+            self.first_user.mutation_generation,
+            self.first_group.mutation_generation,
+        )
+        self.assertEqual(first_mutation_generations, (1, 1, 1))
 
         replayed = self._post("/api/strategies/assign", payload, operation_id=operation_id)
 
         self.assertEqual(replayed.status_code, 200, replayed.content)
         self.assertEqual(replayed.json(), first_body)
         self.first_device.refresh_from_db()
+        self.first_user.refresh_from_db()
+        self.first_group.refresh_from_db()
         self.assertEqual(self.first_device.policy_generation, first_generation)
+        self.assertEqual(
+            (
+                self.first_device.mutation_generation,
+                self.first_user.mutation_generation,
+                self.first_group.mutation_generation,
+            ),
+            first_mutation_generations,
+        )
+
+    def test_strategy_assignment_rejects_non_exact_generation_snapshots_before_mutation(self):
+        device_id = str(self.first_device.pk)
+        exact = {
+            "devices": {device_id: 0},
+            "users": {},
+            "groups": {},
+        }
+        invalid_snapshots = (
+            {"devices": {device_id: 0}, "users": {}},
+            {**exact, "roles": {}},
+            {"devices": {}, "users": {}, "groups": {}},
+            {
+                "devices": {device_id: 0, str(self.second_device.pk): 0},
+                "users": {},
+                "groups": {},
+            },
+            {"devices": {device_id: True}, "users": {}, "groups": {}},
+            {"devices": {device_id: -1}, "users": {}, "groups": {}},
+            {"devices": {device_id: 1 << 63}, "users": {}, "groups": {}},
+        )
+
+        for snapshot in invalid_snapshots:
+            with self.subTest(snapshot=snapshot):
+                response = self._post(
+                    "/api/strategies/assign",
+                    {
+                        "strategy": str(self.strategy.guid),
+                        "peers": [device_id],
+                        "expected_generations": snapshot,
+                    },
+                )
+                self.assertEqual(response.status_code, 400, response.content)
+
+        self.first_device.refresh_from_db()
+        self.assertIsNone(self.first_device.strategy_id)
+        self.assertEqual(self.first_device.mutation_generation, 0)
+        self.assertFalse(ManagementBatchOperation.objects.exists())
+
+    def test_strategy_assignment_stale_snapshot_is_durable_and_zero_mutation(self):
+        RemoteDevice._base_manager.filter(pk=self.first_device.pk).update(mutation_generation=1)
+        payload = {
+            "strategy": str(self.strategy.guid),
+            "peers": [str(self.first_device.pk)],
+            "users": [str(self.first_user.pk)],
+            "groups": [str(self.first_group.guid)],
+            "expected_generations": {
+                "devices": {str(self.first_device.pk): 0},
+                "users": {str(self.first_user.pk): 0},
+                "groups": {str(self.first_group.guid): 0},
+            },
+        }
+        operation_id = str(uuid.uuid4())
+
+        response = self._post(
+            "/api/strategies/assign",
+            payload,
+            operation_id=operation_id,
+        )
+
+        self.assert_zero_application_conflict(response)
+        self.assertEqual(
+            response.json()["stale"]["devices"][str(self.first_device.pk)],
+            1,
+        )
+        self.first_device.refresh_from_db()
+        self.first_user.refresh_from_db()
+        self.first_group.refresh_from_db()
+        self.assertIsNone(self.first_device.strategy_id)
+        self.assertIsNone(self.first_user.strategy_id)
+        self.assertIsNone(self.first_group.strategy_id)
+        self.assertEqual(
+            (
+                self.first_device.mutation_generation,
+                self.first_user.mutation_generation,
+                self.first_group.mutation_generation,
+            ),
+            (1, 0, 0),
+        )
+        receipt = ManagementBatchOperation.objects.get(operation_id=operation_id)
+        self.assertEqual(receipt.status_code, 409)
+        self.assertEqual(receipt.response, response.json())
 
     def test_missing_or_invalid_operation_identifier_is_rejected(self):
         missing = self.client.post(
             "/api/strategies/assign",
-            data=json.dumps({"strategy": None, "peers": [str(self.first_device.pk)]}),
+            data=json.dumps(
+                {
+                    "strategy": None,
+                    "peers": [str(self.first_device.pk)],
+                    "expected_generations": {
+                        "devices": {str(self.first_device.pk): 0},
+                        "users": {},
+                        "groups": {},
+                    },
+                }
+            ),
             content_type="application/json",
             HTTP_AUTHORIZATION=f"Bearer {self.bearer}",
         )
         invalid = self._post(
             "/api/strategies/assign",
-            {"strategy": None, "peers": [str(self.first_device.pk)]},
+            {
+                "strategy": None,
+                "peers": [str(self.first_device.pk)],
+                "expected_generations": {
+                    "devices": {str(self.first_device.pk): 0},
+                    "users": {},
+                    "groups": {},
+                },
+            },
             operation_id="not-a-uuid",
         )
 
@@ -294,6 +493,7 @@ class ManagementBatchOperationTests(TestCase):
             f"/api/device-groups/{self.first_group.guid}",
             payload,
             operation_id=operation_id,
+            expected_generation=0,
         )
         first_body = rejected.json()
         self.assert_zero_application_conflict(rejected)
@@ -306,6 +506,7 @@ class ManagementBatchOperationTests(TestCase):
             f"/api/device-groups/{self.first_group.guid}",
             payload,
             operation_id=operation_id,
+            expected_generation=0,
         )
 
         self.assertEqual(replayed.status_code, 409, replayed.content)
@@ -321,6 +522,7 @@ class ManagementBatchOperationTests(TestCase):
             f"/api/device-groups/{self.first_group.guid}",
             [self.first_device.rid],
             operation_id=operation_id,
+            expected_generation=0,
         )
         self.assert_success_receipt(
             accepted,
@@ -333,6 +535,7 @@ class ManagementBatchOperationTests(TestCase):
             f"/api/device-groups/{self.first_group.guid}",
             [self.second_device.rid],
             operation_id=operation_id,
+            expected_generation=0,
         )
 
         self.assertEqual(conflict.status_code, 409, conflict.content)
@@ -351,6 +554,7 @@ class ManagementBatchOperationTests(TestCase):
             f"/api/device-groups/{self.first_group.guid}",
             payload,
             operation_id=operation_id,
+            expected_generation=0,
         )
         self.assertEqual(accepted.status_code, 200, accepted.content)
         other_admin = UserProfile.objects.create_superuser(
@@ -366,6 +570,7 @@ class ManagementBatchOperationTests(TestCase):
             content_type="application/json",
             HTTP_AUTHORIZATION=f"Bearer {other_bearer}",
             HTTP_IDEMPOTENCY_KEY=operation_id,
+            HTTP_IF_MATCH='"0"',
         )
 
         self.assertEqual(conflict.status_code, 409, conflict.content)
@@ -381,6 +586,7 @@ class ManagementBatchOperationTests(TestCase):
             f"/api/device-groups/{self.first_group.guid}",
             [self.first_device.rid, self.second_device.rid],
             operation_id=add_operation_id,
+            expected_generation=0,
         )
         self.assert_success_receipt(
             added,
@@ -390,8 +596,13 @@ class ManagementBatchOperationTests(TestCase):
         )
         self.first_device.refresh_from_db()
         self.second_device.refresh_from_db()
+        self.first_group.refresh_from_db()
         self.assertEqual(self.first_device.device_group_id, self.first_group.pk)
         self.assertEqual(self.second_device.device_group_id, self.first_group.pk)
+        self.assertEqual(self.first_device.mutation_generation, 1)
+        self.assertEqual(self.second_device.mutation_generation, 1)
+        self.assertEqual(self.first_group.mutation_generation, 1)
+        self.assertEqual(added["ETag"], '"1"')
 
         _token, _raw = _issue_access_token(self.first_user, self.first_device)
         _token, _raw = _issue_access_token(self.second_user, self.second_device)
@@ -410,6 +621,155 @@ class ManagementBatchOperationTests(TestCase):
         self.assertEqual(body["revoked_users"], 2)
         self.assertEqual(body["deleted"], 2)
         self.assertFalse(RemoteToken.objects.filter(device__in=(self.first_device, self.second_device)).exists())
+
+    def test_group_membership_replay_and_stale_generation_are_zero_additional_mutation(self):
+        add_operation_id = str(uuid.uuid4())
+        payload = [self.first_device.rid]
+        accepted = self._post(
+            f"/api/device-groups/{self.first_group.guid}",
+            payload,
+            operation_id=add_operation_id,
+            expected_generation=0,
+        )
+        first_body = self.assert_success_receipt(
+            accepted,
+            "device_group_add_devices",
+            add_operation_id,
+            {"devices": 1},
+        )
+
+        replayed = self._post(
+            f"/api/device-groups/{self.first_group.guid}",
+            payload,
+            operation_id=add_operation_id,
+            expected_generation=0,
+        )
+        stale = self._delete(
+            f"/api/device-groups/{self.first_group.guid}/devices",
+            payload,
+            expected_generation=0,
+        )
+
+        self.assertEqual(replayed.status_code, 200, replayed.content)
+        self.assertEqual(replayed.json(), first_body)
+        self.assert_zero_application_conflict(stale)
+        self.first_device.refresh_from_db()
+        self.first_group.refresh_from_db()
+        self.assertEqual(self.first_device.device_group_id, self.first_group.pk)
+        self.assertEqual(self.first_device.mutation_generation, 1)
+        self.assertEqual(self.first_group.mutation_generation, 1)
+
+        removed = self._delete(
+            f"/api/device-groups/{self.first_group.guid}/devices",
+            payload,
+            expected_generation=1,
+        )
+        self.assertEqual(removed.status_code, 200, removed.content)
+        self.first_device.refresh_from_db()
+        self.first_group.refresh_from_db()
+        self.assertIsNone(self.first_device.device_group_id)
+        self.assertEqual(self.first_device.mutation_generation, 2)
+        self.assertEqual(self.first_group.mutation_generation, 2)
+
+    def test_device_group_assignment_advances_old_and_new_group_generations(self):
+        self.first_device.device_group = self.first_group
+        self.first_device.save(update_fields=("device_group",))
+
+        response = self._post(
+            f"/api/devices/{self.first_device.pk}/assign",
+            {"type": "device_group_name", "value": self.second_group.name},
+            expected_generation=0,
+        )
+
+        self.assertEqual(response.status_code, 200, response.content)
+        self.first_device.refresh_from_db()
+        self.first_group.refresh_from_db()
+        self.second_group.refresh_from_db()
+        self.assertEqual(self.first_device.device_group_id, self.second_group.pk)
+        self.assertEqual(self.first_device.mutation_generation, 1)
+        self.assertEqual(self.first_group.mutation_generation, 1)
+        self.assertEqual(self.second_group.mutation_generation, 1)
+
+    def test_bulk_move_and_device_delete_advance_group_membership_generations_once(self):
+        self.first_device.device_group = self.first_group
+        self.first_device.save(update_fields=("device_group",))
+        move_id = str(uuid.uuid4())
+        payload = [self.first_device.rid]
+        path = f"/api/device-groups/{self.second_group.guid}"
+        moved = self._post(path, payload, operation_id=move_id, expected_generation=0)
+        replayed = self._post(path, payload, operation_id=move_id, expected_generation=0)
+        self.assertEqual(moved.status_code, 200, moved.content)
+        self.assertEqual(replayed.json(), moved.json())
+        self.first_group.refresh_from_db()
+        self.second_group.refresh_from_db()
+        self.first_device.refresh_from_db()
+        self.assertEqual(self.first_group.mutation_generation, 1)
+        self.assertEqual(self.second_group.mutation_generation, 1)
+        self.assertEqual(self.first_device.device_group_id, self.second_group.pk)
+
+        delete_id = str(uuid.uuid4())
+        path = f"/api/devices/{self.first_device.pk}"
+        deleted = self._delete(path, {}, operation_id=delete_id, expected_generation=1)
+        replayed_delete = self._delete(path, {}, operation_id=delete_id, expected_generation=1)
+        self.assertEqual(deleted.status_code, 200, deleted.content)
+        self.assertEqual(replayed_delete.json(), deleted.json())
+        self.second_group.refresh_from_db()
+        self.assertEqual(self.second_group.mutation_generation, 2)
+        self.assertFalse(RemoteDevice.objects.filter(pk=self.first_device.pk).exists())
+
+    def test_user_group_and_strategy_deletes_advance_detached_resource_generations(self):
+        group_device = self.first_device
+        group_device.device_group = self.first_group
+        group_device.save(update_fields=("device_group",))
+        deleted_group = self._delete(
+            f"/api/device-groups/{self.first_group.guid}",
+            {},
+            expected_generation=0,
+        )
+        self.assertEqual(deleted_group.status_code, 200, deleted_group.content)
+        group_device.refresh_from_db()
+        self.assertIsNone(group_device.device_group_id)
+        self.assertEqual(group_device.mutation_generation, 1)
+
+        strategy_user = self.first_user
+        strategy_group = self.second_group
+        strategy_device = self.second_device
+        strategy_user.strategy = self.strategy
+        strategy_user.save(update_fields=("strategy",))
+        strategy_group.strategy = self.strategy
+        strategy_group.save(update_fields=("strategy",))
+        strategy_device.strategy = self.strategy
+        strategy_device.save(update_fields=("strategy",))
+        deleted_strategy = self._delete(
+            f"/api/strategies/{self.strategy.guid}",
+            {},
+            expected_generation=0,
+        )
+        self.assertEqual(deleted_strategy.status_code, 200, deleted_strategy.content)
+        strategy_user.refresh_from_db()
+        strategy_group.refresh_from_db()
+        strategy_device.refresh_from_db()
+        self.assertIsNone(strategy_user.strategy_id)
+        self.assertIsNone(strategy_group.strategy_id)
+        self.assertIsNone(strategy_device.strategy_id)
+        self.assertEqual(strategy_user.mutation_generation, 1)
+        self.assertEqual(strategy_group.mutation_generation, 1)
+        self.assertEqual(strategy_device.mutation_generation, 1)
+
+        user_device_generation = group_device.mutation_generation
+        deleted_user = self._delete(
+            f"/api/users/{self.first_user.pk}",
+            {},
+            expected_generation=strategy_user.mutation_generation,
+        )
+        self.assertEqual(deleted_user.status_code, 200, deleted_user.content)
+        group_device.refresh_from_db()
+        self.assertIsNone(group_device.owner_id)
+        self.assertFalse(group_device.is_active)
+        self.assertEqual(
+            group_device.mutation_generation,
+            user_device_generation + 1,
+        )
 
     def test_unhandled_database_failure_rolls_back_mutation_and_receipt(self):
         operation_id = uuid.uuid4()
@@ -433,13 +793,108 @@ class ManagementBatchOperationTests(TestCase):
         self.assertEqual(self.first_user.note, original_note)
         self.assertFalse(ManagementBatchOperation.objects.filter(operation_id=operation_id).exists())
 
+    def test_receipt_recovery_returns_sensitive_result_only_to_original_actor(self):
+        operation_id = uuid.uuid4()
+        execute_management_operation(
+            actor=self.admin,
+            operation_id=operation_id,
+            operation="recovery_test",
+            request_document={"operation": "recovery_test"},
+            requested={"results": 1},
+            mutation=lambda: management_operations.ManagementMutation(
+                status_code=200,
+                body={"result": "OK", "token": "one-time-recovered-value"},
+                applied={"results": 1},
+                result_state={"created": True},
+            ),
+            sensitive_response=True,
+        )
+        path = f"/api/management-operations/{operation_id}"
+
+        recovered = self.client.get(
+            path,
+            HTTP_AUTHORIZATION=f"Bearer {self.bearer}",
+        )
+
+        self.assertEqual(recovered.status_code, 200, recovered.content)
+        self.assertEqual(recovered.json()["original_status_code"], 200)
+        self.assertEqual(
+            recovered.json()["receipt"]["token"],
+            "one-time-recovered-value",
+        )
+        self.assertEqual(recovered["Cache-Control"], "no-store, private")
+        self.assertEqual(recovered["Referrer-Policy"], "no-referrer")
+
+        self.client.force_login(self.admin)
+        session_recovered = self.client.get(path)
+        self.assertEqual(session_recovered.status_code, 200, session_recovered.content)
+        self.client.force_login(self.first_user)
+        isolated = self.client.get(path)
+        self.assertEqual(isolated.status_code, 404, isolated.content)
+        self.assertNotIn(b"one-time-recovered-value", isolated.content)
+
+    def test_data_encryption_rotation_includes_sensitive_operation_receipts(self):
+        operation_id = uuid.uuid4()
+        execute_management_operation(
+            actor=self.admin,
+            operation_id=operation_id,
+            operation="receipt_rotation_test",
+            request_document={"operation": "receipt_rotation_test"},
+            requested={"results": 1},
+            mutation=lambda: management_operations.ManagementMutation(
+                status_code=200,
+                body={"result": "OK", "token": "rotation-sensitive-value"},
+                applied={"results": 1},
+                result_state={"created": True},
+            ),
+            sensitive_response=True,
+        )
+        old_key_id = settings.DATA_ENCRYPTION_PRIMARY_KEY_ID
+        old_key = settings.DATA_ENCRYPTION_KEYS[old_key_id]
+        new_key_id = "operation-receipt-rotation"
+        new_key = b"r" * 32
+        db_operation_id = ManagementBatchOperation._meta.get_field("operation_id").get_db_prep_value(
+            operation_id,
+            connections["default"],
+        )
+        with connections["default"].cursor() as cursor:
+            cursor.execute(
+                "SELECT secret_response FROM api_managementbatchoperation WHERE operation_id = %s",
+                [db_operation_id],
+            )
+            old_envelope = cursor.fetchone()[0]
+        self.assertTrue(old_envelope.startswith(f"{FIELD_PREFIX}{old_key_id}:"))
+        self.assertNotIn("rotation-sensitive-value", old_envelope)
+
+        with override_settings(
+            DATA_ENCRYPTION_KEY_BYTES=new_key,
+            DATA_ENCRYPTION_KEYS={old_key_id: old_key, new_key_id: new_key},
+            DATA_ENCRYPTION_PRIMARY_KEY_ID=new_key_id,
+            DATA_ENCRYPTION_V1_KEY_ID=old_key_id,
+        ):
+            call_command("rotate_data_encryption", stdout=StringIO())
+            with connections["default"].cursor() as cursor:
+                cursor.execute(
+                    "SELECT secret_response FROM api_managementbatchoperation WHERE operation_id = %s",
+                    [db_operation_id],
+                )
+                new_envelope = cursor.fetchone()[0]
+            self.assertTrue(new_envelope.startswith(f"{FIELD_PREFIX}{new_key_id}:"))
+            receipt = ManagementBatchOperation.objects.get(operation_id=operation_id)
+            self.assertEqual(
+                json.loads(receipt.secret_response)["token"],
+                "rotation-sensitive-value",
+            )
+
     @override_settings(MANAGEMENT_OPERATION_RETENTION_DAYS=30)
     def test_cleanup_purges_expired_receipts_in_bounded_batches(self):
         for device in (self.first_device, self.second_device):
+            self.first_group.refresh_from_db()
             response = self._post(
                 f"/api/device-groups/{self.first_group.guid}",
                 [device.rid],
                 operation_id=str(uuid.uuid4()),
+                expected_generation=self.first_group.mutation_generation,
             )
             self.assertEqual(response.status_code, 200, response.content)
         cutoff_time = timezone.now() - datetime.timedelta(days=31)
@@ -493,15 +948,20 @@ class ManagementBatchOperationConcurrencyTests(TransactionTestCase):
         self.second_strategy = StrategyProfile.objects.create(name="batch-concurrent-second", config_options={})
         _token, self.bearer = _issue_access_token(self.admin, self.admin_device)
 
-    def _request(self, path, payload, operation_id):
+    def _request(self, path, payload, operation_id, expected_generation=None):
         close_old_connections()
         try:
+            headers = {
+                "HTTP_AUTHORIZATION": f"Bearer {self.bearer}",
+                "HTTP_IDEMPOTENCY_KEY": operation_id,
+            }
+            if expected_generation is not None:
+                headers["HTTP_IF_MATCH"] = f'"{expected_generation}"'
             return Client(raise_request_exception=False).post(
                 path,
                 data=json.dumps(payload),
                 content_type="application/json",
-                HTTP_AUTHORIZATION=f"Bearer {self.bearer}",
-                HTTP_IDEMPOTENCY_KEY=operation_id,
+                **headers,
             )
         finally:
             connections.close_all()
@@ -517,6 +977,7 @@ class ManagementBatchOperationConcurrencyTests(TransactionTestCase):
                 f"/api/device-groups/{self.group.guid}",
                 [self.device.rid],
                 operation_id,
+                0,
             )
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
@@ -558,6 +1019,7 @@ class ManagementBatchOperationConcurrencyTests(TransactionTestCase):
                 f"/api/device-groups/{self.group.guid}",
                 [self.device.rid],
                 operation_id,
+                0,
             )
             release_delete.set()
             deleting.result(timeout=60)
@@ -581,6 +1043,11 @@ class ManagementBatchOperationConcurrencyTests(TransactionTestCase):
                 {
                     "strategy": str(strategy.guid),
                     "peers": [str(self.device.pk)],
+                    "expected_generations": {
+                        "devices": {str(self.device.pk): 0},
+                        "users": {},
+                        "groups": {},
+                    },
                 },
                 str(uuid.uuid4()),
             )
@@ -591,13 +1058,15 @@ class ManagementBatchOperationConcurrencyTests(TransactionTestCase):
             barrier.wait(timeout=20)
             responses = (first.result(timeout=60), second.result(timeout=60))
 
-        self.assertTrue(all(response.status_code == 200 for response in responses))
-        self.assertTrue(
-            all(response.json()["applied"] == {"devices": 1, "users": 0, "groups": 0} for response in responses)
+        self.assertEqual(sorted(response.status_code for response in responses), [200, 409])
+        self.assertEqual(
+            sorted(response.json()["applied"]["devices"] for response in responses),
+            [0, 1],
         )
         self.device.refresh_from_db()
         self.assertIn(self.device.strategy_id, (self.first_strategy.pk, self.second_strategy.pk))
-        self.assertEqual(self.device.policy_generation, 2)
+        self.assertEqual(self.device.policy_generation, 1)
+        self.assertEqual(self.device.mutation_generation, 1)
         self.assertEqual(ManagementBatchOperation.objects.count(), 2)
 
     @skipUnlessDBFeature("has_select_for_update")
@@ -631,6 +1100,11 @@ class ManagementBatchOperationConcurrencyTests(TransactionTestCase):
                     "strategy": str(strategy.guid),
                     "peers": [str(device.pk)],
                     "groups": [str(group.guid)],
+                    "expected_generations": {
+                        "devices": {str(device.pk): 0},
+                        "users": {},
+                        "groups": {str(group.guid): 0},
+                    },
                 },
                 str(uuid.uuid4()),
             )

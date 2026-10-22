@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "schema_generation": "management-schema-0032-v1",
+  "schema_generation": "management-schema-0033-v1",
   "migrations": [
     ["admin", "0001_initial"],
     ["admin", "0002_logentry_remove_auto_add"],
@@ -37,6 +37,7 @@
     ["api", "0030_bigint_primary_key_capacity"],
     ["api", "0031_control_filter_indexes"],
     ["api", "0032_context_bound_encrypted_fields"],
+    ["api", "0033_mutation_generations"],
     ["auth", "0001_initial"],
     ["auth", "0002_alter_permission_name_max_length"],
     ["auth", "0003_alter_user_email_max_length"],
@@ -55,7 +56,7 @@
   ],
   "leaf_migrations": [
     ["admin", "0003_logentry_add_action_flag_choices"],
-    ["api", "0032_context_bound_encrypted_fields"],
+    ["api", "0033_mutation_generations"],
     ["auth", "0012_alter_user_first_name_max_length"],
     ["contenttypes", "0002_remove_content_type_name"],
     ["sessions", "0001_initial"]
@@ -65,29 +66,33 @@
       "api_addressbookprofile": ["guid", "id", "secret_context"],
       "api_addressbookrule": ["group_id", "id", "is_everyone", "profile_id", "user_id"],
       "api_connectionauditevent": ["id", "payload_digest", "reporter_sequence"],
-      "api_devicegroup": ["id", "name"],
+      "api_devicegroup": ["id", "mutation_generation", "name"],
+      "api_managementbatchoperation": ["actor_id", "generation", "operation", "operation_id", "secret_response"],
       "api_oidcpendingauth": ["secret_context", "state"],
       "api_recordingupload": ["secret_context", "upload_id"],
-      "api_remotedevice": ["deployment_generation", "id", "owner_id", "policy_generation", "rid", "secret_context"],
+      "api_remotedevice": ["deployment_generation", "id", "mutation_generation", "owner_id", "policy_generation", "rid", "secret_context"],
       "api_remotepeer": ["id", "profile_id", "rid", "secret_context"],
       "api_remotepeer_tags": ["id", "profile_id", "remotepeer_id", "remotetag_id"],
       "api_sequencecapacitystate": ["last_value", "sampled_at", "sequence_name"],
       "api_sharelink_peers": ["id", "owner_id", "profile_id", "remotepeer_id", "sharelink_id"],
-      "api_strategyprofile": ["config_options", "id", "name"],
-      "api_userprofile": ["id", "username", "username_canonical"],
+      "api_strategyprofile": ["config_options", "id", "mutation_generation", "name"],
+      "api_userprofile": ["id", "mutation_generation", "username", "username_canonical"],
       "auth_group": ["id", "name"],
       "django_migrations": ["app", "applied", "id", "name"]
     },
     "postgresql": {
       "column_types": {
         "api_addressbookprofile": {"secret_context": "uuid"},
+        "api_devicegroup": {"mutation_generation": "bigint"},
+        "api_managementbatchoperation": {"secret_response": "text"},
         "api_oidcpendingauth": {"secret_context": "uuid"},
         "api_recordingupload": {"secret_context": "uuid"},
-        "api_remotedevice": {"id": "bigint", "secret_context": "uuid"},
+        "api_remotedevice": {"id": "bigint", "mutation_generation": "bigint", "secret_context": "uuid"},
         "api_remotepeer": {"secret_context": "uuid"},
         "api_remotepeer_tags": {"id": "bigint", "profile_id": "bigint", "remotepeer_id": "bigint", "remotetag_id": "bigint"},
         "api_sharelink_peers": {"id": "bigint", "owner_id": "bigint", "profile_id": "bigint", "remotepeer_id": "bigint", "sharelink_id": "bigint"},
-        "api_userprofile": {"id": "bigint"}
+        "api_strategyprofile": {"mutation_generation": "bigint"},
+        "api_userprofile": {"id": "bigint", "mutation_generation": "bigint"}
       },
       "constraints": {
         "api_addressbookprofile": ["unique_ab_profile_secret_context"],
@@ -112,10 +117,14 @@
       },
       "not_null": {
         "api_addressbookprofile": ["secret_context"],
+        "api_devicegroup": ["mutation_generation"],
+        "api_managementbatchoperation": ["secret_response"],
         "api_oidcpendingauth": ["secret_context"],
         "api_recordingupload": ["secret_context"],
-        "api_remotedevice": ["secret_context"],
-        "api_remotepeer": ["secret_context"]
+        "api_remotedevice": ["mutation_generation", "secret_context"],
+        "api_remotepeer": ["secret_context"],
+        "api_strategyprofile": ["mutation_generation"],
+        "api_userprofile": ["mutation_generation"]
       },
       "runtime_dml": {
         "sequences": {

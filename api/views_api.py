@@ -25,7 +25,7 @@ from django.contrib.auth.models import Group
 from django.core.exceptions import ValidationError
 from django.core.validators import validate_email
 from django.db import IntegrityError, connection, transaction
-from django.db.models import Prefetch, Q, QuerySet
+from django.db.models import F, Prefetch, Q, QuerySet
 from django.http import HttpResponse, HttpResponseRedirect, JsonResponse
 from django.utils import timezone
 from django.utils.translation import gettext as _
@@ -79,8 +79,11 @@ from api.login_admission import complete_login_success, reserve_login_attempt
 from api.management_operations import (
     ManagementMutation,
     ManagementOperationConflict,
+    document_digest,
     execute_management_operation,
+    find_management_operation,
     operation_id_from_request,
+    parse_operation_id,
 )
 from api.models import (
     AddressBookProfile,
@@ -258,6 +261,33 @@ def _get_token_user(request):
         return None, None
     enforce_authenticated_rate_limit(request, user, device)
     return token, user
+
+
+def management_operation_receipt(request, operation_id):
+    """Recover a durable mutation result after response loss or restart."""
+
+    if _get_bearer_token(request):
+        _token, actor = _get_token_user(request)
+    else:
+        actor = request.user if request.user.is_authenticated else None
+    if actor is None:
+        return JsonResponse({"error": "Authentication required"}, status=401)
+    try:
+        parsed_operation_id = parse_operation_id(operation_id)
+    except InvalidIdentifier:
+        return JsonResponse({"error": "Invalid operation identifier"}, status=400)
+    result = find_management_operation(
+        actor=actor,
+        operation_id=parsed_operation_id,
+    )
+    if result is None:
+        return JsonResponse({"error": "Operation receipt not found"}, status=404)
+    return JsonResponse(
+        {
+            "original_status_code": result.status_code,
+            "receipt": result.body,
+        }
+    )
 
 
 def _token_expired(token):
@@ -1352,6 +1382,108 @@ def _operation_id_or_error(request):
         return None, JsonResponse({"error": "Valid Idempotency-Key required"}, status=400)
 
 
+def _state040_operation_id(request):
+    """Require the caller's stable operation id for deterministic replay."""
+
+    return _operation_id_or_error(request)
+
+
+MAX_MUTATION_GENERATION = (1 << 63) - 1
+
+
+def _expected_mutation_generation(request):
+    value = request.META.get("HTTP_IF_MATCH", "").strip()
+    if value.startswith('"') and value.endswith('"'):
+        value = value[1:-1]
+    if not value:
+        return False
+    if not re.fullmatch(r"[0-9]+", value):
+        return False
+    try:
+        generation = int(value)
+    except ValueError:
+        return False
+    return generation if generation <= MAX_MUTATION_GENERATION else False
+
+
+def _generation_conflict(current, kind="resources"):
+    return ManagementMutation(
+        status_code=409,
+        body={
+            "error": "Resource changed",
+            "code": "resource_generation_conflict",
+            "current_generation": current,
+        },
+        applied={kind: 0},
+        result_state={"current_generation": current},
+    )
+
+
+def _advance_mutation_generation(instance):
+    if instance.mutation_generation >= MAX_MUTATION_GENERATION:
+        raise RuntimeError("Resource mutation generation exhausted")
+    updated = type(instance)._base_manager.filter(pk=instance.pk).update(
+        mutation_generation=F("mutation_generation") + 1
+    )
+    if updated != 1:
+        raise RuntimeError("Resource disappeared while advancing mutation generation")
+    instance.mutation_generation += 1
+    return instance.mutation_generation
+
+
+def _advance_mutation_generations(model, object_ids):
+    object_ids = sorted(set(object_ids))
+    if not object_ids:
+        return 0
+    queryset = model._base_manager.filter(pk__in=object_ids)
+    if queryset.filter(mutation_generation__gte=MAX_MUTATION_GENERATION).exists():
+        raise RuntimeError("Resource mutation generation exhausted")
+    updated = queryset.update(mutation_generation=F("mutation_generation") + 1)
+    if updated != len(object_ids):
+        raise RuntimeError("Resource disappeared while advancing mutation generations")
+    return updated
+
+
+MUTATION_GENERATION_TARGETS = ("devices", "users", "groups")
+
+
+def _expected_mutation_generation_map(value, target_ids):
+    """Validate an exact generation snapshot for a multi-resource mutation."""
+
+    if not isinstance(value, dict) or set(value) != set(MUTATION_GENERATION_TARGETS):
+        return None
+    normalized = {}
+    for kind in MUTATION_GENERATION_TARGETS:
+        generations = value.get(kind)
+        expected_ids = tuple(str(target_id) for target_id in target_ids[kind])
+        if not isinstance(generations, dict) or set(generations) != set(expected_ids):
+            return None
+        normalized[kind] = {}
+        for target_id in expected_ids:
+            generation = generations.get(target_id)
+            if (
+                type(generation) is not int
+                or generation < 0
+                or generation > MAX_MUTATION_GENERATION
+            ):
+                return None
+            normalized[kind][target_id] = generation
+    return normalized
+
+
+def _mutation_generation_conflicts(expected, current):
+    conflicts = {}
+    for kind in MUTATION_GENERATION_TARGETS:
+        stale = {
+            target_id: current[kind][target_id]
+            for target_id, generation in expected[kind].items()
+            if current[kind][target_id] != generation
+        }
+        if stale:
+            conflicts[kind] = stale
+    return conflicts
+
+
 MUTATION_FIELD_CONTRACT_VERSION = 1
 MAX_MUTATION_ERROR_FIELDS = 16
 
@@ -1417,7 +1549,11 @@ def _execute_management_batch(**kwargs):
         result = execute_management_operation(**kwargs)
     except ManagementOperationConflict:
         return JsonResponse({"error": "Operation identifier conflict"}, status=409)
-    return JsonResponse(result.body, status=result.status_code)
+    response = JsonResponse(result.body, status=result.status_code)
+    generation = result.body.get("mutation_generation")
+    if isinstance(generation, int) and generation >= 0:
+        response["ETag"] = f'"{generation}"'
+    return response
 
 
 def _strict_bool(value):
@@ -2961,22 +3097,72 @@ def ab_shared_add(request):
         parsed_info = _profile_info_value(info)
         if parsed_info is None:
             return JsonResponse({"error": "Invalid info"}, status=400)
-    profile = _get_or_create_profile(user, name)
-    with transaction.atomic():
-        profile = _lock_profile_for_management(user, profile)
-        if not profile:
-            return JsonResponse({"error": "Authorization changed"}, status=403)
-        profile.note = note
-        update_fields = ["note", "updated_at"]
-        if parsed_info is not None:
-            profile.info = parsed_info
-            update_fields.append("info")
-        if "default_password" in postdata:
-            profile.default_password = default_password
-            update_fields.append("default_password")
-        profile.save(update_fields=update_fields)
-    _log_event(request, "api_ab_shared_add", username=user.username, guid=profile.guid, name=name)
-    return JsonResponse({"code": 1, "guid": profile.guid})
+    operation_id, operation_error = _state040_operation_id(request)
+    if operation_error:
+        return operation_error
+
+    def mutate():
+        try:
+            with transaction.atomic():
+                profile = AddressBookProfile.objects.create(
+                    guid=uuid.uuid4().hex,
+                    name=name,
+                    owner=user,
+                    note=note,
+                    rule=3,
+                    info=parsed_info if parsed_info is not None else {},
+                    default_password=(default_password if "default_password" in postdata else ""),
+                )
+        except IntegrityError:
+            return ManagementMutation(
+                status_code=409,
+                body={"error": "Address book already exists", "code": "profile_name_conflict"},
+                applied={"profiles": 0},
+                result_state={"error": "profile_name_conflict", "name": name},
+            )
+        body = {
+            "code": 1,
+            "guid": str(profile.guid),
+            "mutation_generation": profile.authorization_generation,
+        }
+        return ManagementMutation(
+            status_code=200,
+            body=body,
+            applied={"profiles": 1},
+            result_state={"guid": str(profile.guid), "generation": profile.authorization_generation},
+        )
+
+    response = _execute_management_batch(
+        actor=user,
+        operation_id=operation_id,
+        operation="address_book_profile_create",
+        request_document={
+            "operation": "address_book_profile_create",
+            "name": name,
+            "note": note,
+            "info": parsed_info,
+            "has_default_password": "default_password" in postdata,
+            "default_password_digest": (
+                document_digest(default_password)
+                if "default_password" in postdata
+                else None
+            ),
+        },
+        requested={"profiles": 1},
+        mutation=mutate,
+    )
+    body = json.loads(response.content)
+    _log_event(
+        request,
+        "api_ab_shared_add" if response.status_code == 200 else "api_ab_shared_add_failed",
+        level="info" if response.status_code == 200 else "warning",
+        username=user.username,
+        guid=body.get("guid", ""),
+        name=name,
+        operation_id=str(operation_id),
+        operation_generation=body.get("operation_generation"),
+    )
+    return response
 
 
 def ab_shared_update_profile(request):
@@ -2995,6 +3181,12 @@ def ab_shared_update_profile(request):
         return JsonResponse({"error": "Personal address book cannot be modified"}, status=403)
     if not user.is_admin and str(profile.owner_id) != str(user.id):
         return JsonResponse({"error": "No access"}, status=403)
+    operation_id, operation_error = _state040_operation_id(request)
+    if operation_error:
+        return operation_error
+    expected_generation = _expected_mutation_generation(request)
+    if expected_generation is False:
+        return JsonResponse({"error": "Invalid If-Match"}, status=400)
     if "name" in postdata:
         name = str(postdata.get("name") or "").strip()
         if (
@@ -3032,34 +3224,104 @@ def ab_shared_update_profile(request):
             return JsonResponse({"error": "Owner not found"}, status=404)
         if AddressBookProfile.objects.filter(owner=new_owner, name=profile.name).exclude(pk=profile.pk).exists():
             return JsonResponse({"error": "Owner already has an address book with this name"}, status=409)
-    profile_values = {
-        "name": profile.name,
-        "note": profile.note,
-        "info": profile.info,
-    }
-    with transaction.atomic():
-        profile = _lock_profile_for_management(user, profile)
-        if not profile:
-            return JsonResponse({"error": "Authorization changed"}, status=403)
-        target_owner = new_owner or profile.owner
-        if (
-            AddressBookProfile.objects.filter(owner=target_owner, name=profile_values["name"])
-            .exclude(pk=profile.pk)
-            .exists()
-        ):
-            return JsonResponse({"error": "Owner already has an address book with this name"}, status=409)
-        profile.name = profile_values["name"]
-        profile.note = profile_values["note"]
-        profile.info = profile_values["info"]
-        if "default_password" in postdata:
-            profile.default_password = default_password
-        old_owner_id = profile.owner_id
-        if new_owner and new_owner.id != old_owner_id:
-            profile.owner = new_owner
-            AddressBookShare.objects.filter(profile=profile, user=new_owner).delete()
-        profile.save()
-    _log_event(request, "api_ab_shared_update", username=user.username, guid=guid)
-    return JsonResponse({"code": 1, "data": "ok"})
+    def mutate():
+        with transaction.atomic():
+            locked_profile = _lock_profile_for_management(user, profile)
+            if not locked_profile:
+                return ManagementMutation(
+                    status_code=403,
+                    body={"error": "Authorization changed"},
+                    applied={"profiles": 0},
+                    result_state={"error": "authorization_changed"},
+                )
+            if expected_generation is not None and locked_profile.authorization_generation != expected_generation:
+                return _generation_conflict(locked_profile.authorization_generation, "profiles")
+            target_owner = new_owner or locked_profile.owner
+            current_name = locked_profile.name
+            if "name" in postdata:
+                current_name = str(postdata.get("name") or "").strip()
+            if AddressBookProfile.objects.filter(
+                owner=target_owner,
+                name=current_name,
+            ).exclude(pk=locked_profile.pk).exists():
+                return ManagementMutation(
+                    status_code=409,
+                    body={"error": "Owner already has an address book with this name"},
+                    applied={"profiles": 0},
+                    result_state={"error": "name_conflict"},
+                )
+            changed = False
+            if "name" in postdata:
+                locked_profile.name = current_name
+                changed = True
+            if "note" in postdata and postdata.get("note") is not None:
+                locked_profile.note = _bounded_text_value(postdata.get("note"), 4096)
+                changed = True
+            if "info" in postdata and postdata.get("info") is not None:
+                locked_profile.info = _profile_info_value(postdata.get("info"))
+                changed = True
+            if "default_password" in postdata:
+                locked_profile.default_password = default_password
+                changed = True
+            old_owner_id = locked_profile.owner_id
+            owner_changed = False
+            if new_owner and new_owner.id != old_owner_id:
+                locked_profile.owner = new_owner
+                AddressBookShare.objects.filter(profile=locked_profile, user=new_owner).delete()
+                owner_changed = True
+                changed = True
+            if changed:
+                if not owner_changed:
+                    bump_locked_authorization_generation(locked_profile)
+            locked_profile.save()
+            body = {
+                "code": 1,
+                "data": "ok",
+                "guid": str(locked_profile.guid),
+                "mutation_generation": locked_profile.authorization_generation,
+            }
+            return ManagementMutation(
+                status_code=200,
+                body=body,
+                applied={"profiles": 1},
+                result_state={"guid": str(locked_profile.guid), "generation": locked_profile.authorization_generation},
+            )
+
+    response = _execute_management_batch(
+        actor=user,
+        operation_id=operation_id,
+        operation="address_book_profile_update",
+        request_document={
+            "operation": "address_book_profile_update",
+            "guid": str(guid),
+            "data": {
+                key: value
+                for key, value in postdata.items()
+                if key not in {"default_password"}
+            },
+            "has_default_password": "default_password" in postdata,
+            "default_password_digest": (
+                document_digest(default_password)
+                if "default_password" in postdata
+                else None
+            ),
+            "owner": postdata.get("owner") if "owner" in postdata else None,
+            "expected_generation": expected_generation,
+        },
+        requested={"profiles": 1},
+        mutation=mutate,
+    )
+    body = json.loads(response.content)
+    _log_event(
+        request,
+        "api_ab_shared_update" if response.status_code == 200 else "api_ab_shared_update_failed",
+        level="info" if response.status_code == 200 else "warning",
+        username=user.username,
+        guid=guid,
+        operation_id=str(operation_id),
+        operation_generation=body.get("operation_generation"),
+    )
+    return response
 
 
 def ab_shared_delete(request):
@@ -3073,18 +3335,68 @@ def ab_shared_delete(request):
     if len(postdata) > 100:
         return JsonResponse({"error": "Too many address books"}, status=400)
     requested_guids = [str(value) for value in postdata]
-    with transaction.atomic():
-        candidates = AddressBookProfile.objects.select_for_update().filter(guid__in=requested_guids)
-        if not user.is_admin:
-            candidates = candidates.filter(owner=user)
-        candidates = candidates.exclude(guid__startswith="personal-").order_by("pk")
-        locked_profiles = list(candidates.select_related("owner"))
-        for profile in locked_profiles:
-            profile._audit_actor = user
-            profile.delete()
-        deleted = len(locked_profiles)
-    _log_event(request, "api_ab_shared_delete", username=user.username, count=deleted)
-    return JsonResponse({"code": 1, "deleted": deleted})
+    operation_id, operation_error = _state040_operation_id(request)
+    if operation_error:
+        return operation_error
+    expected_generation = _expected_mutation_generation(request)
+    if expected_generation is False or (expected_generation is not None and len(requested_guids) != 1):
+        return JsonResponse({"error": "Invalid If-Match"}, status=400)
+
+    def mutate():
+        with transaction.atomic():
+            candidates = AddressBookProfile.objects.select_for_update().filter(guid__in=requested_guids)
+            if not user.is_admin:
+                candidates = candidates.filter(owner=user)
+            candidates = candidates.exclude(guid__startswith="personal-").order_by("pk")
+            locked_profiles = list(candidates.select_related("owner"))
+            if expected_generation is not None:
+                if not locked_profiles:
+                    return ManagementMutation(
+                        status_code=404,
+                        body={"error": "Address book not found"},
+                        applied={"profiles": 0},
+                        result_state={"error": "profile_not_found"},
+                    )
+                if locked_profiles[0].authorization_generation != expected_generation:
+                    return _generation_conflict(
+                        locked_profiles[0].authorization_generation,
+                        "profiles",
+                    )
+            deleted_profiles = []
+            for profile in locked_profiles:
+                profile._audit_actor = user
+                deleted_profiles.append({"guid": str(profile.guid), "name": profile.name})
+                profile.delete()
+            return ManagementMutation(
+                status_code=200,
+                body={"code": 1, "deleted": len(deleted_profiles)},
+                applied={"profiles": len(deleted_profiles)},
+                result_state={"deleted": deleted_profiles},
+            )
+
+    response = _execute_management_batch(
+        actor=user,
+        operation_id=operation_id,
+        operation="address_book_profile_delete",
+        request_document={
+            "operation": "address_book_profile_delete",
+            "profiles": sorted(requested_guids),
+            "expected_generation": expected_generation,
+        },
+        requested={"profiles": len(requested_guids)},
+        mutation=mutate,
+    )
+    body = json.loads(response.content)
+    _log_event(
+        request,
+        "api_ab_shared_delete" if response.status_code == 200 else "api_ab_shared_delete_failed",
+        level="info" if response.status_code == 200 else "warning",
+        username=user.username,
+        count=body.get("deleted", 0),
+        operation_id=str(operation_id),
+        operation_generation=body.get("operation_generation"),
+    )
+    return response
 
 
 def ab_rules(request):
@@ -5492,6 +5804,7 @@ def _serialize_user(u):
         "group_name": group_names[0] if group_names else "",
         "group_names": group_names,
         "strategy_name": u.strategy.name if u.strategy_id else "",
+        "mutation_generation": u.mutation_generation,
     }
 
 
@@ -5520,6 +5833,8 @@ def _serialize_device(device):
         "note": device.note or "",
         "is_deployed": deployed,
         "deployment_status": ("disabled" if not device.is_active else ("verified" if deployed else "pending")),
+        "policy_generation": device.policy_generation,
+        "mutation_generation": device.mutation_generation,
     }
 
 
@@ -5530,6 +5845,7 @@ def _serialize_device_group(group):
         "note": group.note or "",
         "allowed_incomings": (group.allowed_incomings if isinstance(group.allowed_incomings, list) else []),
         "strategy_name": group.strategy.name if group.strategy_id else "",
+        "mutation_generation": group.mutation_generation,
     }
 
 
@@ -5548,6 +5864,7 @@ def _serialize_strategy(strategy):
         "enabled": bool(strategy.enabled),
         "status": 1 if strategy.enabled else 0,
         "config_options": options,
+        "mutation_generation": strategy.mutation_generation,
         "updated_at": strategy.updated_at.isoformat() if strategy.updated_at else "",
     }
 
@@ -5642,8 +5959,6 @@ def users(request):
             or group_name is None
         ):
             return JsonResponse({"error": "Invalid user payload"}, status=400)
-        if UserProfile.objects.by_username(username).exists():
-            return _username_conflict_response(request, admin_user, phase="precheck")
         candidate = UserProfile(
             username=username,
             email=email,
@@ -5658,7 +5973,18 @@ def users(request):
             password_validation.validate_password(password, user=candidate)
         except ValidationError:
             return JsonResponse({"error": "Password does not meet security requirements"}, status=400)
-        with transaction.atomic():
+        operation_id, operation_error = _state040_operation_id(request)
+        if operation_error:
+            return operation_error
+
+        def mutate():
+            if UserProfile.objects.by_username(username).exists():
+                return ManagementMutation(
+                    status_code=409,
+                    body={"error": "User already exists", "code": "username_conflict"},
+                    applied={"users": 0},
+                    result_state={"error": "username_conflict"},
+                )
             try:
                 with transaction.atomic():
                     user = UserProfile.objects.create_user(
@@ -5669,19 +5995,49 @@ def users(request):
                     )
             except (IntegrityError, ValidationError):
                 if UserProfile.objects.by_username(username).exists():
-                    return _username_conflict_response(request, admin_user, phase="insert")
+                    return ManagementMutation(
+                        status_code=409,
+                        body={"error": "User already exists", "code": "username_conflict"},
+                        applied={"users": 0},
+                        result_state={"error": "username_conflict"},
+                    )
                 raise
             if group_name:
                 group = _locked_user_group(group_name)
                 user.groups.add(group)
+            body = _serialize_user(user)
+            return ManagementMutation(
+                status_code=200,
+                body=body,
+                applied={"users": 1},
+                result_state=body,
+            )
+
+        response = _execute_management_batch(
+            actor=admin_user,
+            operation_id=operation_id,
+            operation="user_create",
+            request_document={
+                "operation": "user_create",
+                "username": data["name"] if "name" in data else data["username"],
+                "password_digest": document_digest(password),
+                "email": data.get("email", ""),
+                "note": data.get("note", ""),
+                "group_name": data.get("group_name", ""),
+            },
+            requested={"users": 1},
+            mutation=mutate,
+        )
         _log_event(
             request,
-            "api_users_created",
+            "api_users_created" if response.status_code == 200 else "api_users_create_failed",
+            level="info" if response.status_code == 200 else "warning",
             username=admin_user.username,
             target=username,
             changed_fields=sorted(data),
+            operation_id=str(operation_id),
         )
-        return JsonResponse(_serialize_user(user))
+        return response
     _token, user = _get_token_user(request)
     if not user:
         _log_event(request, "api_users_unauthorized", level="warning")
@@ -5692,6 +6048,12 @@ def users(request):
     qs = UserProfile.objects.select_related("strategy").prefetch_related("groups").order_by("id")
     if not user.is_admin:
         qs = qs.filter(Q(id=user.id))
+    guid_filter = request.GET.get("guid")
+    if guid_filter is not None:
+        user_pk = _numeric_pk(guid_filter, UserProfile)
+        if user_pk is None:
+            return JsonResponse({"error": "Invalid user identifier"}, status=400)
+        qs = qs.filter(pk=user_pk)
     try:
         qs = _request_filter_text(request, qs, "username", "name")
         qs = _request_filter_text(request, qs, "groups__name", "group_name")
@@ -5721,6 +6083,9 @@ def user_status(request, guid, action):
     operation_id, operation_error = _operation_id_or_error(request)
     if operation_error:
         return operation_error
+    expected_generation = _expected_mutation_generation(request)
+    if expected_generation is False:
+        return JsonResponse({"error": "Invalid If-Match"}, status=400)
     operation = f"user_status_{action}"
 
     def mutate():
@@ -5732,6 +6097,8 @@ def user_status(request, guid, action):
                 applied={"users": 0},
                 result_state={"missing": {"users": [str(target_pk)]}},
             )
+        if expected_generation is not None and target.mutation_generation != expected_generation:
+            return _generation_conflict(target.mutation_generation, "users")
         if target.id == admin_user.id and action == "disable":
             return ManagementMutation(
                 status_code=400,
@@ -5754,6 +6121,7 @@ def user_status(request, guid, action):
                 result_state={"error": "credential_generation_exhausted"},
             )
         target.refresh_from_db(fields=("is_active", "credential_generation"))
+        _advance_mutation_generation(target)
         return ManagementMutation(
             status_code=200,
             body={
@@ -5761,6 +6129,7 @@ def user_status(request, guid, action):
                 "guid": str(target.pk),
                 "status": 1 if target.is_active else 0,
                 "revoked_tokens": revoked_tokens,
+                "mutation_generation": target.mutation_generation,
             },
             applied={"users": 1},
             result_state={
@@ -5768,6 +6137,7 @@ def user_status(request, guid, action):
                     "id": target.pk,
                     "is_active": target.is_active,
                     "credential_generation": target.credential_generation,
+                    "mutation_generation": target.mutation_generation,
                 },
                 "revoked_tokens": revoked_tokens,
             },
@@ -5777,7 +6147,15 @@ def user_status(request, guid, action):
         actor=admin_user,
         operation_id=operation_id,
         operation=operation,
-        request_document={"operation": operation, "user": str(target_pk)},
+        request_document={
+            "operation": operation,
+            "user": str(target_pk),
+            **(
+                {"expected_generation": expected_generation}
+                if expected_generation is not None
+                else {}
+            ),
+        },
         requested={"users": 1},
         mutation=mutate,
     )
@@ -5813,12 +6191,31 @@ def user_delete(request, guid):
     field_error = _optional_empty_mutation_body_error(request)
     if field_error:
         return field_error
-    with transaction.atomic():
+    operation_id, operation_error = _state040_operation_id(request)
+    if operation_error:
+        return operation_error
+    expected_generation = _expected_mutation_generation(request)
+    if expected_generation is False:
+        return JsonResponse({"error": "Invalid If-Match"}, status=400)
+
+    def mutate():
         target = UserProfile.objects.select_for_update().filter(pk=target_pk).first()
         if not target:
-            return JsonResponse({"error": "User not found"}, status=404)
+            return ManagementMutation(
+                status_code=404,
+                body={"error": "User not found"},
+                applied={"users": 0},
+                result_state={"error": "user_not_found"},
+            )
+        if expected_generation is not None and target.mutation_generation != expected_generation:
+            return _generation_conflict(target.mutation_generation, "users")
         if target.id == admin_user.id:
-            return JsonResponse({"error": "Cannot delete current user"}, status=400)
+            return ManagementMutation(
+                status_code=400,
+                body={"error": "Cannot delete current user"},
+                applied={"users": 0},
+                result_state={"error": "current_user"},
+            )
         username = target.username
         # Keep the user -> device -> credential lock order used by session
         # issuance. Heartbeat locks the device before conditionally renewing
@@ -5837,8 +6234,49 @@ def user_delete(request, guid):
             update_time=timezone.now(),
         )
         target.delete()
-    _log_event(request, "api_user_deleted", username=admin_user.username, target=username)
-    return JsonResponse({"result": "OK"})
+        _advance_mutation_generations(RemoteDevice, device_ids)
+        device_state = list(
+            RemoteDevice.objects.filter(pk__in=device_ids)
+            .order_by("pk")
+            .values("pk", "owner_id", "is_active", "mutation_generation")
+        )
+        return ManagementMutation(
+            status_code=200,
+            body={"result": "OK", "deleted_user": {"guid": str(target_pk), "username": username}},
+            applied={"users": 1},
+            result_state={
+                "deleted_user": {"id": target_pk, "username": username},
+                "devices": device_state,
+            },
+        )
+
+    response = _execute_management_batch(
+        actor=admin_user,
+        operation_id=operation_id,
+        operation="user_delete",
+        request_document={
+            "operation": "user_delete",
+            "user": str(target_pk),
+            **(
+                {"expected_generation": expected_generation}
+                if expected_generation is not None
+                else {}
+            ),
+        },
+        requested={"users": 1},
+        mutation=mutate,
+    )
+    body = json.loads(response.content)
+    _log_event(
+        request,
+        "api_user_deleted" if response.status_code == 200 else "api_user_delete_failed",
+        level="info" if response.status_code == 200 else "warning",
+        username=admin_user.username,
+        target=body.get("deleted_user", {}).get("username", guid),
+        operation_id=str(operation_id),
+        operation_generation=body.get("operation_generation"),
+    )
+    return response
 
 
 def users_force_logout(request):
@@ -5965,6 +6403,12 @@ def devices(request):
     )
     if not user.is_admin:
         qs = qs.filter(Q(owner=user))
+    guid_filter = request.GET.get("guid")
+    if guid_filter is not None:
+        device_pk = _numeric_pk(guid_filter, RemoteDevice)
+        if device_pk is None:
+            return JsonResponse({"error": "Invalid device identifier"}, status=400)
+        qs = qs.filter(pk=device_pk)
     try:
         qs = _request_filter_text(request, qs, "rid", "id", allowed_modes=frozenset(("exact",)))
         qs = _request_filter_text(request, qs, "hostname", "device_name")
@@ -5998,6 +6442,9 @@ def device_status(request, guid, action):
     operation_id, operation_error = _operation_id_or_error(request)
     if operation_error:
         return operation_error
+    expected_generation = _expected_mutation_generation(request)
+    if expected_generation is False:
+        return JsonResponse({"error": "Invalid If-Match"}, status=400)
     operation = f"device_status_{action}"
 
     def mutate():
@@ -6009,6 +6456,8 @@ def device_status(request, guid, action):
                 applied={"devices": 0},
                 result_state={"missing": {"devices": [str(device_pk)]}},
             )
+        if expected_generation is not None and device.mutation_generation != expected_generation:
+            return _generation_conflict(device.mutation_generation, "devices")
         if device.pk == admin_token.device_id and action == "disable":
             return ManagementMutation(
                 status_code=400,
@@ -6032,6 +6481,7 @@ def device_status(request, guid, action):
         revoked_tokens = 0
         if not device.is_active:
             revoked_tokens = _revoke_device_tokens(device)
+        _advance_mutation_generation(device)
         return ManagementMutation(
             status_code=200,
             body={
@@ -6039,6 +6489,7 @@ def device_status(request, guid, action):
                 "guid": str(device.pk),
                 "status": 1 if device.is_active else 0,
                 "revoked_tokens": revoked_tokens,
+                "mutation_generation": device.mutation_generation,
             },
             applied={"devices": 1},
             result_state={
@@ -6047,6 +6498,7 @@ def device_status(request, guid, action):
                     "rid": device.rid,
                     "is_active": device.is_active,
                     "deployment_generation": device.deployment_generation,
+                    "mutation_generation": device.mutation_generation,
                 },
                 "revoked_tokens": revoked_tokens,
             },
@@ -6056,7 +6508,15 @@ def device_status(request, guid, action):
         actor=admin_user,
         operation_id=operation_id,
         operation=operation,
-        request_document={"operation": operation, "device": str(device_pk)},
+        request_document={
+            "operation": operation,
+            "device": str(device_pk),
+            **(
+                {"expected_generation": expected_generation}
+                if expected_generation is not None
+                else {}
+            ),
+        },
         requested={"devices": 1},
         mutation=mutate,
     )
@@ -6098,12 +6558,31 @@ def device_approve_recovery(request, guid):
     if field_error:
         return field_error
     public_key = str(data["pk"]).strip()
-    with transaction.atomic():
+    operation_id, operation_error = _state040_operation_id(request)
+    if operation_error:
+        return operation_error
+    expected_generation = _expected_mutation_generation(request)
+    if expected_generation is False:
+        return JsonResponse({"error": "Invalid If-Match"}, status=400)
+
+    def mutate():
         device = RemoteDevice.objects.select_for_update().filter(pk=device_pk).first()
         if not device:
-            return JsonResponse({"error": "Device not found"}, status=404)
+            return ManagementMutation(
+                status_code=404,
+                body={"error": "Device not found"},
+                applied={"devices": 0},
+                result_state={"error": "device_not_found"},
+            )
+        if expected_generation is not None and device.mutation_generation != expected_generation:
+            return _generation_conflict(device.mutation_generation, "devices")
         if not device.is_active or not device.owner_id or not device.public_key_hash:
-            return JsonResponse({"error": "Device is not eligible for recovery"}, status=409)
+            return ManagementMutation(
+                status_code=409,
+                body={"error": "Device is not eligible for recovery"},
+                applied={"devices": 0},
+                result_state={"error": "device_not_eligible"},
+            )
         try:
             approval = create_recovery_approval(
                 device=device,
@@ -6111,19 +6590,49 @@ def device_approve_recovery(request, guid):
                 admin_user=admin_user,
             )
         except DeviceProofError:
-            return JsonResponse({"error": "Invalid public key"}, status=400)
-    _log_event(
-        request,
-        "api_device_recovery_approved",
-        username=admin_user.username,
-        rid=device.rid,
-    )
-    return JsonResponse(
-        {
+            return ManagementMutation(
+                status_code=400,
+                body={"error": "Invalid public key"},
+                applied={"devices": 0},
+                result_state={"error": "invalid_public_key"},
+            )
+        body = {
             "result": "OK",
             "expires_at": int(approval.expires_at.timestamp()),
+            "device": str(device_pk),
         }
+        body["mutation_generation"] = _advance_mutation_generation(device)
+        return ManagementMutation(
+            status_code=200,
+            body=body,
+            applied={"devices": 1},
+            result_state=body,
+        )
+
+    response = _execute_management_batch(
+        actor=admin_user,
+        operation_id=operation_id,
+        operation="device_approve_recovery",
+        request_document={
+            "operation": "device_approve_recovery",
+            "device": str(device_pk),
+            "public_key_digest": document_digest(public_key),
+            "expected_generation": expected_generation,
+        },
+        requested={"devices": 1},
+        mutation=mutate,
     )
+    body = json.loads(response.content)
+    _log_event(
+        request,
+        "api_device_recovery_approved" if response.status_code == 200 else "api_device_recovery_approval_failed",
+        level="info" if response.status_code == 200 else "warning",
+        username=admin_user.username,
+        target=guid,
+        operation_id=str(operation_id),
+        operation_generation=body.get("operation_generation"),
+    )
+    return response
 
 
 def device_delete(request, guid):
@@ -6139,8 +6648,16 @@ def device_delete(request, guid):
     operation_id, operation_error = _operation_id_or_error(request)
     if operation_error:
         return operation_error
+    expected_generation = _expected_mutation_generation(request)
+    if expected_generation is False:
+        return JsonResponse({"error": "Invalid If-Match"}, status=400)
 
     def mutate():
+        observed_group_id = (
+            RemoteDevice.objects.filter(pk=device_pk).values_list("device_group_id", flat=True).first()
+        )
+        if observed_group_id is not None:
+            list(DeviceGroup.objects.select_for_update().filter(pk=observed_group_id))
         device = RemoteDevice.objects.select_for_update().filter(pk=device_pk).first()
         if not device:
             return ManagementMutation(
@@ -6148,6 +6665,15 @@ def device_delete(request, guid):
                 body={"error": "Device not found"},
                 applied={"devices": 0},
                 result_state={"missing": {"devices": [str(device_pk)]}},
+            )
+        if expected_generation is not None and device.mutation_generation != expected_generation:
+            return _generation_conflict(device.mutation_generation, "devices")
+        if device.device_group_id != observed_group_id:
+            return ManagementMutation(
+                status_code=409,
+                body={"error": "Device group changed"},
+                applied={"devices": 0},
+                result_state={"error": "device_group_changed"},
             )
         if device.pk == admin_token.device_id:
             return ManagementMutation(
@@ -6159,6 +6685,7 @@ def device_delete(request, guid):
         rid = device.rid
         revoked_tokens = _revoke_device_tokens(device)
         device.delete()
+        _advance_mutation_generations(DeviceGroup, [observed_group_id] if observed_group_id is not None else [])
         return ManagementMutation(
             status_code=200,
             body={
@@ -6177,7 +6704,15 @@ def device_delete(request, guid):
         actor=admin_user,
         operation_id=operation_id,
         operation="device_delete",
-        request_document={"operation": "device_delete", "device": str(device_pk)},
+        request_document={
+            "operation": "device_delete",
+            "device": str(device_pk),
+            **(
+                {"expected_generation": expected_generation}
+                if expected_generation is not None
+                else {}
+            ),
+        },
         requested={"devices": 1},
         mutation=mutate,
     )
@@ -6220,45 +6755,133 @@ def device_assign(request, guid):
         return field_error
     typ = str(data.get("type") or "")
     value = data.get("value")
-    owner_changed = False
-    changed_fields = []
-    owner = _user_by_identifier(value, active_only=True) if typ == "user_name" else None
-    if typ == "user_name" and not owner:
-        return JsonResponse({"error": "Active user not found"}, status=404)
-    with transaction.atomic():
-        if owner:
-            owner = UserProfile.objects.select_for_update().filter(pk=owner.pk, is_active=True).first()
-            if not owner:
-                return JsonResponse({"error": "Active user not found"}, status=404)
-        device = (
-            RemoteDevice.objects.select_for_update(of=("self",)).select_related("owner").filter(pk=device_pk).first()
+    if typ == "ab" and isinstance(value, dict):
+        nested_field_error = _mutation_fields_error(
+            value,
+            allowed=DEVICE_ADDRESS_BOOK_FIELDS,
+            require_any=True,
+            prefix="value.",
         )
-        if not device:
-            return JsonResponse({"error": "Device not found"}, status=404)
+        if nested_field_error:
+            return nested_field_error
+    operation_id, operation_error = _state040_operation_id(request)
+    if operation_error:
+        return operation_error
+    expected_generation = _expected_mutation_generation(request)
+    if expected_generation is False:
+        return JsonResponse({"error": "Invalid If-Match"}, status=400)
+    receipt_value = value
+    if typ == "ab" and isinstance(value, dict):
+        receipt_value = {
+            key: nested_value
+            for key, nested_value in value.items()
+            if key != "address_book_password"
+        }
+        receipt_value["has_address_book_password"] = "address_book_password" in value
+        receipt_value["address_book_password_digest"] = (
+            document_digest(value["address_book_password"])
+            if "address_book_password" in value
+            else None
+        )
+
+    def failed(status_code, message, code):
+        return ManagementMutation(
+            status_code=status_code,
+            body={"error": message},
+            applied={"devices": 0},
+            result_state={"error": code},
+        )
+
+    def mutate():
+        owner_changed = False
+        changed_fields = []
+        changed_group_ids = []
+        owner = None
+        group = None
+        strategy = None
+        observed_group_id = None
         if typ == "user_name":
-            owner_changed = device.owner_id != owner.id
-            device.owner = owner
-            changed_fields.append("owner")
+            candidate = _user_by_identifier(value, active_only=True)
+            if not candidate:
+                return failed(404, "Active user not found", "active_user_not_found")
+            owner = UserProfile.objects.select_for_update().filter(pk=candidate.pk, is_active=True).first()
+            if not owner:
+                return failed(404, "Active user not found", "active_user_not_found")
         elif typ == "device_group_name":
             group_name = _bounded_text_value(value, 480)
             if group_name is not None:
                 group_name = group_name.strip()
             if group_name is None:
-                return JsonResponse({"error": "Invalid device group"}, status=400)
-            group = DeviceGroup.objects.filter(name=group_name).first() if group_name else None
-            if group_name and not group:
-                return JsonResponse({"error": "Device group not found"}, status=404)
-            device.device_group = group
-            changed_fields.append("device_group")
+                return failed(400, "Invalid device group", "invalid_device_group")
+            observed = (
+                RemoteDevice.objects.filter(pk=device_pk)
+                .values("device_group_id")
+                .first()
+            )
+            if observed is None:
+                return failed(404, "Device not found", "device_not_found")
+            observed_group_id = observed["device_group_id"]
+            candidate_group_id = None
+            if group_name:
+                candidate_group_id = (
+                    DeviceGroup.objects.filter(name=group_name)
+                    .values_list("pk", flat=True)
+                    .first()
+                )
+                if candidate_group_id is None:
+                    return failed(404, "Device group not found", "device_group_not_found")
+            group_ids = sorted(
+                {
+                    group_id
+                    for group_id in (observed_group_id, candidate_group_id)
+                    if group_id is not None
+                }
+            )
+            locked_groups = list(
+                DeviceGroup.objects.select_for_update()
+                .filter(pk__in=group_ids)
+                .order_by("pk")
+            )
+            groups_by_id = {locked_group.pk: locked_group for locked_group in locked_groups}
+            if len(groups_by_id) != len(group_ids):
+                return failed(409, "Device group changed", "device_group_changed")
+            if candidate_group_id is not None:
+                group = groups_by_id[candidate_group_id]
+                if group.name != group_name:
+                    return failed(409, "Device group changed", "device_group_changed")
         elif typ == "strategy_name":
             strategy_name = _bounded_text_value(value, 240)
             if strategy_name is not None:
                 strategy_name = strategy_name.strip()
             if strategy_name is None:
-                return JsonResponse({"error": "Invalid strategy"}, status=400)
-            strategy = StrategyProfile.objects.filter(name=strategy_name).first() if strategy_name else None
-            if strategy_name and not strategy:
-                return JsonResponse({"error": "Strategy not found"}, status=404)
+                return failed(400, "Invalid strategy", "invalid_strategy")
+            if strategy_name:
+                strategy = StrategyProfile.objects.select_for_update().filter(name=strategy_name).first()
+                if not strategy:
+                    return failed(404, "Strategy not found", "strategy_not_found")
+        device = (
+            RemoteDevice.objects.select_for_update(of=("self",)).select_related("owner").filter(pk=device_pk).first()
+        )
+        if not device:
+            return failed(404, "Device not found", "device_not_found")
+        if expected_generation is not None and device.mutation_generation != expected_generation:
+            return _generation_conflict(device.mutation_generation, "devices")
+        if typ == "user_name":
+            owner_changed = device.owner_id != owner.id
+            device.owner = owner
+            changed_fields.append("owner")
+        elif typ == "device_group_name":
+            if device.device_group_id != observed_group_id:
+                return failed(409, "Device group changed", "device_group_changed")
+            if device.device_group_id != (group.pk if group else None):
+                changed_group_ids = [
+                    group_id
+                    for group_id in (device.device_group_id, group.pk if group else None)
+                    if group_id is not None
+                ]
+            device.device_group = group
+            changed_fields.append("device_group")
+        elif typ == "strategy_name":
             device.strategy = strategy
             changed_fields.append("strategy")
         elif typ in ("note", "device_username", "device_name"):
@@ -6275,23 +6898,16 @@ def device_assign(request, guid):
                 max_bytes=4096 if field_name == "note" else None,
             )
             if text_value is None:
-                return JsonResponse({"error": "Invalid assignment value"}, status=400)
+                return failed(400, "Invalid assignment value", "invalid_assignment_value")
             setattr(device, field_name, text_value)
             changed_fields.append(field_name)
         elif typ == "ab":
             if not isinstance(value, dict):
-                return JsonResponse(
-                    {"error": "Address-book assignment must be an object"},
-                    status=400,
+                return failed(
+                    400,
+                    "Address-book assignment must be an object",
+                    "invalid_address_book_assignment",
                 )
-            nested_field_error = _mutation_fields_error(
-                value,
-                allowed=DEVICE_ADDRESS_BOOK_FIELDS,
-                require_any=True,
-                prefix="value.",
-            )
-            if nested_field_error:
-                return nested_field_error
             ab_updates = _validated_device_update_fields(
                 value,
                 DEVICE_ADDRESS_BOOK_FIELDS,
@@ -6304,27 +6920,63 @@ def device_assign(request, guid):
                 "address_book_note",
             }
             if ab_updates is None or not ab_updates or any(field not in allowed_fields for field in ab_updates):
-                return JsonResponse(
-                    {"error": "Invalid address-book assignment"},
-                    status=400,
-                )
+                return failed(400, "Invalid address-book assignment", "invalid_address_book_assignment")
             for field, field_value in ab_updates.items():
                 setattr(device, field, field_value)
             changed_fields.extend(ab_updates)
         else:
-            return JsonResponse({"error": "Invalid assign type"}, status=400)
+            return failed(400, "Invalid assign type", "invalid_assign_type")
         device.save(update_fields=(*changed_fields, "update_time"))
         if owner_changed:
             _revoke_device_tokens(device)
+        device.refresh_from_db()
+        _advance_mutation_generation(device)
+        _advance_mutation_generations(DeviceGroup, changed_group_ids)
+        body = _serialize_device(device)
+        group_generations = {
+            str(group_guid): generation
+            for group_guid, generation in DeviceGroup.objects.filter(
+                pk__in=changed_group_ids
+            )
+            .order_by("pk")
+            .values_list("guid", "mutation_generation")
+        }
+        return ManagementMutation(
+            status_code=200,
+            body=body,
+            applied={"devices": 1},
+            result_state={
+                "device": body,
+                "group_generations": group_generations,
+            },
+        )
+
+    response = _execute_management_batch(
+        actor=admin_user,
+        operation_id=operation_id,
+        operation="device_assign",
+        request_document={
+            "operation": "device_assign",
+            "device": str(device_pk),
+            "type": typ,
+            "value": receipt_value,
+            "expected_generation": expected_generation,
+        },
+        requested={"devices": 1},
+        mutation=mutate,
+    )
+    body = json.loads(response.content)
     _log_event(
         request,
-        "api_device_assigned",
+        "api_device_assigned" if response.status_code == 200 else "api_device_assign_failed",
+        level="info" if response.status_code == 200 else "warning",
         username=admin_user.username,
-        rid=device.rid,
+        target=guid,
         typ=typ,
-        changed_fields=sorted(changed_fields),
+        operation_id=str(operation_id),
+        operation_generation=body.get("operation_generation"),
     )
-    return JsonResponse(_serialize_device(device))
+    return response
 
 
 def peers(request):
@@ -6447,26 +7099,51 @@ def device_groups(request):
         strategy = StrategyProfile.objects.filter(name=strategy_name).first() if strategy_name else None
         if strategy_name and not strategy:
             return JsonResponse({"error": "Strategy not found"}, status=404)
-        try:
-            group = DeviceGroup.objects.create(
-                name=name,
-                note=note,
-                allowed_incomings=allowed_incomings,
-                strategy=strategy,
-            )
-        except IntegrityError:
-            return JsonResponse(
-                {"error": "Device group already exists"},
-                status=409,
-            )
+        operation_id, operation_error = _state040_operation_id(request)
+        if operation_error:
+            return operation_error
+
+        def mutate():
+            try:
+                group = DeviceGroup.objects.create(
+                    name=name,
+                    note=note,
+                    allowed_incomings=allowed_incomings,
+                    strategy=strategy,
+                )
+            except IntegrityError:
+                return ManagementMutation(
+                    status_code=409,
+                    body={"error": "Device group already exists"},
+                    applied={"groups": 0},
+                    result_state={"error": "group_exists", "name": name},
+                )
+            body = _serialize_device_group(group)
+            return ManagementMutation(status_code=200, body=body, applied={"groups": 1}, result_state=body)
+
+        response = _execute_management_batch(
+            actor=admin_user,
+            operation_id=operation_id,
+            operation="device_group_create",
+            request_document={
+                "operation": "device_group_create",
+                "name": name,
+                "note": note,
+                "allowed_incomings": allowed_incomings,
+                "strategy_name": strategy_name,
+            },
+            requested={"groups": 1},
+            mutation=mutate,
+        )
         _log_event(
             request,
             "api_device_groups_created",
             username=admin_user.username,
             target=name,
             changed_fields=sorted(data),
+            operation_id=str(operation_id),
         )
-        return JsonResponse(_serialize_device_group(group))
+        return response
     admin_user, error = _require_admin(request, "api_device_groups")
     if error:
         return error
@@ -6474,6 +7151,13 @@ def device_groups(request):
     if error_response:
         return error_response
     qs = DeviceGroup.objects.select_related("strategy").order_by("name")
+    guid_filter = request.GET.get("guid")
+    if guid_filter is not None:
+        try:
+            group_guid = parse_uuid(guid_filter)
+        except InvalidIdentifier:
+            return JsonResponse({"error": "Invalid device group identifier"}, status=400)
+        qs = qs.filter(guid=group_guid)
     try:
         qs = _request_filter_text(request, qs, "name", "name")
     except ControlFilterError as error:
@@ -6498,69 +7182,121 @@ def device_group_detail(request, guid):
         )
         if field_error:
             return field_error
-        changed_model_fields = []
-        with transaction.atomic():
-            group = DeviceGroup.objects.select_for_update().filter(guid=group_guid).first()
-            if not group:
-                return JsonResponse({"error": "Device group not found"}, status=404)
-            if "name" in data:
-                new_name = _model_text_value(
-                    data.get("name"),
-                    DeviceGroup,
-                    "name",
-                    allow_empty=False,
-                )
-                if new_name is None:
-                    return JsonResponse({"error": "Invalid name"}, status=400)
-                group.name = new_name
-                changed_model_fields.append("name")
-            if "note" in data:
-                note = _model_text_value(
-                    data.get("note"),
-                    DeviceGroup,
-                    "note",
-                    strip=False,
-                    max_bytes=4096,
-                )
-                if note is None:
-                    return JsonResponse({"error": "Invalid note"}, status=400)
-                group.note = note
-                changed_model_fields.append("note")
-            if "allowed_incomings" in data:
-                allowed_incomings = _allowed_incomings_value(data.get("allowed_incomings"))
-                if allowed_incomings is None:
-                    return JsonResponse(
-                        {"error": "Invalid allowed_incomings"},
-                        status=400,
+        parsed_name = None
+        if "name" in data:
+            parsed_name = _model_text_value(data.get("name"), DeviceGroup, "name", allow_empty=False)
+            if parsed_name is None:
+                return JsonResponse({"error": "Invalid name"}, status=400)
+        parsed_note = None
+        if "note" in data:
+            parsed_note = _model_text_value(
+                data.get("note"),
+                DeviceGroup,
+                "note",
+                strip=False,
+                max_bytes=4096,
+            )
+            if parsed_note is None:
+                return JsonResponse({"error": "Invalid note"}, status=400)
+        parsed_allowed_incomings = None
+        if "allowed_incomings" in data:
+            parsed_allowed_incomings = _allowed_incomings_value(data.get("allowed_incomings"))
+            if parsed_allowed_incomings is None:
+                return JsonResponse({"error": "Invalid allowed_incomings"}, status=400)
+        parsed_strategy_name = None
+        if "strategy_name" in data:
+            parsed_strategy_name = _bounded_text_value(data.get("strategy_name"), 240)
+            if parsed_strategy_name is not None:
+                parsed_strategy_name = parsed_strategy_name.strip()
+            if parsed_strategy_name is None:
+                return JsonResponse({"error": "Invalid strategy"}, status=400)
+        operation_id, operation_error = _state040_operation_id(request)
+        if operation_error:
+            return operation_error
+        expected_generation = _expected_mutation_generation(request)
+        if expected_generation is False:
+            return JsonResponse({"error": "Invalid If-Match"}, status=400)
+
+        def mutate():
+            with transaction.atomic():
+                group = DeviceGroup.objects.select_for_update().filter(guid=group_guid).first()
+                if not group:
+                    return ManagementMutation(
+                        status_code=404,
+                        body={"error": "Device group not found"},
+                        applied={"groups": 0},
+                        result_state={"error": "group_not_found"},
                     )
-                group.allowed_incomings = allowed_incomings
-                changed_model_fields.append("allowed_incomings")
-            if "strategy_name" in data:
-                strategy_name = _bounded_text_value(
-                    data.get("strategy_name"),
-                    240,
+                if expected_generation is not None and group.mutation_generation != expected_generation:
+                    return _generation_conflict(group.mutation_generation, "groups")
+                changed_model_fields = []
+                if "name" in data:
+                    group.name = parsed_name
+                    changed_model_fields.append("name")
+                if "note" in data:
+                    group.note = parsed_note
+                    changed_model_fields.append("note")
+                if "allowed_incomings" in data:
+                    group.allowed_incomings = parsed_allowed_incomings
+                    changed_model_fields.append("allowed_incomings")
+                if "strategy_name" in data:
+                    strategy = (
+                        StrategyProfile.objects.filter(name=parsed_strategy_name).first()
+                        if parsed_strategy_name
+                        else None
+                    )
+                    if parsed_strategy_name and not strategy:
+                        return ManagementMutation(
+                            status_code=404,
+                            body={"error": "Strategy not found"},
+                            applied={"groups": 0},
+                            result_state={"error": "strategy_not_found"},
+                        )
+                    group.strategy = strategy
+                    changed_model_fields.append("strategy")
+                try:
+                    group.save(update_fields=(*changed_model_fields, "updated_at"))
+                except IntegrityError:
+                    return ManagementMutation(
+                        status_code=409,
+                        body={"error": "Device group already exists"},
+                        applied={"groups": 0},
+                        result_state={"error": "group_exists"},
+                    )
+                _advance_mutation_generation(group)
+                body = _serialize_device_group(group)
+                return ManagementMutation(
+                    status_code=200,
+                    body=body,
+                    applied={"groups": 1},
+                    result_state=body,
                 )
-                if strategy_name is not None:
-                    strategy_name = strategy_name.strip()
-                if strategy_name is None:
-                    return JsonResponse({"error": "Invalid strategy"}, status=400)
-                strategy = StrategyProfile.objects.filter(name=strategy_name).first() if strategy_name else None
-                if strategy_name and not strategy:
-                    return JsonResponse({"error": "Strategy not found"}, status=404)
-                group.strategy = strategy
-                changed_model_fields.append("strategy")
-            try:
-                group.save(update_fields=(*changed_model_fields, "updated_at"))
-            except IntegrityError:
-                return JsonResponse({"error": "Device group already exists"}, status=409)
+
+        response = _execute_management_batch(
+            actor=admin_user,
+            operation_id=operation_id,
+            operation="device_group_update",
+            request_document={
+                "operation": "device_group_update",
+                "group": str(group_guid),
+                "data": data,
+                "expected_generation": expected_generation,
+            },
+            requested={"groups": 1},
+            mutation=mutate,
+        )
+        body = json.loads(response.content)
         _log_event(
             request,
-            "api_device_group_updated",
+            "api_device_group_updated" if response.status_code == 200 else "api_device_group_update_failed",
+            level="info" if response.status_code == 200 else "warning",
             username=admin_user.username,
-            target=group.name,
+            target=str(group_guid),
             changed_fields=sorted(data),
+            operation_id=str(operation_id),
+            operation_generation=body.get("operation_generation"),
         )
-        return JsonResponse(_serialize_device_group(group))
+        return response
     elif request.method == "POST":
         ids = _load_json(
             request,
@@ -6572,15 +7308,28 @@ def device_group_detail(request, guid):
         operation_id, operation_error = _operation_id_or_error(request)
         if operation_error:
             return operation_error
+        expected_generation = _expected_mutation_generation(request)
+        if expected_generation is False:
+            return JsonResponse({"error": "Invalid If-Match"}, status=400)
         requested = {"devices": len(ids)}
         request_document = {
             "operation": "device_group_add_devices",
             "group": str(group_guid),
             "devices": ids,
+            "expected_generation": expected_generation,
         }
 
         def mutate():
-            group = DeviceGroup.objects.select_for_update().filter(guid=group_guid).first()
+            observed_groups = dict(
+                RemoteDevice.objects.filter(rid__in=ids).values_list("pk", "device_group_id")
+            )
+            old_group_ids = {group_id for group_id in observed_groups.values() if group_id is not None}
+            locked_groups = list(
+                DeviceGroup.objects.select_for_update()
+                .filter(Q(guid=group_guid) | Q(pk__in=old_group_ids))
+                .order_by("pk")
+            )
+            group = next((item for item in locked_groups if item.guid == group_guid), None)
             if not group:
                 return ManagementMutation(
                     status_code=404,
@@ -6588,8 +7337,11 @@ def device_group_detail(request, guid):
                     applied={"devices": 0},
                     result_state={"error": "group_not_found"},
                 )
+            if group.mutation_generation != expected_generation:
+                return _generation_conflict(group.mutation_generation, "devices")
             devices = list(
-                RemoteDevice.objects.select_for_update().filter(rid__in=ids).order_by("pk").only("pk", "rid")
+                RemoteDevice.objects.select_for_update()
+                .filter(rid__in=ids).order_by("pk").only("pk", "rid", "device_group_id")
             )
             found = {device.rid for device in devices}
             missing = [rid for rid in ids if rid not in found]
@@ -6600,18 +7352,32 @@ def device_group_detail(request, guid):
                     applied={"devices": 0},
                     result_state={"missing": {"devices": missing}},
                 )
+            if any(device.device_group_id != observed_groups.get(device.pk) for device in devices):
+                return ManagementMutation(
+                    status_code=409,
+                    body={"error": "Device group changed"},
+                    applied={"devices": 0},
+                    result_state={"error": "device_group_changed"},
+                )
             device_ids = [device.pk for device in devices]
             updated = RemoteDevice.objects.filter(pk__in=device_ids).update(device_group=group)
             if updated != len(ids):
                 raise RuntimeError("Device group assignment did not apply the complete target set")
+            _advance_mutation_generations(RemoteDevice, device_ids)
+            _advance_mutation_generations(DeviceGroup, old_group_ids - {group.pk})
+            _advance_mutation_generation(group)
             state = list(
                 RemoteDevice.objects.filter(pk__in=device_ids)
                 .order_by("pk")
-                .values("rid", "device_group_id", "policy_generation")
+                .values("rid", "device_group_id", "policy_generation", "mutation_generation")
             )
             return ManagementMutation(
                 status_code=200,
-                body={"result": "OK", "updated": updated},
+                body={
+                    "result": "OK",
+                    "updated": updated,
+                    "mutation_generation": group.mutation_generation,
+                },
                 applied={"devices": updated},
                 result_state={"devices": state},
             )
@@ -6640,14 +7406,73 @@ def device_group_detail(request, guid):
         field_error = _optional_empty_mutation_body_error(request)
         if field_error:
             return field_error
-        with transaction.atomic():
-            group = DeviceGroup.objects.select_for_update().filter(guid=group_guid).first()
-            if not group:
-                return JsonResponse({"error": "Device group not found"}, status=404)
-            name = group.name
-            group.delete()
-        _log_event(request, "api_device_group_deleted", username=admin_user.username, target=name)
-        return JsonResponse({"result": "OK"})
+        operation_id, operation_error = _state040_operation_id(request)
+        if operation_error:
+            return operation_error
+        expected_generation = _expected_mutation_generation(request)
+        if expected_generation is False:
+            return JsonResponse({"error": "Invalid If-Match"}, status=400)
+
+        def mutate():
+            with transaction.atomic():
+                group = DeviceGroup.objects.select_for_update().filter(guid=group_guid).first()
+                if not group:
+                    return ManagementMutation(
+                        status_code=404,
+                        body={"error": "Device group not found"},
+                        applied={"groups": 0},
+                        result_state={"error": "group_not_found"},
+                    )
+                if expected_generation is not None and group.mutation_generation != expected_generation:
+                    return _generation_conflict(group.mutation_generation, "groups")
+                name = group.name
+                device_ids = list(
+                    RemoteDevice.objects.select_for_update()
+                    .filter(device_group=group)
+                    .order_by("pk")
+                    .values_list("pk", flat=True)
+                )
+                group.delete()
+                _advance_mutation_generations(RemoteDevice, device_ids)
+                device_state = list(
+                    RemoteDevice.objects.filter(pk__in=device_ids)
+                    .order_by("pk")
+                    .values("pk", "device_group_id", "mutation_generation")
+                )
+                return ManagementMutation(
+                    status_code=200,
+                    body={"result": "OK", "deleted": str(group_guid), "name": name},
+                    applied={"groups": 1},
+                    result_state={
+                        "deleted": str(group_guid),
+                        "name": name,
+                        "devices": device_state,
+                    },
+                )
+
+        response = _execute_management_batch(
+            actor=admin_user,
+            operation_id=operation_id,
+            operation="device_group_delete",
+            request_document={
+                "operation": "device_group_delete",
+                "group": str(group_guid),
+                "expected_generation": expected_generation,
+            },
+            requested={"groups": 1},
+            mutation=mutate,
+        )
+        body = json.loads(response.content)
+        _log_event(
+            request,
+            "api_device_group_deleted" if response.status_code == 200 else "api_device_group_delete_failed",
+            level="info" if response.status_code == 200 else "warning",
+            username=admin_user.username,
+            target=str(group_guid),
+            operation_id=str(operation_id),
+            operation_generation=body.get("operation_generation"),
+        )
+        return response
 
 
 def device_group_remove_devices(request, guid):
@@ -6668,11 +7493,15 @@ def device_group_remove_devices(request, guid):
     operation_id, operation_error = _operation_id_or_error(request)
     if operation_error:
         return operation_error
+    expected_generation = _expected_mutation_generation(request)
+    if expected_generation is False:
+        return JsonResponse({"error": "Invalid If-Match"}, status=400)
     requested = {"devices": len(ids)}
     request_document = {
         "operation": "device_group_remove_devices",
         "group": str(group_guid),
         "devices": ids,
+        "expected_generation": expected_generation,
     }
 
     def mutate():
@@ -6684,6 +7513,8 @@ def device_group_remove_devices(request, guid):
                 applied={"devices": 0},
                 result_state={"error": "group_not_found"},
             )
+        if group.mutation_generation != expected_generation:
+            return _generation_conflict(group.mutation_generation, "devices")
         devices = list(
             RemoteDevice.objects.select_for_update()
             .filter(rid__in=ids)
@@ -6711,14 +7542,20 @@ def device_group_remove_devices(request, guid):
         updated = RemoteDevice.objects.filter(pk__in=device_ids, device_group=group).update(device_group=None)
         if updated != len(ids):
             raise RuntimeError("Device group removal did not apply the complete target set")
+        _advance_mutation_generations(RemoteDevice, device_ids)
+        _advance_mutation_generation(group)
         state = list(
             RemoteDevice.objects.filter(pk__in=device_ids)
             .order_by("pk")
-            .values("rid", "device_group_id", "policy_generation")
+            .values("rid", "device_group_id", "policy_generation", "mutation_generation")
         )
         return ManagementMutation(
             status_code=200,
-            body={"result": "OK", "updated": updated},
+            body={
+                "result": "OK",
+                "updated": updated,
+                "mutation_generation": group.mutation_generation,
+            },
             applied={"devices": updated},
             result_state={"devices": state},
         )
@@ -6770,22 +7607,53 @@ def strategies(request):
         enabled = _strict_bool(data.get("enabled", True))
         if name is None or options is None or enabled is None:
             return JsonResponse({"error": "Invalid strategy"}, status=400)
-        try:
-            strategy = StrategyProfile.objects.create(
-                name=name,
-                config_options=options,
-                enabled=enabled,
+        operation_id, operation_error = _state040_operation_id(request)
+        if operation_error:
+            return operation_error
+
+        def mutate():
+            try:
+                strategy = StrategyProfile.objects.create(
+                    name=name,
+                    config_options=options,
+                    enabled=enabled,
+                )
+            except IntegrityError:
+                return ManagementMutation(
+                    status_code=409,
+                    body={"error": "Strategy already exists"},
+                    applied={"strategies": 0},
+                    result_state={"error": "strategy_exists", "name": name},
+                )
+            return ManagementMutation(
+                status_code=200,
+                body=_serialize_strategy(strategy),
+                applied={"strategies": 1},
+                result_state=_serialize_strategy(strategy),
             )
-        except IntegrityError:
-            return JsonResponse({"error": "Strategy already exists"}, status=409)
+
+        response = _execute_management_batch(
+            actor=admin_user,
+            operation_id=operation_id,
+            operation="strategy_create",
+            request_document={
+                "operation": "strategy_create",
+                "name": name,
+                "config_options": options,
+                "enabled": enabled,
+            },
+            requested={"strategies": 1},
+            mutation=mutate,
+        )
         _log_event(
             request,
             "api_strategy_created",
             username=admin_user.username,
             target=name,
             changed_fields=sorted(data),
+            operation_id=str(operation_id),
         )
-        return JsonResponse(_serialize_strategy(strategy))
+        return response
     qs = StrategyProfile.objects.all().order_by("name")
     try:
         data = [_serialize_strategy(strategy) for strategy in qs]
@@ -6828,71 +7696,200 @@ def strategy_detail(request, guid):
         )
         if field_error:
             return field_error
-        changed_model_fields = []
-        with transaction.atomic():
-            strategy = StrategyProfile.objects.select_for_update().filter(guid=strategy_guid).first()
-            if not strategy:
-                return JsonResponse({"error": "Strategy not found"}, status=404)
-            if "name" in data:
-                name = _model_text_value(
-                    data.get("name"),
-                    StrategyProfile,
-                    "name",
-                    allow_empty=False,
-                )
-                if name is None:
-                    return JsonResponse({"error": "Invalid strategy name"}, status=400)
-                strategy.name = name
-                changed_model_fields.append("name")
-            if "config_options" in data:
-                options = _strategy_options_value(
-                    data.get("config_options"),
-                )
-                if options is None:
-                    return JsonResponse(
-                        {"error": "Invalid strategy options"},
-                        status=400,
+        operation_id, operation_error = _state040_operation_id(request)
+        if operation_error:
+            return operation_error
+        expected_generation = _expected_mutation_generation(request)
+        if expected_generation is False:
+            return JsonResponse({"error": "Invalid If-Match"}, status=400)
+
+        def mutate():
+            with transaction.atomic():
+                strategy = StrategyProfile.objects.select_for_update().filter(guid=strategy_guid).first()
+                if not strategy:
+                    return ManagementMutation(
+                        status_code=404,
+                        body={"error": "Strategy not found"},
+                        applied={"strategies": 0},
+                        result_state={"error": "strategy_not_found"},
                     )
-                strategy.config_options = options
-                changed_model_fields.append("config_options")
-            if "enabled" in data:
-                enabled = _strict_bool(data.get("enabled"))
-                if enabled is None:
-                    return JsonResponse(
-                        {"error": "Invalid enabled value"},
-                        status=400,
+                if expected_generation is not None and strategy.mutation_generation != expected_generation:
+                    return _generation_conflict(strategy.mutation_generation, "strategies")
+                changed_model_fields = []
+                if "name" in data:
+                    name = _model_text_value(data.get("name"), StrategyProfile, "name", allow_empty=False)
+                    if name is None:
+                        return ManagementMutation(
+                            status_code=400,
+                            body={"error": "Invalid strategy name"},
+                            applied={"strategies": 0},
+                            result_state={"error": "invalid_name"},
+                        )
+                    strategy.name = name
+                    changed_model_fields.append("name")
+                if "config_options" in data:
+                    options = _strategy_options_value(data.get("config_options"))
+                    if options is None:
+                        return ManagementMutation(
+                            status_code=400,
+                            body={"error": "Invalid strategy options"},
+                            applied={"strategies": 0},
+                            result_state={"error": "invalid_options"},
+                        )
+                    strategy.config_options = options
+                    changed_model_fields.append("config_options")
+                if "enabled" in data:
+                    enabled = _strict_bool(data.get("enabled"))
+                    if enabled is None:
+                        return ManagementMutation(
+                            status_code=400,
+                            body={"error": "Invalid enabled value"},
+                            applied={"strategies": 0},
+                            result_state={"error": "invalid_enabled"},
+                        )
+                    strategy.enabled = enabled
+                    changed_model_fields.append("enabled")
+                try:
+                    strategy.save(update_fields=(*changed_model_fields, "updated_at"))
+                except IntegrityError:
+                    return ManagementMutation(
+                        status_code=409,
+                        body={"error": "Strategy already exists"},
+                        applied={"strategies": 0},
+                        result_state={"error": "strategy_exists"},
                     )
-                strategy.enabled = enabled
-                changed_model_fields.append("enabled")
-            try:
-                strategy.save(update_fields=(*changed_model_fields, "updated_at"))
-            except IntegrityError:
-                return JsonResponse({"error": "Strategy already exists"}, status=409)
+                _advance_mutation_generation(strategy)
+                body = _serialize_strategy(strategy)
+                return ManagementMutation(
+                    status_code=200,
+                    body=body,
+                    applied={"strategies": 1},
+                    result_state=body,
+                )
+
+        response = _execute_management_batch(
+            actor=admin_user,
+            operation_id=operation_id,
+            operation="strategy_update",
+            request_document={
+                "operation": "strategy_update",
+                "strategy": str(strategy_guid),
+                "data": data,
+                "expected_generation": expected_generation,
+            },
+            requested={"strategies": 1},
+            mutation=mutate,
+        )
+        body = json.loads(response.content)
         _log_event(
             request,
-            "api_strategy_updated",
+            "api_strategy_updated" if response.status_code == 200 else "api_strategy_update_failed",
+            level="info" if response.status_code == 200 else "warning",
             username=admin_user.username,
-            target=strategy.name,
+            target=str(strategy_guid),
             changed_fields=sorted(data),
+            operation_id=str(operation_id),
+            operation_generation=body.get("operation_generation"),
         )
-        return JsonResponse(_serialize_strategy(strategy))
+        return response
     else:
         field_error = _optional_empty_mutation_body_error(request)
         if field_error:
             return field_error
-        with transaction.atomic():
-            strategy = StrategyProfile.objects.select_for_update().filter(guid=strategy_guid).first()
-            if not strategy:
-                return JsonResponse({"error": "Strategy not found"}, status=404)
-            name = strategy.name
-            strategy.delete()
+        operation_id, operation_error = _state040_operation_id(request)
+        if operation_error:
+            return operation_error
+        expected_generation = _expected_mutation_generation(request)
+        if expected_generation is False:
+            return JsonResponse({"error": "Invalid If-Match"}, status=400)
+
+        def mutate():
+            with transaction.atomic():
+                strategy = StrategyProfile.objects.select_for_update().filter(guid=strategy_guid).first()
+                if not strategy:
+                    return ManagementMutation(
+                        status_code=404,
+                        body={"error": "Strategy not found"},
+                        applied={"strategies": 0},
+                        result_state={"error": "strategy_not_found"},
+                    )
+                if expected_generation is not None and strategy.mutation_generation != expected_generation:
+                    return _generation_conflict(strategy.mutation_generation, "strategies")
+                name = strategy.name
+                groups = list(
+                    DeviceGroup.objects.select_for_update()
+                    .filter(strategy=strategy)
+                    .order_by("pk")
+                    .only("pk")
+                )
+                users = list(
+                    UserProfile.objects.select_for_update()
+                    .filter(strategy=strategy)
+                    .order_by("pk")
+                    .only("pk")
+                )
+                devices = list(
+                    RemoteDevice.objects.select_for_update()
+                    .filter(strategy=strategy)
+                    .order_by("pk")
+                    .only("pk")
+                )
+                group_ids = [group.pk for group in groups]
+                user_ids = [user.pk for user in users]
+                device_ids = [device.pk for device in devices]
+                strategy.delete()
+                _advance_mutation_generations(DeviceGroup, group_ids)
+                _advance_mutation_generations(UserProfile, user_ids)
+                _advance_mutation_generations(RemoteDevice, device_ids)
+                detached = {
+                    "groups": list(
+                        DeviceGroup.objects.filter(pk__in=group_ids)
+                        .order_by("pk")
+                        .values("pk", "strategy_id", "mutation_generation")
+                    ),
+                    "users": list(
+                        UserProfile.objects.filter(pk__in=user_ids)
+                        .order_by("pk")
+                        .values("pk", "strategy_id", "mutation_generation")
+                    ),
+                    "devices": list(
+                        RemoteDevice.objects.filter(pk__in=device_ids)
+                        .order_by("pk")
+                        .values("pk", "strategy_id", "mutation_generation")
+                    ),
+                }
+                return ManagementMutation(
+                    status_code=200,
+                    body={"result": "OK", "deleted": str(strategy_guid), "name": name},
+                    applied={"strategies": 1},
+                    result_state={
+                        "deleted": str(strategy_guid),
+                        "name": name,
+                        "detached": detached,
+                    },
+                )
+
+        response = _execute_management_batch(
+            actor=admin_user,
+            operation_id=operation_id,
+            operation="strategy_delete",
+            request_document={
+                "operation": "strategy_delete",
+                "strategy": str(strategy_guid),
+                "expected_generation": expected_generation,
+            },
+            requested={"strategies": 1},
+            mutation=mutate,
+        )
         _log_event(
             request,
-            "api_strategy_deleted",
+            "api_strategy_deleted" if response.status_code == 200 else "api_strategy_delete_failed",
+            level="info" if response.status_code == 200 else "warning",
             username=admin_user.username,
-            target=name,
+            target=str(strategy_guid),
+            operation_id=str(operation_id),
         )
-        return JsonResponse({"result": "OK"})
+        return response
 
 
 def strategy_status(request, guid):
@@ -6917,20 +7914,60 @@ def strategy_status(request, guid):
         enabled = _strict_bool(data)
     if enabled is None:
         return JsonResponse({"error": "Boolean enabled value required"}, status=400)
-    strategy = StrategyProfile.objects.filter(guid=strategy_guid).first()
-    if not strategy:
-        return JsonResponse({"error": "Strategy not found"}, status=404)
-    strategy.enabled = enabled
-    strategy.save(update_fields=["enabled", "updated_at"])
+    operation_id, operation_error = _state040_operation_id(request)
+    if operation_error:
+        return operation_error
+    expected_generation = _expected_mutation_generation(request)
+    if expected_generation is False:
+        return JsonResponse({"error": "Invalid If-Match"}, status=400)
+
+    def mutate():
+        strategy = StrategyProfile.objects.select_for_update().filter(guid=strategy_guid).first()
+        if not strategy:
+            return ManagementMutation(
+                status_code=404,
+                body={"error": "Strategy not found"},
+                applied={"strategies": 0},
+                result_state={"error": "strategy_not_found"},
+            )
+        if expected_generation is not None and strategy.mutation_generation != expected_generation:
+            return _generation_conflict(strategy.mutation_generation, "strategies")
+        strategy.enabled = enabled
+        strategy.save(update_fields=["enabled", "updated_at"])
+        _advance_mutation_generation(strategy)
+        body = _serialize_strategy(strategy)
+        return ManagementMutation(
+            status_code=200,
+            body=body,
+            applied={"strategies": 1},
+            result_state=body,
+        )
+
+    response = _execute_management_batch(
+        actor=admin_user,
+        operation_id=operation_id,
+        operation="strategy_status",
+        request_document={
+            "operation": "strategy_status",
+            "strategy": str(strategy_guid),
+            "enabled": enabled,
+            "expected_generation": expected_generation,
+        },
+        requested={"strategies": 1},
+        mutation=mutate,
+    )
+    body = json.loads(response.content)
     _log_event(
         request,
-        "api_strategy_status",
+        "api_strategy_status" if response.status_code == 200 else "api_strategy_status_failed",
+        level="info" if response.status_code == 200 else "warning",
         username=admin_user.username,
-        target=strategy.name,
-        enabled=strategy.enabled,
-        changed_fields=["enabled"],
+        target=str(strategy_guid),
+        enabled=enabled,
+        operation_id=str(operation_id),
+        operation_generation=body.get("operation_generation"),
     )
-    return JsonResponse(_serialize_strategy(strategy))
+    return response
 
 
 def strategy_assign(request):
@@ -6943,7 +7980,8 @@ def strategy_assign(request):
     )
     field_error = _mutation_fields_error(
         data,
-        allowed={"strategy", "peers", "users", "groups"},
+        allowed={"strategy", "peers", "users", "groups", "expected_generations"},
+        required={"expected_generations"},
     )
     if field_error:
         return field_error
@@ -6974,6 +8012,17 @@ def strategy_assign(request):
         return JsonResponse({"error": "Invalid assignment targets"}, status=400)
     if not peer_guids and not user_guids and not group_guids:
         return JsonResponse({"error": "No assignment targets"}, status=400)
+    target_ids = {
+        "devices": [str(peer_id) for peer_id in peer_guids],
+        "users": [str(user_id) for user_id in user_guids],
+        "groups": [str(group_id) for group_id in group_guids],
+    }
+    expected_generations = _expected_mutation_generation_map(
+        data.get("expected_generations"),
+        target_ids,
+    )
+    if expected_generations is None:
+        return JsonResponse({"error": "Invalid expected_generations"}, status=400)
     operation_id, operation_error = _operation_id_or_error(request)
     if operation_error:
         return operation_error
@@ -6988,6 +8037,7 @@ def strategy_assign(request):
         "peers": [str(peer_id) for peer_id in peer_guids],
         "users": [str(user_id) for user_id in user_guids],
         "groups": [str(group_id) for group_id in group_guids],
+        "expected_generations": expected_generations,
     }
 
     def mutate():
@@ -7002,16 +8052,27 @@ def strategy_assign(request):
                     result_state={"error": "strategy_not_found"},
                 )
         groups = list(
-            DeviceGroup.objects.select_for_update().filter(guid__in=group_guids).order_by("pk").only("pk", "guid")
+            DeviceGroup.objects.select_for_update()
+            .filter(guid__in=group_guids)
+            .order_by("pk")
+            .only("pk", "guid", "mutation_generation")
         )
-        users = list(UserProfile.objects.select_for_update().filter(pk__in=user_guids).order_by("pk").only("pk"))
+        users = list(
+            UserProfile.objects.select_for_update()
+            .filter(pk__in=user_guids)
+            .order_by("pk")
+            .only("pk", "mutation_generation")
+        )
         group_ids = [group.pk for group in groups]
         user_ids = [user.pk for user in users]
         affected_device_ids = set(peer_guids)
         affected_device_ids.update(device_ids_affected_by_groups(group_ids))
         affected_device_ids.update(device_ids_affected_by_users(user_ids))
         locked_devices = list(
-            RemoteDevice.objects.select_for_update().filter(pk__in=affected_device_ids).order_by("pk").only("pk")
+            RemoteDevice.objects.select_for_update()
+            .filter(pk__in=affected_device_ids)
+            .order_by("pk")
+            .only("pk", "mutation_generation")
         )
         found_devices = {device.pk for device in locked_devices}
         found_users = {user.pk for user in users}
@@ -7028,6 +8089,30 @@ def strategy_assign(request):
                 applied=dict.fromkeys(requested, 0),
                 result_state={"missing": missing},
             )
+        current_generations = {
+            "devices": {
+                str(device.pk): device.mutation_generation
+                for device in locked_devices
+                if device.pk in peer_guids
+            },
+            "users": {str(user.pk): user.mutation_generation for user in users},
+            "groups": {str(group.guid): group.mutation_generation for group in groups},
+        }
+        stale = _mutation_generation_conflicts(
+            expected_generations,
+            current_generations,
+        )
+        if stale:
+            return ManagementMutation(
+                status_code=409,
+                body={
+                    "error": "Resource changed",
+                    "code": "resource_generation_conflict",
+                    "stale": stale,
+                },
+                applied=dict.fromkeys(requested, 0),
+                result_state={"stale": stale},
+            )
         device_ids = list(peer_guids)
         groups_updated = DeviceGroup.objects.filter(pk__in=group_ids).update(strategy=strategy)
         users_updated = UserProfile.objects.filter(pk__in=user_ids).update(strategy=strategy)
@@ -7039,22 +8124,47 @@ def strategy_assign(request):
         }
         if applied != requested:
             raise RuntimeError("Strategy assignment did not apply the complete target set")
+        _advance_mutation_generations(RemoteDevice, device_ids)
+        _advance_mutation_generations(UserProfile, user_ids)
+        _advance_mutation_generations(DeviceGroup, group_ids)
         state = {
             "strategy": str(strategy.guid) if strategy else None,
             "devices": list(
                 RemoteDevice.objects.filter(pk__in=device_ids)
                 .order_by("pk")
-                .values("pk", "strategy_id", "policy_generation")
+                .values("pk", "strategy_id", "policy_generation", "mutation_generation")
             ),
-            "users": list(UserProfile.objects.filter(pk__in=user_ids).order_by("pk").values("pk", "strategy_id")),
+            "users": list(
+                UserProfile.objects.filter(pk__in=user_ids)
+                .order_by("pk")
+                .values("pk", "strategy_id", "mutation_generation")
+            ),
             "groups": [
-                {"guid": str(group.guid), "strategy_id": group.strategy_id}
+                {
+                    "guid": str(group.guid),
+                    "strategy_id": group.strategy_id,
+                    "mutation_generation": group.mutation_generation,
+                }
                 for group in DeviceGroup.objects.filter(pk__in=group_ids).order_by("pk")
             ],
         }
+        next_generations = {
+            "devices": {
+                str(row["pk"]): row["mutation_generation"]
+                for row in state["devices"]
+            },
+            "users": {
+                str(row["pk"]): row["mutation_generation"]
+                for row in state["users"]
+            },
+            "groups": {
+                row["guid"]: row["mutation_generation"]
+                for row in state["groups"]
+            },
+        }
         return ManagementMutation(
             status_code=200,
-            body={"result": "OK", **applied},
+            body={"result": "OK", **applied, "mutation_generations": next_generations},
             applied=applied,
             result_state=state,
         )
