@@ -223,6 +223,8 @@ jobs:
             run.sh \
             sync_web_client.sh \
             scripts/web_client_revision.sh
+          shellcheck scripts/web_client_toolchains.sh
+          bash .github/scripts/tests/test_web_client_toolchains.sh
           python3 .github/scripts/test_manage_release.py
           python3 .github/scripts/test_container_release_evidence.py
           python3 .github/scripts/test_resolve_remote_client_release.py

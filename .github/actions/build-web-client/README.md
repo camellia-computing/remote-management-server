@@ -20,11 +20,13 @@ as its caller.
 | Name | Default | Meaning |
 | --- | --- | --- |
 | `repository-map` | required | Complete reviewed mapping for all Remote logical repository IDs |
-| `flutter-version` | `3.44.5` | Exact Flutter SDK version used for the Web build |
-| `node-version` | `24.18.0` | Exact Node.js version used for the bridge build |
 
 Output `revision` is the full Remote Client commit read from
 `web-client.lock`.
+
+Flutter and Node versions are read from the verified source's CI contract. A
+source lock and its SDK-pinned dependency lockfile are built together; this
+repository does not override them with independently selected SDK defaults.
 
 The action verifies the current Management binding and resolves the Client
 repository under `github.repository_owner`. Incomplete maps, owner-qualified
@@ -64,8 +66,8 @@ Before executing source from Remote Client, the action:
    `static/web_client/.source_revision` and checks required output files and
    symlink absence.
 
-The compiled-runtime cache key includes the source revision, Flutter and Node
-versions, synchronization script, and action definition. A cache hit is still
+The compiled-runtime cache key includes the source revision, toolchain reader,
+synchronization script, and action definition. A cache hit is still
 subject to the final provenance/content checks.
 
 The nested Remote Client `setup-flutter` action is pinned to a full commit SHA.
@@ -77,11 +79,9 @@ Third-party setup/cache actions are also pinned to full SHAs.
    commit.
 2. Update `web-client.lock` through the repository's lock update command or
    documented script; never type an abbreviated SHA.
-3. If the Remote Client setup action changed, update the full SHA in
-   `action.yml` to the same reviewed source line.
-4. If Flutter or Node changes, update the action defaults, calling workflow, and
-   lock/build evidence together.
-5. Run actionlint, ShellCheck, the full Remote Management CI path, and the
+3. The nested setup action and toolchain versions follow the same verified
+   source commit automatically.
+4. Run actionlint, ShellCheck, the full Remote Management CI path, and the
    hardened container/deployment checks before merge.
 
 Do not weaken the reachability or exact-CI checks to work around a missing
