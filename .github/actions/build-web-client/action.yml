@@ -5,14 +5,6 @@ inputs:
   repository-map:
     description: Complete reviewed Remote logical repository map
     required: true
-  flutter-version:
-    description: Flutter SDK version used by the Camellia Remote Web build
-    required: false
-    default: 3.44.5
-  node-version:
-    description: Node.js version used by the Camellia Remote Web bridge build
-    required: false
-    default: 24.18.0
 
 outputs:
   revision:
@@ -104,9 +96,8 @@ runs:
       with:
         path: static/web_client
         key: >-
-          camellia-remote-web-v1-${{ runner.os }}-${{ steps.config.outputs.revision }}-${{
-          inputs.flutter-version }}-${{ inputs.node-version }}-${{
-          hashFiles('sync_web_client.sh', '.github/actions/build-web-client/action.yml') }}
+          camellia-remote-web-${{ runner.os }}-${{ steps.config.outputs.revision }}-${{
+          hashFiles('sync_web_client.sh', 'scripts/web_client_toolchains.sh', '.github/actions/build-web-client/action.yml') }}
 
     - name: Checkout locked Camellia Remote source
       if: steps.runtime-cache.outputs.cache-hit != 'true'
@@ -130,19 +121,25 @@ runs:
           exit 1
         fi
 
+    - name: Read source toolchain contract
+      id: toolchains
+      if: steps.runtime-cache.outputs.cache-hit != 'true'
+      shell: bash
+      run: bash "$GITHUB_WORKSPACE/scripts/web_client_toolchains.sh" "$GITHUB_WORKSPACE/.web-client-source" >> "$GITHUB_OUTPUT"
+
     - name: Set up Flutter
       if: steps.runtime-cache.outputs.cache-hit != 'true'
-      uses: ./.web-client-source/.github/actions/setup-flutter
+      uses: ./.web-client-source/.github/actions/setup-flutter # zizmor: ignore[self-repository] Loaded from the separately checked, exact-SHA source after successful trusted push CI; not an action in this repository.
       with:
         channel: stable
-        flutter-version: ${{ inputs.flutter-version }}
+        flutter-version: ${{ steps.toolchains.outputs.flutter-version }}
         cache: true
 
     - name: Set up Node.js
       if: steps.runtime-cache.outputs.cache-hit != 'true'
-      uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+      uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
       with:
-        node-version: ${{ inputs.node-version }}
+        node-version: ${{ steps.toolchains.outputs.node-version }}
         cache: npm
         cache-dependency-path: .web-client-source/flutter/web/js/package-lock.json
 
