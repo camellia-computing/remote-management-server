@@ -18,6 +18,9 @@ RUN uv sync --locked --no-dev --no-install-project
 
 FROM python:3.15.1-slim@sha256:08275f764e022331c6d3e3ca55d8cce01fa4684b02111adf0445d71806fe7941 AS runtime
 
+RUN python -m pip uninstall --yes pip \
+    && python -c "import importlib.util; assert importlib.util.find_spec('pip') is None"
+
 ARG VERSION
 ARG REVISION
 ARG SOURCE_REPOSITORY_URL
