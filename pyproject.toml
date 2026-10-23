@@ -27,8 +27,7 @@ dev = [
 
 [tool.uv]
 package = false
-# GitHub's hosted Dependabot updater still uses uv 0.11.8 as of 2026-07-30.
-# CI remains pinned to 0.12.0; restore an exact constraint when it catches up.
+# The lockfile is shared by CI and hosted dependency updates.
 required-version = ">=0.11.8,<0.13"
 
 [tool.ruff]
