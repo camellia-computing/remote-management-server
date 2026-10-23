@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.0.1] - 2026-10-23
+
+### Other changes
+
+- build(deps): refresh Python dependencies and pinned CI actions (#72) (`6de00cde6e87`)
+
 ## [1.0.0] - 2026-08-01
 
 ### Features
