@@ -19,7 +19,7 @@ dependencies = [
 
 [dependency-groups]
 dev = [
-  "ruff>=0.16,<0.17",
+  "ruff>=0.17.2,<0.18",
   "pytest>=9,<10",
   "pytest-django>=4.12,<5",
   "coverage>=7.15,<8",
@@ -28,7 +28,7 @@ dev = [
 [tool.uv]
 package = false
 # The lockfile is shared by CI and hosted dependency updates.
-required-version = ">=0.11.8,<0.13"
+required-version = ">=0.11.8,<0.14"
 
 [tool.ruff]
 target-version = "py313"

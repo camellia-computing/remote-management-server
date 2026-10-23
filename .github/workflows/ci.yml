@@ -204,12 +204,12 @@ jobs:
           persist-credentials: false
 
       - name: Audit workflow security
-        uses: zizmorcore/zizmor-action@cc914d7f3750a2d13d75c7f184a1060aa0e9d482 # v0.6.4
+        uses: zizmorcore/zizmor-action@85b2b9fb8e3325e7a23d7d0a9d7ba5ae0f999e3e # v0.7.1
         with:
           inputs: .github
           online-audits: false
           persona: pedantic
-          version: 1.28.0
+          version: 1.31.1
           advanced-security: false
           annotations: true
 
@@ -265,7 +265,7 @@ jobs:
 
       - name: Build Web client
         id: web_client
-        uses: ./.github/actions/build-web-client
+        uses: ./.github/actions/build-web-client # zizmor: ignore[self-repository] actionlint 1.7.12 requires this form; GitHub resolves the reviewed same-commit source.
         with:
           repository-map: ${{ vars.REMOTE_REPOSITORY_MAP }}
 
@@ -286,7 +286,7 @@ jobs:
     timeout-minutes: 30
     services:
       postgres:
-        image: postgres:18-alpine@sha256:9a8afca54e7861fd90fab5fdf4c42477a6b1cb7d293595148e674e0a3181de15
+        image: postgres:18-alpine@sha256:898c60cb390d1085bc97bdd6a1ae968757421df394b071848b52b1c09c89d6a5
         env:
           POSTGRES_DB: camellia_remote_ci
           POSTGRES_USER: camellia_remote_ci
@@ -319,9 +319,9 @@ jobs:
           path: static/web_client
 
       - name: Set up uv
-        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
         with:
-          version: "0.12.24"
+          version: "0.13.5"
           enable-cache: true
           cache-dependency-glob: uv.lock
 
@@ -372,7 +372,7 @@ jobs:
     timeout-minutes: 30
     services:
       postgres:
-        image: postgres:18-alpine@sha256:9a8afca54e7861fd90fab5fdf4c42477a6b1cb7d293595148e674e0a3181de15
+        image: postgres:18-alpine@sha256:898c60cb390d1085bc97bdd6a1ae968757421df394b071848b52b1c09c89d6a5
         env:
           POSTGRES_DB: camellia_remote_container_ci
           POSTGRES_USER: camellia_remote_container_ci
@@ -397,10 +397,10 @@ jobs:
           path: static/web_client
 
       - name: Set up Buildx
-        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
       - name: Build runtime image
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           file: ./Dockerfile
