@@ -1,16 +1,38 @@
 """Read snapshots required by the mandatory Native/CLI mutation protocol."""
 
 import hashlib
+import json
 import uuid
+from pathlib import Path
 from unittest.mock import patch
 
 from django.db import transaction
-from django.test import TestCase
+from django.test import SimpleTestCase, TestCase
 
 from api.address_book_authorization import bump_locked_authorization_generation
 from api.management_operations import document_digest
 from api.models import AddressBookProfile, ManagementBatchOperation, RemoteDevice, RemotePeer, RemoteTag, UserProfile
 from api.views_api import _issue_access_token
+
+
+class AddressBookMutationDigestCorpusTests(SimpleTestCase):
+    def test_shared_native_digest_corpus_matches_provider_canonical_document(self):
+        corpus = json.loads(
+            (Path(__file__).parent / "fixtures" / "address_book_mutations_v1.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(corpus["version"], 1)
+        self.assertEqual(len(corpus["vectors"]), 7)
+        for vector in corpus["vectors"]:
+            with self.subTest(name=vector["name"]):
+                document = {
+                    "operation": vector["operation"],
+                    "method": vector["method"],
+                    "path": vector["path"],
+                    "args": {},
+                    "body_sha256": hashlib.sha256(vector["body"].encode("utf-8")).hexdigest(),
+                    "expected_generation": vector["expected_generation"],
+                }
+                self.assertEqual(document_digest(document), vector["request_digest"])
 
 
 class AddressBookSnapshotContractTests(TestCase):
