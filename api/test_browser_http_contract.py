@@ -93,7 +93,12 @@ class BrowserHttpContractTests(TestCase):
                 with self.subTest(path=path):
                     response = self.client.get(path)
                     self.assertEqual(response.status_code, 200)
+                    self.assertTrue(response["Content-Type"].startswith("text/html"))
                     html = response.content.decode()
                     self.assertIn("ui/http.js", html)
                     self.assertIn(escapejs("The request timed out; its outcome is unknown."), html)
                     self.assertNotIn("请求超时", html)
+                    self.assertIn(escapejs("Safe operation storage is unavailable."), html)
+                    if path == "/api/share":
+                        self.assertIn("ui/mutation_outbox.js", html)
+                        self.assertIn("Full links are shown only on creation or original-operation recovery.", html)

@@ -57,7 +57,7 @@
   <div class="card-header">
     <div>
       <h2 class="card-title">{{ "已创建的分享链接" | translate }}</h2>
-      <p class="card-subtitle">{{ "出于安全考虑，完整链接只在创建时显示一次" | translate }}</p>
+      <p class="card-subtitle">{{ "完整链接仅在创建或原操作恢复时显示，请及时保存。" | translate }}</p>
     </div>
   </div>
   <div class="card-body">
@@ -188,7 +188,7 @@
   };
 
   const updateControls = () => {
-    createButton.disabled = requestInFlight || pendingOperationId !== null;
+    createButton.disabled = requestInFlight || pendingOperationId !== null || window.camelliaMutationRecovery?.blocked === true;
     recoverButton.hidden = pendingOperationId === null;
     recoverButton.disabled = requestInFlight;
     listEl.querySelectorAll('input').forEach((input) => {
@@ -196,8 +196,8 @@
     });
   };
 
-  const clearPending = () => {
-    window.camelliaMutationRecovery.forget(pendingOperationId);
+  const clearPending = async () => {
+    await window.camelliaMutationRecovery.forget(pendingOperationId);
     pendingOperationId = null;
   };
 
@@ -205,12 +205,12 @@
     data.requested && Object.keys(data.requested).length === 1 && data.requested.share_links === 1 &&
     data.applied && Object.keys(data.applied).length === 1 && [0, 1].includes(data.applied.share_links);
 
-  const displayReceipt = (data, status) => {
+  const displayReceipt = async (data, status) => {
     if (!receiptMatches(data)) return false;
     if (status === 200 && data.code === 1 && data.result === 'OK' && data.applied.share_links === 1 &&
         typeof data.token === 'string' && /^[A-Za-z0-9_-]{32,128}$/.test(data.token)) {
-      clearPending();
-      showMessage('{{ "链接只显示一次，请立即复制：" | translate | escapejs }}' + ' ' + baseUrl + '/' + data.token, true);
+      showMessage('{{ "请立即复制并保存链接：" | translate | escapejs }}' + ' ' + baseUrl + '/' + data.token, true);
+      try { await clearPending(); } catch (_error) { /* Keep the received token visible; global recovery stays blocked. */ }
       selected.clear();
       renderList();
       renderTags();
@@ -220,7 +220,7 @@
         typeof data.code === 'string' && /^[a-z][a-z0-9_]{0,63}$/.test(data.code) &&
         typeof data.message === 'string' && data.message.length > 0 && data.message.length <= 256 &&
         typeof data.retryable === 'boolean') {
-      clearPending();
+      try { await clearPending(); } catch (_error) { /* The definite rejection remains visible. */ }
       const kind = status === 429 ? 'rate_limit' : status === 409 ? 'conflict' : 'validation';
       showMessage(window.camelliaHttp.failureMessage(
         new window.camelliaHttp.HttpFailure(kind, { status, data, outcomeKnown: true }), window.camelliaHttpMessages));
@@ -237,6 +237,10 @@
 
   createButton.addEventListener('click', async () => {
     if (requestInFlight || pendingOperationId !== null) return;
+    if (window.camelliaMutationRecovery.blocked === true) {
+      showMessage(window.camelliaMutationRecovery.message({ kind: 'pending' }));
+      return;
+    }
     if (selected.size === 0) {
       showMessage('{{ "请选择至少一台设备。" | translate | escapejs }}');
       return;
@@ -251,18 +255,25 @@
       showMessage('{{ "安全随机数不可用，操作未发送。" | translate | escapejs }}');
       return;
     }
-    window.camelliaMutationRecovery.remember(pendingOperationId);
     requestInFlight = true;
     updateControls();
+    let reserved = false;
     try {
+      await window.camelliaMutationRecovery.remember(pendingOperationId);
+      reserved = true;
       const { data, status, requestId } = await window.camelliaHttp.requestJson('/api/share', {
         headers: { 'X-CSRFToken': getCookie('csrftoken'), 'Idempotency-Key': pendingOperationId },
         body: formData,
       });
-      if (!displayReceipt(data, status)) throw new window.camelliaHttp.HttpFailure('protocol', { status, requestId });
+      if (!await displayReceipt(data, status)) throw new window.camelliaHttp.HttpFailure('protocol', { status, requestId });
     } catch (error) {
-      if (!displayReceipt(error.data, error.status)) {
-        if (error.outcomeKnown === true) clearPending();
+      if (!reserved) {
+        pendingOperationId = null;
+        showMessage(window.camelliaMutationRecovery.message(error));
+      } else if (!await displayReceipt(error.data, error.status)) {
+        if (error.outcomeKnown === true) {
+          try { await clearPending(); } catch (_error) { /* Do not lose the original rejection. */ }
+        }
         showFailure(error);
       }
     } finally {
@@ -278,7 +289,7 @@
     try {
       const { data, requestId } = await window.camelliaHttp.requestJson(
         '/api/management-operations/' + encodeURIComponent(pendingOperationId), { method: 'GET' });
-      if (!displayReceipt(data.receipt, data.original_status_code)) {
+      if (!await displayReceipt(data.receipt, data.original_status_code)) {
         throw new window.camelliaHttp.HttpFailure('protocol', { requestId });
       }
     } catch (error) {
@@ -297,6 +308,7 @@
       showMessage('{{ "页面初始化失败，请刷新页面。" | translate | escapejs }}');
       return;
     }
+    window.camelliaMutationRecovery.subscribe(updateControls);
     updateControls();
   });
 

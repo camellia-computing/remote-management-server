@@ -357,7 +357,7 @@ jobs:
           node-version: "24.18.0"
 
       - name: Browser HTTP and mutation contract tests
-        run: node --test scripts/test_browser_http.cjs scripts/test_browser_mutations.cjs
+        run: node --test scripts/test_browser_http.cjs scripts/test_browser_mutations.cjs scripts/test_mutation_outbox.cjs
 
       - name: Django checks
         run: |

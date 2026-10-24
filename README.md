@@ -31,7 +31,7 @@ uv run ruff check .
 uv run python manage.py makemigrations --check --dry-run
 uv run pytest
 python scripts/test_release_metadata.py
-node --test scripts/test_browser_http.cjs scripts/test_browser_mutations.cjs
+node --test scripts/test_browser_http.cjs scripts/test_browser_mutations.cjs scripts/test_mutation_outbox.cjs
 ```
 
 浏览器登录、注册和分享使用同一有界JSON transport：单请求总预算30秒、普通响应
@@ -39,7 +39,12 @@ node --test scripts/test_browser_http.cjs scripts/test_browser_mutations.cjs
 服务端和协议错误，保留安全的request ID。HTTP4xx不再显示为网络异常，密码在请求结束后
 清除，结果未知时不自动重发。Share冻结原operation ID与选择，只通过只读receipt恢复；
 404或receipt过期不代表未提交，不能据此生成新ID重试。重启恢复仅在同源浏览器保存
-有限的ID/时间，不保存表单、密码或分享token，不替代服务端receipt及人工核对。
+有限的ID/时间，不保存表单、密码或分享token。恢复队列通过Web Locks进行同源跨标签
+原子准入（上限32），不因时钟跳变、容量或404静默淘汰记录；存在未知结果时，当前浏览器
+的新管理mutation须先恢复（其他账号遗留记录须用原账号）。不支持Web Locks、quota或
+存储读写验证失败均在POST前阻止。未知记录只有合法receipt或输入完整原ID并二次确认
+人工核对后才解除；人工确认不代表成功、失败或回滚，须先保存ID并核对服务端状态。
+不以本地队列替代服务端receipt、幂等性和授权；DOM恢复通知最多保留最近32条。
 Node窄测无npm依赖，CI使用当前Web工具链同版本Node24.18.0；本地可独立执行。
 
 ## CI 信任边界

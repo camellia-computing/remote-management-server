@@ -121,10 +121,12 @@ class Element {
       children: [], handlers: {}, style: {}, classList: { add() {}, remove() {} }, focusCount: 0 });
   }
   addEventListener(name, handler) { this.handlers[name] = handler; }
+  setAttribute(name, value) { this[name] = value; }
   appendChild(child) { this.children.push(child); }
   set innerHTML(_value) { this.children = []; }
   querySelectorAll(tag) { return this.children.flatMap((child) => [child, ...child.querySelectorAll(tag)]).filter((el) => el.tagName === tag); }
   focus() { this.focusCount++; }
+  remove() { this.removed = true; }
 }
 
 function templateFixture(name, fetcher) {
@@ -150,7 +152,8 @@ function templateFixture(name, fetcher) {
   }
   const window = { location: { origin: new URL(BASE).origin, pathname: "/api/share", href: BASE, search: "" },
     crypto: webcrypto, camelliaHttp: client(fetcher), camelliaHttpMessages: {},
-    camelliaMutationRecovery: { remember: (id) => pending.add(id), forget: (id) => pending.delete(id) } };
+    camelliaMutationRecovery: { remember: async (id) => pending.add(id), forget: async (id) => pending.delete(id),
+      subscribe: () => () => {}, blocked: false, message: () => "Pending operation must be reconciled first." } };
   const context = { window, document, FormData, URL, URLSearchParams, Uint8Array, setTimeout };
   const html = fs.readFileSync(path.join(__dirname, "../api/templates", name), "utf8");
   let script = [...html.matchAll(/<script[^>]*>([\s\S]*?)<\/script>/g)].map((match) => match[1]).find((text) => text.includes("const form =") || text.includes("const peers ="));
@@ -264,17 +267,26 @@ function recoveryFixture(fetcher) {
     { id: "22222222-2222-4222-8222-222222222222", createdAt: Date.now() }];
   const storage = new Map([[storageKey, JSON.stringify(entries)]]);
   const notices = [];
-  const target = { firstChild: null, insertBefore: (notice) => notices.push(notice) };
+  let panel;
+  const target = { firstChild: null, insertBefore: (notice) => {
+    if (notice.id === "mutation-recovery-status") panel = notice;
+    else notices.push(notice);
+  } };
+  let tail = Promise.resolve();
+  const locks = { request(_name, _options, callback) {
+    const result = tail.then(callback); tail = result.catch(() => {}); return result;
+  } };
   const window = { location: { origin: new URL(BASE).origin }, addEventListener() {},
+    navigator: { locks }, camelliaOutbox: require("../static/ui/mutation_outbox.js"),
     localStorage: { getItem: (key) => storage.get(key), setItem: (key, value) => storage.set(key, value) },
     camelliaHttp: client(fetcher) };
   const context = { window, URL, document: { body: target, querySelector: () => target,
-    addEventListener() {}, createElement: () => ({ setAttribute() {} }) } };
+    addEventListener() {}, createElement: (tag) => new Element(tag) } };
   // Control the automatic startup call so each test awaits the complete recovery run.
   const script = fs.readFileSync(path.join(__dirname, "../static/ui/app.js"), "utf8")
     .replace(/recoverPendingMutations\(\);\s*$/, "");
   vm.runInNewContext(script, context);
-  return { window, notices, remaining: () => JSON.parse(storage.get(storageKey)) };
+  return { window, context, notices, panel: () => panel, remaining: () => JSON.parse(storage.get(storageKey)) };
 }
 
 test("restart recovery retains missing receipts and stops serial waits on shared failures", async () => {
@@ -355,4 +367,62 @@ test("Share typed rejections allow correction but HTTP500/HTML/invalid JSON rema
     assert.ok(fixture.elements.get("share-message").focusCount > 0);
     assert.ok(!fixture.elements.get("share-message").textContent.includes("canary"));
   }
+});
+
+test("Share never posts while recovery is blocked or durable reservation fails", async () => {
+  for (const mode of ["pending", "quota"]) {
+    let posts = 0;
+    const fixture = templateFixture("share.html", async () => { posts++; return response({}); });
+    if (mode === "pending") fixture.window.camelliaMutationRecovery.blocked = true;
+    else fixture.window.camelliaMutationRecovery.remember = async () => { throw { kind: "storage" }; };
+    const checkbox = fixture.elements.get("peer-list").querySelectorAll("input")[0];
+    checkbox.checked = true; checkbox.handlers.change();
+    await fixture.elements.get("create").handlers.click();
+    assert.equal(posts, 0);
+    assert.equal(fixture.pending.size, 0);
+  }
+});
+
+test("a confirmed Share token stays visible when clearing local recovery storage fails", async () => {
+  const fixture = templateFixture("share.html", async (_url, options) =>
+    response(receipt(options.headers.get("Idempotency-Key"))));
+  fixture.window.camelliaMutationRecovery.forget = async () => { throw { kind: "storage" }; };
+  const checkbox = fixture.elements.get("peer-list").querySelectorAll("input")[0];
+  checkbox.checked = true; checkbox.handlers.change();
+  await fixture.elements.get("create").handlers.click();
+  assert.ok(fixture.elements.get("share-message").textContent.endsWith("/" + "A".repeat(43)));
+  assert.equal(fixture.elements.get("create").disabled, true);
+  assert.equal(fixture.pending.size, 1);
+});
+
+test("unknown receipts require typed ID plus explicit manual acknowledgement, never 404 alone", async () => {
+  const fixture = recoveryFixture(async () => rejected(404));
+  await fixture.window.camelliaMutationRecovery.recover();
+  fixture.window.prompt = () => "wrong-id";
+  fixture.window.confirm = () => true;
+  let acknowledge = fixture.panel().children[2].children[1].handlers.click;
+  await acknowledge();
+  assert.equal(fixture.remaining().length, 2);
+  fixture.window.prompt = () => OPERATION_ID;
+  fixture.window.confirm = () => false;
+  await acknowledge();
+  assert.equal(fixture.remaining().length, 2);
+  fixture.window.confirm = () => true;
+  await acknowledge();
+  assert.deepEqual(fixture.remaining().map((entry) => entry.id), ["22222222-2222-4222-8222-222222222222"]);
+});
+
+test("repeated recovery deduplicates notices and retains IDs when storage cleanup fails", async () => {
+  const fixture = recoveryFixture(async () => response({ original_status_code: 200, receipt: receipt(OPERATION_ID) }));
+  fixture.window.localStorage.setItem = () => { throw new Error("quota"); };
+  for (let count = 0; count < 3; count++) await fixture.window.camelliaMutationRecovery.recover();
+  assert.equal(fixture.remaining().length, 2);
+  assert.equal(fixture.notices.length, 1);
+  assert.ok(fixture.notices[0].textContent.endsWith("/" + "A".repeat(43)));
+  for (let count = 0; count < 35; count++) {
+    const id = count.toString(16).padStart(8, "0") + "-1111-4111-8111-111111111111";
+    fixture.window.noticeForTest = { original_status_code: 200, receipt: receipt(id) };
+    vm.runInNewContext("showRecoveredMutation(window.noticeForTest)", fixture.context);
+  }
+  assert.equal(fixture.notices.filter((notice) => !notice.removed).length, 32);
 });

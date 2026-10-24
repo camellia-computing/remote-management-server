@@ -15,6 +15,13 @@ window.camelliaHttpMessages = Object.freeze({
   protocol: '{{ "服务器响应格式无效，无法确认请求结果。" | translate | escapejs }}',
   internal: '{{ "页面无法处理响应，请刷新后核对结果。" | translate | escapejs }}',
   unknown: '{{ "结果尚未确认，请勿重复提交；请先恢复原操作结果。" | translate | escapejs }}',
-  requestId: '{{ "请求编号" | translate | escapejs }}'
+  requestId: '{{ "请求编号" | translate | escapejs }}',
+  outboxPending: '{{ "存在未确认的操作，请先恢复原结果或使用原账号人工核对，勿重复提交。" | translate | escapejs }}',
+  outboxUnavailable: '{{ "无法可靠保存操作编号，新的修改未发送。请检查浏览器支持、存储权限或稍后重试。" | translate | escapejs }}',
+  outboxRecover: '{{ "恢复原操作结果" | translate | escapejs }}',
+  outboxReview: '{{ "人工核对后移除本地记录" | translate | escapejs }}',
+  outboxReviewPrompt: '{{ "请先保存操作编号并使用原账号核对服务端实际状态。移除本地记录不会撤销操作。请输入完整编号确认：" | translate | escapejs }}',
+  outboxReviewConfirm: '{{ "已保存编号并人工核对结果？此确认不代表操作成功、失败或回滚。" | translate | escapejs }}',
+  outboxFormChanged: '{{ "表单在发送前已改变或从历史恢复，修改尚未发送。请核对后重新提交。" | translate | escapejs }}'
 });
 </script>
