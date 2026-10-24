@@ -167,9 +167,34 @@ class AddressBookSnapshotContractTests(TestCase):
         self.assertEqual(ManagementBatchOperation.objects.count(), 0)
 
     def test_observed_snapshot_authorizes_one_write_then_immutable_replay_and_readonly_recovery(self):
-        for operation, path, body in (
-            ("address_book_peer_add", f"/api/ab/peer/add/{self.shared.guid}", '{"id":"840044999","alias":"原生😀"}'),
-            ("address_book_tag_add", f"/api/ab/tag/add/{self.shared.guid}", '{"name":"原生😀","color":1}'),
+        for operation, method, path, body in (
+            (
+                "address_book_peer_add",
+                "post",
+                f"/api/ab/peer/add/{self.shared.guid}",
+                '{"id":"840044999","alias":"原生😀"}',
+            ),
+            (
+                "address_book_peer_update",
+                "put",
+                f"/api/ab/peer/update/{self.shared.guid}",
+                '{"id":"840044999","alias":"更改😀","note":"native note"}',
+            ),
+            ("address_book_tag_add", "post", f"/api/ab/tag/add/{self.shared.guid}", '{"name":"原生😀","color":1}'),
+            (
+                "address_book_tag_rename",
+                "put",
+                f"/api/ab/tag/rename/{self.shared.guid}",
+                '{"old":"原生😀","new":"更改😀"}',
+            ),
+            (
+                "address_book_tag_update",
+                "put",
+                f"/api/ab/tag/update/{self.shared.guid}",
+                '{"name":"更改😀","color":4281558681}',
+            ),
+            ("address_book_peer_delete", "delete", f"/api/ab/peer/{self.shared.guid}", '["840044999"]'),
+            ("address_book_tag_delete", "delete", f"/api/ab/tag/{self.shared.guid}", '["更改😀"]'),
         ):
             with self.subTest(operation=operation):
                 observed = self.post(f"/api/ab/peers?ab={self.shared.guid}").json()["authorization_generation"]
@@ -179,12 +204,13 @@ class AddressBookSnapshotContractTests(TestCase):
                     "HTTP_IDEMPOTENCY_KEY": operation_id,
                     "HTTP_IF_MATCH": f'"{observed}"',
                 }
-                response = self.client.post(path, data=body, content_type="application/json", **headers)
+                write = getattr(self.client, method)
+                response = write(path, data=body, content_type="application/json", **headers)
                 self.assertEqual(response.status_code, 200, response.content)
                 receipt = response.json()
                 expected_document = {
                     "operation": operation,
-                    "method": "POST",
+                    "method": method.upper(),
                     "path": path,
                     "args": {},
                     "body_sha256": hashlib.sha256(body.encode("utf-8")).hexdigest(),
@@ -194,14 +220,14 @@ class AddressBookSnapshotContractTests(TestCase):
                 self.assertEqual(receipt["operation_id"], operation_id)
                 self.assertEqual(receipt["applied"], {"mutations": 1})
                 self.assertEqual(receipt["mutation_generations"], {self.shared.guid: observed + 1})
-                replay = self.client.post(path, data=body, content_type="application/json", **headers)
+                replay = write(path, data=body, content_type="application/json", **headers)
                 self.assertEqual(replay.json(), receipt)
                 recovered = self.client.get(
                     f"/api/management-operations/{operation_id}", HTTP_AUTHORIZATION=f"Bearer {self.token}"
                 )
                 self.assertEqual(recovered.status_code, 200, recovered.content)
                 self.assertEqual(recovered.json()["receipt"], receipt)
-                stale = self.client.post(
+                stale = write(
                     path,
                     data=body,
                     content_type="application/json",
@@ -211,3 +237,13 @@ class AddressBookSnapshotContractTests(TestCase):
                 self.assertEqual(stale.json()["applied"], {"mutations": 0})
                 self.shared.refresh_from_db()
                 self.assertEqual(self.shared.authorization_generation, observed + 1)
+                if operation == "address_book_peer_update":
+                    peer = RemotePeer.objects.get(profile=self.shared, rid="840044999")
+                    self.assertEqual(peer.alias, "更改😀")
+                    self.assertEqual(peer.note, "native note")
+                elif operation == "address_book_tag_update":
+                    tag = RemoteTag.objects.get(profile=self.shared, tag_name="更改😀")
+                    self.assertEqual(int(tag.tag_color), 4281558681)
+        self.assertFalse(RemotePeer.objects.filter(profile=self.shared, rid="840044999").exists())
+        self.assertFalse(RemoteTag.objects.filter(profile=self.shared, tag_name="更改😀").exists())
+        self.assertEqual(ManagementBatchOperation.objects.count(), 14)  # seven writes and seven stale rejections
