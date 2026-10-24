@@ -51,6 +51,10 @@ def credential_browser_view(view, *methods):
     return credential_response(browser_view(view, *methods))
 
 
+def credential_browser_json_post_view(view, *methods):
+    return credential_response(browser_json_post_view(view, *methods))
+
+
 def credential_hybrid_read_api(view):
     """A no-store JSON GET authenticated by bearer token or browser session."""
 
@@ -162,7 +166,7 @@ urlpatterns = [
     url(r"^ab_rules$", browser_view(views_front.ab_rules, "GET", "POST")),
     url(r"^ab_audit$", browser_view(views_front.ab_audit, "GET")),
     url(r"^down_peers$", browser_view(views_front.down_peers, "GET")),
-    url(r"^share$", credential_browser_view(views_front.share, "GET", "POST")),
+    url(r"^share$", credential_browser_json_post_view(views_front.share, "GET", "POST")),
     url(
         r"^share/(?P<share_token>[A-Za-z0-9_-]{32,128})$",
         credential_browser_view(views_front.share, "GET", "POST"),

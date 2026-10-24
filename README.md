@@ -31,7 +31,16 @@ uv run ruff check .
 uv run python manage.py makemigrations --check --dry-run
 uv run pytest
 python scripts/test_release_metadata.py
+node --test scripts/test_browser_http.cjs scripts/test_browser_mutations.cjs
 ```
+
+浏览器登录、注册和分享使用同一有界JSON transport：单请求总预算30秒、普通响应
+64KiB、批量receipt恢复1MiB；区分网络、超时、CSRF/session、权限、输入、冲突、限流、
+服务端和协议错误，保留安全的request ID。HTTP4xx不再显示为网络异常，密码在请求结束后
+清除，结果未知时不自动重发。Share冻结原operation ID与选择，只通过只读receipt恢复；
+404或receipt过期不代表未提交，不能据此生成新ID重试。重启恢复仅在同源浏览器保存
+有限的ID/时间，不保存表单、密码或分享token，不替代服务端receipt及人工核对。
+Node窄测无npm依赖，CI使用当前Web工具链同版本Node24.18.0；本地可独立执行。
 
 ## CI 信任边界
 

@@ -10,7 +10,10 @@
       <h2 class="card-title">{{ "选择需要分享的设备" | translate }}</h2>
       <p class="card-subtitle">{{ "请确认后生成分享链接" | translate }}</p>
     </div>
-    <button id="create" type="button" class="btn btn-primary">{{ "生成分享链接" | translate }}</button>
+    <div>
+      <button id="create" type="button" class="btn btn-primary" disabled>{{ "生成分享链接" | translate }}</button>
+      <button id="recover-share" type="button" class="btn" hidden>{{ "恢复原操作结果" | translate }}</button>
+    </div>
   </div>
   <div class="card-body">
     <div class="panel-grid">
@@ -44,7 +47,7 @@
           <div>{{ "2、所分享的机器，被分享人享有相同的权限，如果机器设置了保存密码，被分享人也可以直接连接。" | translate }}</div>
           <div>{{ "3、链接仅有效1次，非分享人访问后即生效并失效。" | translate }}</div>
         </div>
-        <div id="share-message" class="notice is-success" style="margin-top: 12px; display: none;"></div>
+        <div id="share-message" class="notice is-success" role="alert" tabindex="-1" style="margin-top: 12px; display: none;"></div>
       </div>
     </div>
   </div>
@@ -105,6 +108,7 @@
   const searchEl = document.getElementById('peer-search');
   const messageEl = document.getElementById('share-message');
   const createButton = document.getElementById('create');
+  const recoverButton = document.getElementById('recover-share');
   const baseUrl = window.location.origin + window.location.pathname.replace(/\/$/, '');
   let pendingOperationId = null;
   let requestInFlight = false;
@@ -133,9 +137,11 @@
         checkbox.type = 'checkbox';
         checkbox.value = peer.value;
         checkbox.checked = selected.has(peer.value);
+        checkbox.disabled = requestInFlight || pendingOperationId !== null;
         checkbox.addEventListener('change', () => {
-          if (!requestInFlight) {
-            pendingOperationId = null;
+          if (requestInFlight || pendingOperationId !== null) {
+            checkbox.checked = selected.has(peer.value);
+            return;
           }
           if (checkbox.checked) {
             selected.add(peer.value);
@@ -174,66 +180,124 @@
     return match ? decodeURIComponent(match[2]) : '';
   };
 
+  const showMessage = (message, success = false) => {
+    messageEl.textContent = message;
+    messageEl.className = success ? 'notice is-success' : 'notice is-warning';
+    messageEl.style.display = 'block';
+    messageEl.focus();
+  };
+
+  const updateControls = () => {
+    createButton.disabled = requestInFlight || pendingOperationId !== null;
+    recoverButton.hidden = pendingOperationId === null;
+    recoverButton.disabled = requestInFlight;
+    listEl.querySelectorAll('input').forEach((input) => {
+      input.disabled = requestInFlight || pendingOperationId !== null;
+    });
+  };
+
+  const clearPending = () => {
+    window.camelliaMutationRecovery.forget(pendingOperationId);
+    pendingOperationId = null;
+  };
+
+  const receiptMatches = (data) => window.camelliaHttp.receiptMatches(data, pendingOperationId, 'share_link_create') &&
+    data.requested && Object.keys(data.requested).length === 1 && data.requested.share_links === 1 &&
+    data.applied && Object.keys(data.applied).length === 1 && [0, 1].includes(data.applied.share_links);
+
+  const displayReceipt = (data, status) => {
+    if (!receiptMatches(data)) return false;
+    if (status === 200 && data.code === 1 && data.result === 'OK' && data.applied.share_links === 1 &&
+        typeof data.token === 'string' && /^[A-Za-z0-9_-]{32,128}$/.test(data.token)) {
+      clearPending();
+      showMessage('{{ "链接只显示一次，请立即复制：" | translate | escapejs }}' + ' ' + baseUrl + '/' + data.token, true);
+      selected.clear();
+      renderList();
+      renderTags();
+      return true;
+    }
+    if (status >= 400 && status < 500 && data.applied.share_links === 0 && data.result !== 'unknown' &&
+        typeof data.code === 'string' && /^[a-z][a-z0-9_]{0,63}$/.test(data.code) &&
+        typeof data.message === 'string' && data.message.length > 0 && data.message.length <= 256 &&
+        typeof data.retryable === 'boolean') {
+      clearPending();
+      const kind = status === 429 ? 'rate_limit' : status === 409 ? 'conflict' : 'validation';
+      showMessage(window.camelliaHttp.failureMessage(
+        new window.camelliaHttp.HttpFailure(kind, { status, data, outcomeKnown: true }), window.camelliaHttpMessages));
+      return true;
+    }
+    return false;
+  };
+
+  const showFailure = (error) => {
+    let message = window.camelliaHttp.failureMessage(error, window.camelliaHttpMessages);
+    if (pendingOperationId) message += ' ({{ "操作编号" | translate | escapejs }}: ' + pendingOperationId + ')';
+    showMessage(message);
+  };
+
   createButton.addEventListener('click', async () => {
-    if (requestInFlight) {
-      return;
-    }
-    messageEl.style.display = 'none';
+    if (requestInFlight || pendingOperationId !== null) return;
     if (selected.size === 0) {
-      messageEl.textContent = '{{ "请选择至少一台设备。" | translate | escapejs }}';
-      messageEl.style.display = 'block';
-      messageEl.className = 'notice is-warning';
+      showMessage('{{ "请选择至少一台设备。" | translate | escapejs }}');
       return;
     }
-
-    const payload = peers
-      .filter((peer) => selected.has(peer.value))
+    const payload = peers.filter((peer) => selected.has(peer.value))
       .map((peer) => ({ value: peer.value, title: peer.title }));
-
     const formData = new URLSearchParams();
     formData.append('data', JSON.stringify(payload));
-    pendingOperationId = pendingOperationId || newOperationId();
-    window.camelliaMutationRecovery?.remember(pendingOperationId);
-    requestInFlight = true;
-    createButton.disabled = true;
-
     try {
-      const resp = await fetch('/api/share', {
-        method: 'POST',
-        headers: {
-          'X-CSRFToken': getCookie('csrftoken'),
-          'Idempotency-Key': pendingOperationId,
-        },
-        credentials: 'same-origin',
+      pendingOperationId = newOperationId();
+    } catch (_error) {
+      showMessage('{{ "安全随机数不可用，操作未发送。" | translate | escapejs }}');
+      return;
+    }
+    window.camelliaMutationRecovery.remember(pendingOperationId);
+    requestInFlight = true;
+    updateControls();
+    try {
+      const { data, status, requestId } = await window.camelliaHttp.requestJson('/api/share', {
+        headers: { 'X-CSRFToken': getCookie('csrftoken'), 'Idempotency-Key': pendingOperationId },
         body: formData,
       });
-      const data = await resp.json();
-      const receiptMatches = data.management_operation_receipt_version === 1 &&
-        data.operation_id === pendingOperationId && data.operation === 'share_link_create';
-      if (receiptMatches) {
-        window.camelliaMutationRecovery?.forget(pendingOperationId);
-        pendingOperationId = null;
-      }
-      if (resp.ok && receiptMatches && data.code === 1 && data.token) {
-        messageEl.textContent = '{{ "链接只显示一次，请立即复制：" | translate | escapejs }}' + ' ' + baseUrl + '/' + data.token;
-        messageEl.className = 'notice is-success';
-        messageEl.style.display = 'block';
-        selected.clear();
-        renderList();
-        renderTags();
-      } else {
-        messageEl.textContent = data.message || '{{ "请求失败，请稍后重试。" | translate | escapejs }}';
-        messageEl.className = 'notice is-warning';
-        messageEl.style.display = 'block';
-      }
+      if (!displayReceipt(data, status)) throw new window.camelliaHttp.HttpFailure('protocol', { status, requestId });
     } catch (error) {
-      messageEl.textContent = '{{ "网络异常，请稍后重试。" | translate | escapejs }}';
-      messageEl.className = 'notice is-warning';
-      messageEl.style.display = 'block';
+      if (!displayReceipt(error.data, error.status)) {
+        if (error.outcomeKnown === true) clearPending();
+        showFailure(error);
+      }
     } finally {
       requestInFlight = false;
-      createButton.disabled = false;
+      updateControls();
     }
+  });
+
+  recoverButton.addEventListener('click', async () => {
+    if (requestInFlight || !pendingOperationId) return;
+    requestInFlight = true;
+    updateControls();
+    try {
+      const { data, requestId } = await window.camelliaHttp.requestJson(
+        '/api/management-operations/' + encodeURIComponent(pendingOperationId), { method: 'GET' });
+      if (!displayReceipt(data.receipt, data.original_status_code)) {
+        throw new window.camelliaHttp.HttpFailure('protocol', { requestId });
+      }
+    } catch (error) {
+      // A missing/expired/unauthorized receipt never proves that no mutation occurred.
+      showFailure(new window.camelliaHttp.HttpFailure(error.kind || 'internal', {
+        status: error.status, requestId: error.requestId, outcomeKnown: false,
+      }));
+    } finally {
+      requestInFlight = false;
+      updateControls();
+    }
+  });
+
+  document.addEventListener('DOMContentLoaded', () => {
+    if (!window.camelliaMutationRecovery || !window.camelliaHttp) {
+      showMessage('{{ "页面初始化失败，请刷新页面。" | translate | escapejs }}');
+      return;
+    }
+    updateControls();
   });
 
   searchEl.addEventListener('input', renderList);

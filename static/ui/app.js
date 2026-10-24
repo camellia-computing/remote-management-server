@@ -89,7 +89,7 @@ function showRecoveredMutation(envelope) {
   notice.setAttribute("role", "status");
   let message = `Recovered operation ${receipt.operation} (${receipt.operation_id}).`;
   if (typeof receipt.message === "string" && receipt.message) {
-    message += ` ${receipt.message}`;
+    message += ` ${receipt.message.slice(0, 256)}`;
   }
   if (receipt.operation === "share_link_create" && typeof receipt.token === "string" && receipt.token) {
     message += ` ${window.location.origin}/api/share/${receipt.token}`;
@@ -103,29 +103,35 @@ async function recoverPendingMutations() {
   const entries = pendingMutations();
   for (const entry of entries) {
     try {
-      const response = await window.fetch(`/api/management-operations/${encodeURIComponent(entry.id)}`, {
+      const { data: envelope } = await window.camelliaHttp.requestJson(`/api/management-operations/${encodeURIComponent(entry.id)}`, {
         method: "GET",
-        credentials: "same-origin",
-        headers: { Accept: "application/json" },
+        timeoutMs: 5000,
+        maxBytes: 1024 * 1024,
       });
-      if (response.status === 404) {
-        if (Date.now() - entry.createdAt > 5 * 60 * 1000) {
-          forgetPendingMutation(entry.id);
-        }
-        continue;
-      }
-      const envelope = await response.json();
       if (
-        !response.ok ||
-        envelope?.receipt?.operation_id !== entry.id ||
-        typeof envelope.original_status_code !== "number"
+        !window.camelliaHttp.receiptMatches(envelope?.receipt, entry.id) ||
+        !Number.isInteger(envelope.original_status_code) ||
+        !(envelope.original_status_code === 200 || (envelope.original_status_code >= 400 && envelope.original_status_code < 500)) ||
+        (envelope.original_status_code === 200 &&
+          (envelope.receipt.result !== "OK" || Object.keys(envelope.receipt.requested).some(
+            (key) => envelope.receipt.applied[key] !== envelope.receipt.requested[key]))) ||
+        (envelope.original_status_code === 200 && envelope.receipt.operation === "share_link_create" &&
+          (typeof envelope.receipt.token !== "string" || !/^[A-Za-z0-9_-]{32,128}$/.test(envelope.receipt.token))) ||
+        (envelope.original_status_code >= 400 &&
+          (envelope.receipt.result === "unknown" ||
+            typeof envelope.receipt.code !== "string" || !/^[a-z][a-z0-9_]{0,63}$/.test(envelope.receipt.code) ||
+            typeof envelope.receipt.message !== "string" || !envelope.receipt.message || envelope.receipt.message.length > 256 ||
+            typeof envelope.receipt.retryable !== "boolean" ||
+            Object.values(envelope.receipt.applied).some((count) => count !== 0)))
       ) {
         continue;
       }
       forgetPendingMutation(entry.id);
       showRecoveredMutation(envelope);
-    } catch (_error) {
-      // Leave the operation pending for recovery after the next navigation.
+    } catch (error) {
+      // 404/expiry never proves that the original mutation did not commit.
+      // A shared connection/auth/server failure must not trigger 32 serial waits.
+      if (error.status !== 404) break;
     }
   }
 }

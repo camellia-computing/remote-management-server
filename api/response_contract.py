@@ -157,6 +157,17 @@ def json_pending(code, message, *, retry_after=1, **details):
     return response
 
 
+def csrf_failure(request, reason=""):
+    """Fetch routes get a stable, non-sensitive rejection, normal pages stay HTML."""
+    if response_mode(request) == RESPONSE_MODE_JSON:
+        return json_error(
+            "csrf_failed", "Form verification expired; reload the page before submitting", status=403, retryable=False
+        )
+    from django.views.csrf import csrf_failure as default_csrf_failure
+
+    return default_csrf_failure(request, reason=reason)
+
+
 def empty_success():
     """Return the only valid no-body mutation success shape."""
 

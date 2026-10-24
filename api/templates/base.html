@@ -11,6 +11,8 @@
     <meta name="theme-color" content="#397bff">
     <link rel="icon" type="image/svg+xml" href="{% static 'web_client/favicon.svg' %}">
     <link rel="stylesheet" href="{% static 'ui/app.css' %}">
+    <script src="{% static 'ui/http.js' %}"></script>
+    {% include "http_messages.html" %}
     <script defer src="{% static 'ui/app.js' %}"></script>
     {% block link %}{% endblock %}
 </head>

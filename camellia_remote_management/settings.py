@@ -337,6 +337,7 @@ if not DEBUG and not _secure_tls:
     raise ImproperlyConfigured("CAMELLIA_REMOTE_SECURE_TLS must be true in production")
 SESSION_COOKIE_SECURE = _secure_tls
 CSRF_COOKIE_SECURE = _secure_tls
+CSRF_FAILURE_VIEW = "api.response_contract.csrf_failure"
 SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https") if _secure_tls else None
 SECURE_SSL_REDIRECT = _secure_tls
 SECURE_HSTS_SECONDS = env_int(

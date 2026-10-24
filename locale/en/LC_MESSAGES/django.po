@@ -1592,5 +1592,62 @@ msgstr "You can only share your own devices."
 msgid "此操作不可撤销。确认继续？"
 msgstr "This action cannot be undone. Continue?"
 
+msgid "连接中断，无法确认请求结果。"
+msgstr "The connection was interrupted; the request outcome is unknown."
+
+msgid "请求超时，无法确认请求结果。"
+msgstr "The request timed out; its outcome is unknown."
+
+msgid "请求已取消。"
+msgstr "The request was cancelled."
+
+msgid "登录状态已变化，请刷新页面并重新登录。"
+msgstr "Your session changed. Reload the page and sign in again."
+
+msgid "表单验证已失效，请刷新页面后再提交。"
+msgstr "Form verification expired. Reload the page before submitting."
+
+msgid "身份验证失败，请检查登录信息。"
+msgstr "Authentication failed. Check your sign-in details."
+
+msgid "没有执行此操作的权限。"
+msgstr "You do not have permission to perform this operation."
+
+msgid "请求未被接受，请检查输入信息。"
+msgstr "The request was rejected. Check your input."
+
+msgid "请求与当前状态冲突，请先核对原操作结果。"
+msgstr "The request conflicts with the current state. Check the original operation result first."
+
+msgid "请求过于频繁，请稍后再试。"
+msgstr "Too many requests. Wait before trying again."
+
+msgid "服务器处理失败，请先核对操作结果。"
+msgstr "The server could not complete the request. Check the operation result first."
+
+msgid "服务器响应格式无效，无法确认请求结果。"
+msgstr "The server returned an invalid response; the request outcome is unknown."
+
+msgid "页面无法处理响应，请刷新后核对结果。"
+msgstr "The page could not process the response. Reload and check the result."
+
+msgid "结果尚未确认，请勿重复提交；请先恢复原操作结果。"
+msgstr "The outcome is unknown. Do not submit again; recover the original operation result first."
+
+msgid "请求编号"
+msgstr "Request ID"
+
+msgid "恢复原操作结果"
+msgstr "Recover original operation result"
+
+msgid "操作编号"
+msgstr "Operation ID"
+
+msgid "安全随机数不可用，操作未发送。"
+msgstr "Secure randomness is unavailable. The operation was not sent."
+
+msgid "页面初始化失败，请刷新页面。"
+msgstr "Page initialization failed. Reload the page."
+
 #~ msgid "未知"
 #~ msgstr "UNKNOWN"

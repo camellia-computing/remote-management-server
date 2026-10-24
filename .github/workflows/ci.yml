@@ -351,6 +351,14 @@ jobs:
           uv run python -m compileall api webui2 camellia_remote_management scripts
           uv run ruff check api webui2 camellia_remote_management scripts
 
+      - name: Set up Node for browser contract tests
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "24.18.0"
+
+      - name: Browser HTTP and mutation contract tests
+        run: node --test scripts/test_browser_http.cjs scripts/test_browser_mutations.cjs
+
       - name: Django checks
         run: |
           uv run python scripts/test_deployment_gate.py

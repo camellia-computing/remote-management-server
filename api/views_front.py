@@ -54,6 +54,7 @@ from api.models import (
     UserProfile,
 )
 from api.request_utils import STRICT_SHARE_JSON_ATTRIBUTE, client_ip, load_json_form_field
+from api.response_contract import json_error
 from api.response_security import protect_credential_response
 from api.tag_colors import normalize_tag_color, tag_color_css
 from api.username_identity import canonical_username_key, normalize_username
@@ -1458,9 +1459,9 @@ def share(request, share_token=None):
                 username=request.user.username,
                 reason="empty_data",
             )
-            return JsonResponse({"code": 0, "msg": _("数据为空。")}, status=400)
+            return json_error("share_empty_selection", _("数据为空。"), status=400)
         if not isinstance(data, list) or not 1 <= len(data) <= MAX_SHARE_PEERS:
-            return JsonResponse({"code": 0, "msg": _("一次最多分享 20 台设备。")}, status=400)
+            return json_error("share_selection_limit", _("一次最多分享 20 台设备。"), status=400)
         selected_keys = {str(item.get("value", "")).strip() for item in data if isinstance(item, dict)}
         if len(selected_keys) != len(data) or any(not key.isdigit() for key in selected_keys):
             _log_event(
@@ -1470,7 +1471,7 @@ def share(request, share_token=None):
                 username=request.user.username,
                 reason="empty_ids",
             )
-            return JsonResponse({"code": 0, "msg": _("设备选择无效。")}, status=400)
+            return json_error("share_invalid_selection", _("设备选择无效。"), status=400)
 
         share_uid = request.user.id
         selected_peers = RemotePeer.objects.filter(pk__in=selected_keys)
@@ -1489,7 +1490,7 @@ def share(request, share_token=None):
                     username=request.user.username,
                     reason="owner_missing",
                 )
-                return JsonResponse({"code": 0, "msg": _("未找到所选设备的归属用户。")})
+                return json_error("share_owner_missing", _("未找到所选设备的归属用户。"), status=400)
             if len(owner_ids) > 1:
                 _log_event(
                     request,
@@ -1498,7 +1499,7 @@ def share(request, share_token=None):
                     username=request.user.username,
                     reason="mixed_owner",
                 )
-                return JsonResponse({"code": 0, "msg": _("请选择同一用户的设备进行分享。")})
+                return json_error("share_mixed_owner", _("请选择同一用户的设备进行分享。"), status=400)
             share_uid = owner_ids[0]
         else:
             selected_peers = selected_peers.filter(profile__owner=request.user)
@@ -1510,15 +1511,15 @@ def share(request, share_token=None):
                     username=request.user.username,
                     reason="invalid_owner",
                 )
-                return JsonResponse({"code": 0, "msg": _("仅支持分享自己名下的设备。")}, status=403)
+                return json_error("share_permission_denied", _("仅支持分享自己名下的设备。"), status=403)
 
         selected_peer_keys = list(selected_peers.order_by("pk").values_list("pk", flat=True))
         if len(selected_peer_keys) != len(selected_keys):
-            return JsonResponse({"code": 0, "msg": _("设备选择无效。")}, status=400)
+            return json_error("share_invalid_selection", _("设备选择无效。"), status=400)
         try:
             operation_id = _state040_operation_id(request)
         except InvalidIdentifier:
-            return JsonResponse({"code": 0, "msg": _("Invalid Idempotency-Key")}, status=400)
+            return json_error("invalid_operation_id", _("Invalid Idempotency-Key"), status=400)
 
         def mutate():
             with transaction.atomic():
@@ -1571,7 +1572,7 @@ def share(request, share_token=None):
                 sensitive_response=True,
             )
         except ManagementOperationConflict:
-            return JsonResponse({"code": 0, "msg": _("Operation identifier conflict")}, status=409)
+            return json_error("operation_identifier_conflict", _("Operation identifier conflict"), status=409)
         body = result.body
         _log_event(request, "front_share_create", username=request.user.username, count=len(selected_peer_keys))
         return JsonResponse(body, status=result.status_code)

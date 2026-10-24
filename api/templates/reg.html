@@ -11,6 +11,8 @@
     <title>{{ "注册" | translate }}_【Camellia】</title>
     <link rel="icon" type="image/svg+xml" href="{% static 'web_client/favicon.svg' %}">
     <link rel="stylesheet" href="{% static 'ui/app.css' %}">
+    <script src="{% static 'ui/http.js' %}"></script>
+    {% include "http_messages.html" %}
 </head>
 <body class="auth-body">
   <div class="auth-shell">
@@ -32,7 +34,7 @@
     </div>
     <div class="auth-card">
       <h2>{{ "注册" | translate }}</h2>
-      <div id="form-message" class="form-message"></div>
+      <div id="form-message" class="form-message" role="alert" tabindex="-1"></div>
       <form id="register-form" action="/api/user_action?action=register" method="post">
         {% csrf_token %}
         <div class="form-field">
@@ -58,10 +60,13 @@
   <script nonce="{{ csp_nonce }}">
     const form = document.getElementById('register-form');
     const messageEl = document.getElementById('form-message');
+    let requestInFlight = false;
+    let retryBlocked = false;
 
     const showMessage = (text) => {
       messageEl.textContent = text;
       messageEl.classList.add('is-visible');
+      messageEl.focus();
     };
 
     const getCookie = (name) => {
@@ -71,6 +76,11 @@
 
     form.addEventListener('submit', async (event) => {
       event.preventDefault();
+      if (requestInFlight || retryBlocked) return;
+      if (!window.camelliaHttp) {
+        showMessage('{{ "页面初始化失败，请刷新页面。" | translate | escapejs }}');
+        return;
+      }
       messageEl.classList.remove('is-visible');
       const user = document.getElementById('user').value.trim();
       const pwd = document.getElementById('pwd').value;
@@ -92,8 +102,12 @@
       }
 
       const formData = new FormData(form);
+      requestInFlight = true;
+      const submitButton = form.querySelector('button[type="submit"]');
+      submitButton.disabled = true;
+      let canResubmit = false;
       try {
-        const resp = await fetch(form.action, {
+        const { data } = await window.camelliaHttp.requestJson(form.action, {
           method: 'POST',
           headers: {
             'X-CSRFToken': getCookie('csrftoken'),
@@ -101,17 +115,25 @@
           credentials: 'same-origin',
           body: formData,
         });
-        const data = await resp.json();
         if (data.code === 1) {
           showMessage('{{ "注册成功，正在跳转到登录页。" | translate | escapejs }}');
           setTimeout(() => {
             window.location.href = '/api/user_action?action=login&registered=1';
           }, 450);
         } else {
-          showMessage(data.msg || '{{ "注册失败，请检查输入信息。" | translate | escapejs }}');
+          throw new window.camelliaHttp.HttpFailure('protocol');
         }
       } catch (error) {
-        showMessage('{{ "网络异常，请稍后再试。" | translate | escapejs }}');
+        showMessage(window.camelliaHttp.failureMessage(error, window.camelliaHttpMessages));
+        canResubmit = error.outcomeKnown === true && !['csrf', 'session', 'permission'].includes(error.kind);
+      } finally {
+        document.getElementById('pwd').value = '';
+        document.getElementById('rpwd').value = '';
+        formData.delete('pwd');
+        formData.delete('repassword');
+        requestInFlight = false;
+        retryBlocked = !canResubmit;
+        submitButton.disabled = !canResubmit;
       }
     });
   </script>
