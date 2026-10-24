@@ -1,4 +1,5 @@
 import json
+import uuid
 from io import StringIO
 
 from django.conf import settings as project_settings
@@ -48,19 +49,26 @@ class SharedProfileCredentialTests(TestCase):
         return _issue_access_token(user, device)[1]
 
     def post_json(self, path, payload, token):
+        headers = {}
+        if path == "/api/ab/shared/add":
+            headers["HTTP_IDEMPOTENCY_KEY"] = str(uuid.uuid4())
         return self.client.post(
             path,
             data=json.dumps(payload),
             content_type="application/json",
             HTTP_AUTHORIZATION=f"Bearer {token}",
+            **headers,
         )
 
     def put_json(self, path, payload, token):
+        profile = AddressBookProfile.objects.get(guid=payload["guid"])
         return self.client.put(
             path,
             data=json.dumps(payload),
             content_type="application/json",
             HTTP_AUTHORIZATION=f"Bearer {token}",
+            HTTP_IDEMPOTENCY_KEY=str(uuid.uuid4()),
+            HTTP_IF_MATCH=f'"{profile.authorization_generation}"',
         )
 
     def assert_never_stored(self, response):

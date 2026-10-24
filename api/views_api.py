@@ -125,7 +125,14 @@ from api.policy_generation import (
 from api.rate_limits import enforce_authenticated_rate_limit
 from api.release_schema import RuntimeWriteCapabilityError, check_release_schema, check_runtime_write_capability
 from api.request_deadlines import bounded_timeout, check_request_deadline
-from api.request_utils import InvalidJsonPayload, client_ip, load_json_body, load_json_object, load_json_text
+from api.request_utils import (
+    InvalidJsonPayload,
+    client_ip,
+    load_json_body,
+    load_json_object,
+    load_json_text,
+    require_empty_json_object,
+)
 from api.response_contract import RESPONSE_SCHEMA_VERSION, empty_success, json_error, json_pending
 from api.tag_colors import normalize_tag_color
 from api.username_identity import canonical_username_key, check_username_identity, normalize_username
@@ -2955,9 +2962,18 @@ def ab_personal(request):
     if not user:
         _log_event(request, "api_ab_personal_unauthorized", level="warning")
         return JsonResponse({"error": "Invalid token"}, status=401)
+    require_empty_json_object(request)
     profile = _ensure_personal_profile(user)
     _log_event(request, "api_ab_personal", level="debug", username=user.username)
-    return JsonResponse({"guid": _personal_guid(user), "name": profile.name})
+    return JsonResponse({**_address_book_snapshot(profile), "name": profile.name})
+
+
+def _address_book_snapshot(profile):
+    return {
+        "address_book_snapshot_version": 1,
+        "guid": str(profile.guid),
+        "authorization_generation": profile.authorization_generation,
+    }
 
 
 def ab_shared_profiles(request):
@@ -2965,6 +2981,7 @@ def ab_shared_profiles(request):
     if not user:
         _log_event(request, "api_ab_shared_profiles_unauthorized", level="warning")
         return JsonResponse({"error": "Invalid token"}, status=401)
+    require_empty_json_object(request)
     pagination, error_response = _pagination_or_error(request)
     if error_response:
         return error_response
@@ -2982,7 +2999,7 @@ def ab_shared_profiles(request):
                 existing["rule"] = rule_value
             return
         items[p.guid] = {
-            "guid": p.guid,
+            **_address_book_snapshot(p),
             "name": p.name,
             "owner": owner_name,
             "note": p.note,
@@ -3010,7 +3027,7 @@ def ab_shared_profiles(request):
         for r in rules_qs.select_related("profile", "profile__owner").defer("profile__default_password"):
             add_profile(r.profile, r.rule)
     data = list(items.values())
-    data.sort(key=lambda x: x.get("name", ""))
+    data.sort(key=lambda x: (x["name"], x["guid"]))
     total = len(data)
     _log_event(
         request,
@@ -3023,6 +3040,7 @@ def ab_shared_profiles(request):
     )
     return JsonResponse(
         {
+            "address_book_snapshot_version": 1,
             "total": total,
             **_pagination_response_fields(pagination),
             "data": data[pagination.start : pagination.end],
@@ -3686,19 +3704,22 @@ def ab_rules_delete(request):
     return JsonResponse({"code": 1, "deleted": deleted})
 
 
+@transaction.atomic
 def ab_peers(request):
     _token, user = _get_token_user(request)
     if not user:
         _log_event(request, "api_ab_peers_unauthorized", level="warning")
         return JsonResponse({"error": "Invalid token"}, status=401)
+    require_empty_json_object(request)
     pagination, error_response = _pagination_or_error(request)
     if error_response:
         return error_response
     guid = request.GET.get("ab", "") or _personal_guid(user)
     profile, owner, _rule = _get_profile_access(user, guid)
-    if guid == _personal_guid(user):
-        _ensure_personal_profile(user)
-        owner = user
+    if profile is not None:
+        # Serialize the page's data and generation with all content/ACL writers.
+        # Separate pages are not a transaction: consumers must reject mixed generations.
+        profile, owner, _rule = lock_profile_access(user, profile.pk)
     if not owner:
         _log_event(request, "api_ab_peers_denied", level="warning", username=user.username, guid=guid)
         return JsonResponse({"error": "No access"}, status=403)
@@ -3749,6 +3770,7 @@ def ab_peers(request):
     )
     return JsonResponse(
         {
+            **_address_book_snapshot(profile),
             "total": total,
             **_pagination_response_fields(pagination),
             "data": data,
@@ -3756,19 +3778,20 @@ def ab_peers(request):
     )
 
 
+@transaction.atomic
 def ab_tags(request, guid):
     _token, user = _get_token_user(request)
     if not user:
         _log_event(request, "api_ab_tags_unauthorized", level="warning")
         return JsonResponse({"error": "Invalid token"}, status=401)
+    require_empty_json_object(request)
     profile, owner, _rule = _get_profile_access(user, guid)
-    if guid == _personal_guid(user):
-        _ensure_personal_profile(user)
-        owner = user
+    if profile is not None:
+        profile, owner, _rule = lock_profile_access(user, profile.pk)
     if not owner:
         _log_event(request, "api_ab_tags_denied", level="warning", username=user.username, guid=guid)
         return JsonResponse({"error": "No access"}, status=403)
-    tags = RemoteTag.objects.filter(profile=profile)
+    tags = RemoteTag.objects.filter(profile=profile).order_by("tag_name", "pk")
     data = []
     for t in tags:
         try:
@@ -3777,7 +3800,7 @@ def ab_tags(request, guid):
             color = 0
         data.append({"name": t.tag_name, "color": color})
     _log_event(request, "api_ab_tags", level="debug", username=user.username, guid=guid, total=len(data))
-    return JsonResponse(data, safe=False)
+    return JsonResponse({**_address_book_snapshot(profile), "total": len(data), "data": data})
 
 
 def ab_peer_add(request, guid):

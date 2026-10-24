@@ -612,7 +612,8 @@ class ApiContractTests(ApiTestMixin, TestCase):
         response = self._post_json(f"/api/ab/tags/{profile.guid}", {}, token=token)
 
         self.assertEqual(response.status_code, 200, response.content)
-        self.assertEqual(response.json(), [{"name": "invalid-color", "color": 0}])
+        self.assertEqual(response.json()["data"], [{"name": "invalid-color", "color": 0}])
+        self.assertEqual(response.json()["authorization_generation"], profile.authorization_generation)
 
     def test_address_book_peers_match_flutter_client_contract(self):
         token = self._login("alice", "alice-pass")

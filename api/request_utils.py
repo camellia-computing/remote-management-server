@@ -99,7 +99,7 @@ def _content_length(request):
     return int(raw_length)
 
 
-def _bounded_request_body(request, max_bytes):
+def _bounded_request_body(request, max_bytes, *, allow_empty=False):
     if not isinstance(max_bytes, int) or isinstance(max_bytes, bool) or max_bytes <= 0:
         raise ValueError("max_bytes must be a positive integer")
     declared_length = _content_length(request)
@@ -118,7 +118,7 @@ def _bounded_request_body(request, max_bytes):
         raise InvalidJsonPayload("Request body does not match Content-Length")
     if len(body) > max_bytes:
         raise JsonPayloadTooLarge("Payload exceeds the route byte budget")
-    if not body:
+    if not body and not allow_empty:
         raise InvalidJsonPayload("JSON payload must not be empty")
     return body
 
@@ -231,6 +231,21 @@ def load_json_object(request, *, max_bytes=None):
     if not isinstance(payload, dict):
         raise InvalidJsonPayload("Request body must be a JSON object")
     return payload
+
+
+def require_empty_json_object(request):
+    """Read-only POST selectors live in the query, never an ignored JSON body."""
+
+    _require_json_media_type(request)
+    body = _bounded_request_body(request, 4096, allow_empty=True)
+    if not body:
+        return
+    try:
+        text = body.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise InvalidJsonPayload("Request body is not valid UTF-8") from exc
+    if load_json_text(text, max_bytes=4096) != {}:
+        raise InvalidJsonPayload("Read request body must be empty or an empty JSON object; use query selectors")
 
 
 def load_json_form_field(request, field_name, *, max_bytes, max_form_bytes):
