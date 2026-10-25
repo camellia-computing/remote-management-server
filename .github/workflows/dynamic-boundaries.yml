@@ -1,0 +1,36 @@
+name: Dynamic Boundaries
+
+on:
+  schedule:
+    - cron: "31 3 * * 6"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: management-dynamic-boundaries-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  management-boundaries:
+    name: Bounded Management JSON mutation corpus
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      CAMELLIA_REMOTE_DEBUG: "true"
+      CAMELLIA_REMOTE_SECRET_KEY: dynamic-boundary-ci-only-secret-key
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        with:
+          version: "0.13.5"
+          python-version: "3.15.1"
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+      - name: Install locked dependencies
+        run: uv sync --locked --all-groups
+      - name: Run fixed-size JSON mutation corpus
+        run: uv run pytest api/test_dynamic_input_contract.py

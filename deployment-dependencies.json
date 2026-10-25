@@ -1,0 +1,31 @@
+{
+  "compose_contract": "camellia-remote-management-compose-v1",
+  "database": {
+    "digest": "sha256:898c60cb390d1085bc97bdd6a1ae968757421df394b071848b52b1c09c89d6a5",
+    "image": "docker.io/library/postgres",
+    "name": "postgresql",
+    "platforms": [
+      "linux/amd64",
+      "linux/arm64"
+    ],
+    "reference": "postgres:18-alpine@sha256:898c60cb390d1085bc97bdd6a1ae968757421df394b071848b52b1c09c89d6a5",
+    "tag": "18-alpine"
+  },
+  "scan_policy": {
+    "database_max_age_hours": 24,
+    "ignore_unfixed": false,
+    "rescan_interval_hours": 24,
+    "response_sla_hours": {
+      "CRITICAL": 24,
+      "HIGH": 72
+    },
+    "scanner": "trivy",
+    "scanner_version": "0.72.0",
+    "severities": [
+      "CRITICAL",
+      "HIGH"
+    ]
+  },
+  "schema_version": 1,
+  "systemd_contract": "camellia-remote-management-systemd-v1"
+}

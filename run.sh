@@ -4,6 +4,56 @@ set -eu
 APP_DIR="/app"
 cd "$APP_DIR"
 
+REQUIRE_CGROUP_BUDGET="${CAMELLIA_REMOTE_REQUIRE_CGROUP_BUDGET:-false}"
+CGROUP_ROOT="${CAMELLIA_REMOTE_CGROUP_ROOT:-/sys/fs/cgroup}"
+BUDGET_SCRIPT="$APP_DIR/deploy/shutdown-budget.sh"
+
+validate_cgroup_budget() {
+    case "$REQUIRE_CGROUP_BUDGET" in
+        0|false|FALSE|no|NO)
+            return 0
+            ;;
+        1|true|TRUE|yes|YES)
+            ;;
+        *)
+            echo "CAMELLIA_REMOTE_REQUIRE_CGROUP_BUDGET must be true or false" >&2
+            exit 1
+            ;;
+    esac
+    if [ ! -r "$CGROUP_ROOT/memory.max" ] || [ ! -r "$CGROUP_ROOT/pids.max" ] || [ ! -r "$CGROUP_ROOT/cpu.max" ]; then
+        echo "finite cgroup v2 memory.max, pids.max and cpu.max are required" >&2
+        exit 1
+    fi
+    memory_max=$(cat "$CGROUP_ROOT/memory.max")
+    pids_max=$(cat "$CGROUP_ROOT/pids.max")
+    cpu_max=$(cat "$CGROUP_ROOT/cpu.max")
+    case "$memory_max" in
+        ''|max|*[!0-9]*) echo "cgroup memory.max must be finite" >&2; exit 1 ;;
+    esac
+    case "$pids_max" in
+        ''|max|*[!0-9]*) echo "cgroup pids.max must be finite" >&2; exit 1 ;;
+    esac
+    cpu_quota=${cpu_max%% *}
+    case "$cpu_quota" in
+        ''|max|*[!0-9]*) echo "cgroup cpu.max must be finite" >&2; exit 1 ;;
+    esac
+    if [ "$memory_max" -lt 268435456 ] || [ "$pids_max" -lt 64 ]; then
+        echo "cgroup memory.max/pids.max are below the supported safety floor" >&2
+        exit 1
+    fi
+}
+
+validate_cgroup_budget
+
+if [ ! -x "$BUDGET_SCRIPT" ]; then
+    echo "shutdown budget validator is missing or not executable" >&2
+    exit 1
+fi
+shutdown_budget_values=$("$BUDGET_SCRIPT" --values) || exit 1
+IFS=' ' read -r GRACEFUL_TIMEOUT _DOCKER_STOP_TIMEOUT _SYSTEMD_STOP_TIMEOUT <<EOF
+$shutdown_budget_values
+EOF
+
 if [ "$#" -gt 0 ]; then
     exec "$@"
 fi
@@ -12,13 +62,14 @@ PORT="${CAMELLIA_REMOTE_BIND_PORT:-21114}"
 HOST="${CAMELLIA_REMOTE_BIND_HOST:-0.0.0.0}"
 WORKERS="${CAMELLIA_REMOTE_GUNICORN_WORKERS:-2}"
 THREADS="${CAMELLIA_REMOTE_GUNICORN_THREADS:-2}"
-TIMEOUT="${CAMELLIA_REMOTE_GUNICORN_TIMEOUT_SECONDS:-60}"
-GRACEFUL_TIMEOUT="${CAMELLIA_REMOTE_GUNICORN_GRACEFUL_TIMEOUT_SECONDS:-30}"
+TIMEOUT="${CAMELLIA_REMOTE_GUNICORN_TIMEOUT_SECONDS:-75}"
 KEEP_ALIVE="${CAMELLIA_REMOTE_GUNICORN_KEEP_ALIVE_SECONDS:-5}"
 MAX_REQUESTS="${CAMELLIA_REMOTE_GUNICORN_MAX_REQUESTS:-1000}"
 MAX_REQUESTS_JITTER="${CAMELLIA_REMOTE_GUNICORN_MAX_REQUESTS_JITTER:-100}"
 FORWARDED_ALLOW_IPS="${CAMELLIA_REMOTE_GUNICORN_FORWARDED_ALLOW_IPS:-127.0.0.1}"
+REQUEST_DEADLINE="${CAMELLIA_REMOTE_REQUEST_DEADLINE_SECONDS:-65}"
 RECORD_DIR="${CAMELLIA_REMOTE_RECORD_UPLOAD_ROOT:-$APP_DIR/records}"
+ACCESS_LOG_FORMAT='method=%(m)s route=%(route)s status=%(s)s bytes=%(B)s duration_us=%(D)s request_id=%(request_id)s trace_id=%(trace_id)s span_id=%(span_id)s event_id=%(event_id)s'
 
 require_integer_range() {
     variable_name="$1"
@@ -46,14 +97,19 @@ require_integer_range CAMELLIA_REMOTE_BIND_PORT "$PORT" 1 65535
 require_integer_range CAMELLIA_REMOTE_GUNICORN_WORKERS "$WORKERS" 1 64
 require_integer_range CAMELLIA_REMOTE_GUNICORN_THREADS "$THREADS" 1 64
 require_integer_range CAMELLIA_REMOTE_GUNICORN_TIMEOUT_SECONDS "$TIMEOUT" 1 600
+require_integer_range CAMELLIA_REMOTE_REQUEST_DEADLINE_SECONDS "$REQUEST_DEADLINE" 5 590
 require_integer_range CAMELLIA_REMOTE_GUNICORN_GRACEFUL_TIMEOUT_SECONDS "$GRACEFUL_TIMEOUT" 1 600
 require_integer_range CAMELLIA_REMOTE_GUNICORN_KEEP_ALIVE_SECONDS "$KEEP_ALIVE" 1 120
 require_integer_range CAMELLIA_REMOTE_GUNICORN_MAX_REQUESTS "$MAX_REQUESTS" 1 1000000
 require_integer_range CAMELLIA_REMOTE_GUNICORN_MAX_REQUESTS_JITTER "$MAX_REQUESTS_JITTER" 0 1000000
+if [ "$REQUEST_DEADLINE" -ge "$TIMEOUT" ]; then
+    echo "CAMELLIA_REMOTE_REQUEST_DEADLINE_SECONDS must be shorter than CAMELLIA_REMOTE_GUNICORN_TIMEOUT_SECONDS" >&2
+    exit 1
+fi
 
 case "${CAMELLIA_REMOTE_RUN_MIGRATIONS:-false}" in
     1|true|TRUE|yes|YES)
-        python manage.py migrate --noinput
+        CAMELLIA_REMOTE_DATABASE_OPERATION_PROFILE=MIGRATION python manage.py migrate_with_lease --noinput
         ;;
     0|false|FALSE|no|NO)
         ;;
@@ -63,12 +119,15 @@ case "${CAMELLIA_REMOTE_RUN_MIGRATIONS:-false}" in
         ;;
 esac
 
+python manage.py check_release_schema
+python manage.py check_username_identity
 python manage.py check --deploy
 
 exec gunicorn camellia_remote_management.wsgi:application \
     --bind "$HOST:$PORT" \
     --workers "$WORKERS" \
     --threads "$THREADS" \
+    --worker-class gthread \
     --timeout "$TIMEOUT" \
     --graceful-timeout "$GRACEFUL_TIMEOUT" \
     --keep-alive "$KEEP_ALIVE" \
@@ -76,6 +135,8 @@ exec gunicorn camellia_remote_management.wsgi:application \
     --max-requests-jitter "$MAX_REQUESTS_JITTER" \
     --worker-tmp-dir /tmp \
     --forwarded-allow-ips "$FORWARDED_ALLOW_IPS" \
+    --logger-class camellia_remote_management.access_logging.SafeAccessLogger \
+    --access-logformat "$ACCESS_LOG_FORMAT" \
     --access-logfile "-" \
     --error-logfile "-" \
     --capture-output

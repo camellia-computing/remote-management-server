@@ -14,6 +14,11 @@ WORKDIR /build
 
 COPY --from=uv /uv /uvx /usr/local/bin/
 COPY pyproject.toml uv.lock ./
+# Unicode16 backport has no CPython3.15 wheel. Build only in this stage;
+# neither the compiler nor build backend is copied into the runtime image.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends gcc libc6-dev \
+    && rm -rf /var/lib/apt/lists/*
 RUN uv sync --locked --no-dev --no-install-project
 
 FROM python:3.15.1-slim@sha256:08275f764e022331c6d3e3ca55d8cce01fa4684b02111adf0445d71806fe7941 AS runtime
@@ -42,6 +47,8 @@ RUN test -n "${VERSION}" \
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
+    CAMELLIA_REMOTE_RELEASE_VERSION="${VERSION}" \
+    CAMELLIA_REMOTE_RELEASE_REVISION="${REVISION}" \
     PATH="/opt/venv/bin:${PATH}" \
     HOST="0.0.0.0" \
     PORT="21114" \
@@ -57,6 +64,7 @@ WORKDIR /app
 
 COPY --from=builder /opt/venv /opt/venv
 COPY --chown=appuser:appuser manage.py run.sh ./
+COPY --chown=appuser:appuser deploy/shutdown-budget.sh ./deploy/shutdown-budget.sh
 COPY --chown=appuser:appuser web-client.lock ./
 COPY --chown=appuser:appuser api ./api
 COPY --chown=appuser:appuser locale ./locale

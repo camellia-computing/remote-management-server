@@ -282,6 +282,42 @@ verify_asset_directory() {
     return 1
   }
   verify_registry_evidence "$directory" "$digest"
+  if [[ "$LOGICAL_REPOSITORY_ID" == remote-management ]]; then
+    [[ -f "$directory/deployment-bom.json" && ! -L "$directory/deployment-bom.json" ]] || {
+      echo "Management release is missing its deployment BOM" >&2
+      return 1
+    }
+    [[ -f "$directory/DEPLOYMENT-BOM-ATTESTATION.intoto.jsonl" &&
+      ! -L "$directory/DEPLOYMENT-BOM-ATTESTATION.intoto.jsonl" ]] || {
+      echo "Management release is missing its deployment BOM attestation" >&2
+      return 1
+    }
+    [[ -f "${RELEASE_SOURCE_ROOT:-}/scripts/deployment_dependencies.py" &&
+      ! -L "${RELEASE_SOURCE_ROOT:-}/scripts/deployment_dependencies.py" ]] || {
+      echo "Deployment dependency validator is unavailable" >&2
+      return 1
+    }
+    python3 "${RELEASE_SOURCE_ROOT}/scripts/deployment_dependencies.py" \
+      validate-bom "$directory/deployment-bom.json" \
+      --evidence-root "$directory" >/dev/null
+    jq -e \
+      '.schema_version == 2 and
+       .deployment.bom.name == "deployment-bom.json" and
+       .deployment.attestation.name == "DEPLOYMENT-BOM-ATTESTATION.intoto.jsonl" and
+       (.deployment.bom.sha256 | test("^[0-9a-f]{64}$")) and
+       (.deployment.attestation.sha256 | test("^[0-9a-f]{64}$"))' \
+      "$directory/release-evidence.json" >/dev/null
+    [[ "$(sha256sum "$directory/deployment-bom.json" | awk '{print $1}')" == \
+      "$(jq -r '.deployment.bom.sha256' "$directory/release-evidence.json")" ]] || {
+      echo "Deployment BOM hash is not bound by release evidence" >&2
+      return 1
+    }
+    [[ "$(sha256sum "$directory/DEPLOYMENT-BOM-ATTESTATION.intoto.jsonl" | awk '{print $1}')" == \
+      "$(jq -r '.deployment.attestation.sha256' "$directory/release-evidence.json")" ]] || {
+      echo "Deployment BOM attestation hash is not bound by release evidence" >&2
+      return 1
+    }
+  fi
   while IFS= read -r evidence_name; do
     [[ "$evidence_name" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ &&
       -f "$directory/$evidence_name" && ! -L "$directory/$evidence_name" ]] || {
@@ -308,12 +344,18 @@ verify_remote_release() {
 }
 
 verify_attestations() {
-  local digest="$1"
+  local digest="$1" directory="${2:-$assets_directory}"
   GH_TOKEN="$ACTIONS_TOKEN" gh attestation verify \
     "oci://$primary_image@$digest" --repo "$GITHUB_REPOSITORY" >/dev/null
   GH_TOKEN="$ACTIONS_TOKEN" gh attestation verify \
     "oci://$primary_image@$digest" --repo "$GITHUB_REPOSITORY" \
     --predicate-type "https://spdx.dev/Document/v2.3" >/dev/null
+  if [[ "$LOGICAL_REPOSITORY_ID" == remote-management ]]; then
+    GH_TOKEN="$ACTIONS_TOKEN" gh attestation verify \
+      "$directory/deployment-bom.json" --repo "$GITHUB_REPOSITORY" \
+      --bundle "$directory/DEPLOYMENT-BOM-ATTESTATION.intoto.jsonl" \
+      --cert-identity "$RELEASE_SIGNING_IDENTITY" >/dev/null
+  fi
 }
 
 refresh_release
@@ -329,7 +371,7 @@ if [[ "$verify_published_only" == true || "$(jq -r '.draft' "$release_json")" ==
     verify_image_signature "$image" "$recorded_digest" >/dev/null
   done
   verify_remote_release "$work_directory/published-existing" "$recorded_digest"
-  verify_attestations "$recorded_digest"
+  verify_attestations "$recorded_digest" "$work_directory/published-existing"
   echo "Verified existing immutable $tag and all configured registries"
   exit 0
 fi

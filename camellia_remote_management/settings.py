@@ -2,9 +2,11 @@ import base64
 import binascii
 import hashlib
 import ipaddress
+import json
 import os
 import re
 from pathlib import Path
+from types import MappingProxyType
 from urllib.parse import unquote, urlsplit
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -51,6 +53,58 @@ def env_int(name, default, min_value=None, max_value=None):
     return value
 
 
+def oidc_auto_provision_email_domains(value):
+    domains = []
+    for item in value.replace(";", ",").split(","):
+        domain = item.strip().lower()
+        if not domain:
+            continue
+        if not re.fullmatch(
+            r"(?=.{1,253}\Z)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+"
+            r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?",
+            domain,
+        ):
+            raise ImproperlyConfigured(
+                "CAMELLIA_REMOTE_OIDC_AUTO_PROVISION_EMAIL_DOMAINS must contain exact lowercase DNS domains"
+            )
+        domains.append(domain)
+    return tuple(dict.fromkeys(domains))
+
+
+def oidc_auto_provision_required_claims(value):
+    if not value.strip():
+        return MappingProxyType({})
+    if len(value.encode("utf-8")) > 16 * 1024:
+        raise ImproperlyConfigured("CAMELLIA_REMOTE_OIDC_AUTO_PROVISION_REQUIRED_CLAIMS is too large")
+    try:
+        payload = json.loads(value)
+    except json.JSONDecodeError as exc:
+        raise ImproperlyConfigured("CAMELLIA_REMOTE_OIDC_AUTO_PROVISION_REQUIRED_CLAIMS must be a JSON object") from exc
+    if not isinstance(payload, dict) or not 1 <= len(payload) <= 32:
+        raise ImproperlyConfigured(
+            "CAMELLIA_REMOTE_OIDC_AUTO_PROVISION_REQUIRED_CLAIMS must contain 1-32 claim allowlists"
+        )
+    claims = {}
+    for name, configured_values in payload.items():
+        if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9_.:-]{1,64}", name):
+            raise ImproperlyConfigured("OIDC auto-provision claim names are invalid")
+        values = [configured_values] if isinstance(configured_values, str) else configured_values
+        if not isinstance(values, list) or not 1 <= len(values) <= 64:
+            raise ImproperlyConfigured("OIDC auto-provision claim allowlists must contain 1-64 strings")
+        normalized = []
+        for item in values:
+            if (
+                not isinstance(item, str)
+                or not item
+                or len(item.encode("utf-8")) > 512
+                or any(ord(character) < 32 for character in item)
+            ):
+                raise ImproperlyConfigured("OIDC auto-provision claim values must be bounded non-empty strings")
+            normalized.append(item)
+        claims[name] = tuple(dict.fromkeys(normalized))
+    return MappingProxyType(claims)
+
+
 def env_choice(name, default, choices):
     value = os.environ.get(name, default).strip().upper()
     if value not in choices:
@@ -67,6 +121,50 @@ def canonical_base64_bytes(value, expected_size):
     if len(decoded) != expected_size or base64.b64encode(decoded).decode("ascii") != value:
         return None
     return decoded
+
+
+DATA_ENCRYPTION_KEY_ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,31}$")
+MAX_DATA_ENCRYPTION_KEYS = 8
+
+
+def data_encryption_key_id(value, setting_name):
+    normalized = value.strip().lower()
+    if value != normalized or not DATA_ENCRYPTION_KEY_ID_RE.fullmatch(normalized):
+        raise ImproperlyConfigured(
+            f"{setting_name} must be a lowercase key ID containing 1-32 letters, digits, '.', '_' or '-'"
+        )
+    return normalized
+
+
+def data_encryption_legacy_keys(value):
+    keys = {}
+    if not value.strip():
+        return keys
+    for entry in value.split(","):
+        key_id_raw, separator, encoded_key = entry.strip().partition(":")
+        if not separator:
+            raise ImproperlyConfigured(
+                "CAMELLIA_REMOTE_DATA_ENCRYPTION_LEGACY_KEYS entries must use key-id:canonical-base64"
+            )
+        key_id = data_encryption_key_id(
+            key_id_raw,
+            "CAMELLIA_REMOTE_DATA_ENCRYPTION_LEGACY_KEYS key ID",
+        )
+        key = canonical_base64_bytes(encoded_key, 32)
+        if key is None:
+            raise ImproperlyConfigured(
+                "CAMELLIA_REMOTE_DATA_ENCRYPTION_LEGACY_KEYS values must encode exactly 32 bytes"
+            )
+        if key_id in keys:
+            raise ImproperlyConfigured("CAMELLIA_REMOTE_DATA_ENCRYPTION_LEGACY_KEYS contains a duplicate key ID")
+        if key in keys.values():
+            raise ImproperlyConfigured("CAMELLIA_REMOTE_DATA_ENCRYPTION_LEGACY_KEYS aliases one key under multiple IDs")
+        keys[key_id] = key
+    if len(keys) >= MAX_DATA_ENCRYPTION_KEYS:
+        raise ImproperlyConfigured(
+            f"CAMELLIA_REMOTE_DATA_ENCRYPTION_LEGACY_KEYS supports at most {MAX_DATA_ENCRYPTION_KEYS - 1} keys"
+        )
+    return keys
 
 
 def valid_https_url(value, *, allow_query=True):
@@ -114,7 +212,36 @@ elif DEBUG:
 else:
     raise ImproperlyConfigured("CAMELLIA_REMOTE_DATA_ENCRYPTION_KEY is required when CAMELLIA_REMOTE_DEBUG is false")
 
-DEFAULT_AUTO_FIELD = "django.db.models.AutoField"
+_data_encryption_key_id = os.environ.get("CAMELLIA_REMOTE_DATA_ENCRYPTION_KEY_ID", "").strip()
+if not _data_encryption_key_id:
+    if DEBUG:
+        _data_encryption_key_id = "debug-primary"
+    else:
+        raise ImproperlyConfigured(
+            "CAMELLIA_REMOTE_DATA_ENCRYPTION_KEY_ID is required when CAMELLIA_REMOTE_DEBUG is false"
+        )
+DATA_ENCRYPTION_PRIMARY_KEY_ID = data_encryption_key_id(
+    _data_encryption_key_id,
+    "CAMELLIA_REMOTE_DATA_ENCRYPTION_KEY_ID",
+)
+_data_encryption_keys = data_encryption_legacy_keys(os.environ.get("CAMELLIA_REMOTE_DATA_ENCRYPTION_LEGACY_KEYS", ""))
+if DATA_ENCRYPTION_PRIMARY_KEY_ID in _data_encryption_keys:
+    raise ImproperlyConfigured("The primary data-encryption key ID must not also be a legacy key ID")
+if DATA_ENCRYPTION_KEY_BYTES in _data_encryption_keys.values():
+    raise ImproperlyConfigured("The primary data-encryption key must not be aliased as a legacy key")
+_data_encryption_keys[DATA_ENCRYPTION_PRIMARY_KEY_ID] = DATA_ENCRYPTION_KEY_BYTES
+DATA_ENCRYPTION_KEYS = MappingProxyType(_data_encryption_keys)
+DATA_ENCRYPTION_V1_KEY_ID = data_encryption_key_id(
+    os.environ.get(
+        "CAMELLIA_REMOTE_DATA_ENCRYPTION_V1_KEY_ID",
+        DATA_ENCRYPTION_PRIMARY_KEY_ID,
+    ),
+    "CAMELLIA_REMOTE_DATA_ENCRYPTION_V1_KEY_ID",
+)
+if DATA_ENCRYPTION_V1_KEY_ID not in DATA_ENCRYPTION_KEYS:
+    raise ImproperlyConfigured("CAMELLIA_REMOTE_DATA_ENCRYPTION_V1_KEY_ID must identify a configured key")
+
+DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 ALLOWED_HOSTS = env_csv("CAMELLIA_REMOTE_ALLOWED_HOSTS", ["127.0.0.1", "localhost"])
 CSRF_TRUSTED_ORIGINS = env_csv("CAMELLIA_REMOTE_CSRF_TRUSTED_ORIGINS", ["http://127.0.0.1:21114"])
 if not DEBUG:
@@ -143,12 +270,74 @@ if TRUST_PROXY_HEADERS and not TRUSTED_PROXY_NETWORKS:
         "CAMELLIA_REMOTE_TRUSTED_PROXY_CIDRS is required when CAMELLIA_REMOTE_TRUST_PROXY_HEADERS is enabled"
     )
 
+# Request admission is layered: an in-process ingress cap protects workers
+# before session/database work, while hashed PostgreSQL buckets and leases
+# coordinate route, credential, actor and device limits across replicas.
+REQUEST_RATE_LIMIT_ENABLED = env_bool("CAMELLIA_REMOTE_RATE_LIMIT_ENABLED", True)
+if not DEBUG and not REQUEST_RATE_LIMIT_ENABLED:
+    raise ImproperlyConfigured("CAMELLIA_REMOTE_RATE_LIMIT_ENABLED cannot be disabled in production")
+REQUEST_RATE_LIMIT_GLOBAL_REQUESTS_PER_MINUTE = env_int(
+    "CAMELLIA_REMOTE_RATE_LIMIT_GLOBAL_REQUESTS_PER_MINUTE",
+    12_000,
+    60,
+    100_000,
+)
+REQUEST_RATE_LIMIT_SOURCE_REQUESTS_PER_MINUTE = env_int(
+    "CAMELLIA_REMOTE_RATE_LIMIT_SOURCE_REQUESTS_PER_MINUTE",
+    3_000,
+    10,
+    20_000,
+)
+REQUEST_RATE_LIMIT_CREDENTIAL_REQUESTS_PER_MINUTE = env_int(
+    "CAMELLIA_REMOTE_RATE_LIMIT_CREDENTIAL_REQUESTS_PER_MINUTE",
+    1_200,
+    10,
+    20_000,
+)
+REQUEST_RATE_LIMIT_RECORD_BYTES_PER_MINUTE = env_int(
+    "CAMELLIA_REMOTE_RATE_LIMIT_RECORD_BYTES_PER_MINUTE",
+    256 * 1024 * 1024,
+    1024 * 1024,
+    1024 * 1024 * 1024,
+)
+REQUEST_RATE_LIMIT_GLOBAL_CONCURRENCY = env_int(
+    "CAMELLIA_REMOTE_RATE_LIMIT_GLOBAL_CONCURRENCY",
+    128,
+    4,
+    1024,
+)
+REQUEST_RATE_LIMIT_SOURCE_CONCURRENCY = env_int(
+    "CAMELLIA_REMOTE_RATE_LIMIT_SOURCE_CONCURRENCY",
+    32,
+    1,
+    256,
+)
+REQUEST_RATE_LIMIT_CREDENTIAL_CONCURRENCY = env_int(
+    "CAMELLIA_REMOTE_RATE_LIMIT_CREDENTIAL_CONCURRENCY",
+    8,
+    1,
+    64,
+)
+REQUEST_RATE_LIMIT_LOCAL_CAPACITY = env_int(
+    "CAMELLIA_REMOTE_RATE_LIMIT_LOCAL_CAPACITY",
+    50_000,
+    1_000,
+    500_000,
+)
+REQUEST_RATE_LIMIT_CONCURRENCY_LEASE_SECONDS = env_int(
+    "CAMELLIA_REMOTE_RATE_LIMIT_CONCURRENCY_LEASE_SECONDS",
+    900,
+    30,
+    3600,
+)
+
 # TLS-terminating deployments should set CAMELLIA_REMOTE_SECURE_TLS=true.
 _secure_tls = env_bool("CAMELLIA_REMOTE_SECURE_TLS", False)
 if not DEBUG and not _secure_tls:
     raise ImproperlyConfigured("CAMELLIA_REMOTE_SECURE_TLS must be true in production")
 SESSION_COOKIE_SECURE = _secure_tls
 CSRF_COOKIE_SECURE = _secure_tls
+CSRF_FAILURE_VIEW = "api.response_contract.csrf_failure"
 SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https") if _secure_tls else None
 SECURE_SSL_REDIRECT = _secure_tls
 SECURE_HSTS_SECONDS = env_int(
@@ -208,7 +397,6 @@ if not DEBUG:
             )
     if canonical_base64_bytes(RS_PUB_KEY, 32) is None:
         raise ImproperlyConfigured("CAMELLIA_REMOTE_RS_PUB_KEY must encode exactly 32 bytes")
-PLUGIN_SIGNING_KEY = os.environ.get("CAMELLIA_REMOTE_PLUGIN_SIGNING_KEY", "").strip()
 DEVICE_VERIFICATION_TOKEN = os.environ.get("CAMELLIA_REMOTE_DEVICE_VERIFICATION_TOKEN", "").strip()
 if DEVICE_VERIFICATION_TOKEN and (
     not 32 <= len(DEVICE_VERIFICATION_TOKEN) <= 512
@@ -224,11 +412,38 @@ if not DEBUG and not DEVICE_VERIFICATION_TOKEN:
 
 OIDC_PROVIDERS = {}
 OIDC_HTTP_TIMEOUT_SECONDS = env_int("CAMELLIA_REMOTE_OIDC_HTTP_TIMEOUT_SECONDS", 10, 2, 60)
+REQUEST_DEADLINE_SECONDS = env_int(
+    "CAMELLIA_REMOTE_REQUEST_DEADLINE_SECONDS",
+    65,
+    5,
+    590,
+)
+if REQUEST_DEADLINE_SECONDS < OIDC_HTTP_TIMEOUT_SECONDS * 4 + 15:
+    raise ImproperlyConfigured(
+        "CAMELLIA_REMOTE_REQUEST_DEADLINE_SECONDS must cover discovery, token, JWKS, and key-rotation refresh deadlines"
+    )
+OIDC_CALLBACK_CLAIM_LEASE_SECONDS = env_int(
+    "CAMELLIA_REMOTE_OIDC_CALLBACK_CLAIM_LEASE_SECONDS",
+    max(60, OIDC_HTTP_TIMEOUT_SECONDS * 4 + 15),
+    30,
+    600,
+)
+if OIDC_CALLBACK_CLAIM_LEASE_SECONDS < OIDC_HTTP_TIMEOUT_SECONDS * 4 + 15:
+    raise ImproperlyConfigured(
+        "CAMELLIA_REMOTE_OIDC_CALLBACK_CLAIM_LEASE_SECONDS must cover discovery, token, JWKS, and key-rotation refresh deadlines"
+    )
 _oidc_name = os.environ.get("CAMELLIA_REMOTE_OIDC_NAME", "").strip()
 _oidc_issuer = os.environ.get("CAMELLIA_REMOTE_OIDC_ISSUER", "").strip()
 _oidc_client_id = os.environ.get("CAMELLIA_REMOTE_OIDC_CLIENT_ID", "").strip()
 _oidc_client_secret = os.environ.get("CAMELLIA_REMOTE_OIDC_CLIENT_SECRET", "").strip()
 _oidc_redirect_uri = os.environ.get("CAMELLIA_REMOTE_OIDC_REDIRECT_URI", "").strip()
+_oidc_auto_provision = env_bool("CAMELLIA_REMOTE_OIDC_AUTO_PROVISION", False)
+_oidc_auto_provision_email_domains = oidc_auto_provision_email_domains(
+    os.environ.get("CAMELLIA_REMOTE_OIDC_AUTO_PROVISION_EMAIL_DOMAINS", "")
+)
+_oidc_auto_provision_required_claims = oidc_auto_provision_required_claims(
+    os.environ.get("CAMELLIA_REMOTE_OIDC_AUTO_PROVISION_REQUIRED_CLAIMS", "")
+)
 _oidc_values = (
     _oidc_name,
     _oidc_issuer,
@@ -241,6 +456,14 @@ if any(_oidc_values) and not all(_oidc_values):
         "CAMELLIA_REMOTE_OIDC_NAME, CAMELLIA_REMOTE_OIDC_ISSUER, CAMELLIA_REMOTE_OIDC_CLIENT_ID, "
         "CAMELLIA_REMOTE_OIDC_CLIENT_SECRET and CAMELLIA_REMOTE_OIDC_REDIRECT_URI must be configured together"
     )
+if (_oidc_auto_provision or _oidc_auto_provision_email_domains or _oidc_auto_provision_required_claims) and not all(
+    _oidc_values
+):
+    raise ImproperlyConfigured("OIDC auto-provision policy requires a complete OIDC provider configuration")
+if not _oidc_auto_provision and (_oidc_auto_provision_email_domains or _oidc_auto_provision_required_claims):
+    raise ImproperlyConfigured("OIDC auto-provision policy cannot be configured while auto-provision is disabled")
+if _oidc_auto_provision and not (_oidc_auto_provision_email_domains or _oidc_auto_provision_required_claims):
+    raise ImproperlyConfigured("OIDC auto-provision requires an email-domain or exact-claim policy")
 if all(_oidc_values):
     if not re.fullmatch(r"[A-Za-z0-9._-]{1,64}", _oidc_name):
         raise ImproperlyConfigured("CAMELLIA_REMOTE_OIDC_NAME contains unsupported characters")
@@ -271,6 +494,9 @@ if all(_oidc_values):
         "redirect_uri": _oidc_redirect_uri,
         "scope": _oidc_scope,
         "allowed_hosts": _oidc_allowed_hosts,
+        "auto_provision": _oidc_auto_provision,
+        "auto_provision_email_domains": _oidc_auto_provision_email_domains,
+        "auto_provision_required_claims": _oidc_auto_provision_required_claims,
     }
 
 ALLOW_REGISTRATION = env_bool("CAMELLIA_REMOTE_ALLOW_REGISTRATION", False)
@@ -289,6 +515,12 @@ OIDC_PENDING_RETENTION_MINUTES = env_int(
 )
 SHARE_LINK_RETENTION_DAYS = env_int(
     "CAMELLIA_REMOTE_SHARE_LINK_RETENTION_DAYS",
+    30,
+    1,
+    365,
+)
+MANAGEMENT_OPERATION_RETENTION_DAYS = env_int(
+    "CAMELLIA_REMOTE_MANAGEMENT_OPERATION_RETENTION_DAYS",
     30,
     1,
     365,
@@ -312,7 +544,169 @@ RECORD_UPLOAD_MAX_FILE_BYTES = env_int(
 RECORD_UPLOAD_ROOT = Path(os.environ.get("CAMELLIA_REMOTE_RECORD_UPLOAD_ROOT", BASE_DIR / "records"))
 if not RECORD_UPLOAD_ROOT.is_absolute():
     raise ImproperlyConfigured("CAMELLIA_REMOTE_RECORD_UPLOAD_ROOT must be an absolute path")
-DATA_UPLOAD_MAX_MEMORY_SIZE = RECORD_UPLOAD_MAX_CHUNK_BYTES
+RECORD_UPLOAD_MAX_ACTIVE_PER_DEVICE = env_int("CAMELLIA_REMOTE_RECORD_MAX_ACTIVE_PER_DEVICE", 4, 1, 10_000)
+RECORD_UPLOAD_MAX_ACTIVE_PER_OWNER = env_int("CAMELLIA_REMOTE_RECORD_MAX_ACTIVE_PER_OWNER", 32, 1, 100_000)
+RECORD_UPLOAD_MAX_ACTIVE_GLOBAL = env_int("CAMELLIA_REMOTE_RECORD_MAX_ACTIVE_GLOBAL", 512, 1, 1_000_000)
+RECORD_UPLOAD_MAX_FILES_PER_DEVICE = env_int("CAMELLIA_REMOTE_RECORD_MAX_FILES_PER_DEVICE", 100, 1, 1_000_000)
+RECORD_UPLOAD_MAX_FILES_PER_OWNER = env_int("CAMELLIA_REMOTE_RECORD_MAX_FILES_PER_OWNER", 1_000, 1, 10_000_000)
+RECORD_UPLOAD_MAX_FILES_GLOBAL = env_int("CAMELLIA_REMOTE_RECORD_MAX_FILES_GLOBAL", 100_000, 1, 100_000_000)
+RECORD_UPLOAD_MAX_BYTES_PER_DEVICE = env_int(
+    "CAMELLIA_REMOTE_RECORD_MAX_BYTES_PER_DEVICE",
+    100 * 1024 * 1024 * 1024,
+    RECORD_UPLOAD_MAX_FILE_BYTES,
+    1024 * 1024 * 1024 * 1024 * 1024,
+)
+RECORD_UPLOAD_MAX_BYTES_PER_OWNER = env_int(
+    "CAMELLIA_REMOTE_RECORD_MAX_BYTES_PER_OWNER",
+    1024 * 1024 * 1024 * 1024,
+    RECORD_UPLOAD_MAX_BYTES_PER_DEVICE,
+    1024 * 1024 * 1024 * 1024 * 1024,
+)
+RECORD_UPLOAD_MAX_BYTES_GLOBAL = env_int(
+    "CAMELLIA_REMOTE_RECORD_MAX_BYTES_GLOBAL",
+    10 * 1024 * 1024 * 1024 * 1024,
+    RECORD_UPLOAD_MAX_BYTES_PER_OWNER,
+    1024 * 1024 * 1024 * 1024 * 1024,
+)
+if not (
+    RECORD_UPLOAD_MAX_ACTIVE_PER_DEVICE <= RECORD_UPLOAD_MAX_ACTIVE_PER_OWNER <= RECORD_UPLOAD_MAX_ACTIVE_GLOBAL
+    and RECORD_UPLOAD_MAX_FILES_PER_DEVICE <= RECORD_UPLOAD_MAX_FILES_PER_OWNER <= RECORD_UPLOAD_MAX_FILES_GLOBAL
+    and RECORD_UPLOAD_MAX_BYTES_PER_DEVICE <= RECORD_UPLOAD_MAX_BYTES_PER_OWNER <= RECORD_UPLOAD_MAX_BYTES_GLOBAL
+):
+    raise ImproperlyConfigured("Recording owner/global quotas must not be smaller than their child scope")
+RECORD_UPLOAD_ACTIVE_TIMEOUT_MINUTES = env_int(
+    "CAMELLIA_REMOTE_RECORD_ACTIVE_TIMEOUT_MINUTES", 24 * 60, 5, 30 * 24 * 60
+)
+RECORD_UPLOAD_RETENTION_DAYS = env_int("CAMELLIA_REMOTE_RECORD_RETENTION_DAYS", 30, 1, 3650)
+RECORD_UPLOAD_ABORTED_RETENTION_DAYS = env_int("CAMELLIA_REMOTE_RECORD_ABORTED_RETENTION_DAYS", 1, 1, 365)
+RECORD_UPLOAD_ORPHAN_QUARANTINE_DAYS = env_int("CAMELLIA_REMOTE_RECORD_ORPHAN_QUARANTINE_DAYS", 7, 1, 365)
+RECORD_UPLOAD_VOLUME_RESERVE_BYTES = env_int(
+    "CAMELLIA_REMOTE_RECORD_VOLUME_RESERVE_BYTES",
+    2 * 1024 * 1024 * 1024,
+    0,
+    1024 * 1024 * 1024 * 1024,
+)
+RECORD_UPLOAD_VOLUME_RESERVE_INODES = env_int("CAMELLIA_REMOTE_RECORD_VOLUME_RESERVE_INODES", 1024, 0, 100_000_000)
+RECORD_UPLOAD_REQUIRE_MOUNT = env_bool("CAMELLIA_REMOTE_RECORD_REQUIRE_MOUNT", not DEBUG)
+RECORD_UPLOAD_CAPABILITY_CACHE_SECONDS = env_int("CAMELLIA_REMOTE_RECORD_CAPABILITY_CACHE_SECONDS", 2, 0, 60)
+
+DEVICE_INVENTORY_EXPORT_MAX_ROWS = env_int(
+    "CAMELLIA_REMOTE_DEVICE_INVENTORY_EXPORT_MAX_ROWS",
+    100_000,
+    1,
+    1_000_000,
+)
+DEVICE_INVENTORY_EXPORT_MAX_BYTES = env_int(
+    "CAMELLIA_REMOTE_DEVICE_INVENTORY_EXPORT_MAX_BYTES",
+    64 * 1024 * 1024,
+    64 * 1024,
+    1024 * 1024 * 1024,
+)
+DEVICE_INVENTORY_EXPORT_DEADLINE_SECONDS = env_int(
+    "CAMELLIA_REMOTE_DEVICE_INVENTORY_EXPORT_DEADLINE_SECONDS",
+    60,
+    1,
+    600,
+)
+DEVICE_INVENTORY_EXPORT_SPOOL_MEMORY_BYTES = env_int(
+    "CAMELLIA_REMOTE_DEVICE_INVENTORY_EXPORT_SPOOL_MEMORY_BYTES",
+    2 * 1024 * 1024,
+    64 * 1024,
+    64 * 1024 * 1024,
+)
+DEVICE_INVENTORY_EXPORT_CHUNK_SIZE = env_int(
+    "CAMELLIA_REMOTE_DEVICE_INVENTORY_EXPORT_CHUNK_SIZE",
+    1000,
+    1,
+    10_000,
+)
+
+AUDIT_MAX_CONNECTIONS_PER_DEVICE = env_int("CAMELLIA_REMOTE_AUDIT_MAX_CONNECTIONS_PER_DEVICE", 10_000, 1, 10_000_000)
+AUDIT_MAX_CONNECTIONS_PER_OWNER = env_int("CAMELLIA_REMOTE_AUDIT_MAX_CONNECTIONS_PER_OWNER", 100_000, 1, 100_000_000)
+AUDIT_MAX_CONNECTIONS_GLOBAL = env_int("CAMELLIA_REMOTE_AUDIT_MAX_CONNECTIONS_GLOBAL", 10_000_000, 1, 1_000_000_000)
+AUDIT_MAX_EVENTS_PER_CONNECTION = env_int("CAMELLIA_REMOTE_AUDIT_MAX_EVENTS_PER_CONNECTION", 100_000, 2, 10_000_000)
+AUDIT_MAX_EVENTS_PER_DEVICE = env_int("CAMELLIA_REMOTE_AUDIT_MAX_EVENTS_PER_DEVICE", 1_000_000, 2, 100_000_000)
+AUDIT_MAX_EVENTS_PER_OWNER = env_int("CAMELLIA_REMOTE_AUDIT_MAX_EVENTS_PER_OWNER", 10_000_000, 2, 1_000_000_000)
+AUDIT_MAX_EVENTS_GLOBAL = env_int("CAMELLIA_REMOTE_AUDIT_MAX_EVENTS_GLOBAL", 100_000_000, 2, 2_000_000_000)
+if not (
+    AUDIT_MAX_CONNECTIONS_PER_DEVICE <= AUDIT_MAX_CONNECTIONS_PER_OWNER <= AUDIT_MAX_CONNECTIONS_GLOBAL
+    and AUDIT_MAX_EVENTS_PER_DEVICE <= AUDIT_MAX_EVENTS_PER_OWNER <= AUDIT_MAX_EVENTS_GLOBAL
+):
+    raise ImproperlyConfigured("Audit owner/global quotas must not be smaller than their child scope")
+AUDIT_CONNECTION_LEASE_SECONDS = env_int("CAMELLIA_REMOTE_AUDIT_CONNECTION_LEASE_SECONDS", 90, 30, 600)
+AUDIT_RETENTION_DAYS = env_int("CAMELLIA_REMOTE_AUDIT_RETENTION_DAYS", 90, 1, 3650)
+INGESTION_CLEANUP_BATCH_SIZE = env_int("CAMELLIA_REMOTE_INGESTION_CLEANUP_BATCH_SIZE", 100, 1, 1000)
+SEQUENCE_CAPACITY_WARNING_PERCENT = env_int(
+    "CAMELLIA_REMOTE_SEQUENCE_CAPACITY_WARNING_PERCENT",
+    80,
+    1,
+    98,
+)
+SEQUENCE_CAPACITY_CRITICAL_PERCENT = env_int(
+    "CAMELLIA_REMOTE_SEQUENCE_CAPACITY_CRITICAL_PERCENT",
+    95,
+    2,
+    99,
+)
+if SEQUENCE_CAPACITY_CRITICAL_PERCENT <= SEQUENCE_CAPACITY_WARNING_PERCENT:
+    raise ImproperlyConfigured("CAMELLIA_REMOTE_SEQUENCE_CAPACITY_CRITICAL_PERCENT must exceed the warning threshold")
+
+# JSON endpoints reject oversized input before Django materializes or parses it.
+# These route budgets are deliberately independent from recording chunks: a
+# larger recording setting must never expand the login/control-plane contract.
+JSON_AUTH_MAX_BODY_BYTES = env_int(
+    "CAMELLIA_REMOTE_JSON_AUTH_MAX_BODY_BYTES",
+    32 * 1024,
+    4 * 1024,
+    1024 * 1024,
+)
+JSON_CONTROL_MAX_BODY_BYTES = env_int(
+    "CAMELLIA_REMOTE_JSON_CONTROL_MAX_BODY_BYTES",
+    64 * 1024,
+    JSON_AUTH_MAX_BODY_BYTES,
+    1024 * 1024,
+)
+JSON_AUDIT_MAX_BODY_BYTES = env_int(
+    "CAMELLIA_REMOTE_JSON_AUDIT_MAX_BODY_BYTES",
+    64 * 1024,
+    32 * 1024,
+    1024 * 1024,
+)
+JSON_MANAGEMENT_BATCH_MAX_BODY_BYTES = env_int(
+    "CAMELLIA_REMOTE_JSON_MANAGEMENT_BATCH_MAX_BODY_BYTES",
+    256 * 1024,
+    JSON_CONTROL_MAX_BODY_BYTES,
+    4 * 1024 * 1024,
+)
+JSON_ADDRESS_BOOK_BULK_MAX_BODY_BYTES = env_int(
+    "CAMELLIA_REMOTE_JSON_ADDRESS_BOOK_BULK_MAX_BODY_BYTES",
+    4 * 1024 * 1024,
+    JSON_MANAGEMENT_BATCH_MAX_BODY_BYTES,
+    16 * 1024 * 1024,
+)
+JSON_SHARE_EMBEDDED_MAX_BYTES = env_int(
+    "CAMELLIA_REMOTE_JSON_SHARE_EMBEDDED_MAX_BYTES",
+    16 * 1024,
+    1024,
+    64 * 1024,
+)
+JSON_SHARE_FORM_MAX_BODY_BYTES = env_int(
+    "CAMELLIA_REMOTE_JSON_SHARE_FORM_MAX_BODY_BYTES",
+    64 * 1024,
+    JSON_SHARE_EMBEDDED_MAX_BYTES,
+    1024 * 1024,
+)
+
+# Django still needs one operational materialization ceiling for request.body.
+# It is derived rather than operator-tuned and is not an endpoint contract:
+# recording and strict JSON helpers enforce their own smaller limits and exact
+# framing before parsing or mutation.
+_minimum_request_body_materialization_bytes = max(
+    RECORD_UPLOAD_MAX_CHUNK_BYTES,
+    JSON_ADDRESS_BOOK_BULK_MAX_BODY_BYTES,
+    JSON_SHARE_FORM_MAX_BODY_BYTES,
+)
+DATA_UPLOAD_MAX_MEMORY_SIZE = _minimum_request_body_materialization_bytes
 DATA_UPLOAD_MAX_NUMBER_FIELDS = env_int("CAMELLIA_REMOTE_DATA_UPLOAD_MAX_NUMBER_FIELDS", 1000, 100, 10000)
 DATA_UPLOAD_MAX_NUMBER_FILES = 0
 FILE_UPLOAD_PERMISSIONS = 0o600
@@ -324,6 +718,84 @@ DATABASE_NAME = os.environ.get("CAMELLIA_REMOTE_DATABASE_NAME", "").strip()
 DATABASE_USER = os.environ.get("CAMELLIA_REMOTE_DATABASE_USER", "").strip()
 DATABASE_PASSWORD = os.environ.get("CAMELLIA_REMOTE_DATABASE_PASSWORD", "")
 SQLITE_DB_PATH = os.environ.get("CAMELLIA_REMOTE_SQLITE_DB_PATH", "").strip()
+MIGRATION_LOCK_TIMEOUT_SECONDS = env_int("CAMELLIA_REMOTE_MIGRATION_LOCK_TIMEOUT_SECONDS", 120, 1, 900)
+DATABASE_OPERATION_PROFILE = env_choice(
+    "CAMELLIA_REMOTE_DATABASE_OPERATION_PROFILE",
+    "RUNTIME",
+    {"RUNTIME", "MIGRATION", "CLEANUP", "BACKUP"},
+)
+_database_deadline_defaults = {
+    "RUNTIME": (45_000, 5_000, 15_000, 50_000),
+    "MIGRATION": (1_800_000, 300_000, 120_000, 2_100_000),
+    "CLEANUP": (180_000, 15_000, 30_000, 240_000),
+    "BACKUP": (2_400_000, 30_000, 60_000, 2_700_000),
+}
+_database_statement_default, _database_lock_default, _database_idle_default, _database_operation_default = (
+    _database_deadline_defaults[DATABASE_OPERATION_PROFILE]
+)
+_database_profile_prefix = f"CAMELLIA_REMOTE_DATABASE_{DATABASE_OPERATION_PROFILE}_"
+DATABASE_STATEMENT_TIMEOUT_MS = env_int(
+    f"{_database_profile_prefix}STATEMENT_TIMEOUT_MS",
+    _database_statement_default,
+    100,
+    3_600_000,
+)
+DATABASE_LOCK_TIMEOUT_MS = env_int(
+    f"{_database_profile_prefix}LOCK_TIMEOUT_MS",
+    _database_lock_default,
+    100,
+    900_000,
+)
+DATABASE_IDLE_TRANSACTION_TIMEOUT_MS = env_int(
+    f"{_database_profile_prefix}IDLE_TRANSACTION_TIMEOUT_MS",
+    _database_idle_default,
+    1_000,
+    900_000,
+)
+DATABASE_OPERATION_DEADLINE_MS = env_int(
+    f"{_database_profile_prefix}OPERATION_DEADLINE_MS",
+    _database_operation_default,
+    1_000,
+    3_900_000,
+)
+DATABASE_KEEPALIVES_IDLE_SECONDS = env_int(
+    "CAMELLIA_REMOTE_DATABASE_KEEPALIVES_IDLE_SECONDS",
+    10,
+    1,
+    300,
+)
+DATABASE_KEEPALIVES_INTERVAL_SECONDS = env_int(
+    "CAMELLIA_REMOTE_DATABASE_KEEPALIVES_INTERVAL_SECONDS",
+    5,
+    1,
+    60,
+)
+DATABASE_KEEPALIVES_COUNT = env_int(
+    "CAMELLIA_REMOTE_DATABASE_KEEPALIVES_COUNT",
+    3,
+    1,
+    20,
+)
+DATABASE_TCP_USER_TIMEOUT_MS = env_int(
+    "CAMELLIA_REMOTE_DATABASE_TCP_USER_TIMEOUT_MS",
+    30_000,
+    1_000,
+    300_000,
+)
+if DATABASE_LOCK_TIMEOUT_MS > DATABASE_STATEMENT_TIMEOUT_MS:
+    raise ImproperlyConfigured("database lock timeout must not exceed statement timeout")
+if DATABASE_STATEMENT_TIMEOUT_MS >= DATABASE_OPERATION_DEADLINE_MS:
+    raise ImproperlyConfigured("database statement timeout must be shorter than the operation deadline")
+if DATABASE_IDLE_TRANSACTION_TIMEOUT_MS >= DATABASE_OPERATION_DEADLINE_MS:
+    raise ImproperlyConfigured("database idle transaction timeout must be shorter than the operation deadline")
+if DATABASE_TCP_USER_TIMEOUT_MS >= DATABASE_OPERATION_DEADLINE_MS:
+    raise ImproperlyConfigured("database TCP user timeout must be shorter than the operation deadline")
+if (
+    DATABASE_KEEPALIVES_IDLE_SECONDS + DATABASE_KEEPALIVES_INTERVAL_SECONDS * DATABASE_KEEPALIVES_COUNT
+) * 1000 >= DATABASE_OPERATION_DEADLINE_MS:
+    raise ImproperlyConfigured("database keepalive failure detection must be shorter than the operation deadline")
+if DATABASE_OPERATION_PROFILE == "RUNTIME" and REQUEST_DEADLINE_SECONDS * 1000 <= DATABASE_OPERATION_DEADLINE_MS:
+    raise ImproperlyConfigured("HTTP request deadline must exceed the runtime database operation deadline")
 if SQLITE_DB_PATH and not Path(SQLITE_DB_PATH).is_absolute():
     raise ImproperlyConfigured("CAMELLIA_REMOTE_SQLITE_DB_PATH must be an absolute path")
 
@@ -332,24 +804,31 @@ LANGUAGE_CODE = os.environ.get("CAMELLIA_REMOTE_LANGUAGE_CODE", "zh-hans")
 # Application definition
 
 INSTALLED_APPS = [
-    "django.contrib.admin",
+    "api.admin_config.CamelliaAdminConfig",
     "django.contrib.auth",
     "django.contrib.contenttypes",
     "django.contrib.sessions",
     "django.contrib.messages",
+    "django.contrib.postgres",
     "django.contrib.staticfiles",
     "api.apps.ApiConfig",
     "webui2.apps.Webui2Config",
 ]
 
 MIDDLEWARE = [
+    "api.middleware.RequestDeadlineMiddleware",
+    "api.middleware.SafeAccessLogMiddleware",
+    "api.middleware.DatabaseDeadlineMiddleware",
+    "api.rate_limits.IngressRateLimitMiddleware",
     "django.middleware.security.SecurityMiddleware",
     "django.middleware.csp.ContentSecurityPolicyMiddleware",
     "whitenoise.middleware.WhiteNoiseMiddleware",
     "django.contrib.sessions.middleware.SessionMiddleware",
     "django.middleware.common.CommonMiddleware",
-    "django.middleware.csrf.CsrfViewMiddleware",
     "django.contrib.auth.middleware.AuthenticationMiddleware",
+    "api.rate_limits.RateLimitMiddleware",
+    "api.middleware.StrictShareJsonPreflightMiddleware",
+    "django.middleware.csrf.CsrfViewMiddleware",
     "django.contrib.messages.middleware.MessageMiddleware",
     "api.middleware.ApiExceptionMiddleware",
     "django.middleware.clickjacking.XFrameOptionsMiddleware",
@@ -437,7 +916,17 @@ def _database_tls_options(database_host):
 
     options = {
         "connect_timeout": env_int("CAMELLIA_REMOTE_DATABASE_CONNECT_TIMEOUT", 10, 1, 60),
+        "keepalives": 1,
+        "keepalives_count": DATABASE_KEEPALIVES_COUNT,
+        "keepalives_idle": DATABASE_KEEPALIVES_IDLE_SECONDS,
+        "keepalives_interval": DATABASE_KEEPALIVES_INTERVAL_SECONDS,
+        "options": (
+            f"-c statement_timeout={DATABASE_STATEMENT_TIMEOUT_MS} "
+            f"-c lock_timeout={DATABASE_LOCK_TIMEOUT_MS} "
+            f"-c idle_in_transaction_session_timeout={DATABASE_IDLE_TRANSACTION_TIMEOUT_MS}"
+        ),
         "sslmode": sslmode,
+        "tcp_user_timeout": DATABASE_TCP_USER_TIMEOUT_MS,
     }
     certificate_options = {
         "CAMELLIA_REMOTE_DATABASE_SSLROOTCERT": "sslrootcert",
@@ -592,11 +1081,26 @@ LOGGING = {
             "style": "{",
             "datefmt": "%Y-%m-%d %H:%M:%S",
         },
+        "structured_event": {
+            "()": "camellia_remote_management.observability.StructuredEventFormatter",
+        },
+    },
+    "filters": {
+        "safe_django_request": {
+            "()": "camellia_remote_management.access_logging.SafeDjangoRequestFilter",
+        },
     },
     "handlers": {
         "console": {
             "class": "logging.StreamHandler",
             "formatter": "standard",
+            "filters": ["safe_django_request"],
+            "level": LOG_LEVEL,
+        },
+        "structured_console": {
+            "class": "logging.StreamHandler",
+            "formatter": "structured_event",
+            "filters": ["safe_django_request"],
             "level": LOG_LEVEL,
         },
     },
@@ -606,7 +1110,7 @@ LOGGING = {
     },
     "loggers": {
         "django": {"handlers": ["console"], "level": LOG_LEVEL, "propagate": False},
-        "api": {"handlers": ["console"], "level": LOG_LEVEL, "propagate": False},
+        "api": {"handlers": ["structured_console"], "level": LOG_LEVEL, "propagate": False},
     },
 }
 STATIC_URL = "/static/"

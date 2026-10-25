@@ -3,11 +3,11 @@ name = "camellia-remote-management-server"
 version = "1.0.0"
 description = "Production management API and web console for Camellia Remote"
 readme = "README.md"
-requires-python = ">=3.13"
+requires-python = ">=3.13,<3.16"
 license = "AGPL-3.0-only"
 authors = [{ name = "Camellia Computing" }]
 dependencies = [
-  "django>=6.0,<7.0",
+  "django>=6.1.2,<6.2",
   "openpyxl>=3.1,<4",
   "gunicorn>=26,<27",
   "whitenoise>=6.12,<7",
@@ -15,20 +15,27 @@ dependencies = [
   "requests>=2.32,<3",
   "pynacl>=1.6,<2",
   "psycopg[binary]>=3.3,<4",
+  "unicodedata2==16.0.0; python_version != '3.14'",
 ]
 
 [dependency-groups]
 dev = [
+  "defusedxml>=0.7.1,<1",
   "ruff>=0.17.2,<0.18",
   "pytest>=9,<10",
   "pytest-django>=4.12,<5",
   "coverage>=7.15,<8",
+  "hypothesis>=6.138,<7",
 ]
 
 [tool.uv]
 package = false
-# The lockfile is shared by CI and hosted dependency updates.
-required-version = ">=0.11.8,<0.14"
+# Hash-verified build constraints require the same uv used by CI and Docker.
+required-version = ">=0.13.5,<0.14"
+require-build-hashes = true
+build-constraint-dependencies = [
+  { requirement = "setuptools==83.0.0", hashes = ["sha256:29b23c360f22f414dc7336bb39178cc7bcbf6021ed2733cde173f09dba19abb3", "sha256:025bccbbf0fa05b6192bc64ae1e7b16e001fd6d6d4d5de03c97b1c1ade523bef"] },
+]
 
 [tool.ruff]
 target-version = "py313"
@@ -44,9 +51,17 @@ select = ["E", "F", "B", "BLE", "C4", "I", "PIE", "RUF059", "S", "UP"]
 ignore = ["E501"]
 
 [tool.ruff.lint.per-file-ignores]
+".github/scripts/ci_coverage_contract.py" = ["S603", "S607"]
 "api/migrations/*" = ["I", "S"]
 "api/tests.py" = ["S105", "S106"]
+"api/test_shared_profile_credentials.py" = ["S105", "S106"]
 "webui2/tests.py" = ["S106"]
+"scripts/test_backup_*.py" = ["S603"]
+"scripts/test_systemd_maintenance.py" = ["S603"]
+"scripts/test_deployment_gate.py" = ["S603"]
+"scripts/test_management_supervisor.py" = ["S603"]
+"scripts/test_shutdown_budget.py" = ["S603"]
+"scripts/test_database_roles.py" = ["S603", "S607", "S608"]
 
 [tool.pytest.ini_options]
 DJANGO_SETTINGS_MODULE = "camellia_remote_management.settings"
@@ -54,9 +69,11 @@ python_files = ["tests.py", "test_*.py", "*_tests.py"]
 addopts = "--strict-markers --reuse-db"
 
 [tool.coverage.run]
+branch = true
 source = ["api", "webui2", "camellia_remote_management"]
 omit = [
   "*/migrations/*",
+  "*/test_*.py",
   "*/tests.py",
   "api/front_locale.py",
   "camellia_remote_management/asgi.py",
@@ -64,7 +81,17 @@ omit = [
 ]
 
 [tool.coverage.report]
-fail_under = 45
+# Branch-aware total floor is evidence-backed by the current 73.3% production baseline;
+# critical module and changed-line floors are enforced by ci_coverage_contract.
+fail_under = 70
+omit = [
+  "*/migrations/*",
+  "*/test_*.py",
+  "*/tests.py",
+  "api/front_locale.py",
+  "camellia_remote_management/asgi.py",
+  "camellia_remote_management/wsgi.py",
+]
 precision = 1
 skip_covered = true
 show_missing = true

@@ -1,14 +1,25 @@
 [Unit]
 Description=Remove expired Camellia Remote Management authentication state
-Requires=camellia-remote-management-stack.service
 After=camellia-remote-management-stack.service
+OnFailure=camellia-remote-management-maintenance-failure@%n.service
 
 [Service]
 Type=oneshot
-ExecStart=/usr/bin/docker compose --env-file /etc/camellia-remote-management/management.env -f /opt/camellia-remote-management/docker-compose.yaml exec -T management python manage.py purge_expired_state
+EnvironmentFile=/etc/camellia-remote-management/management.env
+ExecStartPre=/usr/bin/test -x /opt/camellia-remote-management/run-cleanup.sh
+ExecStartPre=/usr/bin/test -x /opt/camellia-remote-management/deploy/run-compose-operation.sh
+ExecStartPre=/usr/bin/test -f /opt/camellia-remote-management/scripts/maintenance_ledger.py
+ExecStartPre=/usr/bin/test ! -L /opt/camellia-remote-management/scripts/maintenance_ledger.py
+ExecStartPre=/usr/bin/test -x /opt/camellia-remote-management/deploy/run-maintenance-cleanup.sh
+ExecStart=/opt/camellia-remote-management/deploy/run-maintenance-cleanup.sh
+TimeoutStartSec=11min
+TimeoutStopSec=1min
+KillMode=control-group
 User=root
 Group=root
 UMask=0077
+StateDirectory=camellia-remote-management/maintenance
+StateDirectoryMode=0700
 Nice=10
 CapabilityBoundingSet=
 MemoryDenyWriteExecute=yes
@@ -20,6 +31,7 @@ ProtectHostname=yes
 ProtectProc=invisible
 ProtectSystem=strict
 ProtectHome=yes
+ReadWritePaths=/var/lib/camellia-remote-management/maintenance
 ProtectKernelLogs=yes
 ProtectKernelModules=yes
 ProtectKernelTunables=yes

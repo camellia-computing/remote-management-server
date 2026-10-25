@@ -1,0 +1,85 @@
+{
+  "schema_version": 1,
+  "symbols": [
+    {
+      "path": "api.audit_expressions.AuditSearchDocument",
+      "kind": "expression",
+      "deconstruct_path": "api.audit_expressions.AuditSearchDocument",
+      "consumers": ["0021_audit_ordering_indexes.py"]
+    },
+    {
+      "path": "api.encrypted_fields.EncryptedTextField",
+      "kind": "field",
+      "deconstruct_path": "api.encrypted_fields.EncryptedTextField",
+      "consumers": [
+        "0001_initial.py",
+        "0010_addressbookprofile_default_password.py",
+        "0016_recording_encryption.py",
+        "0032_context_bound_encrypted_fields.py",
+        "0033_mutation_generations.py"
+      ]
+    },
+    {
+      "path": "api.encrypted_fields.FIELD_PREFIX",
+      "kind": "constant",
+      "consumers": ["0032_context_bound_encrypted_fields.py"]
+    },
+    {
+      "path": "api.encrypted_fields.LEGACY_FIELD_PREFIX",
+      "kind": "constant",
+      "consumers": ["0032_context_bound_encrypted_fields.py"]
+    },
+    {
+      "path": "api.encrypted_fields.UNBOUND_FIELD_PREFIX",
+      "kind": "constant",
+      "consumers": ["0032_context_bound_encrypted_fields.py"]
+    },
+    {
+      "path": "api.encrypted_fields.build_encryption_context",
+      "kind": "callable",
+      "consumers": ["0032_context_bound_encrypted_fields.py"]
+    },
+    {
+      "path": "api.encrypted_fields.decrypt_text",
+      "kind": "callable",
+      "consumers": ["0032_context_bound_encrypted_fields.py"]
+    },
+    {
+      "path": "api.encrypted_fields.encrypt_text",
+      "kind": "callable",
+      "consumers": ["0032_context_bound_encrypted_fields.py"]
+    },
+    {
+      "path": "api.models_user.MyUserManager",
+      "kind": "manager",
+      "deconstruct_path": "api.models_user.MyUserManager",
+      "consumers": ["0001_initial.py"]
+    },
+    {
+      "path": "api.models_work.share_link_expiry",
+      "kind": "callable",
+      "consumers": ["0001_initial.py"]
+    },
+    {
+      "path": "api.username_unicode16.canonical_username_key",
+      "kind": "callable",
+      "consumers": ["0034_frozen_username_identity.py"]
+    },
+    {
+      "path": "api.username_unicode16.normalize_username",
+      "kind": "callable",
+      "consumers": ["0034_frozen_username_identity.py"]
+    },
+    {
+      "path": "api.username_unicode16.require_unicode_version",
+      "kind": "callable",
+      "consumers": ["0034_frozen_username_identity.py"]
+    },
+    {
+      "path": "api.username_validators.Unicode16UsernameValidator",
+      "kind": "validator",
+      "deconstruct_path": "api.username_validators.Unicode16UsernameValidator",
+      "consumers": ["0034_frozen_username_identity.py"]
+    }
+  ]
+}

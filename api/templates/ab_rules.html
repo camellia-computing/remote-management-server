@@ -7,7 +7,7 @@
   <a class="btn btn-secondary btn-xs" href="/api/ab_manage">{% trans "返回权限配置" %}</a>
   <a class="btn btn-ghost btn-xs" href="/api/ab_audit">{% trans "规则审计" %}</a>
   <a class="btn btn-ghost btn-xs" href="/api/ab_rules_export?format=csv{% if filter_q %}&q={{ filter_q|urlencode }}{% endif %}">{% trans "导出 CSV" %}</a>
-  <a class="btn btn-ghost btn-xs" href="/api/ab_rules_export?format=xls{% if filter_q %}&q={{ filter_q|urlencode }}{% endif %}">{% trans "导出 Excel" %}</a>
+  <a class="btn btn-ghost btn-xs" href="/api/ab_rules_export?format=xlsx{% if filter_q %}&q={{ filter_q|urlencode }}{% endif %}">{% trans "导出 Excel" %}</a>
 {% endblock %}
 
 {% block content %}
@@ -70,7 +70,7 @@
   </div>
 {% endif %}
 
-<form id="ab-bulk-form" class="ab-bulk" method="post" action="/api/ab_rules">
+<form id="ab-bulk-form" class="ab-bulk" method="post" action="/api/ab_rules" data-replayable-address-book data-expected-generations="{{ rule_generation_map|escape }}">
   {% csrf_token %}
   {% if filter_q %}
     <input type="hidden" name="q" value="{{ filter_q }}">
@@ -106,7 +106,7 @@
             <div class="item-meta">{{ entry.profile_guid }}</div>
           </div>
           <label class="ab-peer-select">
-            <input form="ab-bulk-form" class="ab-check" type="checkbox" name="selected" value="{{ entry.guid }}" aria-label="{% trans "选择" %}">
+            <input form="ab-bulk-form" class="ab-check" type="checkbox" name="selected" value="{{ entry.guid }}" data-profile-guid="{{ entry.profile_guid }}" aria-label="{% trans "选择" %}">
             <span>{% trans "选择" %}</span>
           </label>
         </div>
@@ -129,7 +129,7 @@
           </div>
         </div>
         <div class="action-stack">
-          <form class="action-panel" method="post" action="/api/ab_rules">
+          <form class="action-panel" method="post" action="/api/ab_rules" data-replayable-address-book data-expected-generation="{{ entry.authorization_generation }}">
             {% csrf_token %}
             {% if filter_q %}
               <input type="hidden" name="q" value="{{ filter_q }}">
@@ -146,7 +146,7 @@
               <button class="btn btn-ghost btn-xs" type="submit">{% trans "更新" %}</button>
             </div>
           </form>
-          <form class="action-panel action-panel--danger" method="post" action="/api/ab_rules" data-confirm="{% trans "此操作不可撤销。确认继续？" %}">
+          <form class="action-panel action-panel--danger" method="post" action="/api/ab_rules" data-replayable-address-book data-expected-generation="{{ entry.authorization_generation }}" data-confirm="{% trans "此操作不可撤销。确认继续？" %}">
             {% csrf_token %}
             {% if filter_q %}
               <input type="hidden" name="q" value="{{ filter_q }}">

@@ -3,31 +3,84 @@ from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.http import require_http_methods
 
 from api import views_api, views_front
+from api.replayable_mutations import replayable_stateless_api
+from api.response_contract import (
+    RESPONSE_MODE_BROWSER,
+    RESPONSE_MODE_BROWSER_JSON_POST,
+    RESPONSE_MODE_JSON,
+    RESPONSE_MODE_MARKER,
+)
+from api.response_security import credential_response, sensitive_response
 
 
 def stateless_api(view, *methods):
     """Declare the method contract for APIs that never authenticate by cookie."""
-    return csrf_exempt(require_http_methods(methods)(view))
+    wrapped = csrf_exempt(require_http_methods(methods)(view))
+    setattr(wrapped, RESPONSE_MODE_MARKER, RESPONSE_MODE_JSON)
+    return wrapped
 
 
 def browser_view(view, *methods):
     """Declare the method contract while retaining session and CSRF protection."""
-    return require_http_methods(methods)(view)
+    wrapped = sensitive_response(require_http_methods(methods)(view))
+    setattr(wrapped, RESPONSE_MODE_MARKER, RESPONSE_MODE_BROWSER)
+    return wrapped
+
+
+def browser_json_post_view(view, *methods):
+    """Use browser HTML for GET and the machine contract for POST."""
+
+    wrapped = sensitive_response(require_http_methods(methods)(view))
+    setattr(wrapped, RESPONSE_MODE_MARKER, RESPONSE_MODE_BROWSER_JSON_POST)
+    return wrapped
+
+
+def credential_stateless_api(view, *methods):
+    return credential_response(stateless_api(view, *methods))
+
+
+def credential_stateless_browser(view, *methods):
+    """Declare a CSRF-free browser handoff such as the OIDC callback."""
+
+    wrapped = credential_response(csrf_exempt(require_http_methods(methods)(view)))
+    setattr(wrapped, RESPONSE_MODE_MARKER, RESPONSE_MODE_BROWSER)
+    return wrapped
+
+
+def credential_browser_view(view, *methods):
+    return credential_response(browser_view(view, *methods))
+
+
+def credential_browser_json_post_view(view, *methods):
+    return credential_response(browser_json_post_view(view, *methods))
+
+
+def credential_hybrid_read_api(view):
+    """A no-store JSON GET authenticated by bearer token or browser session."""
+
+    wrapped = credential_response(require_http_methods(("GET",))(view))
+    setattr(wrapped, RESPONSE_MODE_MARKER, RESPONSE_MODE_JSON)
+    return wrapped
 
 
 urlpatterns = [
+    url(
+        r"^management-operations/(?P<operation_id>[^/]+)$",
+        credential_hybrid_read_api(views_api.management_operation_receipt),
+    ),
     url(r"^login-options$", stateless_api(views_api.login_options, "GET")),
-    url(r"^oidc/auth$", stateless_api(views_api.oidc_auth, "POST")),
-    url(r"^oidc/auth-query$", stateless_api(views_api.oidc_auth_query, "GET")),
-    url(r"^oidc/callback$", stateless_api(views_api.oidc_callback, "GET")),
-    url(r"^login$", stateless_api(views_api.login, "POST")),
-    url(r"^logout$", stateless_api(views_api.logout, "POST")),
-    url(r"^currentUser$", stateless_api(views_api.currentUser, "POST")),
+    url(r"^oidc/auth$", credential_stateless_api(views_api.oidc_auth, "POST")),
+    url(r"^oidc/auth-query$", credential_stateless_api(views_api.oidc_auth_query, "POST")),
+    url(r"^oidc/callback$", credential_stateless_browser(views_api.oidc_callback, "GET")),
+    url(r"^login$", credential_stateless_api(views_api.login, "POST")),
+    url(r"^logout$", credential_stateless_api(views_api.logout, "POST")),
+    url(r"^currentUser$", credential_stateless_api(views_api.currentUser, "POST")),
     url(r"^sysinfo_ver$", stateless_api(views_api.sysinfo_ver, "POST")),
     url(r"^sysinfo$", stateless_api(views_api.sysinfo, "POST")),
-    url(r"^heartbeat$", stateless_api(views_api.heartbeat, "POST")),
+    url(r"^heartbeat$", credential_stateless_api(views_api.heartbeat, "POST")),
     url(r"^record$", stateless_api(views_api.record, "POST")),
     url(r"^devices/cli$", stateless_api(views_api.devices_cli, "POST")),
+    url(r"^devices/proof-challenge$", stateless_api(views_api.devices_proof_challenge, "POST")),
     url(r"^devices/deploy$", stateless_api(views_api.devices_deploy, "POST")),
     url(r"^devices/verify-deployment$", stateless_api(views_api.devices_verify_deployment, "POST")),
     url(
@@ -37,21 +90,22 @@ urlpatterns = [
     url(r"^audit$", stateless_api(views_api.audit_root, "PUT")),
     url(r"^ab/settings$", stateless_api(views_api.ab_settings, "POST")),
     url(r"^ab/personal$", stateless_api(views_api.ab_personal, "POST")),
-    url(r"^ab/shared/profiles$", stateless_api(views_api.ab_shared_profiles, "POST")),
+    url(r"^ab/shared/profiles$", credential_stateless_api(views_api.ab_shared_profiles, "POST")),
+    url(r"^ab/shared/credential$", credential_stateless_api(views_api.ab_shared_credential, "POST")),
     url(r"^ab/shared/add$", stateless_api(views_api.ab_shared_add, "POST")),
     url(r"^ab/shared/update/profile$", stateless_api(views_api.ab_shared_update_profile, "PUT")),
     url(r"^ab/shared$", stateless_api(views_api.ab_shared_delete, "DELETE")),
-    url(r"^ab/peers$", stateless_api(views_api.ab_peers, "POST")),
+    url(r"^ab/peers$", credential_stateless_api(views_api.ab_peers, "POST")),
     url(r"^ab/tags/(?P<guid>[^/]+)$", stateless_api(views_api.ab_tags, "POST")),
-    url(r"^ab/peer/add/(?P<guid>[^/]+)$", stateless_api(views_api.ab_peer_add, "POST")),
-    url(r"^ab/peer/update/(?P<guid>[^/]+)$", stateless_api(views_api.ab_peer_update, "PUT")),
-    url(r"^ab/peer/(?P<guid>[^/]+)$", stateless_api(views_api.ab_peer_delete, "DELETE")),
-    url(r"^ab/tag/add/(?P<guid>[^/]+)$", stateless_api(views_api.ab_tag_add, "POST")),
-    url(r"^ab/tag/rename/(?P<guid>[^/]+)$", stateless_api(views_api.ab_tag_rename, "PUT")),
-    url(r"^ab/tag/update/(?P<guid>[^/]+)$", stateless_api(views_api.ab_tag_update, "PUT")),
-    url(r"^ab/tag/(?P<guid>[^/]+)$", stateless_api(views_api.ab_tag_delete, "DELETE")),
-    url(r"^ab/rules$", stateless_api(views_api.ab_rules, "GET", "DELETE")),
-    url(r"^ab/rule$", stateless_api(views_api.ab_rule, "POST", "PATCH")),
+    url(r"^ab/peer/add/(?P<guid>[^/]+)$", replayable_stateless_api(views_api.ab_peer_add, "address_book_peer_add", "POST")),
+    url(r"^ab/peer/update/(?P<guid>[^/]+)$", replayable_stateless_api(views_api.ab_peer_update, "address_book_peer_update", "PUT")),
+    url(r"^ab/peer/(?P<guid>[^/]+)$", replayable_stateless_api(views_api.ab_peer_delete, "address_book_peer_delete", "DELETE")),
+    url(r"^ab/tag/add/(?P<guid>[^/]+)$", replayable_stateless_api(views_api.ab_tag_add, "address_book_tag_add", "POST")),
+    url(r"^ab/tag/rename/(?P<guid>[^/]+)$", replayable_stateless_api(views_api.ab_tag_rename, "address_book_tag_rename", "PUT")),
+    url(r"^ab/tag/update/(?P<guid>[^/]+)$", replayable_stateless_api(views_api.ab_tag_update, "address_book_tag_update", "PUT")),
+    url(r"^ab/tag/(?P<guid>[^/]+)$", replayable_stateless_api(views_api.ab_tag_delete, "address_book_tag_delete", "DELETE")),
+    url(r"^ab/rules$", replayable_stateless_api(views_api.ab_rules, "address_book_rule_delete", "GET", "DELETE")),
+    url(r"^ab/rule$", replayable_stateless_api(views_api.ab_rule, "address_book_rule_mutation", "POST", "PATCH")),
     url(r"^device-group/accessible$", stateless_api(views_api.device_group_accessible, "GET")),
     url(r"^device-groups$", stateless_api(views_api.device_groups, "GET", "POST")),
     url(
@@ -70,6 +124,10 @@ urlpatterns = [
     url(
         r"^devices/(?P<guid>[^/]+)/enable$",
         stateless_api(lambda request, guid: views_api.device_status(request, guid, "enable"), "POST"),
+    ),
+    url(
+        r"^devices/(?P<guid>[^/]+)/approve-recovery$",
+        stateless_api(views_api.device_approve_recovery, "POST"),
     ),
     url(r"^devices/(?P<guid>[^/]+)/assign$", stateless_api(views_api.device_assign, "POST")),
     url(r"^devices/(?P<guid>[^/]+)$", stateless_api(views_api.device_delete, "DELETE")),
@@ -92,7 +150,7 @@ urlpatterns = [
         stateless_api(views_api.strategy_detail, "GET", "PATCH", "DELETE"),
     ),
     url(r"^peers$", stateless_api(views_api.peers, "GET")),
-    url(r"^user_action$", browser_view(views_front.user_action, "GET", "POST")),
+    url(r"^user_action$", browser_json_post_view(views_front.user_action, "GET", "POST")),
     url(r"^home$", browser_view(views_front.home, "GET")),
     url(r"^work$", browser_view(views_front.work, "GET")),
     url(r"^ab_dashboard$", browser_view(views_front.ab_dashboard, "GET")),
@@ -108,10 +166,10 @@ urlpatterns = [
     url(r"^ab_rules$", browser_view(views_front.ab_rules, "GET", "POST")),
     url(r"^ab_audit$", browser_view(views_front.ab_audit, "GET")),
     url(r"^down_peers$", browser_view(views_front.down_peers, "GET")),
-    url(r"^share$", browser_view(views_front.share, "GET", "POST")),
+    url(r"^share$", credential_browser_json_post_view(views_front.share, "GET", "POST")),
     url(
         r"^share/(?P<share_token>[A-Za-z0-9_-]{32,128})$",
-        browser_view(views_front.share, "GET", "POST"),
+        credential_browser_view(views_front.share, "GET", "POST"),
     ),
     url(r"^conn_log$", browser_view(views_front.conn_log, "GET")),
     url(r"^file_log$", browser_view(views_front.file_log, "GET")),

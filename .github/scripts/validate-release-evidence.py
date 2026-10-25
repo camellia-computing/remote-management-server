@@ -6,7 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import re
-from datetime import date, datetime, timezone
+from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any
 
@@ -39,6 +39,7 @@ ROOT_KEYS = {
     "files",
     "images",
 }
+DEPLOYMENT_ROOT_KEYS = ROOT_KEYS | {"deployment"}
 SOURCE_KEYS = {"commit", "ref", "validation_run_id"}
 POLICY_KEYS = {
     "repository_policy_revision",
@@ -92,10 +93,9 @@ IMAGE_SIGNATURE_KEYS = {
     "issuer",
     "evidence",
 }
+DEPLOYMENT_KEYS = {"bom", "attestation"}
 LOGICAL_ID_PATTERN = r"[a-z0-9]+(?:-[a-z0-9]+)*"
-SEMVER_PATTERN = (
-    r"[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z]+(?:\.[0-9A-Za-z]+)*)?"
-)
+SEMVER_PATTERN = r"[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z]+(?:\.[0-9A-Za-z]+)*)?"
 REVISION_PATTERN = r"20[0-9]{2}-[0-9]{2}-[0-9]{2}\.[1-9][0-9]*"
 DIGEST_PATTERN = r"sha256:[0-9a-f]{64}"
 
@@ -185,12 +185,7 @@ def validate_signing(
         raise ValueError(f"{location}.distribution is invalid")
 
     if category == "not-applicable":
-        if (
-            verification != "not-applicable"
-            or verifier != "none"
-            or timestamp != "not-applicable"
-            or evidence
-        ):
+        if verification != "not-applicable" or verifier != "none" or timestamp != "not-applicable" or evidence:
             raise ValueError(f"{location} contradicts its not-applicable category")
         if platform not in {"source", "web"}:
             raise ValueError(f"{location} is not applicable only to source or Web files")
@@ -207,22 +202,14 @@ def validate_signing(
     if distribution == "source-only" and platform != "source":
         raise ValueError(f"{location} source-only distribution requires source platform")
     if distribution == "not-applicable" and platform not in {"source", "web"}:
-        raise ValueError(
-            f"{location} not-applicable distribution requires source or Web platform"
-        )
+        raise ValueError(f"{location} not-applicable distribution requires source or Web platform")
     if distribution == "re-signing-input" and platform not in {"android", "ios"}:
-        raise ValueError(
-            f"{location} re-signing inputs are limited to Android and iOS"
-        )
+        raise ValueError(f"{location} re-signing inputs are limited to Android and iOS")
     if category == "unsigned" and platform in {"android", "ios"}:
         if distribution != "re-signing-input":
-            raise ValueError(
-                f"{location} unsigned mobile output must be a re-signing input"
-            )
+            raise ValueError(f"{location} unsigned mobile output must be a re-signing input")
     if category == "ad-hoc" and distribution == "installable":
-        raise ValueError(
-            f"{location} ad-hoc artifacts cannot claim installable distribution"
-        )
+        raise ValueError(f"{location} ad-hoc artifacts cannot claim installable distribution")
 
 
 def validate_policy(
@@ -292,9 +279,7 @@ def validate_dependencies(value: Any) -> None:
         require_string(dependency, "evidence")
         identities.append((repository, relation, commit))
     if identities != sorted(set(identities)):
-        raise ValueError(
-            "dependencies must be sorted and unique by repository, relation, commit"
-        )
+        raise ValueError("dependencies must be sorted and unique by repository, relation, commit")
 
 
 def validate_files(value: Any) -> None:
@@ -363,9 +348,7 @@ def validate_registry(
         reason = require_string(value, "reason")
         expected_reason = "candidate-only" if release_kind == "candidate" else "not-configured"
         if reason != expected_reason:
-            raise ValueError(
-                f"{location} skipped {release_kind} result must use {expected_reason}"
-            )
+            raise ValueError(f"{location} skipped {release_kind} result must use {expected_reason}")
         return name, status
     if status != "published" or set(value) != PUBLISHED_REGISTRY_KEYS:
         raise ValueError(f"{location} has an invalid publication result")
@@ -386,9 +369,7 @@ def validate_registry(
     )
     required_aliases = {version, f"sha-{commit}"}
     if not required_aliases.issubset(aliases):
-        raise ValueError(
-            f"{location}.aliases must include the stable version and full source SHA"
-        )
+        raise ValueError(f"{location}.aliases must include the stable version and full source SHA")
     validate_image_signature(value.get("signature"), f"{location}.signature")
     if value.get("readback") != "verified":
         raise ValueError(f"{location}.readback must be verified")
@@ -419,10 +400,7 @@ def validate_images(
         platform_digests: list[str] = []
         for platform_index, platform in enumerate(platforms):
             platform_location = f"{location}.platforms[{platform_index}]"
-            if (
-                not isinstance(platform, dict)
-                or set(platform) != IMAGE_PLATFORM_KEYS
-            ):
+            if not isinstance(platform, dict) or set(platform) != IMAGE_PLATFORM_KEYS:
                 raise ValueError(f"{platform_location} has unexpected fields")
             if platform.get("platform") != "linux":
                 raise ValueError(f"{platform_location}.platform must be linux")
@@ -430,9 +408,7 @@ def validate_images(
             if architecture not in {"amd64", "arm64"}:
                 raise ValueError(f"{platform_location}.architecture is invalid")
             platform_ids.append(("linux", architecture))
-            platform_digests.append(
-                validate_digest(platform.get("digest"), f"{platform_location}.digest")
-            )
+            platform_digests.append(validate_digest(platform.get("digest"), f"{platform_location}.digest"))
         if platform_ids != sorted(set(platform_ids)):
             raise ValueError(f"{location}.platforms must be sorted and unique")
         if len(platform_digests) != len(set(platform_digests)):
@@ -442,9 +418,7 @@ def validate_images(
 
         registries = image.get("registries")
         if not isinstance(registries, list) or len(registries) != len(REGISTRIES):
-            raise ValueError(
-                f"{location}.registries must explicitly cover Docker Hub and GHCR"
-            )
+            raise ValueError(f"{location}.registries must explicitly cover Docker Hub and GHCR")
         registry_results = [
             validate_registry(
                 registry,
@@ -458,20 +432,34 @@ def validate_images(
         ]
         if [item[0] for item in registry_results] != sorted(REGISTRIES):
             raise ValueError(f"{location}.registries must be sorted and unique by name")
-        if release_kind == "formal" and not any(
-            status == "published" for _, status in registry_results
-        ):
+        if release_kind == "formal" and not any(status == "published" for _, status in registry_results):
             raise ValueError(f"{location} formal image has no configured registry")
     if names != sorted(set(names)):
         raise ValueError("images must be sorted and unique by name")
 
 
 def validate_release_evidence(value: dict[str, Any]) -> None:
-    if set(value) != ROOT_KEYS:
-        raise ValueError("release evidence has unexpected fields")
-    if value.get("schema_version") != 1:
-        raise ValueError("schema_version must be 1")
-    validate_logical_id(value.get("repository"), "repository")
+    if not isinstance(value, dict):
+        raise ValueError("release evidence must be an object")
+    repository = validate_logical_id(value.get("repository"), "repository")
+    schema_version = value.get("schema_version")
+    if schema_version == 1:
+        if repository == "remote-management" or set(value) != ROOT_KEYS:
+            raise ValueError("schema v1 release evidence is not valid for Management")
+    elif schema_version == 2:
+        if repository != "remote-management" or set(value) != DEPLOYMENT_ROOT_KEYS:
+            raise ValueError("schema v2 is reserved for complete Management deployment evidence")
+        deployment = value.get("deployment")
+        if not isinstance(deployment, dict) or set(deployment) != DEPLOYMENT_KEYS:
+            raise ValueError("deployment evidence has unexpected fields")
+        validate_evidence_file(deployment.get("bom"), "deployment.bom")
+        validate_evidence_file(deployment.get("attestation"), "deployment.attestation")
+        if deployment["bom"]["name"] != "deployment-bom.json":
+            raise ValueError("deployment.bom has an unexpected name")
+        if deployment["attestation"]["name"] != "DEPLOYMENT-BOM-ATTESTATION.intoto.jsonl":
+            raise ValueError("deployment.attestation has an unexpected name")
+    else:
+        raise ValueError("schema_version must be 1 or 2")
     version = validate_semver(value.get("version"), "version")
     source = value.get("source")
     if not isinstance(source, dict) or set(source) != SOURCE_KEYS:
@@ -481,11 +469,7 @@ def validate_release_evidence(value: dict[str, Any]) -> None:
         raise ValueError("source.commit must be a full lowercase commit SHA")
     source_ref = require_string(source, "ref")
     validation_run_id = source.get("validation_run_id")
-    if (
-        not isinstance(validation_run_id, int)
-        or isinstance(validation_run_id, bool)
-        or validation_run_id < 1
-    ):
+    if not isinstance(validation_run_id, int) or isinstance(validation_run_id, bool) or validation_run_id < 1:
         raise ValueError("source.validation_run_id must be a positive integer")
     release_kind = value.get("release_kind")
     if release_kind not in {"candidate", "formal"}:
@@ -496,12 +480,10 @@ def validate_release_evidence(value: dict[str, Any]) -> None:
     if not generated_at.endswith("Z"):
         raise ValueError("generated_at must use UTC")
     try:
-        generated_timestamp = datetime.fromisoformat(
-            generated_at.removesuffix("Z") + "+00:00"
-        )
+        generated_timestamp = datetime.fromisoformat(generated_at.removesuffix("Z") + "+00:00")
     except ValueError as error:
         raise ValueError("generated_at must be RFC 3339") from error
-    if generated_timestamp.tzinfo != timezone.utc:
+    if generated_timestamp.tzinfo != UTC:
         raise ValueError("generated_at must use UTC")
 
     validate_policy(value.get("policy"), generated_on=generated_timestamp.date())
@@ -525,10 +507,7 @@ def main() -> None:
     if not isinstance(value, dict):
         raise TypeError("release evidence root must be an object")
     validate_release_evidence(value)
-    print(
-        "Validated release evidence for "
-        f"{len(value['files'])} files and {len(value['images'])} images"
-    )
+    print(f"Validated release evidence for {len(value['files'])} files and {len(value['images'])} images")
 
 
 if __name__ == "__main__":

@@ -1,0 +1,203 @@
+name: Performance
+
+on:
+  schedule:
+    - cron: "11 5 * * 3"
+  workflow_dispatch:
+    inputs:
+      tier:
+        description: Evidence tier
+        required: true
+        default: scheduled
+        type: choice
+        options:
+          - scheduled
+          - release
+      control_revision:
+        description: Exact 40-character control SHA; required for release
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: remote-management-performance-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CAMELLIA_PERFORMANCE_DATABASE_URL: postgres://camellia_performance:performance-password@127.0.0.1:55627/postgres
+
+jobs:
+  compare:
+    name: ${{ github.event_name == 'schedule' && 'Scheduled' || inputs.tier }} A/B
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    services:
+      postgres:
+        image: postgres:18-alpine@sha256:898c60cb390d1085bc97bdd6a1ae968757421df394b071848b52b1c09c89d6a5
+        env:
+          POSTGRES_DB: postgres
+          POSTGRES_USER: camellia_performance
+          POSTGRES_PASSWORD: performance-password
+          POSTGRES_INITDB_ARGS: --encoding=UTF8 --locale-provider=builtin --builtin-locale=C.UTF-8
+        ports:
+          - 55627:5432
+        options: >-
+          --health-cmd "pg_isready -U camellia_performance -d postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    steps:
+      - name: Checkout exact candidate
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 2
+          path: candidate
+          persist-credentials: false
+          ref: ${{ github.sha }}
+
+      - name: Resolve immutable A/B inputs
+        id: inputs
+        working-directory: candidate
+        shell: bash
+        env:
+          CANDIDATE_REVISION: ${{ github.sha }}
+          CONTROL_INPUT: ${{ inputs.control_revision }}
+          TIER_INPUT: ${{ inputs.tier }}
+        run: |
+          set -euo pipefail
+          candidate="$(git rev-parse HEAD)"
+          [[ "$candidate" == "$CANDIDATE_REVISION" && "$candidate" =~ ^[0-9a-f]{40}$ ]]
+          tier="${TIER_INPUT:-scheduled}"
+          [[ "$tier" == scheduled || "$tier" == release ]]
+          if [[ -n "$CONTROL_INPUT" ]]; then
+            [[ "$CONTROL_INPUT" =~ ^[0-9a-f]{40}$ ]]
+            control="$CONTROL_INPUT"
+          else
+            [[ "$tier" == scheduled ]]
+            control="$(git rev-parse HEAD^)"
+          fi
+          [[ "$control" != "$candidate" ]]
+          if [[ "$tier" == release ]]; then
+            iterations=5
+            warmups=0
+            work_seconds=60
+            timeout_seconds=90
+          else
+            iterations=15
+            warmups=1
+            work_seconds=5
+            timeout_seconds=30
+          fi
+          {
+            echo "candidate=$candidate"
+            echo "control=$control"
+            echo "iterations=$iterations"
+            echo "policy=performance/management-http-devices-v1.$tier.json"
+            echo "tier=$tier"
+            echo "timeout_seconds=$timeout_seconds"
+            echo "warmups=$warmups"
+            echo "work_seconds=$work_seconds"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Checkout exact control
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: control
+          persist-credentials: false
+          ref: ${{ steps.inputs.outputs.control }}
+
+      - name: Resolve exact shared contract
+        id: contract
+        working-directory: candidate
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -t revisions < performance/contract.lock
+          [[ ${#revisions[@]} -eq 1 && "${revisions[0]}" =~ ^[0-9a-f]{40}$ ]]
+          echo "revision=${revisions[0]}" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout immutable performance contract
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ github.repository_owner }}/remote-protocol
+          path: performance-contract
+          persist-credentials: false
+          ref: ${{ steps.contract.outputs.revision }}
+
+      - name: Set up exact Python environments
+        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        with:
+          version: "0.13.5"
+          enable-cache: true
+          cache-dependency-glob: |
+            candidate/uv.lock
+            control/uv.lock
+
+      - name: Validate shared contract and prepare exact dependencies
+        run: |
+          set -euo pipefail
+          test "$(git -C performance-contract rev-parse HEAD)" = "${{ steps.contract.outputs.revision }}"
+          python3 -m unittest -v tools.test_performance_contract
+          uv sync --project ../candidate --locked --all-groups
+          uv sync --project ../control --locked --all-groups
+        working-directory: performance-contract
+
+      - name: Compare authenticated HTTP and database observations
+        env:
+          CAMELLIA_PERFORMANCE_WORK_SECONDS: ${{ steps.inputs.outputs.work_seconds }}
+          CANDIDATE_REVISION: ${{ steps.inputs.outputs.candidate }}
+          CONTROL_REVISION: ${{ steps.inputs.outputs.control }}
+          ITERATIONS: ${{ steps.inputs.outputs.iterations }}
+          POLICY: ${{ steps.inputs.outputs.policy }}
+          TIER: ${{ steps.inputs.outputs.tier }}
+          TIMEOUT_SECONDS: ${{ steps.inputs.outputs.timeout_seconds }}
+          WARMUPS: ${{ steps.inputs.outputs.warmups }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          install -d -m 0755 control/performance
+          install -m 0755 \
+            candidate/performance/management_http_observation.py \
+            control/performance/management_http_observation.py
+          pg_version="$(control/.venv/bin/python - <<'PY'
+          import os
+          import psycopg
+
+          with psycopg.connect(os.environ["CAMELLIA_PERFORMANCE_DATABASE_URL"]) as connection:
+              print(connection.execute("SHOW server_version").fetchone()[0].split()[0])
+          PY
+          )"
+          [[ "$pg_version" =~ ^18[.][0-9]+$ ]]
+          python3 performance-contract/tools/performance_contract.py collect-pair \
+            --repository remote-management-server \
+            --control-revision "$CONTROL_REVISION" \
+            --candidate-revision "$CANDIDATE_REVISION" \
+            --scenario management-http-devices-v1 \
+            --tier "$TIER" \
+            --runner-class github-ubuntu-24.04-x64 \
+            --toolchain "python-3.15-django-6-postgresql-$pg_version" \
+            --iterations "$ITERATIONS" --warmups "$WARMUPS" \
+            --timeout-seconds "$TIMEOUT_SECONDS" \
+            --control-output "$RUNNER_TEMP/management-control-performance.json" \
+            --candidate-output "$RUNNER_TEMP/management-candidate-performance.json" \
+            -- control/.venv/bin/python control/performance/management_http_observation.py \
+            ::: candidate/.venv/bin/python candidate/performance/management_http_observation.py
+          python3 performance-contract/tools/performance_contract.py compare \
+            "$RUNNER_TEMP/management-control-performance.json" \
+            "$RUNNER_TEMP/management-candidate-performance.json" \
+            "candidate/$POLICY" \
+            --output "$RUNNER_TEMP/management-performance-comparison.json"
+
+      - name: Upload bounded evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: management-${{ steps.inputs.outputs.tier }}-${{ steps.inputs.outputs.candidate }}
+          path: |
+            ${{ runner.temp }}/management-control-performance.json
+            ${{ runner.temp }}/management-candidate-performance.json
+            ${{ runner.temp }}/management-performance-comparison.json
+          if-no-files-found: error
+          retention-days: 30

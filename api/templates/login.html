@@ -11,6 +11,8 @@
     <title>{{ "登录" | translate }}_【Camellia】</title>
     <link rel="icon" type="image/svg+xml" href="{% static 'web_client/favicon.svg' %}">
     <link rel="stylesheet" href="{% static 'ui/app.css' %}">
+    <script src="{% static 'ui/http.js' %}"></script>
+    {% include "http_messages.html" %}
 </head>
 <body class="auth-body">
   <div class="auth-shell">
@@ -32,7 +34,7 @@
     </div>
     <div class="auth-card">
       <h2>{{ "登录" | translate }}</h2>
-      <div id="form-message" class="form-message"></div>
+      <div id="form-message" class="form-message" role="alert" tabindex="-1"></div>
       <form id="login-form" action="/api/user_action?action=login" method="post">
         {% csrf_token %}
         <input type="hidden" name="next" id="next-url">
@@ -56,6 +58,8 @@
   <script nonce="{{ csp_nonce }}">
     const messageEl = document.getElementById('form-message');
     const form = document.getElementById('login-form');
+    let requestInFlight = false;
+    let retryBlocked = false;
     const getCookie = (name) => {
       const match = document.cookie.match(new RegExp('(^| )' + name + '=([^;]+)'));
       return match ? decodeURIComponent(match[2]) : '';
@@ -64,6 +68,7 @@
     const showMessage = (text) => {
       messageEl.textContent = text;
       messageEl.classList.add('is-visible');
+      messageEl.focus();
     };
 
     document.getElementById('forget-link').addEventListener('click', () => {
@@ -74,7 +79,11 @@
     const urlParams = new URLSearchParams(window.location.search);
     const nextParam = urlParams.get('next') || '';
     const registered = urlParams.get('registered') || '';
-    const isSafeNext = (value) => value.startsWith('/') && !value.startsWith('//');
+    const isSafeNext = (value) => {
+      if (typeof value !== 'string' || !value.startsWith('/') || value.startsWith('//')) return false;
+      if (Array.from(value).some((char) => char.charCodeAt(0) <= 32 || [92, 127].includes(char.charCodeAt(0)))) return false;
+      return new URL(value, window.location.origin).origin === window.location.origin;
+    };
     if (nextParam && isSafeNext(nextParam)) {
       nextField.value = nextParam;
     }
@@ -84,10 +93,19 @@
 
     form.addEventListener('submit', async (event) => {
       event.preventDefault();
+      if (requestInFlight || retryBlocked) return;
+      if (!window.camelliaHttp) {
+        showMessage('{{ "页面初始化失败，请刷新页面。" | translate | escapejs }}');
+        return;
+      }
       messageEl.classList.remove('is-visible');
       const formData = new FormData(form);
+      requestInFlight = true;
+      const submitButton = form.querySelector('button[type="submit"]');
+      submitButton.disabled = true;
+      let canResubmit = false;
       try {
-        const resp = await fetch(form.action, {
+        const { data } = await window.camelliaHttp.requestJson(form.action, {
           method: 'POST',
           headers: {
             'X-CSRFToken': getCookie('csrftoken'),
@@ -95,15 +113,21 @@
           credentials: 'same-origin',
           body: formData,
         });
-        const data = await resp.json();
-        if (data.code === 1) {
+        if (data.code === 1 && isSafeNext(data.url)) {
           const target = nextField.value && isSafeNext(nextField.value) ? nextField.value : data.url;
           window.location.href = target;
         } else {
-          showMessage(data.msg || '{{ "登录失败，请检查输入信息。" | translate | escapejs }}');
+          throw new window.camelliaHttp.HttpFailure('protocol');
         }
       } catch (error) {
-        showMessage('{{ "网络异常，请稍后再试。" | translate | escapejs }}');
+        showMessage(window.camelliaHttp.failureMessage(error, window.camelliaHttpMessages));
+        canResubmit = error.outcomeKnown === true && !['csrf', 'session', 'permission'].includes(error.kind);
+      } finally {
+        document.getElementById('password').value = '';
+        formData.delete('password');
+        requestInFlight = false;
+        retryBlocked = !canResubmit;
+        submitButton.disabled = !canResubmit;
       }
     });
   </script>

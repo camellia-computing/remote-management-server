@@ -1,5 +1,5 @@
 [Unit]
-Description=Hourly Camellia Remote Management PostgreSQL backup
+Description=Hourly Camellia Remote Management consistent data backup
 
 [Timer]
 OnCalendar=hourly

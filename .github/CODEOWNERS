@@ -1,1 +1,6 @@
 * @camellia-computing/remote
+
+# CI is a production security boundary. Keep these review paths explicit.
+/.github/workflows/ @camellia-computing/remote
+/.github/actions/ @camellia-computing/remote
+/.github/scripts/ci_* @camellia-computing/remote

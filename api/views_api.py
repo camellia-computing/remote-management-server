@@ -1,18 +1,19 @@
 import base64
 import binascii
-import contextlib
+import copy
 import datetime
-import functools
 import hashlib
 import ipaddress
 import json
 import logging
-import os
+import math
 import re
 import secrets
-import stat
+import threading
 import time
 import uuid
+from collections import OrderedDict
+from dataclasses import dataclass
 from urllib.parse import urlsplit
 
 import requests
@@ -24,26 +25,80 @@ from django.contrib.auth.models import Group
 from django.core.exceptions import ValidationError
 from django.core.validators import validate_email
 from django.db import IntegrityError, connection, transaction
-from django.db.models import Prefetch, Q, QuerySet
+from django.db.models import F, Prefetch, Q, QuerySet
 from django.http import HttpResponse, HttpResponseRedirect, JsonResponse
 from django.utils import timezone
 from django.utils.translation import gettext as _
 from joserfc import jwt
+from joserfc.errors import InvalidKeyIdError
 from joserfc.jwk import KeySet
 from joserfc.jwt import JWTClaimsRegistry
-from nacl.signing import SigningKey
+
+from api import audit_lifecycle, ingestion_governance, recording_uploads
 
 # from django.forms.models import model_to_dict
+from api.address_book_authorization import (
+    bump_locked_authorization_generation,
+    lock_profile_access,
+)
+from api.control_filters import (
+    CONTROL_FILTER_CONTRACT_VERSION,
+    ControlFilterError,
+    apply_control_filter,
+)
+from api.credential_sessions import (
+    CredentialGenerationExhausted,
+    revoke_device_credentials,
+    revoke_user_credentials,
+)
+from api.device_identity import (
+    MAX_DEPLOYMENT_GENERATION,
+    DeviceProofError,
+    DeviceRecoveryRequired,
+    consume_deployment_proof,
+    consume_session_proof,
+    create_recovery_approval,
+    deployment_assertion,
+    issue_proof_challenge,
+)
+from api.device_inventory import (
+    DeviceInventory,
+    InvalidInventoryCursor,
+    dump_inventory_cursor,
+    load_inventory_cursor,
+)
+from api.encrypted_fields import verify_key_canary
+from api.identifiers import (
+    InvalidIdentifier,
+    parse_model_pk,
+    parse_model_pk_list,
+    parse_uuid,
+    parse_uuid_list,
+)
+from api.login_admission import complete_login_success, reserve_login_attempt
+from api.management_operations import (
+    ManagementMutation,
+    ManagementOperationConflict,
+    document_digest,
+    execute_management_operation,
+    find_management_operation,
+    operation_id_from_request,
+    parse_operation_id,
+)
 from api.models import (
     AddressBookProfile,
     AddressBookRule,
     AddressBookRuleAudit,
     AddressBookShare,
     AlarmLog,
+    ConnectionAuditEvent,
     ConnLog,
+    DataEncryptionKeyState,
     DeviceGroup,
+    DeviceProofChallenge,
+    DeviceRecoveryApproval,
     FileLog,
-    LoginAttempt,
+    FileTransferAuditEvent,
     OidcIdentity,
     OidcPendingAuth,
     RemoteDevice,
@@ -53,52 +108,121 @@ from api.models import (
     StrategyProfile,
     UserProfile,
 )
-from api.request_utils import client_ip, load_json_body, load_json_object
+from api.oidc_documents import (
+    OIDC_DOCUMENT_MAX_BYTES,
+    parse_oidc_json,
+    validate_oidc_discovery,
+    validate_oidc_jwks,
+    validated_signing_algorithms,
+)
+from api.policy_generation import (
+    InvalidManagedPolicy,
+    device_ids_affected_by_groups,
+    device_ids_affected_by_users,
+    managed_policy_document,
+    normalize_policy_options,
+)
+from api.rate_limits import enforce_authenticated_rate_limit
+from api.release_schema import RuntimeWriteCapabilityError, check_release_schema, check_runtime_write_capability
+from api.request_deadlines import bounded_timeout, check_request_deadline
+from api.request_utils import (
+    InvalidJsonPayload,
+    client_ip,
+    load_json_body,
+    load_json_object,
+    load_json_text,
+    require_empty_json_object,
+)
+from api.response_contract import RESPONSE_SCHEMA_VERSION, empty_success, json_error, json_pending
 from api.tag_colors import normalize_tag_color
+from api.username_identity import canonical_username_key, check_username_identity, normalize_username
+from api.username_unicode16 import username_candidate
+from camellia_remote_management.observability import log_structured_event
 
 logger = logging.getLogger(__name__)
 EFFECTIVE_SECONDS = 7200
+DEVICE_LEASE_SECONDS = 60
 MAX_DEPLOY_KEY_LEN = 512
-MAX_PLUGIN_SIGN_MSG_BYTES = 64 * 1024
 OIDC_PENDING_MINUTES = settings.OIDC_PENDING_RETENTION_MINUTES
 OIDC_MAX_PENDING_PER_IP = 20
-OIDC_DOCUMENT_MAX_BYTES = 1024 * 1024
-LOGIN_LOCK_MAX_FAILURES = 10
-LOGIN_LOCK_MAX_IP_FAILURES = 100
-LOGIN_LOCK_WINDOW_MINUTES = settings.LOGIN_ATTEMPT_RETENTION_MINUTES
+MAX_OIDC_CALLBACK_CLAIM_GENERATION = (1 << 63) - 1
 MAX_DEVICE_UUID_TEXT_LEN = 344
 MAX_AUDIT_INFO_BYTES = 16 * 1024
 MAX_AUDIT_NOTE_BYTES = 16 * 1024
 MAX_AUDIT_FILES = 10
+AUDIT_PROTOCOL_VERSION = 3
+FILE_AUDIT_PROTOCOL_VERSION = 4
+AUDIT_EVIDENCE_RECEIPT_VERSION = 1
+MAX_AUDIT_INTEGER = 9_223_372_036_854_775_807
 MAX_AB_PEERS = 10_000
 MAX_AB_TAGS = 256
 MAX_AB_TAGS_PER_PEER = 32
+MAX_AB_PROFILE_PASSWORD_BYTES = 240
 MAX_MANAGEMENT_BATCH_ITEMS = 500
-MAX_STRATEGY_OPTIONS_BYTES = 64 * 1024
 MAX_ALLOWED_INCOMINGS = 500
-RECORD_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]{1,255}$")
-OIDC_SAFE_ID_TOKEN_ALGORITHMS = frozenset(
-    {
-        "RS256",
-        "RS384",
-        "RS512",
-        "PS256",
-        "PS384",
-        "PS512",
-        "ES256",
-        "ES384",
-        "ES512",
-        "EdDSA",
-    }
-)
+PAGINATION_CONTRACT_VERSION = 1
+MAX_API_PAGE_SIZE = 500
+MAX_API_PAGE_OFFSET = 10_000
+OIDC_DOCUMENT_CACHE_MAX_ENTRIES = 16
+OIDC_DOCUMENT_CACHE_TTL_SECONDS = 300
+OIDC_DOCUMENT_CACHE_STALE_SECONDS = 900
 
 
-def _load_json(request):
-    return load_json_body(request)
+@dataclass(frozen=True)
+class _OidcCallbackClaim:
+    state: str
+    owner: uuid.UUID
+    generation: int
+    provider: str
+    nonce: str
+    code_verifier: str
 
 
-def _load_json_object(request):
-    return load_json_object(request)
+@dataclass(frozen=True)
+class _OidcDocumentCacheEntry:
+    document: dict
+    etag: str
+    fresh_until: float
+    stale_until: float
+
+
+@dataclass
+class _OidcDocumentFlight:
+    event: threading.Event
+    error: Exception | None = None
+    fallback_document: dict | None = None
+    fallback_until: float = 0.0
+
+
+@dataclass(frozen=True)
+class _Pagination:
+    current: int
+    page_size: int
+    start: int
+    end: int
+
+
+class _InvalidPagination(ValueError):
+    def __init__(self, field):
+        self.field = field
+        super().__init__(f"invalid pagination field: {field}")
+
+
+class _OidcCallbackClaimLost(RuntimeError):
+    pass
+
+
+_oidc_document_cache = OrderedDict()
+_oidc_document_inflight = {}
+_oidc_document_cache_lock = threading.Lock()
+
+
+def _load_json(request, *, max_bytes=None):
+    return load_json_body(request, max_bytes=max_bytes)
+
+
+def _load_json_object(request, *, max_bytes=None):
+    return load_json_object(request, max_bytes=max_bytes)
 
 
 def _get_bearer_token(request):
@@ -119,6 +243,7 @@ def _get_token_user(request):
         return None, None
     token = (
         RemoteToken.objects.select_related(
+            "subject_user__strategy",
             "device__owner__strategy",
             "device__device_group__strategy",
             "device__strategy",
@@ -131,14 +256,46 @@ def _get_token_user(request):
     if _token_expired(token):
         token.delete()
         return None, None
-    user = token.device.owner if token.device_id else None
-    if not user:
+    device = token.device if token.device_id else None
+    user = token.subject_user if token.subject_user_id else None
+    if not device or not user:
         token.delete()
         return None, None
-    if user and not user.is_active:
+    if not device.is_active or device.owner_id != user.id or not user.is_active:
         token.delete()
         return None, None
+    if not secrets.compare_digest(token.credential_hash, user.get_session_auth_hash()):
+        token.delete()
+        return None, None
+    enforce_authenticated_rate_limit(request, user, device)
     return token, user
+
+
+def management_operation_receipt(request, operation_id):
+    """Recover a durable mutation result after response loss or restart."""
+
+    if _get_bearer_token(request):
+        _token, actor = _get_token_user(request)
+    else:
+        actor = request.user if request.user.is_authenticated else None
+    if actor is None:
+        return JsonResponse({"error": "Authentication required"}, status=401)
+    try:
+        parsed_operation_id = parse_operation_id(operation_id)
+    except InvalidIdentifier:
+        return JsonResponse({"error": "Invalid operation identifier"}, status=400)
+    result = find_management_operation(
+        actor=actor,
+        operation_id=parsed_operation_id,
+    )
+    if result is None:
+        return JsonResponse({"error": "Operation receipt not found"}, status=404)
+    return JsonResponse(
+        {
+            "original_status_code": result.status_code,
+            "receipt": result.body,
+        }
+    )
 
 
 def _token_expired(token):
@@ -155,15 +312,18 @@ def _issue_access_token(user, device):
     expires_at = timezone.now() + datetime.timedelta(seconds=EFFECTIVE_SECONDS)
     raw_token = secrets.token_urlsafe(32)
     with transaction.atomic():
-        locked_device = RemoteDevice.objects.select_for_update().get(
-            pk=device.pk,
-        )
-        if locked_device.owner_id != user.id or not locked_device.is_active:
+        locked_user = UserProfile.objects.select_for_update().filter(pk=user.pk).first()
+        if not locked_user or not locked_user.is_active:
+            raise PermissionError("User is inactive")
+        locked_device = RemoteDevice.objects.select_for_update().filter(pk=device.pk).first()
+        if not locked_device or locked_device.owner_id != locked_user.id or not locked_device.is_active:
             raise PermissionError("Device ownership mismatch")
         token, _created = RemoteToken.objects.update_or_create(
             device=locked_device,
             defaults={
+                "subject_user": locked_user,
                 "access_token": _hash_token(raw_token),
+                "credential_hash": locked_user.get_session_auth_hash(),
                 "expires_at": expires_at,
             },
         )
@@ -229,7 +389,9 @@ def _deployment_identity(rid, device_uuid, public_key):
 def _revoke_device_tokens(device):
     if not device:
         return 0
-    return RemoteToken.objects.filter(device=device).delete()[0]
+    DeviceProofChallenge.objects.filter(device=device).delete()
+    DeviceRecoveryApproval.objects.filter(device=device, consumed_at__isnull=True).delete()
+    return revoke_device_credentials((device.pk,))
 
 
 def _get_device_token_user(request, rid, device_uuid):
@@ -239,6 +401,15 @@ def _get_device_token_user(request, rid, device_uuid):
     if token.device.rid != rid or token.device.uuid != device_uuid:
         return token, None
     return token, user
+
+
+def _revoked_device_lease(rid, device_uuid):
+    return {
+        "version": 1,
+        "state": "revoked",
+        "id": rid,
+        "uuid": device_uuid,
+    }
 
 
 def _get_active_token_device(token, user):
@@ -264,6 +435,22 @@ def _is_active_owned_device(device, user):
 
 class DeviceIdentityConflict(Exception):
     pass
+
+
+class DeviceCredentialFinalizationError(RuntimeError):
+    pass
+
+
+class _OidcPolicyRevocationRequired(Exception):
+    def __init__(self, user_id):
+        self.user_id = user_id
+        super().__init__("OIDC policy revocation is required")
+
+
+class _OidcPolicyDenied(PermissionError):
+    def __init__(self, user_id):
+        self.user_id = user_id
+        super().__init__("OIDC auto-provision policy no longer permits this identity")
 
 
 def _device_by_identity(rid, device_uuid, *, for_update=False):
@@ -297,6 +484,8 @@ def _claim_session_device(
     device_uuid,
     ip_address="",
     device_info=None,
+    device_proof=None,
+    proof_purpose=None,
 ):
     """Return the one device row a login session is allowed to claim."""
 
@@ -306,15 +495,18 @@ def _claim_session_device(
     for attempt in range(2):
         try:
             with transaction.atomic():
+                locked_user = UserProfile.objects.select_for_update().get(pk=user.pk)
+                if not locked_user.is_active:
+                    raise PermissionError("User is inactive")
                 device = _device_by_identity(
                     rid,
                     device_uuid,
                     for_update=True,
                 )
-                if device and (not device.is_active or (device.owner_id and device.owner_id != user.id)):
+                if device and (not device.is_active or (device.owner_id and device.owner_id != locked_user.id)):
                     raise PermissionError("Device is unavailable")
                 if not device:
-                    return RemoteDevice.objects.create(
+                    device = RemoteDevice.objects.create(
                         rid=rid,
                         cpu="-",
                         hostname=hostname,
@@ -324,24 +516,32 @@ def _claim_session_device(
                         username="",
                         version="-",
                         ip_address=ip_address,
-                        owner=user,
+                        owner=locked_user,
                     )
-                update_fields = []
-                if device.owner_id is None:
-                    device.owner = user
-                    update_fields.append("owner")
-                if ip_address and device.ip_address != ip_address:
-                    device.ip_address = ip_address
-                    update_fields.append("ip_address")
-                if hostname != "-" and device.hostname != hostname:
-                    device.hostname = hostname
-                    update_fields.append("hostname")
-                if operating_system != "-" and device.os != operating_system:
-                    device.os = operating_system
-                    update_fields.append("os")
-                if update_fields:
-                    update_fields.append("update_time")
-                    device.save(update_fields=update_fields)
+                else:
+                    update_fields = []
+                    if device.owner_id is None:
+                        device.owner = locked_user
+                        update_fields.append("owner")
+                    if ip_address and device.ip_address != ip_address:
+                        device.ip_address = ip_address
+                        update_fields.append("ip_address")
+                    if hostname != "-" and device.hostname != hostname:
+                        device.hostname = hostname
+                        update_fields.append("hostname")
+                    if operating_system != "-" and device.os != operating_system:
+                        device.os = operating_system
+                        update_fields.append("os")
+                    if update_fields:
+                        update_fields.append("update_time")
+                        device.save(update_fields=update_fields)
+                if device.public_key_hash or device_proof:
+                    consume_session_proof(
+                        proof=device_proof,
+                        purpose=proof_purpose,
+                        device=device,
+                        user=locked_user,
+                    )
                 return device
         except IntegrityError:
             if attempt:
@@ -420,54 +620,210 @@ def _oidc_endpoint_allowed(url, allowed_hosts):
     return hostname in frozenset(allowed_hosts)
 
 
-def _fetch_oidc_json(url, allowed_hosts):
+def _oidc_response_content_type(response):
+    raw_value = response.headers.get("Content-Type", "")
+    if not isinstance(raw_value, str) or not raw_value or len(raw_value) > 255:
+        raise ValueError("OIDC response has an invalid Content-Type")
+    parts = raw_value.split(";")
+    media_type = parts[0].strip().lower()
+    if media_type not in ("application/json", "application/jwk-set+json"):
+        raise ValueError("OIDC response is not JSON")
+    parameters = {}
+    for raw_parameter in parts[1:]:
+        if "=" not in raw_parameter:
+            raise ValueError("OIDC response has ambiguous Content-Type parameters")
+        raw_name, raw_parameter_value = raw_parameter.split("=", 1)
+        name = raw_name.strip().lower()
+        value = raw_parameter_value.strip()
+        if len(value) >= 2 and value[0] == value[-1] == '"':
+            value = value[1:-1]
+        elif value.startswith('"') or value.endswith('"'):
+            raise ValueError("OIDC response has ambiguous Content-Type parameters")
+        value = value.lower()
+        if not name or not value or name in parameters or "\\" in value or '"' in value:
+            raise ValueError("OIDC response has ambiguous Content-Type parameters")
+        parameters[name] = value
+    if set(parameters) - {"charset"} or parameters.get("charset", "utf-8") != "utf-8":
+        raise ValueError("OIDC response must contain UTF-8 JSON")
+
+
+def _request_oidc_json(url, allowed_hosts, *, etag=""):
     if not _oidc_endpoint_allowed(url, allowed_hosts):
         raise ValueError("OIDC endpoint is outside the configured host allowlist")
-    timeout = getattr(settings, "OIDC_HTTP_TIMEOUT_SECONDS", 10)
+    timeout = bounded_timeout(getattr(settings, "OIDC_HTTP_TIMEOUT_SECONDS", 10))
+    headers = {"Accept": "application/json, application/jwk-set+json"}
+    if etag:
+        headers["If-None-Match"] = etag
     with requests.get(
         url,
         timeout=timeout,
         allow_redirects=False,
         stream=True,
-        headers={"Accept": "application/json"},
+        headers=headers,
     ) as response:
+        check_request_deadline()
+        if response.status_code == 304:
+            return None, etag, True
         response.raise_for_status()
+        _oidc_response_content_type(response)
         content_length = response.headers.get("Content-Length")
-        if content_length and int(content_length) > OIDC_DOCUMENT_MAX_BYTES:
-            raise ValueError("OIDC document is too large")
+        if content_length is not None:
+            if (
+                not isinstance(content_length, str)
+                or not content_length
+                or len(content_length) > 10
+                or not content_length.isascii()
+                or not content_length.isdecimal()
+                or (len(content_length) > 1 and content_length.startswith("0"))
+            ):
+                raise ValueError("OIDC response has an invalid Content-Length")
+            if int(content_length) > OIDC_DOCUMENT_MAX_BYTES:
+                raise ValueError("OIDC document is too large")
         body = bytearray()
         for chunk in response.iter_content(64 * 1024):
+            check_request_deadline()
             body.extend(chunk)
             if len(body) > OIDC_DOCUMENT_MAX_BYTES:
                 raise ValueError("OIDC document is too large")
-    document = json.loads(body)
-    if not isinstance(document, dict):
-        raise ValueError("OIDC document must be a JSON object")
+        check_request_deadline()
+        response_etag = response.headers.get("ETag", "")
+        if (
+            not isinstance(response_etag, str)
+            or len(response_etag) > 256
+            or any(ord(character) < 32 or ord(character) == 127 for character in response_etag)
+        ):
+            response_etag = ""
+    return parse_oidc_json(bytes(body)), response_etag, False
+
+
+def _fetch_oidc_json(url, allowed_hosts):
+    document, _etag, not_modified = _request_oidc_json(url, allowed_hosts)
+    if not_modified:
+        raise ValueError("OIDC endpoint returned an unsolicited not-modified response")
     return document
 
 
-@functools.lru_cache(maxsize=16)
+def _copy_oidc_document(document):
+    return copy.deepcopy(document)
+
+
+def _clear_oidc_document_cache():
+    with _oidc_document_cache_lock:
+        _oidc_document_cache.clear()
+
+
+def _cached_oidc_document(url, allowed_hosts, *, document_type, validator, force_refresh=False):
+    allowed_hosts = tuple(sorted(frozenset(allowed_hosts)))
+    cache_key = (document_type, url, allowed_hosts)
+    wait_timeout = bounded_timeout(getattr(settings, "OIDC_HTTP_TIMEOUT_SECONDS", 10) + 1)
+    while True:
+        now = time.monotonic()
+        with _oidc_document_cache_lock:
+            cached = _oidc_document_cache.get(cache_key)
+            if cached is not None and not force_refresh and now < cached.fresh_until:
+                _oidc_document_cache.move_to_end(cache_key)
+                return _copy_oidc_document(cached.document)
+            inflight = _oidc_document_inflight.get(cache_key)
+            if inflight is None:
+                inflight = _OidcDocumentFlight(event=threading.Event())
+                _oidc_document_inflight[cache_key] = inflight
+                leader = True
+            else:
+                leader = False
+        if leader:
+            break
+        check_request_deadline()
+        if not inflight.event.wait(wait_timeout):
+            with _oidc_document_cache_lock:
+                stale = _oidc_document_cache.get(cache_key)
+                if stale is not None and time.monotonic() < stale.stale_until:
+                    return _copy_oidc_document(stale.document)
+            raise ValueError("OIDC document single-flight timed out")
+        if inflight.error is not None:
+            if inflight.fallback_document is not None and time.monotonic() < inflight.fallback_until:
+                return _copy_oidc_document(inflight.fallback_document)
+            raise inflight.error
+        force_refresh = False
+
+    flight_error = None
+    fallback_document = None
+    fallback_until = 0.0
+    try:
+        etag = cached.etag if cached is not None else ""
+        raw_document, response_etag, not_modified = _request_oidc_json(
+            url,
+            allowed_hosts,
+            etag=etag,
+        )
+        if not_modified:
+            if cached is None:
+                raise ValueError("OIDC endpoint returned an unsolicited not-modified response")
+            document = cached.document
+            response_etag = cached.etag
+        else:
+            document = validator(raw_document)
+        stored_at = time.monotonic()
+        entry = _OidcDocumentCacheEntry(
+            document=_copy_oidc_document(document),
+            etag=response_etag,
+            fresh_until=stored_at + OIDC_DOCUMENT_CACHE_TTL_SECONDS,
+            stale_until=stored_at + OIDC_DOCUMENT_CACHE_TTL_SECONDS + OIDC_DOCUMENT_CACHE_STALE_SECONDS,
+        )
+        with _oidc_document_cache_lock:
+            _oidc_document_cache[cache_key] = entry
+            _oidc_document_cache.move_to_end(cache_key)
+            while len(_oidc_document_cache) > OIDC_DOCUMENT_CACHE_MAX_ENTRIES:
+                _oidc_document_cache.popitem(last=False)
+        return _copy_oidc_document(document)
+    except requests.RequestException as error:
+        if cached is not None and time.monotonic() < cached.stale_until:
+            flight_error = error
+            fallback_document = _copy_oidc_document(cached.document)
+            fallback_until = cached.stale_until
+            return _copy_oidc_document(cached.document)
+        flight_error = error
+        raise
+    except Exception as error:
+        flight_error = error
+        raise
+    finally:
+        with _oidc_document_cache_lock:
+            completed = _oidc_document_inflight.pop(cache_key, None)
+            if completed is not None:
+                completed.error = flight_error
+                completed.fallback_document = fallback_document
+                completed.fallback_until = fallback_until
+                completed.event.set()
+
+
 def _oidc_metadata(issuer, allowed_hosts):
     issuer = str(issuer or "").rstrip("/")
     if not _oidc_endpoint_allowed(issuer, allowed_hosts):
         raise ValueError("OIDC issuer is outside the configured host allowlist")
-    metadata = _fetch_oidc_json(
+
+    def validate(document):
+        metadata = validate_oidc_discovery(document)
+        metadata_issuer = str(metadata["issuer"]).rstrip("/")
+        if metadata_issuer != issuer:
+            raise ValueError("OIDC discovery issuer mismatch")
+        metadata["issuer"] = metadata_issuer
+        for key in ("authorization_endpoint", "token_endpoint", "jwks_uri"):
+            if not _oidc_endpoint_allowed(metadata[key], allowed_hosts):
+                raise ValueError(f"OIDC discovery contains an invalid {key}")
+        userinfo_endpoint = metadata.get("userinfo_endpoint")
+        if userinfo_endpoint and not _oidc_endpoint_allowed(userinfo_endpoint, allowed_hosts):
+            raise ValueError("OIDC discovery contains an invalid userinfo_endpoint")
+        return metadata
+
+    return _cached_oidc_document(
         f"{issuer}/.well-known/openid-configuration",
         allowed_hosts,
+        document_type="discovery-v1",
+        validator=validate,
     )
-    metadata_issuer = str(metadata.get("issuer") or "").rstrip("/")
-    if metadata_issuer != issuer:
-        raise ValueError("OIDC discovery issuer mismatch")
-    for key in ("authorization_endpoint", "token_endpoint", "jwks_uri"):
-        if not _oidc_endpoint_allowed(metadata.get(key), allowed_hosts):
-            raise ValueError(f"OIDC discovery contains an invalid {key}")
-    userinfo_endpoint = metadata.get("userinfo_endpoint")
-    if userinfo_endpoint and not _oidc_endpoint_allowed(
-        userinfo_endpoint,
-        allowed_hosts,
-    ):
-        raise ValueError("OIDC discovery contains an invalid userinfo_endpoint")
-    return metadata
+
+
+_oidc_metadata.cache_clear = _clear_oidc_document_cache
 
 
 def _oidc_client(provider, state=None):
@@ -478,24 +834,78 @@ def _oidc_client(provider, state=None):
         redirect_uri=provider["redirect_uri"],
         state=state,
         code_challenge_method="S256",
-        default_timeout=getattr(settings, "OIDC_HTTP_TIMEOUT_SECONDS", 10),
+        default_timeout=bounded_timeout(getattr(settings, "OIDC_HTTP_TIMEOUT_SECONDS", 10)),
     )
+
+
+def _oidc_jwks(metadata, provider, *, force_refresh=False):
+    return _cached_oidc_document(
+        metadata["jwks_uri"],
+        provider["allowed_hosts"],
+        document_type="jwks-v1",
+        validator=validate_oidc_jwks,
+        force_refresh=force_refresh,
+    )
+
+
+def _oidc_token_header(encoded):
+    parts = encoded.split(".")
+    if len(parts) != 3 or not parts[0] or len(parts[0]) > 8192:
+        raise ValueError("OIDC ID token has an invalid compact header")
+    encoded_header = parts[0]
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", encoded_header):
+        raise ValueError("OIDC ID token has an invalid compact header")
+    try:
+        raw_header = base64.b64decode(
+            encoded_header + ("=" * (-len(encoded_header) % 4)),
+            altchars=b"-_",
+            validate=True,
+        )
+        if base64.urlsafe_b64encode(raw_header).rstrip(b"=").decode("ascii") != encoded_header:
+            raise ValueError("non-canonical header")
+        header = load_json_text(raw_header.decode("utf-8"), max_bytes=16 * 1024)
+    except (UnicodeDecodeError, ValueError, InvalidJsonPayload) as error:
+        raise ValueError("OIDC ID token has an invalid compact header") from error
+    if not isinstance(header, dict):
+        raise ValueError("OIDC ID token header must be an object")
+    algorithm = header.get("alg")
+    kid = header.get("kid")
+    if (
+        not isinstance(algorithm, str)
+        or not algorithm
+        or not isinstance(kid, str)
+        or not 1 <= len(kid) <= 128
+        or not kid.isascii()
+        or any(ord(character) < 33 or ord(character) > 126 for character in kid)
+    ):
+        raise ValueError("OIDC ID token header must contain bounded alg and kid")
+    return algorithm, kid
+
+
+def _decode_oidc_id_token(encoded, jwks, algorithms):
+    algorithm, kid = _oidc_token_header(encoded)
+    if algorithm not in algorithms:
+        raise ValueError("OIDC ID token algorithm is not allowed")
+    if not any(
+        key.get("kid") == kid and (key.get("alg") is None or key.get("alg") == algorithm)
+        for key in jwks.get("keys", ())
+    ):
+        raise InvalidKeyIdError(f"No key for kid: '{kid}'")
+    key_set = KeySet.import_key_set(jwks)
+    return jwt.decode(encoded, key_set, algorithms=algorithms)
 
 
 def _validate_oidc_id_token(token, metadata, provider, nonce):
     encoded = token.get("id_token")
     if not isinstance(encoded, str) or not encoded or len(encoded) > 64 * 1024:
         raise ValueError("OIDC provider did not return an ID token")
-    jwks = _fetch_oidc_json(
-        metadata["jwks_uri"],
-        provider["allowed_hosts"],
-    )
-    key_set = KeySet.import_key_set(jwks)
-    configured_algorithms = metadata.get("id_token_signing_alg_values_supported") or ["RS256"]
-    algorithms = [value for value in configured_algorithms if value in OIDC_SAFE_ID_TOKEN_ALGORITHMS]
-    if not algorithms:
-        raise ValueError("OIDC provider has no supported ID token algorithm")
-    decoded = jwt.decode(encoded, key_set, algorithms=algorithms)
+    algorithms = validated_signing_algorithms(metadata.get("id_token_signing_alg_values_supported"))
+    jwks = validate_oidc_jwks(_oidc_jwks(metadata, provider))
+    try:
+        decoded = _decode_oidc_id_token(encoded, jwks, algorithms)
+    except InvalidKeyIdError:
+        refreshed_jwks = validate_oidc_jwks(_oidc_jwks(metadata, provider, force_refresh=True))
+        decoded = _decode_oidc_id_token(encoded, refreshed_jwks, algorithms)
     claims = decoded.claims
     issuer = str(metadata["issuer"]).rstrip("/")
     registry = JWTClaimsRegistry(
@@ -518,42 +928,72 @@ def _validate_oidc_id_token(token, metadata, provider, nonce):
 
 
 def _oidc_local_username(claims, issuer, subject, attempt=0):
+    email = claims.get("email")
     raw_candidates = (
         claims.get("preferred_username"),
         claims.get("name"),
-        str(claims.get("email") or "").split("@", 1)[0],
+        email.split("@", 1)[0] if isinstance(email, str) else None,
         subject,
     )
     max_length = UserProfile._meta.get_field("username").max_length
     base = ""
     for value in raw_candidates:
-        value = str(value or "").strip()
-        value = re.sub(r"[^\w.@+-]+", "-", value, flags=re.UNICODE).strip("-")
-        if value:
-            base = value[:max_length]
+        base = username_candidate(value)
+        if base:
             break
     if not base:
         base = "oidc-user"
-    if attempt == 0 and not UserProfile.objects.filter(username__iexact=base).exists():
+    if attempt == 0 and not UserProfile.objects.by_username(base).exists():
         return base
     suffix = "-" + hashlib.sha256(f"{issuer}\0{subject}\0{attempt}".encode()).hexdigest()[:10]
     return f"{base[: max_length - len(suffix)]}{suffix}"
 
 
-def _resolve_oidc_user(provider_name, issuer, claims):
+def _validated_oidc_email(claims):
+    if claims.get("email_verified") is not True:
+        return ""
+    email = str(claims.get("email") or "").strip()
+    if not email or len(email) > 254:
+        return ""
+    try:
+        validate_email(email)
+    except ValidationError:
+        return ""
+    return email
+
+
+def _oidc_auto_provision_allowed(provider, claims):
+    if not provider.get("auto_provision", False):
+        return False
+
+    allowed_domains = provider.get("auto_provision_email_domains", ())
+    required_claims = provider.get("auto_provision_required_claims", {})
+    if not allowed_domains and not required_claims:
+        return False
+    if allowed_domains:
+        email = _validated_oidc_email(claims)
+        _local, separator, domain = email.rpartition("@")
+        if not separator or domain.lower() not in allowed_domains:
+            return False
+
+    for claim_name, allowed_values in required_claims.items():
+        claim_value = claims.get(claim_name)
+        claim_values = claim_value if isinstance(claim_value, list) else [claim_value]
+        if not any(isinstance(value, str) and value in allowed_values for value in claim_values):
+            return False
+    return True
+
+
+def _resolve_oidc_user(provider_name, issuer, claims, *, defer_policy_revocation=False):
+    provider = getattr(settings, "OIDC_PROVIDERS", {}).get(provider_name)
+    if not provider or str(provider.get("issuer") or "").rstrip("/") != issuer:
+        raise ValueError("OIDC provider does not match the validated issuer")
     subject = str(claims.get("sub") or "").strip()
     if not subject or len(subject) > OidcIdentity._meta.get_field("subject").max_length:
         raise ValueError("OIDC subject is invalid")
     last_username = str(claims.get("preferred_username") or claims.get("name") or "").strip()[:255]
-    email = str(claims.get("email") or "").strip()
-    if claims.get("email_verified") is not True:
-        email = ""
-    email = email[:254]
-    if email:
-        try:
-            validate_email(email)
-        except ValidationError:
-            email = ""
+    email = _validated_oidc_email(claims)
+    auto_provision_allowed = _oidc_auto_provision_allowed(provider, claims)
 
     user = None
     for attempt in range(16):
@@ -566,6 +1006,8 @@ def _resolve_oidc_user(provider_name, issuer, claims):
                     .first()
                 )
                 if identity:
+                    if identity.is_auto_provisioned and not auto_provision_allowed:
+                        raise _OidcPolicyRevocationRequired(identity.user_id)
                     user = identity.user
                     identity.provider = provider_name
                     identity.last_username = last_username
@@ -579,6 +1021,8 @@ def _resolve_oidc_user(provider_name, issuer, claims):
                         ]
                     )
                 else:
+                    if not auto_provision_allowed:
+                        raise PermissionError("OIDC identity is not pre-authorized")
                     username = _oidc_local_username(
                         claims,
                         issuer,
@@ -596,13 +1040,22 @@ def _resolve_oidc_user(provider_name, issuer, claims):
                         subject=subject,
                         provider=provider_name,
                         user=user,
+                        is_auto_provisioned=True,
                         last_username=last_username,
                         last_email=email,
                     )
             break
-        except IntegrityError:
+        except _OidcPolicyRevocationRequired as exc:
+            if not defer_policy_revocation:
+                revoke_user_credentials((exc.user_id,))
+            raise _OidcPolicyDenied(exc.user_id) from None
+        except (IntegrityError, ValidationError):
             identity = OidcIdentity.objects.select_related("user").filter(issuer=issuer, subject=subject).first()
             if identity:
+                if identity.is_auto_provisioned and not auto_provision_allowed:
+                    if not defer_policy_revocation:
+                        revoke_user_credentials((identity.user_id,))
+                    raise _OidcPolicyDenied(identity.user_id) from None
                 user = identity.user
                 break
     if user is None:
@@ -621,146 +1074,15 @@ def _log_event(request, event, level="info", **extra):
     username = (
         user.username if user and getattr(user, "is_authenticated", False) else extra.pop("username", "anonymous")
     )
-    payload = {
-        "event": event,
+    attributes = {
         "user": username,
         "ip": get_client_ip(request),
-        "path": getattr(request, "path", ""),
-        "method": getattr(request, "method", ""),
     }
-    payload.update({k: v for k, v in extra.items() if v is not None})
-    details = json.dumps(payload, ensure_ascii=False, default=str)
-    log_fn = getattr(logger, level, logger.info)
-    log_fn("event=%s details=%s", event, details)
+    attributes.update({k: v for k, v in extra.items() if v is not None})
+    log_structured_event(logger, request, event, level=level, attributes=attributes)
 
 
-def _record_dir():
-    return os.fspath(settings.RECORD_UPLOAD_ROOT)
-
-
-def _safe_record_name(name):
-    if not isinstance(name, str) or name != os.path.basename(name):
-        return ""
-    return name if RECORD_NAME_RE.fullmatch(name) else ""
-
-
-def _record_device_dir(token):
-    namespace = hashlib.sha256(
-        (f"{token.device.owner_id}\0{token.device.rid}\0{token.device.uuid}").encode()
-    ).hexdigest()
-    return os.path.join(_record_dir(), namespace)
-
-
-def _secure_directory(path):
-    try:
-        os.mkdir(path, 0o700)
-    except FileExistsError:
-        pass
-    directory_stat = os.lstat(path)
-    if not stat.S_ISDIR(directory_stat.st_mode) or stat.S_ISLNK(directory_stat.st_mode):
-        raise OSError("Recording directory is not a real directory")
-    if directory_stat.st_mode & 0o077:
-        os.chmod(path, 0o700)
-
-
-def _ensure_record_device_dir(token):
-    root = _record_dir()
-    _secure_directory(root)
-    device_dir = _record_device_dir(token)
-    _secure_directory(device_dir)
-    return device_dir
-
-
-def _fsync_directory(path):
-    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
-    directory_fd = os.open(path, flags)
-    try:
-        os.fsync(directory_fd)
-    finally:
-        os.close(directory_fd)
-
-
-@contextlib.contextmanager
-def _record_file_lock(base_dir, filename):
-    lock_dir = os.path.join(base_dir, ".locks")
-    _secure_directory(lock_dir)
-    lock_name = hashlib.sha256(filename.encode()).hexdigest() + ".lock"
-    lock_path = os.path.join(lock_dir, lock_name)
-    lock_fd = None
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0)
-    for _attempt in range(2):
-        try:
-            lock_fd = os.open(lock_path, flags, 0o600)
-            break
-        except FileExistsError:
-            try:
-                lock_stat = os.lstat(lock_path)
-            except FileNotFoundError:
-                continue
-            if not stat.S_ISREG(lock_stat.st_mode) or time.time() - lock_stat.st_mtime <= 300:
-                raise BlockingIOError("Recording is busy") from None
-            try:
-                os.unlink(lock_path)
-            except FileNotFoundError:
-                continue
-    if lock_fd is None:
-        raise BlockingIOError("Recording is busy")
-    try:
-        os.write(lock_fd, f"{os.getpid()} {time.time_ns()}\n".encode())
-        os.fsync(lock_fd)
-        yield
-    finally:
-        os.close(lock_fd)
-        try:
-            os.unlink(lock_path)
-        except FileNotFoundError:
-            pass
-
-
-def _open_record_file(filepath, flags):
-    fd = os.open(
-        filepath,
-        flags | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
-        0o600,
-    )
-    file_stat = os.fstat(fd)
-    if not stat.S_ISREG(file_stat.st_mode):
-        os.close(fd)
-        raise OSError("Recording path is not a regular file")
-    return fd
-
-
-def _write_all(fd, data):
-    written = 0
-    while written < len(data):
-        count = os.write(fd, data[written:])
-        if count <= 0:
-            raise OSError("Recording write did not make progress")
-        written += count
-
-
-def _request_content_length(request):
-    try:
-        return int(request.META.get("CONTENT_LENGTH", "0") or 0)
-    except (TypeError, ValueError):
-        return -1
-
-
-def _plugin_signing_key():
-    raw = getattr(settings, "PLUGIN_SIGNING_KEY", "").strip()
-    if not raw:
-        return None
-    for decoder in (
-        lambda value: base64.b64decode(value, validate=True),
-        lambda value: binascii.unhexlify(value),
-    ):
-        try:
-            key = decoder(raw)
-        except (binascii.Error, ValueError):
-            continue
-        if len(key) == 32:
-            return SigningKey(key)
-    return None
+_record_file_lock = recording_uploads._record_file_lock
 
 
 def _personal_guid(user):
@@ -827,6 +1149,9 @@ def _get_rule_access(profile, user):
 def _audit_ab_rule(profile, actor, action, target_type, target_name, rule, details=None):
     if not profile:
         return
+    target_name = target_name or ""
+    if len(target_name) > 150:
+        raise ValueError("Address-book audit target name is too long")
     payload = _json_value(
         details if details is not None else {},
         expected_type=(dict, list),
@@ -834,12 +1159,18 @@ def _audit_ab_rule(profile, actor, action, target_type, target_name, rule, detai
     )
     if payload is None:
         payload = {}
+    if isinstance(payload, dict):
+        payload.setdefault("authorization_generation", profile.authorization_generation)
+    owner = getattr(profile, "owner", None)
     AddressBookRuleAudit.objects.create(
         profile=profile,
+        profile_guid=str(profile.guid or ""),
+        profile_name=str(profile.name or ""),
+        profile_owner_name=getattr(owner, "username", "") or "",
         actor=actor if actor and getattr(actor, "id", None) else None,
         action=action,
         target_type=target_type,
-        target_name=target_name or "",
+        target_name=target_name,
         rule=int(rule or 1),
         details=payload,
     )
@@ -864,6 +1195,20 @@ def _get_profile_access(user, guid):
 
 def _can_write_rule(rule):
     return rule in (2, 3)
+
+
+def _lock_profile_for_content_write(user, profile):
+    current, owner, rule = lock_profile_access(user, profile.pk)
+    if not current or not owner or not _can_write_rule(rule):
+        return None, None, 0
+    return current, owner, rule
+
+
+def _lock_profile_for_management(user, profile):
+    current, _owner, _rule = lock_profile_access(user, profile.pk)
+    if not current or (not user.is_admin and str(current.owner_id) != str(user.pk)):
+        return None
+    return current
 
 
 def _safe_tags(tags):
@@ -943,29 +1288,61 @@ def _json_value(value, *, expected_type, max_bytes):
     return value if len(encoded) <= max_bytes else None
 
 
-def _strategy_options_value(value):
-    value = _json_value(
-        value,
-        expected_type=dict,
-        max_bytes=MAX_STRATEGY_OPTIONS_BYTES,
-    )
-    if value is None or len(value) > 512:
+_PROFILE_INFO_FORBIDDEN_KEYS = frozenset(
+    {
+        "credential",
+        "credentials",
+        "password",
+        "rhash",
+        "secret",
+        "token",
+    }
+)
+
+
+def _profile_info_contains_credential(value):
+    if isinstance(value, dict):
+        for key, child in value.items():
+            if isinstance(key, str) and key.casefold() in _PROFILE_INFO_FORBIDDEN_KEYS:
+                return True
+            if _profile_info_contains_credential(child):
+                return True
+    elif isinstance(value, list):
+        return any(_profile_info_contains_credential(child) for child in value)
+    return False
+
+
+def _profile_info_value(value):
+    parsed = _json_value(value, expected_type=(dict, list), max_bytes=16 * 1024)
+    if parsed is None or _profile_info_contains_credential(parsed):
         return None
-    output = {}
-    for key, option_value in value.items():
-        if (
-            not isinstance(key, str)
-            or not key
-            or len(key) > 128
-            or len(key.encode()) > 512
-            or any(ord(character) < 32 for character in key)
-            or not isinstance(option_value, str)
-            or len(option_value) > 4096
-            or len(option_value.encode()) > 16 * 1024
-        ):
-            return None
-        output[key] = option_value
-    return output
+    return parsed
+
+
+def _public_profile_info(value):
+    if isinstance(value, dict):
+        return {
+            key: _public_profile_info(child)
+            for key, child in value.items()
+            if not isinstance(key, str) or key.casefold() not in _PROFILE_INFO_FORBIDDEN_KEYS
+        }
+    if isinstance(value, list):
+        return [_public_profile_info(child) for child in value]
+    return value
+
+
+def _profile_default_password(value):
+    value = _bounded_text_value(value, MAX_AB_PROFILE_PASSWORD_BYTES)
+    if value is None or len(value) > 60:
+        return None
+    return value
+
+
+def _strategy_options_value(value):
+    try:
+        return normalize_policy_options(value)
+    except InvalidManagedPolicy:
+        return None
 
 
 def _allowed_incomings_value(value):
@@ -987,19 +1364,200 @@ def _allowed_incomings_value(value):
     return result
 
 
-def _identifier_list(value, *, numeric=False):
+def _rid_list(value):
     if not isinstance(value, list) or len(value) > MAX_MANAGEMENT_BATCH_ITEMS:
         return None
     result = []
     seen = set()
     for item in value:
-        item = str(item).strip()
-        if not item or len(item) > 64 or (numeric and (not item.isascii() or not item.isdigit())):
+        if not isinstance(item, str) or not item or len(item) > 64 or item != item.strip():
             return None
-        if item not in seen:
-            seen.add(item)
-            result.append(item)
+        if item in seen:
+            return None
+        seen.add(item)
+        result.append(item)
     return result
+
+
+def _operation_id_or_error(request):
+    try:
+        return operation_id_from_request(request), None
+    except InvalidIdentifier:
+        return None, JsonResponse({"error": "Valid Idempotency-Key required"}, status=400)
+
+
+def _state040_operation_id(request):
+    """Require the caller's stable operation id for deterministic replay."""
+
+    return _operation_id_or_error(request)
+
+
+MAX_MUTATION_GENERATION = (1 << 63) - 1
+
+
+def _expected_mutation_generation(request):
+    value = request.META.get("HTTP_IF_MATCH", "").strip()
+    if value.startswith('"') and value.endswith('"'):
+        value = value[1:-1]
+    if not value:
+        return False
+    if not re.fullmatch(r"[0-9]+", value):
+        return False
+    try:
+        generation = int(value)
+    except ValueError:
+        return False
+    return generation if generation <= MAX_MUTATION_GENERATION else False
+
+
+def _generation_conflict(current, kind="resources"):
+    return ManagementMutation(
+        status_code=409,
+        body={
+            "error": "Resource changed",
+            "code": "resource_generation_conflict",
+            "current_generation": current,
+        },
+        applied={kind: 0},
+        result_state={"current_generation": current},
+    )
+
+
+def _advance_mutation_generation(instance):
+    if instance.mutation_generation >= MAX_MUTATION_GENERATION:
+        raise RuntimeError("Resource mutation generation exhausted")
+    updated = type(instance)._base_manager.filter(pk=instance.pk).update(
+        mutation_generation=F("mutation_generation") + 1
+    )
+    if updated != 1:
+        raise RuntimeError("Resource disappeared while advancing mutation generation")
+    instance.mutation_generation += 1
+    return instance.mutation_generation
+
+
+def _advance_mutation_generations(model, object_ids):
+    object_ids = sorted(set(object_ids))
+    if not object_ids:
+        return 0
+    queryset = model._base_manager.filter(pk__in=object_ids)
+    if queryset.filter(mutation_generation__gte=MAX_MUTATION_GENERATION).exists():
+        raise RuntimeError("Resource mutation generation exhausted")
+    updated = queryset.update(mutation_generation=F("mutation_generation") + 1)
+    if updated != len(object_ids):
+        raise RuntimeError("Resource disappeared while advancing mutation generations")
+    return updated
+
+
+MUTATION_GENERATION_TARGETS = ("devices", "users", "groups")
+
+
+def _expected_mutation_generation_map(value, target_ids):
+    """Validate an exact generation snapshot for a multi-resource mutation."""
+
+    if not isinstance(value, dict) or set(value) != set(MUTATION_GENERATION_TARGETS):
+        return None
+    normalized = {}
+    for kind in MUTATION_GENERATION_TARGETS:
+        generations = value.get(kind)
+        expected_ids = tuple(str(target_id) for target_id in target_ids[kind])
+        if not isinstance(generations, dict) or set(generations) != set(expected_ids):
+            return None
+        normalized[kind] = {}
+        for target_id in expected_ids:
+            generation = generations.get(target_id)
+            if (
+                type(generation) is not int
+                or generation < 0
+                or generation > MAX_MUTATION_GENERATION
+            ):
+                return None
+            normalized[kind][target_id] = generation
+    return normalized
+
+
+def _mutation_generation_conflicts(expected, current):
+    conflicts = {}
+    for kind in MUTATION_GENERATION_TARGETS:
+        stale = {
+            target_id: current[kind][target_id]
+            for target_id, generation in expected[kind].items()
+            if current[kind][target_id] != generation
+        }
+        if stale:
+            conflicts[kind] = stale
+    return conflicts
+
+
+MUTATION_FIELD_CONTRACT_VERSION = 1
+MAX_MUTATION_ERROR_FIELDS = 16
+
+
+def _mutation_fields_error(
+    data,
+    *,
+    allowed,
+    required=(),
+    require_any=False,
+    exactly_one=(),
+    prefix="",
+):
+    allowed = frozenset(allowed)
+    supplied = frozenset(data)
+    unknown = sorted(f"{prefix}{field}" for field in supplied - allowed)
+    missing = sorted(f"{prefix}{field}" for field in frozenset(required) - supplied)
+    conflicting = []
+    required_one_of = []
+    for alternatives in exactly_one:
+        alternatives = frozenset(alternatives)
+        present = supplied & alternatives
+        if len(present) > 1:
+            conflicting.extend(f"{prefix}{field}" for field in present)
+        elif not present:
+            required_one_of.append(sorted(f"{prefix}{field}" for field in alternatives))
+    if (
+        not unknown
+        and not missing
+        and not conflicting
+        and not required_one_of
+        and (not require_any or supplied & allowed)
+    ):
+        return None
+    body = {
+        "error": "Invalid request fields",
+        "code": "invalid_request_fields",
+        "field_contract_version": MUTATION_FIELD_CONTRACT_VERSION,
+    }
+    if unknown:
+        body["unknown_fields"] = unknown[:MAX_MUTATION_ERROR_FIELDS]
+        if len(unknown) > MAX_MUTATION_ERROR_FIELDS:
+            body["unknown_field_count"] = len(unknown)
+    if missing:
+        body["missing_fields"] = missing
+    if conflicting:
+        body["conflicting_fields"] = sorted(conflicting)[:MAX_MUTATION_ERROR_FIELDS]
+    if required_one_of:
+        body["required_one_of"] = required_one_of
+    if require_any and not supplied & allowed:
+        body["required_any_of"] = sorted(f"{prefix}{field}" for field in allowed)
+    return JsonResponse(body, status=400)
+
+
+def _optional_empty_mutation_body_error(request):
+    if not request.body:
+        return None
+    return _mutation_fields_error(_load_json_object(request), allowed=())
+
+
+def _execute_management_batch(**kwargs):
+    try:
+        result = execute_management_operation(**kwargs)
+    except ManagementOperationConflict:
+        return JsonResponse({"error": "Operation identifier conflict"}, status=409)
+    response = JsonResponse(result.body, status=result.status_code)
+    generation = result.body.get("mutation_generation")
+    if isinstance(generation, int) and generation >= 0:
+        response["ETag"] = f'"{generation}"'
+    return response
 
 
 def _strict_bool(value):
@@ -1010,20 +1568,32 @@ def _user_by_identifier(value, *, active_only=False):
     value = str(value or "").strip()
     if not value or len(value) > 150:
         return None
-    query = Q(username__iexact=value)
+    queries = []
+    try:
+        queries.append(Q(username_canonical=canonical_username_key(value)))
+    except ValueError:
+        pass
     if value.isascii() and value.isdigit():
-        query |= Q(pk=int(value))
+        try:
+            queries.append(Q(pk=parse_model_pk(value, UserProfile)))
+        except InvalidIdentifier:
+            pass
+    if not queries:
+        return None
+    query = queries[0]
+    for candidate in queries[1:]:
+        query |= candidate
     users = UserProfile.objects.filter(query)
     if active_only:
         users = users.filter(is_active=True)
     return users.order_by("pk").first()
 
 
-def _numeric_pk(value):
-    value = str(value or "").strip()
-    if not value or len(value) > 20 or not value.isascii() or not value.isdigit():
+def _numeric_pk(value, model):
+    try:
+        return parse_model_pk(value, model)
+    except InvalidIdentifier:
         return None
-    return int(value)
 
 
 def _validated_tags(tags):
@@ -1276,46 +1846,44 @@ def _ensure_personal_device_peer(user, device):
     if not device or not device.public_key_hash:
         return None
     profile = _ensure_personal_profile(user)
-    peer, _created = RemotePeer.objects.get_or_create(
-        profile=profile,
-        rid=device.rid,
-        defaults={
-            "username": device.username or "",
-            "hostname": device.hostname or "",
-            "platform": device.os or "",
-        },
-    )
+    with transaction.atomic():
+        profile, owner, rule = lock_profile_access(user, profile.pk)
+        if not profile or not owner or not _can_write_rule(rule) or profile.guid != _personal_guid(user):
+            return None
+        peer, _created = RemotePeer.objects.get_or_create(
+            profile=profile,
+            rid=device.rid,
+            defaults={
+                "username": device.username or "",
+                "hostname": device.hostname or "",
+                "platform": device.os or "",
+            },
+        )
     return peer
 
 
-def _login_locked(ip, username):
-    window_start = timezone.now() - datetime.timedelta(minutes=LOGIN_LOCK_WINDOW_MINUTES)
-    attempts = LoginAttempt.objects.filter(Q(ip=ip) & Q(created_at__gte=window_start))
-    if attempts.count() >= LOGIN_LOCK_MAX_IP_FAILURES:
-        return True
-    return attempts.filter(Q(username=username.casefold())).count() >= LOGIN_LOCK_MAX_FAILURES
-
-
-def _record_login_failure(ip, username):
-    LoginAttempt.objects.create(
-        ip=ip or "0.0.0.0",  # noqa: S104 - non-routable audit sentinel, not a bind address
-        username=username.casefold()[:150],
-    )
+def _finalize_personal_device_peer(user, device):
+    try:
+        return _ensure_personal_device_peer(user, device)
+    except IntegrityError as exc:
+        raise DeviceCredentialFinalizationError("Personal device peer finalization failed") from exc
 
 
 def login(request):
     result = {}
-    data = _load_json_object(request)
+    data = _load_json_object(request, max_bytes=settings.JSON_AUTH_MAX_BODY_BYTES)
 
     username_value = data.get("username", "")
-    username = username_value.strip() if isinstance(username_value, str) else ""
+    try:
+        username = normalize_username(username_value)
+    except ValueError:
+        username = ""
     password = data.get("password", "")
     rid = data.get("id", "")
     uuid = data.get("uuid", "")
     device_info = _validated_login_device_info(data.get("deviceInfo", {}))
     if (
         not username
-        or len(username) > UserProfile._meta.get_field("username").max_length
         or not isinstance(password, str)
         or not password
         or len(password) > settings.MAX_PASSWORD_LENGTH
@@ -1325,12 +1893,12 @@ def login(request):
         _log_event(request, "api_login_invalid_payload", level="warning", username=username)
         return JsonResponse({"error": "Invalid login payload"}, status=400)
     client_ip = get_client_ip(request)
-    if _login_locked(client_ip, username):
+    admission = reserve_login_attempt(client_ip, username)
+    if admission is None:
         _log_event(request, "api_login_locked", level="warning", username=username)
         return JsonResponse({"error": _("尝试次数过多，请稍后再试。")}, status=429)
     user = auth.authenticate(username=username, password=password)
     if not user:
-        _record_login_failure(client_ip, username)
         result["error"] = _("帐号或密码错误！请重试，多次重试后将被锁定IP！")
         _log_event(request, "api_login_failed", level="warning", username=username)
         return JsonResponse(result, status=401)
@@ -1339,20 +1907,25 @@ def login(request):
         return JsonResponse({"error": _("账号已被禁用")}, status=403)
 
     try:
-        device = _claim_session_device(
-            user,
-            rid,
-            uuid,
-            client_ip,
-            device_info,
-        )
-        _token, raw_token = _issue_access_token(user, device)
+        with transaction.atomic():
+            device = _claim_session_device(
+                user,
+                rid,
+                uuid,
+                client_ip,
+                device_info,
+                data.get("device_proof"),
+                DeviceProofChallenge.PURPOSE_LOGIN,
+            )
+            _token, raw_token = _issue_access_token(user, device)
+            _finalize_personal_device_peer(user, device)
+            complete_login_success(admission)
     except DeviceIdentityConflict:
         _log_event(
             request, "api_login_denied", level="warning", username=username, reason="device_identity_conflict", rid=rid
         )
         return JsonResponse({"error": "Device identity conflict"}, status=409)
-    except PermissionError:
+    except (PermissionError, DeviceProofError):
         _log_event(
             request, "api_login_denied", level="warning", username=username, reason="device_unavailable", rid=rid
         )
@@ -1362,10 +1935,6 @@ def login(request):
             request, "api_login_denied", level="warning", username=username, reason="device_identity_race", rid=rid
         )
         return JsonResponse({"error": "Device identity conflict"}, status=409)
-    LoginAttempt.objects.filter(Q(ip=client_ip) & Q(username=username.casefold())).delete()
-
-    _ensure_personal_device_peer(user, device)
-
     result.update(_auth_body(user, raw_token))
     _log_event(request, "api_login_success", username=user.username, rid=rid)
     return JsonResponse(result)
@@ -1385,14 +1954,11 @@ def logout(request):
 
 def currentUser(request):
     result = {}
-    token, user = _get_token_user(request)
+    _token, user = _get_token_user(request)
 
     if not user:
         _log_event(request, "api_current_user_failed", level="warning")
         return JsonResponse({"error": "Invalid token"}, status=401)
-    if token:
-        # Tokens are stored hashed; echo back the raw token the client presented.
-        result["access_token"] = _get_bearer_token(request)
     result["type"] = "access_token"
     result["name"] = user.username
     result["status"] = 1 if user.is_active else 0
@@ -1410,7 +1976,7 @@ def sysinfo(request):
     device_uuid = postdata.get("uuid")
     if not _valid_device_identity(rid, device_uuid):
         _log_event(request, "api_sysinfo_missing_id", level="warning")
-        return HttpResponse("ID_NOT_FOUND", status=400)
+        return json_error("device_identity_invalid", "Invalid device identity", status=400)
     token, user = _get_device_token_user(request, rid, device_uuid)
     if not token or not user:
         _log_event(request, "api_sysinfo_unauthorized", level="warning", rid=rid)
@@ -1441,7 +2007,7 @@ def sysinfo(request):
         _log_event(request, "api_sysinfo_conflict", level="warning", username=user.username, rid=rid)
         return JsonResponse({"error": "Device identity conflict"}, status=409)
     _log_event(request, "api_sysinfo_updated", level="debug", username=user.username, rid=rid, uuid=device_uuid)
-    return HttpResponse("SYSINFO_UPDATED")
+    return JsonResponse({"updated": True, "sysinfo_schema_version": 1})
 
 
 def heartbeat(request):
@@ -1454,7 +2020,13 @@ def heartbeat(request):
     token, user = _get_device_token_user(request, rid, device_uuid)
     if not token or not user:
         _log_event(request, "api_heartbeat_unauthorized", level="warning", rid=rid)
-        return JsonResponse({"error": "Invalid device token"}, status=401)
+        return JsonResponse(
+            {
+                "error": "Invalid device token",
+                "device_lease": _revoked_device_lease(rid, device_uuid),
+            },
+            status=401,
+        )
     with transaction.atomic():
         try:
             device = _device_by_identity(rid, device_uuid, for_update=True)
@@ -1470,35 +2042,66 @@ def heartbeat(request):
                 uuid=device_uuid,
             )
             return JsonResponse(
-                {"error": "Device is not active for this account"},
+                {
+                    "error": "Device is not active for this account",
+                    "device_lease": _revoked_device_lease(rid, device_uuid),
+                },
                 status=403,
             )
         device.ip_address = get_client_ip(request)
-        device.save(update_fields=["ip_address", "update_time"])
+        now = timezone.now()
 
-        # Sliding expiry is extended only after the device authorization is
-        # revalidated while holding the same transaction lock.
-        token.expires_at = timezone.now() + datetime.timedelta(seconds=EFFECTIVE_SECONDS)
-        token.save(update_fields=["expires_at"])
-    response = {}
+        # Do not save the previously loaded token instance: a concurrent
+        # credential revocation may already have deleted it. A conditional
+        # update cannot resurrect a deleted row and binds renewal to the
+        # freshly locked device owner's current credential generation.
+        renewed = RemoteToken.objects.filter(
+            pk=token.pk,
+            device=device,
+            subject_user=device.owner,
+            credential_hash=device.owner.get_session_auth_hash(),
+            expires_at__gt=now,
+        ).update(expires_at=now + datetime.timedelta(seconds=EFFECTIVE_SECONDS))
+        if renewed != 1:
+            _log_event(
+                request,
+                "api_heartbeat_credential_revoked",
+                level="warning",
+                username=user.username,
+                rid=rid,
+                uuid=device_uuid,
+            )
+            return JsonResponse(
+                {
+                    "error": "Invalid device token",
+                    "device_lease": _revoked_device_lease(rid, device_uuid),
+                },
+                status=401,
+            )
+        device.save(update_fields=["ip_address", "update_time"])
+    response = {
+        "device_lease": {
+            "version": 1,
+            "state": "active",
+            "id": device.rid,
+            "uuid": device.uuid,
+            "deployment_generation": device.deployment_generation,
+            "valid_for_seconds": DEVICE_LEASE_SECONDS,
+        }
+    }
     try:
-        client_modified = int(postdata.get("modified_at", 0))
-    except (TypeError, ValueError):
-        client_modified = 0
-    if device:
+        response["managed_policy"] = managed_policy_document(device)
+    except InvalidManagedPolicy:
         profile = device.effective_strategy()
-        if profile and profile.enabled:
-            server_modified = int(profile.updated_at.timestamp())
-            if server_modified != client_modified:
-                response["modified_at"] = server_modified
-                options = _strategy_options_value(profile.config_options)
-                if options is None:
-                    logger.error(
-                        "event=invalid_strategy_options strategy_id=%s",
-                        profile.pk,
-                    )
-                    return JsonResponse({"error": "Invalid strategy configuration"}, status=503)
-                response["strategy"] = {"config_options": options, "extra": {}}
+        logger.error(
+            "event=invalid_strategy_options strategy_id=%s",
+            profile.pk if profile else None,
+        )
+        return json_error(
+            "invalid_strategy_configuration",
+            "Invalid strategy configuration",
+            status=503,
+        )
     _log_event(request, "api_heartbeat", level="debug", username=user.username, rid=rid, uuid=device_uuid)
     return JsonResponse(response)
 
@@ -1508,7 +2111,7 @@ def sysinfo_ver(request):
     if not user:
         return JsonResponse({"error": "Invalid token"}, status=401)
     _log_event(request, "api_sysinfo_ver", level="debug", username=user.username)
-    return HttpResponse("1")
+    return JsonResponse({"sysinfo_schema_version": 1})
 
 
 def health_live(request):
@@ -1522,7 +2125,30 @@ def health_ready(request):
         with connection.cursor() as cursor:
             cursor.execute("SELECT 1")
             cursor.fetchone()
+        check_release_schema()
+        check_runtime_write_capability()
+        check_username_identity(full=False)
         RemoteDevice.objects.order_by("pk").values_list("pk", flat=True).first()
+        key_states = list(DataEncryptionKeyState.objects.order_by("key_id")[: settings.MAX_DATA_ENCRYPTION_KEYS + 1])
+        primary_key_id = getattr(settings, "DATA_ENCRYPTION_PRIMARY_KEY_ID", "")
+        if (
+            not key_states
+            or len(key_states) > settings.MAX_DATA_ENCRYPTION_KEYS
+            or [state.key_id for state in key_states if state.is_primary] != [primary_key_id]
+            or any(
+                not verify_key_canary(
+                    state.key_id,
+                    state.key_fingerprint,
+                    state.encrypted_canary,
+                )
+                for state in key_states
+            )
+        ):
+            raise ValidationError("Data-encryption key inventory does not match this replica")
+        ingestion_governance.check_recording_storage_capability()
+    except RuntimeWriteCapabilityError as exc:
+        logger.warning("readiness runtime capability failed reason=%s", exc.reason)
+        return JsonResponse({"status": "not_ready"}, status=503)
     except Exception as exc:  # noqa: BLE001 - readiness normalizes backend failures
         logger.warning("readiness database check failed: %s", type(exc).__name__)
         return JsonResponse({"status": "not_ready"}, status=503)
@@ -1532,11 +2158,11 @@ def health_ready(request):
 def login_options(request):
     _log_event(request, "api_login_options", level="debug")
     providers = getattr(settings, "OIDC_PROVIDERS", {})
-    return JsonResponse([f"oidc/{name}" for name in providers.keys()], safe=False)
+    return JsonResponse({"options": [f"oidc/{name}" for name in providers.keys()]})
 
 
 def oidc_auth(request):
-    data = _load_json_object(request)
+    data = _load_json_object(request, max_bytes=settings.JSON_AUTH_MAX_BODY_BYTES)
     provider_name = _oidc_provider_name(data.get("op"))
     provider = getattr(settings, "OIDC_PROVIDERS", {}).get(provider_name)
     if not provider:
@@ -1547,7 +2173,8 @@ def oidc_auth(request):
     if not _valid_device_identity(rid, device_uuid):
         return JsonResponse({"error": "Invalid device identity"}, status=400)
     device_info = _validated_login_device_info(data.get("deviceInfo", {}))
-    if device_info is None:
+    device_proof = data.get("device_proof", {})
+    if device_info is None or not isinstance(device_proof, dict):
         return JsonResponse({"error": "Invalid deviceInfo"}, status=400)
 
     now = timezone.now()
@@ -1589,6 +2216,7 @@ def oidc_auth(request):
             rid=rid,
             device_uuid=device_uuid,
             device_info=device_info,
+            device_proof=device_proof,
             nonce=nonce,
             code_verifier=code_verifier,
             status=OidcPendingAuth.STATUS_PENDING,
@@ -1606,10 +2234,27 @@ def oidc_auth(request):
     return JsonResponse({"code": poll_code, "url": auth_url})
 
 
+def _oidc_poll_pending_response():
+    return json_pending(
+        "oidc_pending",
+        "OIDC authorization is still pending",
+        retry_after=1,
+    )
+
+
+def _oidc_poll_error_response(code, message, *, status):
+    return json_error(code, message, status=status, pending=False)
+
+
 def oidc_auth_query(request):
-    poll_code = str(request.GET.get("code", "")).strip()
+    data = _load_json_object(request, max_bytes=settings.JSON_AUTH_MAX_BODY_BYTES)
+    poll_code = str(data.get("code", "")).strip()
+    rid = data.get("id", "")
+    device_uuid = data.get("uuid", "")
+    if not _valid_device_identity(rid, device_uuid):
+        return _oidc_poll_error_response("oidc_poll_invalid", "Invalid device identity", status=400)
     if not poll_code or len(poll_code) > 128:
-        return JsonResponse({"error": "No authed oidc is found"})
+        return _oidc_poll_error_response("oidc_poll_invalid", "Invalid OIDC poll code", status=400)
     with transaction.atomic():
         session = (
             OidcPendingAuth.objects.select_for_update(of=("self",))
@@ -1618,19 +2263,21 @@ def oidc_auth_query(request):
             .first()
         )
         if not session:
-            return JsonResponse({"error": "No authed oidc is found"})
+            return _oidc_poll_error_response("oidc_poll_invalid", "Invalid OIDC poll code", status=400)
+        if not secrets.compare_digest(session.rid, rid) or not secrets.compare_digest(session.device_uuid, device_uuid):
+            return _oidc_poll_error_response("oidc_authorization_failed", "OIDC authorization failed", status=403)
         if timezone.now() - session.created_at > datetime.timedelta(minutes=OIDC_PENDING_MINUTES):
             session.delete()
-            return JsonResponse({"error": "OIDC authorization timeout"}, status=408)
+            return _oidc_poll_error_response("oidc_authorization_timeout", "OIDC authorization timeout", status=408)
         if session.status == OidcPendingAuth.STATUS_ERROR:
             session.delete()
-            return JsonResponse({"error": "OIDC authorization failed"}, status=400)
+            return _oidc_poll_error_response("oidc_authorization_failed", "OIDC authorization failed", status=400)
         if session.status != OidcPendingAuth.STATUS_DONE or not session.authenticated_user:
-            return JsonResponse({"error": "No authed oidc is found"})
+            return _oidc_poll_pending_response()
         user = session.authenticated_user
         if not user.is_active:
             session.delete()
-            return JsonResponse({"error": "OIDC authorization failed"}, status=403)
+            return _oidc_poll_error_response("oidc_authorization_failed", "OIDC authorization failed", status=403)
         try:
             device = _claim_session_device(
                 user,
@@ -1638,49 +2285,215 @@ def oidc_auth_query(request):
                 session.device_uuid,
                 session.request_ip,
                 session.device_info,
+                session.device_proof,
+                DeviceProofChallenge.PURPOSE_OIDC,
             )
             _token, raw_token = _issue_access_token(user, device)
         except (DeviceIdentityConflict, IntegrityError):
             session.delete()
-            return JsonResponse({"error": "OIDC authorization failed"}, status=409)
-        except PermissionError:
+            return _oidc_poll_error_response("oidc_authorization_conflict", "OIDC authorization failed", status=409)
+        except (PermissionError, DeviceProofError):
             session.delete()
-            return JsonResponse({"error": "OIDC authorization failed"}, status=403)
+            return _oidc_poll_error_response("oidc_authorization_failed", "OIDC authorization failed", status=403)
         body = _auth_body(user, raw_token)
         session.delete()
     return JsonResponse(body)
 
 
+def _oidc_callback_deadline(session):
+    return session.created_at + datetime.timedelta(minutes=OIDC_PENDING_MINUTES)
+
+
+def _reject_pending_oidc_callback(state):
+    now = timezone.now()
+    with transaction.atomic():
+        session = OidcPendingAuth.objects.select_for_update(of=("self",)).filter(state=state).first()
+        if not session:
+            return HttpResponse("Invalid OIDC callback", status=400)
+        if now >= _oidc_callback_deadline(session):
+            session.delete()
+            return HttpResponse("OIDC authorization expired", status=408)
+        if session.status == OidcPendingAuth.STATUS_DONE:
+            return HttpResponse("OIDC authorization completed. You can close this window.")
+        if session.status == OidcPendingAuth.STATUS_PROCESSING:
+            return HttpResponse("OIDC authorization is already being processed.", status=409)
+        if session.status != OidcPendingAuth.STATUS_PENDING:
+            return HttpResponse("OIDC authorization was not completed.", status=400)
+        session.status = OidcPendingAuth.STATUS_ERROR
+        session.error_code = "provider_denied"
+        session.save(update_fields=["status", "error_code"])
+    return HttpResponse("OIDC authorization was not completed.", status=400)
+
+
+def _claim_oidc_callback(state):
+    now = timezone.now()
+    with transaction.atomic():
+        session = OidcPendingAuth.objects.select_for_update(of=("self",)).filter(state=state).first()
+        if not session:
+            return None, HttpResponse("Invalid OIDC callback", status=400)
+        deadline = _oidc_callback_deadline(session)
+        if now >= deadline:
+            session.delete()
+            return None, HttpResponse("OIDC authorization expired", status=408)
+        if session.status == OidcPendingAuth.STATUS_DONE:
+            return None, HttpResponse("OIDC authorization completed. You can close this window.")
+        if session.status == OidcPendingAuth.STATUS_ERROR:
+            return None, HttpResponse("OIDC authorization was not completed.", status=400)
+        if session.status == OidcPendingAuth.STATUS_PROCESSING:
+            if not session.callback_claim_expires_at or session.callback_claim_expires_at > now:
+                return None, HttpResponse("OIDC authorization is already being processed.", status=409)
+        elif session.status != OidcPendingAuth.STATUS_PENDING:
+            raise RuntimeError("OIDC callback state is invalid")
+        if session.callback_claim_generation >= MAX_OIDC_CALLBACK_CLAIM_GENERATION:
+            session.status = OidcPendingAuth.STATUS_ERROR
+            session.error_code = "claim_generation_exhausted"
+            session.callback_claim_owner = None
+            session.callback_claim_expires_at = None
+            session.save(
+                update_fields=[
+                    "status",
+                    "error_code",
+                    "callback_claim_owner",
+                    "callback_claim_expires_at",
+                ]
+            )
+            return None, HttpResponse("OIDC authorization failed", status=409)
+        owner = uuid.uuid4()
+        generation = session.callback_claim_generation + 1
+        expires_at = min(
+            now + datetime.timedelta(seconds=settings.OIDC_CALLBACK_CLAIM_LEASE_SECONDS),
+            deadline,
+        )
+        session.status = OidcPendingAuth.STATUS_PROCESSING
+        session.error_code = ""
+        session.callback_claim_owner = owner
+        session.callback_claim_generation = generation
+        session.callback_claim_expires_at = expires_at
+        session.save(
+            update_fields=[
+                "status",
+                "error_code",
+                "callback_claim_owner",
+                "callback_claim_generation",
+                "callback_claim_expires_at",
+            ]
+        )
+        claim = _OidcCallbackClaim(
+            state=state,
+            owner=owner,
+            generation=generation,
+            provider=session.provider,
+            nonce=session.nonce,
+            code_verifier=session.code_verifier,
+        )
+    return claim, None
+
+
+def _fail_oidc_callback_claim(claim, error_code):
+    now = timezone.now()
+    with transaction.atomic():
+        updated = OidcPendingAuth.objects.filter(
+            state=claim.state,
+            status=OidcPendingAuth.STATUS_PROCESSING,
+            callback_claim_owner=claim.owner,
+            callback_claim_generation=claim.generation,
+            callback_claim_expires_at__gt=now,
+        ).update(
+            status=OidcPendingAuth.STATUS_ERROR,
+            error_code=error_code,
+            authenticated_user=None,
+            callback_claim_owner=None,
+            callback_claim_expires_at=None,
+        )
+    return updated == 1
+
+
+def _oidc_callback_claim_is_live(pending, claim, now):
+    return bool(
+        pending
+        and pending.status == OidcPendingAuth.STATUS_PROCESSING
+        and pending.callback_claim_owner == claim.owner
+        and pending.callback_claim_generation == claim.generation
+        and pending.callback_claim_expires_at
+        and pending.callback_claim_expires_at > now
+    )
+
+
+def _complete_oidc_callback_claim(claim, issuer, claims):
+    with transaction.atomic():
+        pending = OidcPendingAuth.objects.select_for_update(of=("self",)).filter(state=claim.state).first()
+        if not _oidc_callback_claim_is_live(pending, claim, timezone.now()):
+            raise _OidcCallbackClaimLost("OIDC callback claim is no longer authoritative")
+        user = _resolve_oidc_user(
+            claim.provider,
+            issuer,
+            claims,
+            defer_policy_revocation=True,
+        )
+        if pending.callback_claim_expires_at <= timezone.now():
+            raise _OidcCallbackClaimLost("OIDC callback claim expired while provisioning")
+        pending.authenticated_user = user
+        pending.status = OidcPendingAuth.STATUS_DONE
+        pending.error_code = ""
+        pending.callback_claim_owner = None
+        pending.callback_claim_expires_at = None
+        pending.save(
+            update_fields=[
+                "authenticated_user",
+                "status",
+                "error_code",
+                "callback_claim_owner",
+                "callback_claim_expires_at",
+            ]
+        )
+    return user
+
+
+def _reject_oidc_policy_claim(claim, user_id):
+    with transaction.atomic():
+        pending = OidcPendingAuth.objects.select_for_update(of=("self",)).filter(state=claim.state).first()
+        if not _oidc_callback_claim_is_live(pending, claim, timezone.now()):
+            raise _OidcCallbackClaimLost("OIDC callback claim is no longer authoritative")
+        revoke_user_credentials((user_id,))
+        if pending.callback_claim_expires_at <= timezone.now():
+            raise _OidcCallbackClaimLost("OIDC callback claim expired while revoking credentials")
+        pending.status = OidcPendingAuth.STATUS_ERROR
+        pending.error_code = "policy_rejected"
+        pending.authenticated_user = None
+        pending.callback_claim_owner = None
+        pending.callback_claim_expires_at = None
+        pending.save(
+            update_fields=[
+                "status",
+                "error_code",
+                "authenticated_user",
+                "callback_claim_owner",
+                "callback_claim_expires_at",
+            ]
+        )
+
+
 def oidc_callback(request):
     state = str(request.GET.get("state", "")).strip()
     code = str(request.GET.get("code", "")).strip()
-    session = OidcPendingAuth.objects.filter(Q(state=state)).first() if state else None
     provider_error = str(request.GET.get("error", "")).strip()
-    if provider_error and session:
-        OidcPendingAuth.objects.filter(
-            state=state,
-            status=OidcPendingAuth.STATUS_PENDING,
-        ).update(
-            status=OidcPendingAuth.STATUS_ERROR,
-            error_code="provider_denied",
-        )
-        return HttpResponse("OIDC authorization was not completed.", status=400)
-    if not state or not code or not session:
+    if provider_error:
+        if not state:
+            return HttpResponse("Invalid OIDC callback", status=400)
+        return _reject_pending_oidc_callback(state)
+    if not state or not code:
         return HttpResponse("Invalid OIDC callback", status=400)
-    if timezone.now() - session.created_at > datetime.timedelta(minutes=OIDC_PENDING_MINUTES):
-        session.delete()
-        return HttpResponse("OIDC authorization expired", status=408)
-    if session.status == OidcPendingAuth.STATUS_DONE:
-        return HttpResponse("OIDC authorization completed. You can close this window.")
-    if session.status != OidcPendingAuth.STATUS_PENDING:
-        return HttpResponse("OIDC authorization was not completed.", status=400)
-    provider = getattr(settings, "OIDC_PROVIDERS", {}).get(session.provider)
+
+    claim, claim_response = _claim_oidc_callback(state)
+    if claim_response:
+        return claim_response
+    provider = getattr(settings, "OIDC_PROVIDERS", {}).get(claim.provider)
     if not provider:
-        session.status = OidcPendingAuth.STATUS_ERROR
-        session.error_code = "provider_not_configured"
-        session.save(update_fields=["status", "error_code"])
+        if not _fail_oidc_callback_claim(claim, "provider_not_configured"):
+            return HttpResponse("OIDC authorization was already consumed.", status=409)
         return HttpResponse("OIDC provider is not configured", status=400)
     try:
+        check_request_deadline()
         metadata = _oidc_metadata(
             provider["issuer"],
             provider["allowed_hosts"],
@@ -1689,36 +2502,56 @@ def oidc_callback(request):
         token = client.fetch_token(
             metadata["token_endpoint"],
             code=code,
-            code_verifier=session.code_verifier,
+            code_verifier=claim.code_verifier,
             allow_redirects=False,
         )
-        claims = _validate_oidc_id_token(token, metadata, provider, session.nonce)
+        check_request_deadline()
+        claims = _validate_oidc_id_token(token, metadata, provider, claim.nonce)
+        check_request_deadline()
         issuer = str(claims["iss"]).rstrip("/")
-        user = _resolve_oidc_user(session.provider, issuer, claims)
-        with transaction.atomic():
-            pending = OidcPendingAuth.objects.select_for_update().filter(state=state).first()
-            if not pending or pending.status != OidcPendingAuth.STATUS_PENDING:
-                return HttpResponse("OIDC authorization was already consumed.", status=409)
-            pending.authenticated_user = user
-            pending.status = OidcPendingAuth.STATUS_DONE
-            pending.error_code = ""
-            pending.save(update_fields=["authenticated_user", "status", "error_code"])
-        _log_event(request, "api_oidc_callback_success", username=user.username)
-    except Exception as exc:  # noqa: BLE001 - external provider failures are normalized
-        OidcPendingAuth.objects.filter(
-            state=state,
-            status=OidcPendingAuth.STATUS_PENDING,
-        ).update(
-            status=OidcPendingAuth.STATUS_ERROR,
-            error_code="verification_failed",
-        )
+        user = _complete_oidc_callback_claim(claim, issuer, claims)
+    except _OidcCallbackClaimLost:
+        return HttpResponse("OIDC authorization was already consumed.", status=409)
+    except _OidcPolicyDenied as exc:
+        try:
+            _reject_oidc_policy_claim(claim, exc.user_id)
+        except _OidcCallbackClaimLost:
+            return HttpResponse("OIDC authorization was already consumed.", status=409)
+        except Exception as revocation_exc:  # noqa: BLE001 - callback response remains bounded
+            _log_event(
+                request,
+                "api_oidc_callback_failed",
+                level="error",
+                error_type=type(revocation_exc).__name__,
+                claim_generation=claim.generation,
+            )
+            return HttpResponse("OIDC authorization could not be finalized", status=503)
         _log_event(
             request,
             "api_oidc_callback_failed",
             level="warning",
             error_type=type(exc).__name__,
+            claim_generation=claim.generation,
         )
         return HttpResponse("OIDC authorization failed", status=400)
+    except Exception as exc:  # noqa: BLE001 - external provider failures are normalized
+        claim_failed = _fail_oidc_callback_claim(claim, "verification_failed")
+        _log_event(
+            request,
+            "api_oidc_callback_failed",
+            level="warning",
+            error_type=type(exc).__name__,
+            claim_generation=claim.generation,
+        )
+        if not claim_failed:
+            return HttpResponse("OIDC authorization was already consumed.", status=409)
+        return HttpResponse("OIDC authorization failed", status=400)
+    _log_event(
+        request,
+        "api_oidc_callback_success",
+        username=user.username,
+        claim_generation=claim.generation,
+    )
     return HttpResponse("OIDC authorization completed. You can close this window.")
 
 
@@ -1736,11 +2569,21 @@ def devices_cli(request):
     owner_name = postdata.get("user_name", "")
     if not isinstance(owner_name, str) or len(owner_name) > 150:
         return JsonResponse({"error": "Invalid user_name"}, status=400)
-    if owner_name and owner_name != user.username:
-        _log_event(
-            request, "api_devices_cli_denied", level="warning", username=user.username, rid=rid, reason="owner_mismatch"
-        )
-        return JsonResponse({"error": "Device ownership cannot be changed here"}, status=403)
+    if owner_name:
+        try:
+            owner_key = canonical_username_key(owner_name)
+        except ValueError:
+            return JsonResponse({"error": "Invalid user_name"}, status=400)
+        if owner_key != bytes(user.username_canonical):
+            _log_event(
+                request,
+                "api_devices_cli_denied",
+                level="warning",
+                username=user.username,
+                rid=rid,
+                reason="owner_mismatch",
+            )
+            return JsonResponse({"error": "Device ownership cannot be changed here"}, status=403)
     if _contains_device_policy_assignment(postdata):
         _log_event(
             request,
@@ -1784,6 +2627,9 @@ def devices_cli(request):
                     raise ValueError("Invalid user_name")
                 profile = _get_or_create_profile(device.owner, ab_name) if ab_name else None
                 profile = profile or _ensure_personal_profile(device.owner)
+                profile, current_owner, current_rule = lock_profile_access(device.owner, profile.pk)
+                if not profile or not current_owner or not _can_write_rule(current_rule):
+                    raise PermissionError("Address-book authorization changed")
                 guid = profile.guid
                 is_personal = guid == _personal_guid(device.owner)
                 tags = [ab_tag] if ab_tag else []
@@ -1804,6 +2650,16 @@ def devices_cli(request):
                         tag_name=ab_tag,
                         defaults={"tag_color": ""},
                     )
+    except PermissionError:
+        _log_event(
+            request,
+            "api_devices_cli_denied",
+            level="warning",
+            username=user.username,
+            rid=rid,
+            reason="address_book_authorization_changed",
+        )
+        return JsonResponse({"error": "Address-book authorization changed"}, status=403)
     except ValueError:
         _log_event(
             request,
@@ -1818,7 +2674,48 @@ def devices_cli(request):
         _log_event(request, "api_devices_cli_conflict", level="warning", username=user.username, rid=rid)
         return JsonResponse({"error": "Device identity conflict"}, status=409)
     _log_event(request, "api_devices_cli_updated", username=user.username, rid=rid)
-    return HttpResponse("")
+    return empty_success()
+
+
+def devices_proof_challenge(request):
+    postdata = _load_json_object(request)
+    purpose = str(postdata.get("purpose", "")).strip()
+    rid = str(postdata.get("id", "")).strip()
+    uuid_value = str(postdata.get("uuid", "")).strip()
+    public_key = str(postdata.get("pk", "")).strip()
+    if not _valid_device_identity(rid, uuid_value):
+        return JsonResponse({"error": "Invalid device identity"}, status=400)
+
+    token = user = None
+    if purpose == DeviceProofChallenge.PURPOSE_DEPLOY:
+        token, user = _get_token_user(request)
+        device = token.device if token and user else None
+        if not device or device.uuid != uuid_value:
+            return JsonResponse({"error": "Invalid device token"}, status=401)
+    elif purpose not in (
+        DeviceProofChallenge.PURPOSE_LOGIN,
+        DeviceProofChallenge.PURPOSE_OIDC,
+    ):
+        return JsonResponse({"error": "Invalid proof purpose"}, status=400)
+    else:
+        try:
+            device = _device_by_identity(rid, uuid_value)
+        except DeviceIdentityConflict:
+            return JsonResponse({"error": "Device identity conflict"}, status=409)
+    try:
+        body = issue_proof_challenge(
+            purpose=purpose,
+            rid=rid,
+            device_uuid=uuid_value,
+            public_key_text=public_key,
+            request_ip=get_client_ip(request),
+            device=device,
+            user=user,
+        )
+    except DeviceProofError as exc:
+        status = 429 if "Too many" in str(exc) else 400
+        return JsonResponse({"error": str(exc)}, status=status)
+    return JsonResponse(body)
 
 
 def devices_deploy(request):
@@ -1833,6 +2730,7 @@ def devices_deploy(request):
     rid = str(postdata.get("id", "")).strip()
     uuid_value = str(postdata.get("uuid", "")).strip()
     pk = str(postdata.get("pk", "")).strip()
+    device_proof = postdata.get("device_proof")
     identity = _deployment_identity(rid, uuid_value, pk)
     if identity is None or len(pk) > MAX_DEPLOY_KEY_LEN:
         _log_event(request, "api_devices_deploy_invalid_input", level="warning", username=user.username, rid=rid)
@@ -1851,6 +2749,41 @@ def devices_deploy(request):
 
     try:
         with transaction.atomic():
+            # Identity mutations use one lock order: user authority first,
+            # then devices by primary key, followed by proofs and tokens.
+            # In particular, a full device save and personal-profile
+            # finalization can both require PostgreSQL to validate an owner
+            # FK. Locking a device first would therefore deadlock with account
+            # deletion, which holds the user row before locking its devices.
+            locked_user = UserProfile.objects.select_for_update().filter(pk=user.pk, is_active=True).first()
+            if not locked_user:
+                _log_event(
+                    request,
+                    "api_devices_deploy_denied",
+                    level="warning",
+                    username=user.username,
+                    rid=rid,
+                    reason="inactive_user",
+                )
+                return JsonResponse({"error": "Invalid token"}, status=401)
+            token_is_current = RemoteToken.objects.filter(
+                pk=token.pk,
+                device_id=token.device_id,
+                subject_user=locked_user,
+                credential_hash=locked_user.get_session_auth_hash(),
+                expires_at__gt=timezone.now(),
+            ).exists()
+            if not token_is_current:
+                _log_event(
+                    request,
+                    "api_devices_deploy_denied",
+                    level="warning",
+                    username=locked_user.username,
+                    rid=rid,
+                    reason="stale_token",
+                )
+                return JsonResponse({"error": "Invalid token"}, status=401)
+            user = locked_user
             matches = list(
                 RemoteDevice.objects.select_for_update().filter(Q(rid=rid) | Q(uuid=uuid_value)).order_by("pk")
             )
@@ -1891,19 +2824,30 @@ def devices_deploy(request):
             old_rid = device.rid
             old_uuid = device.uuid
             old_key_hash = device.public_key_hash
+            proof_result = consume_deployment_proof(
+                proof=device_proof,
+                device=device,
+                user=user,
+                new_rid=rid,
+                new_uuid=uuid_value,
+            )
             device.rid = rid
             device.uuid = uuid_value
-            device.public_key_hash = public_key_hash
+            device.public_key_hash = proof_result.public_key_hash
             device.owner = user
             device.ip_address = get_client_ip(request)
             device.save()
             if old_rid != rid or old_uuid != uuid_value or (old_key_hash and old_key_hash != public_key_hash):
                 _revoke_device_tokens(device)
+            _finalize_personal_device_peer(user, device)
+    except DeviceRecoveryRequired:
+        return JsonResponse({"result": "RECOVERY_REQUIRED"}, status=409)
+    except DeviceProofError:
+        return JsonResponse({"error": "Invalid device proof"}, status=403)
     except IntegrityError:
         _log_event(request, "api_devices_deploy_conflict", level="warning", username=user.username, rid=rid)
         return JsonResponse({"result": "ID_TAKEN"}, status=409)
 
-    _ensure_personal_device_peer(user, device)
     _log_event(request, "api_devices_deploy_ok", username=user.username, rid=rid)
     return JsonResponse({"result": "OK"})
 
@@ -1925,53 +2869,35 @@ def devices_verify_deployment(request):
     rid = str(postdata.get("id", "")).strip()
     uuid_value = str(postdata.get("uuid", "")).strip()
     public_key_hash = str(postdata.get("public_key_hash", "")).strip().lower()
+    request_nonce = str(postdata.get("request_nonce", "")).strip()
     if (
         not re.fullmatch(r"[A-Za-z0-9_-]{6,16}", rid)
         or _decode_canonical_base64(uuid_value, max_decoded_bytes=256) is None
         or not re.fullmatch(r"[0-9a-f]{64}", public_key_hash)
+        or len(request_nonce) > 128
     ):
         return HttpResponse(status=400)
-    authorized = RemoteDevice.objects.filter(
+    device = RemoteDevice.objects.filter(
         rid=rid,
         uuid=uuid_value,
         public_key_hash=public_key_hash,
         is_active=True,
         owner__is_active=True,
-    ).exists()
-    return HttpResponse(status=204 if authorized else 404)
-
-
-def plugin_sign(request):
-    _token, user = _get_token_user(request)
-    if not user:
-        _log_event(request, "api_plugin_sign_unauthorized", level="warning")
-        return JsonResponse({"error": "Invalid token"}, status=401)
-    if not user.is_admin:
-        _log_event(request, "api_plugin_sign_denied", level="warning", username=user.username)
-        return JsonResponse({"error": "Admin required"}, status=403)
-    signing_key = _plugin_signing_key()
-    if signing_key is None:
-        _log_event(request, "api_plugin_sign_not_configured", level="warning")
-        return JsonResponse({"error": "Plugin signing key is not configured"}, status=503)
-    postdata = _load_json_object(request)
-    msg = postdata.get("msg", [])
-    if not isinstance(msg, list) or len(msg) > MAX_PLUGIN_SIGN_MSG_BYTES:
-        _log_event(request, "api_plugin_sign_invalid_msg", level="warning")
-        return JsonResponse({"error": "Invalid msg"}, status=400)
-    for item in msg:
-        if not isinstance(item, int) or item < 0 or item > 255:
-            _log_event(request, "api_plugin_sign_invalid_byte", level="warning")
-            return JsonResponse({"error": "Invalid msg"}, status=400)
-    signed_msg = bytes(signing_key.sign(bytes(msg)))
-    _log_event(
-        request,
-        "api_plugin_sign_ok",
-        level="debug",
-        username=user.username,
-        plugin_id=str(postdata.get("plugin_id", "")),
-        version=str(postdata.get("version", "")),
-    )
-    return JsonResponse({"signed_msg": list(signed_msg)})
+    ).first()
+    if not device:
+        return HttpResponse(status=404)
+    try:
+        body = deployment_assertion(
+            secret=expected_token,
+            rid=rid,
+            device_uuid=uuid_value,
+            key_hash=public_key_hash,
+            generation=device.deployment_generation,
+            request_nonce=request_nonce,
+        )
+    except DeviceProofError:
+        return HttpResponse(status=400)
+    return JsonResponse(body)
 
 
 def record(request):
@@ -1979,160 +2905,34 @@ def record(request):
     if not token or not user or not _get_active_token_device(token, user):
         _log_event(request, "api_record_unauthorized", level="warning")
         return JsonResponse({"error": "Invalid device token"}, status=401)
-    record_type = request.GET.get("type", "")
-    filename = _safe_record_name(request.GET.get("file", ""))
-    if not filename:
-        _log_event(request, "api_record_invalid_file", level="warning")
-        return JsonResponse({"error": "Invalid file"}, status=400)
-    content_length = _request_content_length(request)
-    max_chunk = settings.RECORD_UPLOAD_MAX_CHUNK_BYTES
-    if content_length < 0 or content_length > max_chunk:
-        return JsonResponse({"error": "Upload chunk is too large"}, status=413)
-    try:
-        base_dir = _ensure_record_device_dir(token)
-    except OSError:
-        _log_event(
-            request,
-            "api_record_storage_error",
-            level="error",
-            username=user.username,
-            rid=token.device.rid,
-        )
-        return JsonResponse({"error": "Recording storage failed"}, status=500)
-    filepath = os.path.join(base_dir, filename)
-    if record_type == "new":
-        if content_length != 0:
-            return JsonResponse({"error": "New recording body must be empty"}, status=400)
-        try:
-            with _record_file_lock(base_dir, filename):
-                fd = _open_record_file(filepath, os.O_WRONLY | os.O_CREAT | os.O_EXCL)
-                try:
-                    os.fsync(fd)
-                finally:
-                    os.close(fd)
-                _fsync_directory(base_dir)
-        except BlockingIOError:
-            return JsonResponse({"error": "Recording is busy"}, status=423)
-        except FileExistsError:
-            return JsonResponse({"error": "Recording already exists"}, status=409)
-        except OSError:
-            _log_event(request, "api_record_storage_error", level="error", username=user.username, rid=token.device.rid)
-            return JsonResponse({"error": "Recording storage failed"}, status=500)
-        _log_event(request, "api_record_new", level="info", username=user.username, rid=token.device.rid, file=filename)
-        return HttpResponse("")
-    if record_type in ("part", "tail"):
-        try:
-            offset = int(request.GET.get("offset", "0"))
-            declared_length = int(request.GET.get("length", "-1"))
-        except (TypeError, ValueError):
-            return JsonResponse({"error": "Invalid upload range"}, status=400)
-        if offset < 0 or declared_length != content_length:
-            return JsonResponse({"error": "Invalid upload range"}, status=400)
-        data = request.body or b""
-        if len(data) != content_length:
-            return JsonResponse({"error": "Incomplete upload body"}, status=400)
-        if record_type == "tail" and offset != 0:
-            return JsonResponse({"error": "Invalid tail offset"}, status=400)
-        try:
-            with _record_file_lock(base_dir, filename):
-                fd = _open_record_file(filepath, os.O_RDWR)
-                try:
-                    current_size = os.fstat(fd).st_size
-                    if record_type == "part":
-                        if offset != current_size:
-                            return JsonResponse({"error": "Upload offset conflict"}, status=409)
-                        if current_size + len(data) > settings.RECORD_UPLOAD_MAX_FILE_BYTES:
-                            return JsonResponse({"error": "Recording is too large"}, status=413)
-                    os.lseek(fd, offset, os.SEEK_SET)
-                    _write_all(fd, data)
-                    os.fsync(fd)
-                finally:
-                    os.close(fd)
-        except BlockingIOError:
-            return JsonResponse({"error": "Recording is busy"}, status=423)
-        except FileNotFoundError:
-            return JsonResponse({"error": "Recording does not exist"}, status=404)
-        except OSError:
-            _log_event(request, "api_record_storage_error", level="error", username=user.username, rid=token.device.rid)
-            return JsonResponse({"error": "Recording storage failed"}, status=500)
-        _log_event(
-            request,
-            "api_record_write",
-            level="debug",
-            username=user.username,
-            rid=token.device.rid,
-            file=filename,
-            offset=offset,
-            size=len(data),
-        )
-        return HttpResponse("")
-    if record_type == "remove":
-        if content_length != 0:
-            return JsonResponse({"error": "Remove recording body must be empty"}, status=400)
-        try:
-            with _record_file_lock(base_dir, filename):
-                file_stat = os.lstat(filepath)
-                if not stat.S_ISREG(file_stat.st_mode):
-                    return JsonResponse({"error": "Invalid recording path"}, status=400)
-                os.unlink(filepath)
-                _fsync_directory(base_dir)
-        except BlockingIOError:
-            return JsonResponse({"error": "Recording is busy"}, status=423)
-        except FileNotFoundError:
-            pass
-        except OSError:
-            _log_event(request, "api_record_storage_error", level="error", username=user.username, rid=token.device.rid)
-            return JsonResponse({"error": "Recording storage failed"}, status=500)
-        _log_event(
-            request, "api_record_remove", level="info", username=user.username, rid=token.device.rid, file=filename
-        )
-        return HttpResponse("")
-    return JsonResponse({"error": "Invalid type"}, status=400)
+    return recording_uploads.handle_record_upload(request, token)
 
 
 def audit_with_type(request, typ):
     _log_event(request, "api_audit_dispatch", level="debug", typ=typ)
-    if request.method == "GET":
-        if typ == "conn/active":
-            return _audit_conn_active(request)
+    try:
+        if request.method == "GET":
+            if typ == "conn/active":
+                return _audit_conn_active(request)
+            return JsonResponse({"error": "Not found"}, status=404)
+        if typ == "conn":
+            return _audit_conn(request)
+        if typ == "file":
+            return _audit_file(request)
+        if typ == "alarm":
+            return _audit_alarm(request)
+        _log_event(request, "api_audit_unknown", level="warning", typ=typ)
         return JsonResponse({"error": "Not found"}, status=404)
-    if typ == "conn":
-        return _audit_conn(request)
-    if typ == "file":
-        return _audit_file(request)
-    if typ == "alarm":
-        return _audit_alarm(request)
-    _log_event(request, "api_audit_unknown", level="warning", typ=typ)
-    return JsonResponse({"error": "Not found"}, status=404)
+    except ingestion_governance.IngestionQuotaExceeded as error:
+        return ingestion_governance.quota_response(error)
 
 
 def audit_note(request):
-    token, user = _get_token_user(request)
-    if not token or not user or not _get_active_token_device(token, user):
-        _log_event(request, "api_audit_note_unauthorized", level="warning")
-        return JsonResponse({"error": "Invalid token"}, status=401)
     postdata = _load_json_object(request)
-    guid = postdata.get("guid", "")
-    note = postdata.get("note", "")
-    if not isinstance(guid, str) or not isinstance(note, str):
-        _log_event(request, "api_audit_note_invalid_guid", level="warning")
-        return JsonResponse({"error": "Invalid audit note"}, status=400)
     try:
-        parsed_guid = uuid.UUID(guid)
-    except (ValueError, AttributeError):
-        return JsonResponse({"error": "Invalid audit note"}, status=400)
-    if len(note.encode()) > MAX_AUDIT_NOTE_BYTES:
-        return JsonResponse({"error": "Audit note is too large"}, status=413)
-    updated = ConnLog.objects.filter(
-        guid=parsed_guid,
-        actor=user,
-        from_id=token.device.rid,
-    ).update(note=note)
-    if updated != 1:
-        _log_event(request, "api_audit_note_denied", level="warning", username=user.username, guid=guid)
-        return JsonResponse({"error": "Connection audit not found"}, status=404)
-    _log_event(request, "api_audit_note_update", username=user.username, guid=guid)
-    return JsonResponse({"code": 1, "data": "ok"})
+        return _audit_controller_note_by_capability(request, postdata)
+    except ingestion_governance.IngestionQuotaExceeded as error:
+        return ingestion_governance.quota_response(error)
 
 
 def audit_root(request):
@@ -2159,9 +2959,18 @@ def ab_personal(request):
     if not user:
         _log_event(request, "api_ab_personal_unauthorized", level="warning")
         return JsonResponse({"error": "Invalid token"}, status=401)
+    require_empty_json_object(request)
     profile = _ensure_personal_profile(user)
     _log_event(request, "api_ab_personal", level="debug", username=user.username)
-    return JsonResponse({"guid": _personal_guid(user), "name": profile.name})
+    return JsonResponse({**_address_book_snapshot(profile), "name": profile.name})
+
+
+def _address_book_snapshot(profile):
+    return {
+        "address_book_snapshot_version": 1,
+        "guid": str(profile.guid),
+        "authorization_generation": profile.authorization_generation,
+    }
 
 
 def ab_shared_profiles(request):
@@ -2169,13 +2978,16 @@ def ab_shared_profiles(request):
     if not user:
         _log_event(request, "api_ab_shared_profiles_unauthorized", level="warning")
         return JsonResponse({"error": "Invalid token"}, status=401)
-    current, page_size, _start, _end = _pagination(request)
+    require_empty_json_object(request)
+    pagination, error_response = _pagination_or_error(request)
+    if error_response:
+        return error_response
     items = {}
 
     def add_profile(p, rule_value):
         if not p or _is_personal_guid(p.guid):
             return
-        info = p.info
+        info = _public_profile_info(p.info)
         owner_name = p.owner.username if p.owner else ""
         existing = items.get(p.guid)
         rule_value = int(rule_value or 0)
@@ -2184,7 +2996,7 @@ def ab_shared_profiles(request):
                 existing["rule"] = rule_value
             return
         items[p.guid] = {
-            "guid": p.guid,
+            **_address_book_snapshot(p),
             "name": p.name,
             "owner": owner_name,
             "note": p.note,
@@ -2193,35 +3005,87 @@ def ab_shared_profiles(request):
         }
 
     if user.is_admin:
-        for p in AddressBookProfile.objects.all():
+        for p in AddressBookProfile.objects.defer("default_password").all():
             add_profile(p, 3)
     else:
-        for p in AddressBookProfile.objects.filter(Q(owner=user)):
+        for p in AddressBookProfile.objects.defer("default_password").filter(Q(owner=user)):
             add_profile(p, 3)
-        for share in AddressBookShare.objects.filter(Q(user=user)).select_related("profile", "profile__owner"):
+        for share in (
+            AddressBookShare.objects.filter(Q(user=user))
+            .select_related("profile", "profile__owner")
+            .defer("profile__default_password")
+        ):
             add_profile(share.profile, share.rule)
         group_ids = list(user.groups.values_list("id", flat=True))
         rules_qs = AddressBookRule.objects.filter(Q(is_everyone=True))
         if group_ids:
             rules_qs = rules_qs | AddressBookRule.objects.filter(Q(group_id__in=group_ids))
         rules_qs = rules_qs | AddressBookRule.objects.filter(Q(user=user))
-        for r in rules_qs.select_related("profile", "profile__owner"):
+        for r in rules_qs.select_related("profile", "profile__owner").defer("profile__default_password"):
             add_profile(r.profile, r.rule)
     data = list(items.values())
-    data.sort(key=lambda x: x.get("name", ""))
+    data.sort(key=lambda x: (x["name"], x["guid"]))
     total = len(data)
-    start = (current - 1) * page_size
-    end = start + page_size
     _log_event(
         request,
         "api_ab_shared_profiles",
         level="debug",
         username=user.username,
         total=total,
-        page=current,
-        page_size=page_size,
+        page=pagination.current,
+        page_size=pagination.page_size,
     )
-    return JsonResponse({"total": total, "data": data[start:end]})
+    return JsonResponse(
+        {
+            "address_book_snapshot_version": 1,
+            "total": total,
+            **_pagination_response_fields(pagination),
+            "data": data[pagination.start : pagination.end],
+        }
+    )
+
+
+def ab_shared_credential(request):
+    _token, user = _get_token_user(request)
+    if not user:
+        _log_event(request, "api_ab_shared_credential_unauthorized", level="warning")
+        return JsonResponse({"error": "Invalid token"}, status=401)
+    postdata = _load_json_object(request)
+    guid = _bounded_text_value(postdata.get("guid"), 60, allow_empty=False)
+    rid = _bounded_text_value(postdata.get("id"), 16, allow_empty=False)
+    if guid is None or rid is None or any(ch.isspace() for ch in rid):
+        return JsonResponse({"error": "Invalid target"}, status=400)
+
+    with transaction.atomic():
+        profile_id = AddressBookProfile.objects.filter(guid=guid).values_list("pk", flat=True).first()
+        if profile_id is None or _is_personal_guid(guid):
+            return JsonResponse({"error": "Not found"}, status=404)
+        profile, owner, rule = lock_profile_access(user, profile_id)
+        if not profile or not owner or not rule:
+            _log_event(
+                request,
+                "api_ab_shared_credential_denied",
+                level="warning",
+                username=user.username,
+                guid=guid,
+                rid=rid,
+            )
+            return JsonResponse({"error": "No access"}, status=403)
+        if not RemotePeer.objects.filter(profile_id=profile.pk, rid=rid).exists():
+            return JsonResponse({"error": "Target not found"}, status=404)
+        password = profile.default_password
+        if not password:
+            return JsonResponse({"error": "Default credential not configured"}, status=404)
+
+    _log_event(
+        request,
+        "api_ab_shared_credential_issued",
+        level="info",
+        username=user.username,
+        guid=guid,
+        rid=rid,
+    )
+    return JsonResponse({"password": password})
 
 
 def ab_shared_add(request):
@@ -2233,25 +3097,87 @@ def ab_shared_add(request):
     name = str(postdata.get("name", "")).strip()
     note = postdata.get("note", "")
     info = postdata.get("info", None)
+    default_password = (
+        _profile_default_password(postdata["default_password"]) if "default_password" in postdata else None
+    )
     if not name or len(name) > 60 or _bounded_text_value(note, 4096) is None:
         _log_event(request, "api_ab_shared_add_failed", level="warning", username=user.username, reason="missing_name")
         return JsonResponse({"error": "Invalid name"}, status=400)
     if _is_reserved_ab_profile_name(name):
         return JsonResponse({"error": "Reserved name"}, status=400)
-    profile = _get_or_create_profile(user, name)
-    profile.note = note
+    if "default_password" in postdata and default_password is None:
+        return JsonResponse({"error": "Invalid default password"}, status=400)
+    parsed_info = None
     if info is not None:
-        info = _json_value(
-            info,
-            expected_type=(dict, list),
-            max_bytes=16 * 1024,
-        )
-        if info is None:
+        parsed_info = _profile_info_value(info)
+        if parsed_info is None:
             return JsonResponse({"error": "Invalid info"}, status=400)
-        profile.info = info
-    profile.save()
-    _log_event(request, "api_ab_shared_add", username=user.username, guid=profile.guid, name=name)
-    return JsonResponse({"code": 1, "guid": profile.guid})
+    operation_id, operation_error = _state040_operation_id(request)
+    if operation_error:
+        return operation_error
+
+    def mutate():
+        try:
+            with transaction.atomic():
+                profile = AddressBookProfile.objects.create(
+                    guid=uuid.uuid4().hex,
+                    name=name,
+                    owner=user,
+                    note=note,
+                    rule=3,
+                    info=parsed_info if parsed_info is not None else {},
+                    default_password=(default_password if "default_password" in postdata else ""),
+                )
+        except IntegrityError:
+            return ManagementMutation(
+                status_code=409,
+                body={"error": "Address book already exists", "code": "profile_name_conflict"},
+                applied={"profiles": 0},
+                result_state={"error": "profile_name_conflict", "name": name},
+            )
+        body = {
+            "code": 1,
+            "guid": str(profile.guid),
+            "mutation_generation": profile.authorization_generation,
+        }
+        return ManagementMutation(
+            status_code=200,
+            body=body,
+            applied={"profiles": 1},
+            result_state={"guid": str(profile.guid), "generation": profile.authorization_generation},
+        )
+
+    response = _execute_management_batch(
+        actor=user,
+        operation_id=operation_id,
+        operation="address_book_profile_create",
+        request_document={
+            "operation": "address_book_profile_create",
+            "name": name,
+            "note": note,
+            "info": parsed_info,
+            "has_default_password": "default_password" in postdata,
+            "default_password_digest": (
+                document_digest(default_password)
+                if "default_password" in postdata
+                else None
+            ),
+        },
+        requested={"profiles": 1},
+        mutation=mutate,
+    )
+    body = json.loads(response.content)
+    _log_event(
+        request,
+        "api_ab_shared_add" if response.status_code == 200 else "api_ab_shared_add_failed",
+        level="info" if response.status_code == 200 else "warning",
+        username=user.username,
+        guid=body.get("guid", ""),
+        name=name,
+        operation_id=str(operation_id),
+        operation_generation=body.get("operation_generation"),
+    )
+    return response
 
 
 def ab_shared_update_profile(request):
@@ -2270,6 +3196,12 @@ def ab_shared_update_profile(request):
         return JsonResponse({"error": "Personal address book cannot be modified"}, status=403)
     if not user.is_admin and str(profile.owner_id) != str(user.id):
         return JsonResponse({"error": "No access"}, status=403)
+    operation_id, operation_error = _state040_operation_id(request)
+    if operation_error:
+        return operation_error
+    expected_generation = _expected_mutation_generation(request)
+    if expected_generation is False:
+        return JsonResponse({"error": "Invalid If-Match"}, status=400)
     if "name" in postdata:
         name = str(postdata.get("name") or "").strip()
         if (
@@ -2285,12 +3217,13 @@ def ab_shared_update_profile(request):
         if note is None:
             return JsonResponse({"error": "Invalid note"}, status=400)
         profile.note = note
+    default_password = None
+    if "default_password" in postdata:
+        default_password = _profile_default_password(postdata["default_password"])
+        if default_password is None:
+            return JsonResponse({"error": "Invalid default password"}, status=400)
     if "info" in postdata and postdata.get("info") is not None:
-        info = _json_value(
-            postdata.get("info"),
-            expected_type=(dict, list),
-            max_bytes=16 * 1024,
-        )
+        info = _profile_info_value(postdata.get("info"))
         if info is None:
             return JsonResponse({"error": "Invalid info"}, status=400)
         profile.info = info
@@ -2306,23 +3239,104 @@ def ab_shared_update_profile(request):
             return JsonResponse({"error": "Owner not found"}, status=404)
         if AddressBookProfile.objects.filter(owner=new_owner, name=profile.name).exclude(pk=profile.pk).exists():
             return JsonResponse({"error": "Owner already has an address book with this name"}, status=409)
-    profile_values = {
-        "name": profile.name,
-        "note": profile.note,
-        "info": profile.info,
-    }
-    with transaction.atomic():
-        profile = AddressBookProfile.objects.select_for_update().get(pk=profile.pk)
-        profile.name = profile_values["name"]
-        profile.note = profile_values["note"]
-        profile.info = profile_values["info"]
-        old_owner_id = profile.owner_id
-        if new_owner and new_owner.id != old_owner_id:
-            profile.owner = new_owner
-            AddressBookShare.objects.filter(profile=profile, user=new_owner).delete()
-        profile.save()
-    _log_event(request, "api_ab_shared_update", username=user.username, guid=guid)
-    return JsonResponse({"code": 1, "data": "ok"})
+    def mutate():
+        with transaction.atomic():
+            locked_profile = _lock_profile_for_management(user, profile)
+            if not locked_profile:
+                return ManagementMutation(
+                    status_code=403,
+                    body={"error": "Authorization changed"},
+                    applied={"profiles": 0},
+                    result_state={"error": "authorization_changed"},
+                )
+            if expected_generation is not None and locked_profile.authorization_generation != expected_generation:
+                return _generation_conflict(locked_profile.authorization_generation, "profiles")
+            target_owner = new_owner or locked_profile.owner
+            current_name = locked_profile.name
+            if "name" in postdata:
+                current_name = str(postdata.get("name") or "").strip()
+            if AddressBookProfile.objects.filter(
+                owner=target_owner,
+                name=current_name,
+            ).exclude(pk=locked_profile.pk).exists():
+                return ManagementMutation(
+                    status_code=409,
+                    body={"error": "Owner already has an address book with this name"},
+                    applied={"profiles": 0},
+                    result_state={"error": "name_conflict"},
+                )
+            changed = False
+            if "name" in postdata:
+                locked_profile.name = current_name
+                changed = True
+            if "note" in postdata and postdata.get("note") is not None:
+                locked_profile.note = _bounded_text_value(postdata.get("note"), 4096)
+                changed = True
+            if "info" in postdata and postdata.get("info") is not None:
+                locked_profile.info = _profile_info_value(postdata.get("info"))
+                changed = True
+            if "default_password" in postdata:
+                locked_profile.default_password = default_password
+                changed = True
+            old_owner_id = locked_profile.owner_id
+            owner_changed = False
+            if new_owner and new_owner.id != old_owner_id:
+                locked_profile.owner = new_owner
+                AddressBookShare.objects.filter(profile=locked_profile, user=new_owner).delete()
+                owner_changed = True
+                changed = True
+            if changed:
+                if not owner_changed:
+                    bump_locked_authorization_generation(locked_profile)
+            locked_profile.save()
+            body = {
+                "code": 1,
+                "data": "ok",
+                "guid": str(locked_profile.guid),
+                "mutation_generation": locked_profile.authorization_generation,
+            }
+            return ManagementMutation(
+                status_code=200,
+                body=body,
+                applied={"profiles": 1},
+                result_state={"guid": str(locked_profile.guid), "generation": locked_profile.authorization_generation},
+            )
+
+    response = _execute_management_batch(
+        actor=user,
+        operation_id=operation_id,
+        operation="address_book_profile_update",
+        request_document={
+            "operation": "address_book_profile_update",
+            "guid": str(guid),
+            "data": {
+                key: value
+                for key, value in postdata.items()
+                if key not in {"default_password"}
+            },
+            "has_default_password": "default_password" in postdata,
+            "default_password_digest": (
+                document_digest(default_password)
+                if "default_password" in postdata
+                else None
+            ),
+            "owner": postdata.get("owner") if "owner" in postdata else None,
+            "expected_generation": expected_generation,
+        },
+        requested={"profiles": 1},
+        mutation=mutate,
+    )
+    body = json.loads(response.content)
+    _log_event(
+        request,
+        "api_ab_shared_update" if response.status_code == 200 else "api_ab_shared_update_failed",
+        level="info" if response.status_code == 200 else "warning",
+        username=user.username,
+        guid=guid,
+        operation_id=str(operation_id),
+        operation_generation=body.get("operation_generation"),
+    )
+    return response
 
 
 def ab_shared_delete(request):
@@ -2335,16 +3349,69 @@ def ab_shared_delete(request):
         return JsonResponse({"error": "Invalid data"}, status=400)
     if len(postdata) > 100:
         return JsonResponse({"error": "Too many address books"}, status=400)
-    candidates = AddressBookProfile.objects.filter(guid__in=[str(x) for x in postdata])
-    if not user.is_admin:
-        candidates = candidates.filter(owner=user)
-    candidates = candidates.exclude(guid__startswith="personal-")
-    guids = list(candidates.values_list("guid", flat=True))
-    with transaction.atomic():
-        candidates.delete()
-        deleted = len(guids)
-    _log_event(request, "api_ab_shared_delete", username=user.username, count=deleted)
-    return JsonResponse({"code": 1, "deleted": deleted})
+    requested_guids = [str(value) for value in postdata]
+    operation_id, operation_error = _state040_operation_id(request)
+    if operation_error:
+        return operation_error
+    expected_generation = _expected_mutation_generation(request)
+    if expected_generation is False or (expected_generation is not None and len(requested_guids) != 1):
+        return JsonResponse({"error": "Invalid If-Match"}, status=400)
+
+    def mutate():
+        with transaction.atomic():
+            candidates = AddressBookProfile.objects.select_for_update().filter(guid__in=requested_guids)
+            if not user.is_admin:
+                candidates = candidates.filter(owner=user)
+            candidates = candidates.exclude(guid__startswith="personal-").order_by("pk")
+            locked_profiles = list(candidates.select_related("owner"))
+            if expected_generation is not None:
+                if not locked_profiles:
+                    return ManagementMutation(
+                        status_code=404,
+                        body={"error": "Address book not found"},
+                        applied={"profiles": 0},
+                        result_state={"error": "profile_not_found"},
+                    )
+                if locked_profiles[0].authorization_generation != expected_generation:
+                    return _generation_conflict(
+                        locked_profiles[0].authorization_generation,
+                        "profiles",
+                    )
+            deleted_profiles = []
+            for profile in locked_profiles:
+                profile._audit_actor = user
+                deleted_profiles.append({"guid": str(profile.guid), "name": profile.name})
+                profile.delete()
+            return ManagementMutation(
+                status_code=200,
+                body={"code": 1, "deleted": len(deleted_profiles)},
+                applied={"profiles": len(deleted_profiles)},
+                result_state={"deleted": deleted_profiles},
+            )
+
+    response = _execute_management_batch(
+        actor=user,
+        operation_id=operation_id,
+        operation="address_book_profile_delete",
+        request_document={
+            "operation": "address_book_profile_delete",
+            "profiles": sorted(requested_guids),
+            "expected_generation": expected_generation,
+        },
+        requested={"profiles": len(requested_guids)},
+        mutation=mutate,
+    )
+    body = json.loads(response.content)
+    _log_event(
+        request,
+        "api_ab_shared_delete" if response.status_code == 200 else "api_ab_shared_delete_failed",
+        level="info" if response.status_code == 200 else "warning",
+        username=user.username,
+        count=body.get("deleted", 0),
+        operation_id=str(operation_id),
+        operation_generation=body.get("operation_generation"),
+    )
+    return response
 
 
 def ab_rules(request):
@@ -2357,6 +3424,9 @@ def ab_rules(request):
             return HttpResponseRedirect("/api/ab_rules")
         _log_event(request, "api_ab_rules_unauthorized", level="warning")
         return JsonResponse({"error": "Invalid token"}, status=401)
+    pagination, error_response = _pagination_or_error(request)
+    if error_response:
+        return error_response
     guid = request.GET.get("ab", "") or request.GET.get("guid", "")
     if not guid:
         return JsonResponse({"error": "Invalid guid"}, status=400)
@@ -2368,7 +3438,6 @@ def ab_rules(request):
     if not user.is_admin and str(profile.owner_id) != str(user.id):
         _log_event(request, "api_ab_rules_denied", level="warning", username=user.username, guid=guid)
         return JsonResponse({"error": "No access"}, status=403)
-    current, page_size, _start, _end = _pagination(request)
     data = []
     shares = AddressBookShare.objects.filter(Q(profile=profile)).select_related("user")
     for share in shares:
@@ -2390,10 +3459,14 @@ def ab_rules(request):
             }
         )
     total = len(data)
-    start = (current - 1) * page_size
-    end = start + page_size
     _log_event(request, "api_ab_rules", level="debug", username=user.username, guid=guid, total=total)
-    return JsonResponse({"total": total, "data": data[start:end]})
+    return JsonResponse(
+        {
+            "total": total,
+            **_pagination_response_fields(pagination),
+            "data": data[pagination.start : pagination.end],
+        }
+    )
 
 
 def ab_rule(request):
@@ -2423,119 +3496,140 @@ def ab_rule(request):
                 {"error": "Specify exactly one rule target"},
                 status=400,
             )
+        target_user = None
+        target_group = None
         if user_name:
             target_user = _user_by_identifier(user_name, active_only=True)
             if not target_user:
                 return JsonResponse({"error": "User not found"}, status=404)
-            if target_user.id == profile.owner_id:
-                return JsonResponse({"error": "Owner already has full access"}, status=400)
-            share, created = AddressBookShare.objects.update_or_create(
-                profile=profile,
-                user=target_user,
-                defaults={"rule": rule_value},
-            )
-            _audit_ab_rule(
-                profile,
-                user,
-                "share_add" if created else "share_update",
-                "user",
-                target_user.username,
-                rule_value,
-                {"guid": str(share.guid)},
-            )
-            _log_event(
-                request,
-                "api_ab_rule_add",
-                username=user.username,
-                guid=guid,
-                rule=rule_value,
-                user=target_user.username,
-            )
-            return JsonResponse({"guid": share.guid, "rule": share.rule})
-        if group_name:
-            group = Group.objects.filter(Q(name=group_name)).first()
-            if not group:
+        elif group_name:
+            target_group = Group.objects.filter(Q(name=group_name)).first()
+            if not target_group:
                 return JsonResponse({"error": "Group not found"}, status=404)
-            rule_obj, created = AddressBookRule.objects.update_or_create(
-                profile=profile,
-                target_key=f"group:{group.id}",
-                defaults={
-                    "group": group,
-                    "user": None,
-                    "rule": rule_value,
-                    "is_everyone": False,
-                },
-            )
+        with transaction.atomic():
+            profile = _lock_profile_for_management(user, profile)
+            if not profile:
+                return JsonResponse({"error": "Authorization changed"}, status=403)
+            if target_user:
+                if target_user.id == profile.owner_id:
+                    return JsonResponse({"error": "Owner already has full access"}, status=400)
+                changed, created = AddressBookShare.objects.update_or_create(
+                    profile=profile,
+                    user=target_user,
+                    defaults={"rule": rule_value},
+                )
+                target_type = "user"
+                target_name = target_user.username
+            else:
+                if target_group:
+                    changed, created = AddressBookRule.objects.update_or_create(
+                        profile=profile,
+                        group=target_group,
+                        defaults={
+                            "user": None,
+                            "rule": rule_value,
+                            "is_everyone": False,
+                        },
+                    )
+                else:
+                    changed, created = AddressBookRule.objects.update_or_create(
+                        profile=profile,
+                        is_everyone=True,
+                        defaults={
+                            "group": None,
+                            "user": None,
+                            "rule": rule_value,
+                        },
+                    )
+                target_type = "group" if target_group else "everyone"
+                target_name = target_group.name if target_group else "Everyone"
+            bump_locked_authorization_generation(profile)
             _audit_ab_rule(
                 profile,
                 user,
-                "rule_add" if created else "rule_update",
-                "group",
-                group.name,
+                ("share_add" if created else "share_update")
+                if target_user
+                else ("rule_add" if created else "rule_update"),
+                target_type,
+                target_name,
                 rule_value,
-                {"guid": str(rule_obj.guid)},
+                {"guid": str(changed.guid)},
             )
-            _log_event(request, "api_ab_rule_add", username=user.username, guid=guid, rule=rule_value, group=group.name)
-            return JsonResponse({"guid": rule_obj.guid, "rule": rule_obj.rule})
-        rule_obj, created = AddressBookRule.objects.update_or_create(
-            profile=profile,
-            target_key="everyone",
-            defaults={
-                "group": None,
-                "user": None,
-                "rule": rule_value,
-                "is_everyone": True,
-            },
+        _log_event(
+            request,
+            "api_ab_rule_add",
+            username=user.username,
+            guid=guid,
+            rule=rule_value,
+            target=target_name,
         )
-        _audit_ab_rule(
-            profile,
-            user,
-            "rule_add" if created else "rule_update",
-            "everyone",
-            "Everyone",
-            rule_value,
-            {"guid": str(rule_obj.guid)},
-        )
-        _log_event(request, "api_ab_rule_add", username=user.username, guid=guid, rule=rule_value, target="everyone")
-        return JsonResponse({"guid": rule_obj.guid, "rule": rule_obj.rule})
+        return JsonResponse({"guid": changed.guid, "rule": changed.rule})
+
+    rule_guid = postdata.get("guid", "")
+    rule_value = _valid_ab_rule(postdata.get("rule", 1))
+    if rule_value is None:
+        return JsonResponse({"error": "Invalid rule"}, status=400)
+    if not rule_guid:
+        return JsonResponse({"error": "Invalid guid"}, status=400)
+    share = AddressBookShare.objects.filter(Q(guid=rule_guid)).select_related("profile").first()
+    rule_obj = None
+    if share:
+        profile = share.profile
     else:
-        rule_guid = postdata.get("guid", "")
-        rule_value = _valid_ab_rule(postdata.get("rule", 1))
-        if rule_value is None:
-            return JsonResponse({"error": "Invalid rule"}, status=400)
-        if not rule_guid:
-            return JsonResponse({"error": "Invalid guid"}, status=400)
-        share = AddressBookShare.objects.filter(Q(guid=rule_guid)).select_related("profile").first()
-        if share:
-            profile = share.profile
-            if not user.is_admin and str(profile.owner_id) != str(user.id):
-                return JsonResponse({"error": "No access"}, status=403)
-            share.rule = rule_value
-            share.save()
-            target_name = share.user.username if share.user else ""
-            _audit_ab_rule(profile, user, "share_update", "user", target_name, rule_value, {"guid": str(share.guid)})
-            _log_event(request, "api_ab_rule_update", username=user.username, guid=rule_guid, rule=rule_value)
-            return JsonResponse({"code": 1})
         rule_obj = AddressBookRule.objects.filter(Q(guid=rule_guid)).select_related("profile").first()
         if not rule_obj:
             return JsonResponse({"error": "Not found"}, status=404)
         profile = rule_obj.profile
-        if not user.is_admin and str(profile.owner_id) != str(user.id):
-            return JsonResponse({"error": "No access"}, status=403)
-        rule_obj.rule = rule_value
-        rule_obj.save()
-        if rule_obj.is_everyone:
-            target_type = "everyone"
-            target_name = "Everyone"
-        elif rule_obj.group_id:
-            target_type = "group"
-            target_name = rule_obj.group.name if rule_obj.group else ""
-        else:
+    with transaction.atomic():
+        profile = _lock_profile_for_management(user, profile)
+        if not profile:
+            return JsonResponse({"error": "Authorization changed"}, status=403)
+        if share:
+            share = (
+                AddressBookShare.objects.select_for_update()
+                .select_related("user")
+                .filter(pk=share.pk, profile=profile)
+                .first()
+            )
+            if not share:
+                return JsonResponse({"error": "Not found"}, status=404)
+            share.rule = rule_value
+            share.save(update_fields=("rule",))
             target_type = "user"
-            target_name = rule_obj.user.username if rule_obj.user else ""
-        _audit_ab_rule(profile, user, "rule_update", target_type, target_name, rule_value, {"guid": str(rule_obj.guid)})
-        _log_event(request, "api_ab_rule_update", username=user.username, guid=rule_guid, rule=rule_value)
-        return JsonResponse({"code": 1})
+            target_name = share.user.username if share.user else ""
+            changed = share
+        else:
+            rule_obj = (
+                AddressBookRule.objects.select_for_update()
+                .select_related("user", "group")
+                .filter(pk=rule_obj.pk, profile=profile)
+                .first()
+            )
+            if not rule_obj:
+                return JsonResponse({"error": "Not found"}, status=404)
+            rule_obj.rule = rule_value
+            rule_obj.save(update_fields=("rule", "updated_at"))
+            if rule_obj.is_everyone:
+                target_type, target_name = "everyone", "Everyone"
+            elif rule_obj.group_id:
+                target_type = "group"
+                target_name = rule_obj.group.name if rule_obj.group else ""
+            else:
+                target_type = "user"
+                target_name = rule_obj.user.username if rule_obj.user else ""
+            changed = rule_obj
+        bump_locked_authorization_generation(profile)
+        _audit_ab_rule(
+            profile,
+            user,
+            "share_update" if share else "rule_update",
+            target_type,
+            target_name,
+            rule_value,
+            {"guid": str(changed.guid)},
+        )
+    _log_event(request, "api_ab_rule_update", username=user.username, guid=rule_guid, rule=rule_value)
+    return JsonResponse({"code": 1})
 
 
 def ab_rules_delete(request):
@@ -2553,8 +3647,20 @@ def ab_rules_delete(request):
         share = AddressBookShare.objects.filter(Q(guid=rule_guid)).select_related("profile").first()
         if share:
             profile = share.profile
-            if user.is_admin or str(profile.owner_id) == str(user.id):
+            with transaction.atomic():
+                profile = _lock_profile_for_management(user, profile)
+                if not profile:
+                    continue
+                share = (
+                    AddressBookShare.objects.select_for_update()
+                    .select_related("user")
+                    .filter(pk=share.pk, profile=profile)
+                    .first()
+                )
+                if not share:
+                    continue
                 target_name = share.user.username if share.user else ""
+                bump_locked_authorization_generation(profile)
                 _audit_ab_rule(
                     profile, user, "share_delete", "user", target_name, share.rule, {"guid": str(share.guid)}
                 )
@@ -2564,7 +3670,18 @@ def ab_rules_delete(request):
         rule_obj = AddressBookRule.objects.filter(Q(guid=rule_guid)).select_related("profile").first()
         if rule_obj:
             profile = rule_obj.profile
-            if user.is_admin or str(profile.owner_id) == str(user.id):
+            with transaction.atomic():
+                profile = _lock_profile_for_management(user, profile)
+                if not profile:
+                    continue
+                rule_obj = (
+                    AddressBookRule.objects.select_for_update()
+                    .select_related("user", "group")
+                    .filter(pk=rule_obj.pk, profile=profile)
+                    .first()
+                )
+                if not rule_obj:
+                    continue
                 if rule_obj.is_everyone:
                     target_type = "everyone"
                     target_name = "Everyone"
@@ -2574,6 +3691,7 @@ def ab_rules_delete(request):
                 else:
                     target_type = "user"
                     target_name = rule_obj.user.username if rule_obj.user else ""
+                bump_locked_authorization_generation(profile)
                 _audit_ab_rule(
                     profile, user, "rule_delete", target_type, target_name, rule_obj.rule, {"guid": str(rule_obj.guid)}
                 )
@@ -2583,20 +3701,25 @@ def ab_rules_delete(request):
     return JsonResponse({"code": 1, "deleted": deleted})
 
 
+@transaction.atomic
 def ab_peers(request):
     _token, user = _get_token_user(request)
     if not user:
         _log_event(request, "api_ab_peers_unauthorized", level="warning")
         return JsonResponse({"error": "Invalid token"}, status=401)
+    require_empty_json_object(request)
+    pagination, error_response = _pagination_or_error(request)
+    if error_response:
+        return error_response
     guid = request.GET.get("ab", "") or _personal_guid(user)
     profile, owner, _rule = _get_profile_access(user, guid)
-    if guid == _personal_guid(user):
-        _ensure_personal_profile(user)
-        owner = user
+    if profile is not None:
+        # Serialize the page's data and generation with all content/ACL writers.
+        # Separate pages are not a transaction: consumers must reject mixed generations.
+        profile, owner, _rule = lock_profile_access(user, profile.pk)
     if not owner:
         _log_event(request, "api_ab_peers_denied", level="warning", username=user.username, guid=guid)
         return JsonResponse({"error": "No access"}, status=403)
-    current, page_size, _start, _end = _pagination(request)
     qs = (
         RemotePeer.objects.filter(profile=profile)
         .prefetch_related(
@@ -2609,11 +3732,9 @@ def ab_peers(request):
         .order_by("rid")
     )
     total = qs.count()
-    start = (current - 1) * page_size
-    end = start + page_size
     data = []
     is_personal = guid == _personal_guid(owner)
-    for p in qs[start:end]:
+    for p in qs[pagination.start : pagination.end]:
         tags = [tag.tag_name for tag in p.ordered_tags]
         item = {
             "id": p.rid,
@@ -2641,25 +3762,33 @@ def ab_peers(request):
         username=user.username,
         guid=guid,
         total=total,
-        page=current,
-        page_size=page_size,
+        page=pagination.current,
+        page_size=pagination.page_size,
     )
-    return JsonResponse({"total": total, "data": data})
+    return JsonResponse(
+        {
+            **_address_book_snapshot(profile),
+            "total": total,
+            **_pagination_response_fields(pagination),
+            "data": data,
+        }
+    )
 
 
+@transaction.atomic
 def ab_tags(request, guid):
     _token, user = _get_token_user(request)
     if not user:
         _log_event(request, "api_ab_tags_unauthorized", level="warning")
         return JsonResponse({"error": "Invalid token"}, status=401)
+    require_empty_json_object(request)
     profile, owner, _rule = _get_profile_access(user, guid)
-    if guid == _personal_guid(user):
-        _ensure_personal_profile(user)
-        owner = user
+    if profile is not None:
+        profile, owner, _rule = lock_profile_access(user, profile.pk)
     if not owner:
         _log_event(request, "api_ab_tags_denied", level="warning", username=user.username, guid=guid)
         return JsonResponse({"error": "No access"}, status=403)
-    tags = RemoteTag.objects.filter(profile=profile)
+    tags = RemoteTag.objects.filter(profile=profile).order_by("tag_name", "pk")
     data = []
     for t in tags:
         try:
@@ -2668,7 +3797,7 @@ def ab_tags(request, guid):
             color = 0
         data.append({"name": t.tag_name, "color": color})
     _log_event(request, "api_ab_tags", level="debug", username=user.username, guid=guid, total=len(data))
-    return JsonResponse(data, safe=False)
+    return JsonResponse({**_address_book_snapshot(profile), "total": len(data), "data": data})
 
 
 def ab_peer_add(request, guid):
@@ -2708,7 +3837,10 @@ def ab_peer_add(request, guid):
         peer_data.pop("hash", None)
     try:
         with transaction.atomic():
-            AddressBookProfile.objects.select_for_update().get(pk=profile.pk)
+            profile, owner, _rule = _lock_profile_for_content_write(user, profile)
+            if not profile:
+                return JsonResponse({"error": "Authorization changed"}, status=403)
+            is_personal = profile.guid == _personal_guid(owner)
             existing = RemotePeer.objects.filter(
                 profile=profile,
                 rid=rid,
@@ -2728,7 +3860,7 @@ def ab_peer_add(request, guid):
     except ValueError:
         return JsonResponse({"error": "Invalid peer"}, status=400)
     _log_event(request, "api_ab_peer_add", username=user.username, guid=guid, rid=rid)
-    return HttpResponse("")
+    return empty_success()
 
 
 def ab_peer_update(request, guid):
@@ -2768,24 +3900,28 @@ def ab_peer_update(request, guid):
         peer_data.pop("password", None)
     else:
         peer_data.pop("hash", None)
-    peer = RemotePeer.objects.filter(profile=profile, rid=rid).first()
-    if not peer:
-        _log_event(
-            request,
-            "api_ab_peer_update_failed",
-            level="warning",
-            username=user.username,
-            guid=guid,
-            rid=rid,
-            reason="not_found",
-        )
-        return JsonResponse({"error": "ID_NOT_FOUND"}, status=404)
     try:
-        _upsert_ab_peer(profile, rid, peer_data, is_personal)
+        with transaction.atomic():
+            profile, owner, _rule = _lock_profile_for_content_write(user, profile)
+            if not profile:
+                return JsonResponse({"error": "Authorization changed"}, status=403)
+            is_personal = profile.guid == _personal_guid(owner)
+            if not RemotePeer.objects.filter(profile=profile, rid=rid).exists():
+                _log_event(
+                    request,
+                    "api_ab_peer_update_failed",
+                    level="warning",
+                    username=user.username,
+                    guid=guid,
+                    rid=rid,
+                    reason="not_found",
+                )
+                return JsonResponse({"error": "ID_NOT_FOUND"}, status=404)
+            _upsert_ab_peer(profile, rid, peer_data, is_personal)
     except ValueError:
         return JsonResponse({"error": "Invalid peer"}, status=400)
     _log_event(request, "api_ab_peer_update", username=user.username, guid=guid, rid=rid)
-    return HttpResponse("")
+    return empty_success()
 
 
 def ab_peer_delete(request, guid):
@@ -2806,7 +3942,10 @@ def ab_peer_delete(request, guid):
             request, "api_ab_peer_delete_denied", level="warning", username=user.username, guid=guid, reason="read_only"
         )
         return JsonResponse({"error": "Read-only"}, status=403)
-    postdata = _load_json(request)
+    postdata = _load_json(
+        request,
+        max_bytes=settings.JSON_ADDRESS_BOOK_BULK_MAX_BODY_BYTES,
+    )
     if (
         not isinstance(postdata, list)
         or len(postdata) > 1000
@@ -2821,9 +3960,13 @@ def ab_peer_delete(request, guid):
             reason="invalid_ids",
         )
         return JsonResponse({"error": "Invalid ids"}, status=400)
-    RemotePeer.objects.filter(profile=profile, rid__in=postdata).delete()
+    with transaction.atomic():
+        profile, _owner, _rule = _lock_profile_for_content_write(user, profile)
+        if not profile:
+            return JsonResponse({"error": "Authorization changed"}, status=403)
+        RemotePeer.objects.filter(profile=profile, rid__in=postdata).delete()
     _log_event(request, "api_ab_peer_delete", username=user.username, guid=guid, count=len(postdata))
-    return HttpResponse("")
+    return empty_success()
 
 
 def ab_tag_add(request, guid):
@@ -2853,7 +3996,9 @@ def ab_tag_add(request, guid):
         )
         return JsonResponse({"error": "Invalid tag"}, status=400)
     with transaction.atomic():
-        AddressBookProfile.objects.select_for_update().get(pk=profile.pk)
+        profile, _owner, _rule = _lock_profile_for_content_write(user, profile)
+        if not profile:
+            return JsonResponse({"error": "Authorization changed"}, status=403)
         if (
             not RemoteTag.objects.filter(
                 profile=profile,
@@ -2874,7 +4019,7 @@ def ab_tag_add(request, guid):
             defaults={"tag_color": color},
         )
     _log_event(request, "api_ab_tag_add", username=user.username, guid=guid, tag=name)
-    return HttpResponse("")
+    return empty_success()
 
 
 def ab_tag_rename(request, guid):
@@ -2914,6 +4059,9 @@ def ab_tag_rename(request, guid):
         )
         return JsonResponse({"error": "Invalid tag"}, status=400)
     with transaction.atomic():
+        profile, _owner, _rule = _lock_profile_for_content_write(user, profile)
+        if not profile:
+            return JsonResponse({"error": "Authorization changed"}, status=403)
         old_tag = (
             RemoteTag.objects.select_for_update()
             .filter(
@@ -2935,7 +4083,7 @@ def ab_tag_rename(request, guid):
             old_tag.tag_name = new
             old_tag.save(update_fields=["tag_name"])
     _log_event(request, "api_ab_tag_rename", username=user.username, guid=guid, old=old, new=new)
-    return HttpResponse("")
+    return empty_success()
 
 
 def ab_tag_update(request, guid):
@@ -2969,11 +4117,15 @@ def ab_tag_update(request, guid):
             reason="missing_name",
         )
         return JsonResponse({"error": "Invalid tag"}, status=400)
-    RemoteTag.objects.filter(profile=profile, tag_name=name).update(
-        tag_color=str(color),
-    )
+    with transaction.atomic():
+        profile, _owner, _rule = _lock_profile_for_content_write(user, profile)
+        if not profile:
+            return JsonResponse({"error": "Authorization changed"}, status=403)
+        RemoteTag.objects.filter(profile=profile, tag_name=name).update(
+            tag_color=str(color),
+        )
     _log_event(request, "api_ab_tag_update", username=user.username, guid=guid, tag=name)
-    return HttpResponse("")
+    return empty_success()
 
 
 def ab_tag_delete(request, guid):
@@ -2994,7 +4146,10 @@ def ab_tag_delete(request, guid):
             request, "api_ab_tag_delete_denied", level="warning", username=user.username, guid=guid, reason="read_only"
         )
         return JsonResponse({"error": "Read-only"}, status=403)
-    postdata = _load_json(request)
+    postdata = _load_json(
+        request,
+        max_bytes=settings.JSON_MANAGEMENT_BATCH_MAX_BODY_BYTES,
+    )
     if (
         not isinstance(postdata, list)
         or len(postdata) > MAX_AB_TAGS
@@ -3009,25 +4164,29 @@ def ab_tag_delete(request, guid):
             reason="invalid_tags",
         )
         return JsonResponse({"error": "Invalid tags"}, status=400)
-    RemoteTag.objects.filter(
-        profile=profile,
-        tag_name__in=postdata,
-    ).delete()
+    with transaction.atomic():
+        profile, _owner, _rule = _lock_profile_for_content_write(user, profile)
+        if not profile:
+            return JsonResponse({"error": "Authorization changed"}, status=403)
+        RemoteTag.objects.filter(
+            profile=profile,
+            tag_name__in=postdata,
+        ).delete()
     _log_event(request, "api_ab_tag_delete", username=user.username, guid=guid, count=len(postdata))
-    return HttpResponse("")
+    return empty_success()
 
 
 def _audit_device_context(request, postdata):
     rid = postdata.get("id")
     device_uuid = postdata.get("uuid")
     if not _valid_device_identity(rid, device_uuid):
-        return None, None, JsonResponse({"error": "Invalid device identity"}, status=400)
+        return None, None, json_error("audit_device_identity_invalid", "Invalid device identity", status=400)
     token, user = _get_device_token_user(request, rid, device_uuid)
     if not token or not user:
-        return None, None, JsonResponse({"error": "Invalid device token"}, status=401)
+        return None, None, json_error("audit_device_token_invalid", "Invalid device token", status=401)
     device = _get_active_token_device(token, user)
     if not device:
-        return None, None, JsonResponse({"error": "Device is not active"}, status=403)
+        return None, None, json_error("audit_device_not_active", "Device is not active", status=403)
     return token, user, None
 
 
@@ -3047,6 +4206,12 @@ def _audit_connection_id(value):
     if isinstance(value, bool) or not isinstance(value, int):
         return None
     return value if 1 <= value <= 2_147_483_647 else None
+
+
+def _audit_revision(value):
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value if 1 <= value <= 9_223_372_036_854_775_807 else None
 
 
 def _audit_session_id(value):
@@ -3081,45 +4246,498 @@ def _audit_enum(value, allowed):
     return parsed if parsed in allowed else None
 
 
+def _audit_uuid4(value):
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = uuid.UUID(value)
+    except (ValueError, AttributeError):
+        return None
+    return parsed if parsed.version == 4 and str(parsed) == value.lower() else None
+
+
+def _audit_version_is_current(value):
+    if isinstance(value, bool):
+        return False
+    if isinstance(value, int):
+        return value == AUDIT_PROTOCOL_VERSION
+    return isinstance(value, str) and value == str(AUDIT_PROTOCOL_VERSION)
+
+
+def _audit_upgrade_required(required_version=AUDIT_PROTOCOL_VERSION):
+    return json_error(
+        "audit_protocol_upgrade_required",
+        "Unsupported audit protocol version",
+        status=426,
+        required_version=required_version,
+    )
+
+
+def _audit_evidence_upgrade_required(protocol_version):
+    return json_error(
+        "audit_evidence_upgrade_required",
+        "Unsupported audit evidence receipt version",
+        status=426,
+        required_version=protocol_version,
+        required_receipt_version=AUDIT_EVIDENCE_RECEIPT_VERSION,
+    )
+
+
+def _file_audit_version_is_current(value):
+    if isinstance(value, bool):
+        return False
+    if isinstance(value, int):
+        return value == FILE_AUDIT_PROTOCOL_VERSION
+    return isinstance(value, str) and value == str(FILE_AUDIT_PROTOCOL_VERSION)
+
+
+def _audit_evidence_receipt_version_is_current(value):
+    if isinstance(value, bool):
+        return False
+    if isinstance(value, int):
+        return value == AUDIT_EVIDENCE_RECEIPT_VERSION
+    return isinstance(value, str) and value == str(AUDIT_EVIDENCE_RECEIPT_VERSION)
+
+
+def _audit_nonnegative_integer(value):
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value if 0 <= value <= MAX_AUDIT_INTEGER else None
+
+
+def _audit_reporter_sequence(value):
+    parsed = _audit_nonnegative_integer(value)
+    return parsed if parsed is not None and parsed >= 1 else None
+
+
+def _audit_evidence_digest(
+    *,
+    event_id,
+    connection_log,
+    kind,
+    actor,
+    reporter_device,
+    reporter_sequence,
+    details,
+):
+    canonical = json.dumps(
+        {
+            "schema": "audit-evidence-receipt-v1",
+            "event_id": str(event_id),
+            "audit_session_id": str(connection_log.guid),
+            "kind": kind,
+            "actor_id": actor.id,
+            "reporter_device_id": reporter_device.id,
+            "reporter_device_generation": connection_log.host_device_generation,
+            "reporter_device_uuid": reporter_device.uuid,
+            "reporter_sequence": reporter_sequence,
+            "details": details,
+        },
+        ensure_ascii=False,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
+
+
+def _matching_evidence_event(
+    existing,
+    connection_log,
+    kind,
+    actor,
+    reporter_device,
+    reporter_sequence,
+    payload_digest,
+):
+    return (
+        existing.connection_id == connection_log.id
+        and existing.kind == kind
+        and existing.actor_id == actor.id
+        and existing.reporter_device_uuid == reporter_device.uuid
+        and existing.reporter_device_id_at_event == reporter_device.id
+        and existing.reporter_device_generation == connection_log.host_device_generation
+        and existing.reporter_sequence == reporter_sequence
+        and len(existing.payload_digest) == 64
+        and secrets.compare_digest(existing.payload_digest, payload_digest)
+        and isinstance(existing.acknowledgement, dict)
+        and bool(existing.acknowledgement)
+    )
+
+
+def _reporter_sequence_conflict(reporter_sequence):
+    return json_error(
+        "audit_reporter_sequence_conflict",
+        "Audit reporter sequence is already bound",
+        status=409,
+        reporter_sequence=reporter_sequence,
+    )
+
+
+def _store_evidence_acknowledgement(event, acknowledgement):
+    event.acknowledgement = acknowledgement
+    event.save(update_fields=("acknowledgement",))
+
+
+def _audit_success_payload(connection_log, event_id):
+    now = audit_lifecycle.database_now()
+    lease_remaining = 0
+    if connection_log.state in ConnLog.OPEN_STATES and connection_log.lease_expires_at is not None:
+        lease_remaining = max(0, math.ceil((connection_log.lease_expires_at - now).total_seconds()))
+    return {
+        "response_schema_version": RESPONSE_SCHEMA_VERSION,
+        "version": AUDIT_PROTOCOL_VERSION,
+        "audit_session_id": str(connection_log.guid),
+        "acknowledged_event_id": str(event_id),
+        "event_revision": connection_log.event_revision,
+        "state": connection_log.state,
+        "state_revision": connection_log.state_revision,
+        "heartbeat_revision": connection_log.heartbeat_revision,
+        "lease_remaining_seconds": lease_remaining,
+        "terminal_reason": connection_log.terminal_reason,
+        "terminal_source": connection_log.terminal_source,
+    }
+
+
+def _audit_success(connection_log, event_id, *, status=200):
+    return JsonResponse(_audit_success_payload(connection_log, event_id), status=status)
+
+
+def _file_audit_success(connection_log, transfer_event):
+    acknowledgement = transfer_event.connection_event.acknowledgement
+    if acknowledgement:
+        return JsonResponse(acknowledgement)
+    return JsonResponse(
+        {
+            "response_schema_version": RESPONSE_SCHEMA_VERSION,
+            "version": FILE_AUDIT_PROTOCOL_VERSION,
+            "audit_session_id": str(connection_log.guid),
+            "acknowledged_event_id": str(transfer_event.connection_event.event_id),
+            "transfer_id": str(transfer_event.transfer.transfer_id),
+            "transfer_revision": transfer_event.revision,
+            "transfer_state": transfer_event.state,
+            "transferred_bytes": transfer_event.transferred_bytes,
+        }
+    )
+
+
+def _audit_terminal_conflict(connection_log):
+    return json_error(
+        "audit_connection_not_active",
+        "Connection is not active",
+        status=409,
+        version=AUDIT_PROTOCOL_VERSION,
+        state=connection_log.state,
+        state_revision=connection_log.state_revision,
+        terminal_reason=connection_log.terminal_reason,
+        terminal_source=connection_log.terminal_source,
+    )
+
+
+def _locked_audit_device(token, user):
+    return (
+        RemoteDevice.objects.select_for_update()
+        .filter(
+            pk=token.device_id,
+            owner=user,
+            is_active=True,
+        )
+        .first()
+    )
+
+
+def _audit_host_authority_is_current(connection_log, host_device):
+    return (
+        connection_log.audit_version == AUDIT_PROTOCOL_VERSION
+        and connection_log.host_device_id == host_device.id
+        and connection_log.host_device_id_at_create == host_device.id
+        and connection_log.host_device_generation == host_device.deployment_generation
+        and connection_log.owner_id_at_create == host_device.owner_id
+        and host_device.is_active
+    )
+
+
+def _audit_controller_authority_is_current(connection_log, controller_device):
+    return (
+        controller_device is not None
+        and controller_device.owner_id is not None
+        and connection_log.actor_id is not None
+        and connection_log.controller_device_id == controller_device.id
+        and connection_log.controller_device_id_at_bind == controller_device.id
+        and connection_log.controller_device_generation == controller_device.deployment_generation
+        and connection_log.controller_owner_id_at_bind == controller_device.owner_id
+        and connection_log.actor_id == controller_device.owner_id
+        and connection_log.from_id == controller_device.rid
+        and controller_device.is_active
+    )
+
+
+def _locked_host_audit_session(token, user, audit_session_id, *, active=True, require_controller=False):
+    authority = (
+        ConnLog.objects.filter(
+            guid=audit_session_id,
+            audit_version=AUDIT_PROTOCOL_VERSION,
+            host_device_id=token.device_id,
+        )
+        .values("host_device_id", "controller_device_id")
+        .first()
+    )
+    if not authority:
+        return None, None, json_error("audit_connection_not_found", "Connection not found", status=404)
+    device_ids = {authority["host_device_id"]}
+    if require_controller and authority["controller_device_id"] is not None:
+        device_ids.add(authority["controller_device_id"])
+    locked_devices = {
+        device.id: device
+        for device in RemoteDevice.objects.select_for_update().filter(pk__in=device_ids).order_by("pk")
+    }
+    device = locked_devices.get(authority["host_device_id"])
+    if not device or device.owner_id != user.id or not device.is_active:
+        return None, None, json_error("audit_device_not_active", "Device is not active", status=403)
+    connection_log = (
+        ConnLog.objects.select_for_update()
+        .filter(
+            guid=audit_session_id,
+            audit_version=AUDIT_PROTOCOL_VERSION,
+            host_device=device,
+        )
+        .first()
+    )
+    if not connection_log:
+        return device, None, json_error("audit_connection_not_found", "Connection not found", status=404)
+    if not _audit_host_authority_is_current(connection_log, device):
+        return (
+            device,
+            None,
+            json_error(
+                "audit_connection_authority_changed",
+                "Connection authority changed",
+                status=403,
+            ),
+        )
+    if require_controller:
+        controller_device = locked_devices.get(connection_log.controller_device_id)
+        if not _audit_controller_authority_is_current(connection_log, controller_device):
+            return device, None, json_error("audit_controller_not_bound", "Controller is not bound", status=403)
+    if active:
+        now = audit_lifecycle.database_now()
+        audit_lifecycle.expire_locked_connection(connection_log, now, source="request_reconciler")
+        if connection_log.state not in ConnLog.OPEN_STATES:
+            return device, None, _audit_terminal_conflict(connection_log)
+    return device, connection_log, None
+
+
+def _existing_audit_event(event_id):
+    return ConnectionAuditEvent.objects.filter(event_id=event_id).first()
+
+
+def _matching_audit_event(existing, connection_log, kind, actor, reporter_device_uuid, details):
+    return (
+        existing.connection_id == connection_log.id
+        and existing.kind == kind
+        and existing.actor_id == (actor.id if actor else None)
+        and existing.reporter_device_uuid == reporter_device_uuid
+        and existing.details == details
+    )
+
+
+def _append_audit_event(
+    connection_log,
+    event_id,
+    kind,
+    actor,
+    reporter_device_uuid,
+    details,
+    *,
+    reporter_device=None,
+    reporter_sequence=None,
+    payload_digest="",
+):
+    existing = _existing_audit_event(event_id)
+    if existing:
+        if not _matching_audit_event(existing, connection_log, kind, actor, reporter_device_uuid, details):
+            raise IntegrityError("Audit event identity conflict")
+        return existing, False
+    if connection_log.event_revision >= 9_223_372_036_854_775_807:
+        raise IntegrityError("Audit event revision exhausted")
+    ingestion_governance.reserve_audit_event(
+        connection_log.owner_id_at_create,
+        connection_log.host_device_id_at_create,
+        connection_log.event_revision,
+        closes_connection=kind
+        in (
+            ConnectionAuditEvent.KIND_CLOSED,
+            ConnectionAuditEvent.KIND_ABORTED,
+            ConnectionAuditEvent.KIND_EXPIRED,
+        ),
+    )
+    sequence = connection_log.event_revision + 1
+    event = ConnectionAuditEvent.objects.create(
+        event_id=event_id,
+        connection=connection_log,
+        sequence=sequence,
+        kind=kind,
+        actor=actor,
+        actor_id_at_event=actor.id if actor else connection_log.owner_id_at_create,
+        reporter_device_uuid=reporter_device_uuid,
+        reporter_device_id_at_event=(reporter_device.id if reporter_device else None),
+        reporter_device_generation=(connection_log.host_device_generation if reporter_device else None),
+        reporter_sequence=reporter_sequence,
+        payload_digest=payload_digest,
+        details=details,
+    )
+    connection_log.event_revision = sequence
+    connection_log.save(update_fields=["event_revision"])
+    return event, True
+
+
+def _audit_event_conflict(request=None, *, kind="unknown"):
+    if request is not None:
+        _log_event(
+            request,
+            "api_audit_event_identity_conflict",
+            level="warning",
+            kind=kind,
+        )
+    return json_error("audit_event_identity_conflict", "Audit event identity conflict", status=409)
+
+
 def _audit_conn_active(request):
     token, user = _get_token_user(request)
     if not token or not user or not _get_active_token_device(token, user):
         _log_event(request, "api_audit_conn_active_unauthorized", level="warning")
-        return JsonResponse("", safe=False, status=401)
+        return json_error("audit_unauthorized", "Invalid audit credential", status=401)
+    if not _audit_version_is_current(request.GET.get("version")):
+        return _audit_upgrade_required()
     peer_id = _audit_rid(request.GET.get("id", ""))
     session_id = _audit_session_id(request.GET.get("session_id", ""))
     conn_type = _audit_enum(request.GET.get("conn_type", 0), range(5))
-    if peer_id is None or session_id is None or conn_type is None:
+    event_id = _audit_uuid4(request.GET.get("event_id"))
+    if peer_id is None or session_id is None or conn_type is None or event_id is None:
         _log_event(request, "api_audit_conn_active_failed", level="warning", reason="missing_id")
-        return JsonResponse("", safe=False, status=400)
-    with transaction.atomic():
-        connection_log = (
-            ConnLog.objects.select_for_update()
-            .filter(
-                rid=peer_id,
-                session_id=session_id,
-                from_id=token.device.rid,
+        return json_error("audit_request_invalid", "Invalid audit binding request", status=400)
+    try:
+        with transaction.atomic():
+            controller_rid = RemoteDevice.objects.filter(pk=token.device_id).values_list("rid", flat=True).first()
+            if controller_rid is None:
+                return json_error("audit_binding_forbidden", "Audit binding is not allowed", status=403)
+            candidate = (
+                ConnLog.objects.filter(
+                    audit_version=AUDIT_PROTOCOL_VERSION,
+                    rid=peer_id,
+                    session_id=session_id,
+                    from_id=controller_rid,
+                )
+                .order_by("-conn_start", "-pk")
+                .values_list("host_device_id", flat=True)
+                .first()
             )
-            .first()
-        )
-        if not connection_log:
-            # The host posts the controller identity after the initial
-            # connection record. An empty 200 keeps the client's bounded retry
-            # loop alive without exposing another user's audit GUID.
-            return JsonResponse("", safe=False)
-        if connection_log.actor_id and connection_log.actor_id != user.id:
-            return JsonResponse("", safe=False, status=403)
-        update_fields = []
-        if connection_log.actor_id is None:
-            connection_log.actor = user
-            update_fields.append("actor")
-        if connection_log.conn_type is None:
-            connection_log.conn_type = conn_type
-            update_fields.append("conn_type")
-        elif connection_log.conn_type != conn_type:
-            return JsonResponse("", safe=False, status=409)
-        if update_fields:
-            connection_log.save(update_fields=update_fields)
+            if candidate is None:
+                # The host publishes the authenticated controller identity after
+                # opening the audit session. The explicit pending state keeps the
+                # bounded client retry alive without exposing another capability.
+                return json_pending(
+                    "audit_binding_pending",
+                    "Audit binding is pending",
+                    retry_after=1,
+                )
+            locked_devices = {
+                device.id: device
+                for device in RemoteDevice.objects.select_for_update()
+                .filter(pk__in={candidate, token.device_id})
+                .order_by("pk")
+            }
+            host_device = locked_devices.get(candidate)
+            controller_device = locked_devices.get(token.device_id)
+            connection_log = (
+                ConnLog.objects.select_for_update()
+                .filter(
+                    audit_version=AUDIT_PROTOCOL_VERSION,
+                    rid=peer_id,
+                    session_id=session_id,
+                    from_id=controller_device.rid if controller_device else "",
+                )
+                .order_by("-conn_start", "-pk")
+                .first()
+            )
+            if not connection_log or not host_device or not controller_device:
+                return json_error("audit_binding_forbidden", "Audit binding is not allowed", status=403)
+            if not _audit_host_authority_is_current(connection_log, host_device):
+                return json_error("audit_binding_forbidden", "Audit binding is not allowed", status=403)
+            if controller_device.owner_id != user.id or not controller_device.is_active:
+                return json_error("audit_binding_forbidden", "Audit binding is not allowed", status=403)
+            if connection_log.conn_type is None:
+                return json_pending(
+                    "audit_connection_pending",
+                    "Audit connection type is pending",
+                    retry_after=1,
+                )
+            if connection_log.conn_type != conn_type:
+                return json_error("audit_connection_conflict", "Audit connection type conflict", status=409)
+            if connection_log.actor_id and connection_log.actor_id != user.id:
+                return json_error("audit_binding_forbidden", "Audit binding is not allowed", status=403)
+            now = audit_lifecycle.database_now()
+            audit_lifecycle.expire_locked_connection(connection_log, now, source="controller_query")
+            if connection_log.state != ConnLog.STATE_ACTIVE:
+                if connection_log.state == ConnLog.STATE_STARTING:
+                    return json_pending(
+                        "audit_connection_pending",
+                        "Audit connection is starting",
+                        retry_after=1,
+                    )
+                return _audit_terminal_conflict(connection_log)
+            details = {
+                "controller_device_id": controller_device.rid,
+                "controller_device_pk": controller_device.id,
+                "controller_device_uuid": controller_device.uuid,
+                "controller_device_generation": controller_device.deployment_generation,
+                "controller_owner_id": user.id,
+                "conn_type": conn_type,
+            }
+            existing = _existing_audit_event(event_id)
+            if existing:
+                if not _matching_audit_event(
+                    existing,
+                    connection_log,
+                    ConnectionAuditEvent.KIND_CONTROLLER_BOUND,
+                    user,
+                    controller_device.uuid,
+                    details,
+                ):
+                    return _audit_event_conflict()
+                return _audit_success(connection_log, event_id)
+            if connection_log.actor_id is None:
+                if connection_log.controller_device_id is not None:
+                    return json_error("audit_binding_conflict", "Audit binding conflict", status=409)
+                _append_audit_event(
+                    connection_log,
+                    event_id,
+                    ConnectionAuditEvent.KIND_CONTROLLER_BOUND,
+                    user,
+                    controller_device.uuid,
+                    details,
+                )
+                connection_log.actor = user
+                connection_log.controller_device = controller_device
+                connection_log.controller_device_id_at_bind = controller_device.id
+                connection_log.controller_device_generation = controller_device.deployment_generation
+                connection_log.controller_device_name_at_bind = controller_device.hostname
+                connection_log.controller_owner_id_at_bind = user.id
+                connection_log.save(
+                    update_fields=[
+                        "actor",
+                        "controller_device",
+                        "controller_device_id_at_bind",
+                        "controller_device_generation",
+                        "controller_device_name_at_bind",
+                        "controller_owner_id_at_bind",
+                    ]
+                )
+            else:
+                if not _audit_controller_authority_is_current(connection_log, controller_device):
+                    return json_error("audit_binding_forbidden", "Audit binding is not allowed", status=403)
+    except IntegrityError:
+        return _audit_event_conflict()
     _log_event(
         request,
         "api_audit_conn_active",
@@ -3129,58 +4747,118 @@ def _audit_conn_active(request):
         session_id=session_id,
         conn_type=conn_type,
     )
-    return JsonResponse(str(connection_log.guid), safe=False)
+    return _audit_success(connection_log, event_id)
 
 
 def _audit_controller_note(request, postdata):
+    return _audit_controller_note_by_capability(request, postdata)
+
+
+def _audit_controller_note_by_capability(request, postdata):
     token, user = _get_token_user(request)
     if not token or not user or not _get_active_token_device(token, user):
         return JsonResponse({"error": "Invalid token"}, status=401)
-    peer_id = _audit_rid(postdata.get("id"))
-    session_id = _audit_session_id(postdata.get("session_id"))
+    if not _audit_version_is_current(postdata.get("version")):
+        return _audit_upgrade_required()
+    audit_session_id = _audit_uuid4(postdata.get("audit_session_id") or postdata.get("guid"))
+    event_id = _audit_uuid4(postdata.get("event_id"))
     note = postdata.get("note")
-    if peer_id is None or session_id is None or not isinstance(note, str) or len(note.encode()) > MAX_AUDIT_NOTE_BYTES:
+    if (
+        audit_session_id is None
+        or event_id is None
+        or not isinstance(note, str)
+        or len(note.encode()) > MAX_AUDIT_NOTE_BYTES
+    ):
         return JsonResponse({"error": "Invalid audit note"}, status=400)
-    with transaction.atomic():
-        connection_log = (
-            ConnLog.objects.select_for_update()
-            .filter(
-                rid=peer_id,
-                session_id=session_id,
-                from_id=token.device.rid,
+    try:
+        with transaction.atomic():
+            authority = (
+                ConnLog.objects.filter(
+                    guid=audit_session_id,
+                    audit_version=AUDIT_PROTOCOL_VERSION,
+                )
+                .values("host_device_id", "controller_device_id")
+                .first()
             )
-            .first()
-        )
-        if not connection_log:
-            return JsonResponse({"error": "Connection audit not found"}, status=404)
-        if connection_log.actor_id and connection_log.actor_id != user.id:
-            return JsonResponse({"error": "Connection audit not found"}, status=404)
-        connection_log.actor = connection_log.actor or user
-        connection_log.note = note
-        connection_log.save(update_fields=["actor", "note"])
+            if not authority or authority["controller_device_id"] != token.device_id:
+                return json_error("audit_connection_not_found", "Connection not found", status=404)
+            locked_devices = {
+                device.id: device
+                for device in RemoteDevice.objects.select_for_update()
+                .filter(pk__in={authority["host_device_id"], token.device_id})
+                .order_by("pk")
+            }
+            host_device = locked_devices.get(authority["host_device_id"])
+            controller_device = locked_devices.get(token.device_id)
+            connection_log = (
+                ConnLog.objects.select_for_update()
+                .filter(
+                    guid=audit_session_id,
+                    audit_version=AUDIT_PROTOCOL_VERSION,
+                    controller_device=controller_device,
+                    actor=user,
+                )
+                .first()
+            )
+            if not connection_log:
+                return json_error("audit_connection_not_found", "Connection not found", status=404)
+            if not host_device or not controller_device:
+                return json_error(
+                    "audit_connection_authority_changed",
+                    "Connection authority changed",
+                    status=403,
+                )
+            if not _audit_host_authority_is_current(connection_log, host_device):
+                return JsonResponse({"error": "Connection authority changed"}, status=403)
+            if not _audit_controller_authority_is_current(connection_log, controller_device):
+                return json_error("audit_controller_authority_changed", "Controller authority changed", status=403)
+            existing = _existing_audit_event(event_id)
+            if existing:
+                if (
+                    existing.connection_id != connection_log.id
+                    or existing.kind != ConnectionAuditEvent.KIND_NOTE
+                    or existing.actor_id != user.id
+                    or existing.reporter_device_uuid != controller_device.uuid
+                    or existing.details.get("note") != note
+                ):
+                    return _audit_event_conflict()
+                return _audit_success(connection_log, event_id)
+            observed_at = audit_lifecycle.database_now()
+            audit_lifecycle.expire_locked_connection(connection_log, observed_at, source="controller_note")
+            if connection_log.state != ConnLog.STATE_ACTIVE:
+                return _audit_terminal_conflict(connection_log)
+            details = {"previous_note": connection_log.note, "note": note}
+            _append_audit_event(
+                connection_log,
+                event_id,
+                ConnectionAuditEvent.KIND_NOTE,
+                user,
+                controller_device.uuid,
+                details,
+            )
+            connection_log.note = note
+            connection_log.save(update_fields=["note"])
+    except IntegrityError:
+        return _audit_event_conflict()
     _log_event(request, "api_audit_note_update", username=user.username, guid=connection_log.guid)
-    return JsonResponse({"code": 1, "data": "ok"})
+    return _audit_success(connection_log, event_id)
 
 
 def _audit_conn(request):
-    postdata = _load_json_object(request)
+    postdata = _load_json_object(request, max_bytes=settings.JSON_AUDIT_MAX_BODY_BYTES)
     if "note" in postdata and "uuid" not in postdata:
         return _audit_controller_note(request, postdata)
     token, user, error = _audit_device_context(request, postdata)
     if error:
         return error
+    if not _audit_version_is_current(postdata.get("version")):
+        return _audit_upgrade_required()
     action = postdata.get("action", "")
     conn_id = _audit_connection_id(postdata.get("conn_id"))
-    peer_id = token.device.rid
     session_id = _audit_session_id(postdata.get("session_id"))
-    if conn_id is None or session_id is None:
+    event_id = _audit_uuid4(postdata.get("event_id"))
+    if conn_id is None or session_id is None or event_id is None:
         return JsonResponse({"error": "Invalid connection identity"}, status=400)
-    scoped_logs = ConnLog.objects.filter(
-        conn_id=conn_id,
-        rid=token.device.rid,
-        uuid=token.device.uuid,
-        session_id=session_id,
-    )
     if action == "new":
         raw_conn_type = postdata.get("type")
         conn_type = None if raw_conn_type is None else _audit_enum(raw_conn_type, range(5))
@@ -3192,63 +4870,249 @@ def _audit_conn(request):
         audit_ref = _bounded_audit_text(postdata.get("conn_audit_ref", ""), 256)
         if audit_ref is None:
             return JsonResponse({"error": "Invalid audit reference"}, status=400)
+        created = False
         try:
             with transaction.atomic():
-                connection_log, created = ConnLog.objects.get_or_create(
-                    rid=peer_id,
-                    session_id=session_id,
-                    uuid=token.device.uuid,
-                    defaults={
-                        "conn_id": conn_id,
-                        "from_ip": source_ip,
-                        "from_id": "",
-                        "conn_type": conn_type,
-                        "audit_ref": audit_ref,
-                        "reporter": user,
-                    },
-                )
-                if not created and (
-                    connection_log.conn_id != conn_id
-                    or connection_log.from_ip != source_ip
-                    or connection_log.reporter_id != user.id
-                ):
-                    return JsonResponse(
-                        {"error": "Connection session conflict"},
-                        status=409,
+                device = _locked_audit_device(token, user)
+                if not device:
+                    return json_error("audit_device_not_active", "Device is not active", status=403)
+                observed_at = audit_lifecycle.database_now()
+                connection_log = (
+                    ConnLog.objects.select_for_update()
+                    .filter(
+                        audit_version=AUDIT_PROTOCOL_VERSION,
+                        host_device=device,
+                        create_id=event_id,
                     )
+                    .first()
+                )
+                if connection_log:
+                    if (
+                        connection_log.conn_id != conn_id
+                        or connection_log.rid != device.rid
+                        or connection_log.uuid != device.uuid
+                        or connection_log.session_id != session_id
+                        or connection_log.from_ip != source_ip
+                        or connection_log.conn_type != conn_type
+                        or connection_log.audit_ref != audit_ref
+                        or connection_log.reporter_id != user.id
+                        or not _audit_host_authority_is_current(connection_log, device)
+                    ):
+                        return json_error(
+                            "audit_connection_session_conflict",
+                            "Connection session conflict",
+                            status=409,
+                        )
+                else:
+                    ingestion_governance.reserve_audit_connection(user.id, device.id)
+                    connection_log = ConnLog.objects.create(
+                        audit_version=AUDIT_PROTOCOL_VERSION,
+                        create_id=event_id,
+                        host_device=device,
+                        host_device_id_at_create=device.id,
+                        host_device_generation=device.deployment_generation,
+                        host_device_name_at_create=device.hostname,
+                        owner_id_at_create=user.id,
+                        event_revision=1,
+                        state=ConnLog.STATE_STARTING,
+                        state_revision=1,
+                        last_seen_at=observed_at,
+                        lease_expires_at=audit_lifecycle.lease_deadline(observed_at),
+                        conn_id=conn_id,
+                        from_ip=source_ip,
+                        from_id="",
+                        rid=device.rid,
+                        conn_start=observed_at,
+                        session_id=session_id,
+                        uuid=device.uuid,
+                        conn_type=conn_type,
+                        audit_ref=audit_ref,
+                        reporter=user,
+                    )
+                    ConnectionAuditEvent.objects.create(
+                        event_id=event_id,
+                        connection=connection_log,
+                        sequence=1,
+                        kind=ConnectionAuditEvent.KIND_OPENED,
+                        actor=user,
+                        actor_id_at_event=user.id,
+                        reporter_device_uuid=device.uuid,
+                        details={
+                            "conn_id": conn_id,
+                            "from_ip": source_ip,
+                            "host_id": device.rid,
+                            "host_device_pk": device.id,
+                            "host_device_uuid": device.uuid,
+                            "host_device_generation": device.deployment_generation,
+                            "owner_id_at_create": user.id,
+                            "session_id": session_id,
+                            "conn_type": conn_type,
+                            "audit_ref": audit_ref,
+                            "state": ConnLog.STATE_STARTING,
+                            "state_revision": 1,
+                            "lease_seconds": settings.AUDIT_CONNECTION_LEASE_SECONDS,
+                        },
+                    )
+                    created = True
         except IntegrityError:
-            return JsonResponse({"error": "Connection session conflict"}, status=409)
+            return json_error("audit_connection_session_conflict", "Connection session conflict", status=409)
         _log_event(
             request,
             "api_audit_conn_new",
             level="info",
             username=user.username,
             conn_id=conn_id,
-            peer_id=peer_id,
+            peer_id=connection_log.rid,
             session_id=session_id,
             conn_type=conn_type,
         )
-    elif action == "close":
+        return _audit_success(connection_log, event_id, status=201 if created else 200)
+    elif action == "heartbeat":
+        audit_session_id = _audit_uuid4(postdata.get("audit_session_id"))
+        heartbeat_revision = _audit_revision(postdata.get("heartbeat_revision"))
+        if audit_session_id is None or heartbeat_revision is None:
+            return JsonResponse({"error": "Invalid audit heartbeat"}, status=400)
         with transaction.atomic():
-            connection_log = scoped_logs.select_for_update().first()
-            if not connection_log:
-                return JsonResponse({"error": "Connection not found"}, status=404)
-            if connection_log.conn_end is None:
-                connection_log.conn_end = timezone.now()
-                connection_log.save(update_fields=["conn_end"])
+            device, connection_log, authority_error = _locked_host_audit_session(
+                token,
+                user,
+                audit_session_id,
+            )
+            if authority_error:
+                return authority_error
+            if connection_log.conn_id != conn_id or connection_log.session_id != session_id:
+                return json_error("audit_connection_not_found", "Connection not found", status=404)
+            if heartbeat_revision < connection_log.heartbeat_revision:
+                return JsonResponse({"error": "Stale audit heartbeat"}, status=409)
+            if heartbeat_revision == connection_log.heartbeat_revision:
+                if connection_log.last_heartbeat_id != event_id:
+                    return json_error(
+                        "audit_heartbeat_identity_conflict",
+                        "Audit heartbeat identity conflict",
+                        status=409,
+                    )
+                return _audit_success(connection_log, event_id)
+            observed_at = audit_lifecycle.database_now()
+            connection_log.heartbeat_revision = heartbeat_revision
+            connection_log.last_heartbeat_id = event_id
+            audit_lifecycle.refresh_host_lease(connection_log, observed_at)
+            connection_log.save(
+                update_fields=(
+                    "heartbeat_revision",
+                    "last_heartbeat_id",
+                    "last_seen_at",
+                    "lease_expires_at",
+                )
+            )
+        _log_event(
+            request,
+            "api_audit_conn_heartbeat",
+            level="debug",
+            username=user.username,
+            conn_id=conn_id,
+            session_id=session_id,
+            heartbeat_revision=heartbeat_revision,
+        )
+        return _audit_success(connection_log, event_id)
+    elif action == "close":
+        audit_session_id = _audit_uuid4(postdata.get("audit_session_id"))
+        if audit_session_id is None:
+            return JsonResponse({"error": "Invalid audit session capability"}, status=400)
+        try:
+            with transaction.atomic():
+                device, connection_log, authority_error = _locked_host_audit_session(
+                    token,
+                    user,
+                    audit_session_id,
+                    active=False,
+                )
+                if authority_error:
+                    return authority_error
+                if connection_log.conn_id != conn_id or connection_log.session_id != session_id:
+                    return json_error("audit_connection_not_found", "Connection not found", status=404)
+                existing = _existing_audit_event(event_id)
+                if existing:
+                    if (
+                        existing.connection_id != connection_log.id
+                        or existing.kind not in (ConnectionAuditEvent.KIND_CLOSED, ConnectionAuditEvent.KIND_ABORTED)
+                        or existing.actor_id != user.id
+                        or existing.reporter_device_uuid != device.uuid
+                    ):
+                        return _audit_event_conflict()
+                    return _audit_success(connection_log, event_id)
+                terminal_at = audit_lifecycle.database_now()
+                audit_lifecycle.expire_locked_connection(connection_log, terminal_at, source="close_reconciler")
+                if connection_log.state not in ConnLog.OPEN_STATES:
+                    return _audit_terminal_conflict(connection_log)
+                event_kind = (
+                    ConnectionAuditEvent.KIND_CLOSED
+                    if connection_log.state == ConnLog.STATE_ACTIVE
+                    else ConnectionAuditEvent.KIND_ABORTED
+                )
+                terminal_state = (
+                    ConnLog.STATE_CLOSED if connection_log.state == ConnLog.STATE_ACTIVE else ConnLog.STATE_ABORTED
+                )
+                terminal_reason = "host_close" if terminal_state == ConnLog.STATE_CLOSED else "ended_before_active"
+                terminal_event, _created = _append_audit_event(
+                    connection_log,
+                    event_id,
+                    event_kind,
+                    user,
+                    device.uuid,
+                    {
+                        "terminal_at": terminal_at.isoformat(),
+                        "terminal_state": terminal_state,
+                        "reason": terminal_reason,
+                        "source": "host",
+                    },
+                )
+                if connection_log.state_revision >= 9_223_372_036_854_775_807:
+                    raise IntegrityError("Audit state revision exhausted")
+                connection_log.state = terminal_state
+                connection_log.state_revision += 1
+                connection_log.last_seen_at = terminal_at
+                connection_log.lease_expires_at = terminal_at
+                connection_log.terminal_at = terminal_at
+                connection_log.terminal_reason = terminal_reason
+                connection_log.terminal_source = "host"
+                connection_log.conn_end = terminal_at
+                connection_log.save(
+                    update_fields=(
+                        "state",
+                        "state_revision",
+                        "last_seen_at",
+                        "lease_expires_at",
+                        "terminal_at",
+                        "terminal_reason",
+                        "terminal_source",
+                        "conn_end",
+                    )
+                )
+                audit_lifecycle.reconcile_open_file_transfers(
+                    connection_log,
+                    terminal_event,
+                    terminal_at,
+                    reason=terminal_reason,
+                )
+        except IntegrityError:
+            return _audit_event_conflict()
         _log_event(
             request,
             "api_audit_conn_close",
             level="info",
             username=user.username,
             conn_id=conn_id,
-            peer_id=peer_id,
+            peer_id=connection_log.rid,
             session_id=session_id,
         )
+        return _audit_success(connection_log, event_id)
     else:
         if action not in ("", "update"):
             return JsonResponse({"error": "Invalid action"}, status=400)
-        updates = {}
+        audit_session_id = _audit_uuid4(postdata.get("audit_session_id"))
+        if audit_session_id is None:
+            return JsonResponse({"error": "Invalid audit session capability"}, status=400)
+        submitted = {}
         if "peer" in postdata:
             peer = postdata.get("peer", [])
             if not isinstance(peer, (list, tuple)) or len(peer) != 2:
@@ -3256,114 +5120,406 @@ def _audit_conn(request):
             from_id = _audit_rid(peer[0])
             if from_id is None:
                 return JsonResponse({"error": "Invalid peer identity"}, status=400)
-            updates["from_id"] = from_id
+            submitted["from_id"] = from_id
         if "type" in postdata:
             update_type = _audit_enum(postdata.get("type"), range(5))
             if update_type is None:
                 return JsonResponse({"error": "Invalid connection type"}, status=400)
-            updates["conn_type"] = update_type
+            submitted["conn_type"] = update_type
         if "primary_auth" in postdata:
             primary_auth = _audit_enum(postdata.get("primary_auth"), range(1, 5))
             if primary_auth is None:
                 return JsonResponse({"error": "Invalid primary authentication"}, status=400)
-            updates["primary_auth"] = primary_auth
+            submitted["primary_auth"] = primary_auth
         if "two_factor" in postdata:
             two_factor = _audit_enum(postdata.get("two_factor"), range(1, 3))
             if two_factor is None:
                 return JsonResponse({"error": "Invalid second factor"}, status=400)
-            updates["two_factor"] = two_factor
+            submitted["two_factor"] = two_factor
         if "conn_audit_ref" in postdata:
             audit_ref = _bounded_audit_text(postdata.get("conn_audit_ref"), 256)
             if audit_ref is None:
                 return JsonResponse({"error": "Invalid audit reference"}, status=400)
-            updates["audit_ref"] = audit_ref
+            submitted["audit_ref"] = audit_ref
         if "note" in postdata:
-            note = _bounded_audit_text(postdata.get("note"), MAX_AUDIT_NOTE_BYTES)
-            if note is None:
-                return JsonResponse({"error": "Invalid audit note"}, status=400)
-            updates["note"] = note
-        updated = scoped_logs.update(**updates) if updates else int(scoped_logs.exists())
-        if updated != 1:
-            return JsonResponse({"error": "Connection not found"}, status=404)
+            return JsonResponse({"error": "Host cannot write controller notes"}, status=403)
+        try:
+            with transaction.atomic():
+                device, connection_log, authority_error = _locked_host_audit_session(
+                    token,
+                    user,
+                    audit_session_id,
+                )
+                if authority_error:
+                    return authority_error
+                if connection_log.conn_id != conn_id or connection_log.session_id != session_id:
+                    return json_error("audit_connection_not_found", "Connection not found", status=404)
+                existing = _existing_audit_event(event_id)
+                if existing:
+                    if not _matching_audit_event(
+                        existing,
+                        connection_log,
+                        ConnectionAuditEvent.KIND_AUTHORIZED,
+                        user,
+                        device.uuid,
+                        submitted,
+                    ):
+                        return _audit_event_conflict()
+                    return _audit_success(connection_log, event_id)
+                update_fields = []
+                for field, value in submitted.items():
+                    previous = getattr(connection_log, field)
+                    unset = previous is None or (field in ("from_id", "audit_ref") and previous == "")
+                    if unset:
+                        setattr(connection_log, field, value)
+                        update_fields.append(field)
+                    elif previous != value:
+                        return json_error("audit_connection_fact_immutable", "Connection fact is immutable", status=409)
+                if (
+                    connection_log.state == ConnLog.STATE_STARTING
+                    and connection_log.from_id
+                    and connection_log.conn_type is not None
+                ):
+                    if connection_log.state_revision >= 9_223_372_036_854_775_807:
+                        raise IntegrityError("Audit state revision exhausted")
+                    connection_log.state = ConnLog.STATE_ACTIVE
+                    connection_log.state_revision += 1
+                    update_fields.extend(("state", "state_revision"))
+                observed_at = audit_lifecycle.database_now()
+                audit_lifecycle.refresh_host_lease(connection_log, observed_at)
+                update_fields.extend(("last_seen_at", "lease_expires_at"))
+                connection_log.save(update_fields=tuple(dict.fromkeys(update_fields)))
+                _append_audit_event(
+                    connection_log,
+                    event_id,
+                    ConnectionAuditEvent.KIND_AUTHORIZED,
+                    user,
+                    device.uuid,
+                    submitted,
+                )
+        except IntegrityError:
+            return _audit_event_conflict()
         _log_event(
             request,
             "api_audit_conn_update",
             level="debug",
             username=user.username,
             conn_id=conn_id,
-            peer_id=peer_id,
+            peer_id=connection_log.rid,
             session_id=session_id,
         )
-    return JsonResponse({"code": 1, "data": "ok"})
+        return _audit_success(connection_log, event_id)
 
 
 def _audit_file(request):
-    postdata = _load_json_object(request)
+    postdata = _load_json_object(request, max_bytes=settings.JSON_AUDIT_MAX_BODY_BYTES)
     token, user, error = _audit_device_context(request, postdata)
     if error:
         return error
-    if "is_file" not in postdata:
-        return JsonResponse({"code": 1, "data": "ok"})
-    info = postdata.get("info", "{}")
-    if isinstance(info, str) and len(info.encode()) > MAX_AUDIT_INFO_BYTES:
-        return JsonResponse({"error": "Audit information is too large"}, status=413)
-    try:
-        info_obj = json.loads(info) if isinstance(info, str) else info
-    except (TypeError, ValueError, json.JSONDecodeError):
-        return JsonResponse({"error": "Invalid audit information"}, status=400)
-    if not isinstance(info_obj, dict):
-        return JsonResponse({"error": "Invalid audit information"}, status=400)
-    files = info_obj.get("files", [])
-    total_size = 0
-    if files:
-        if not isinstance(files, list) or len(files) > MAX_AUDIT_FILES:
-            return JsonResponse({"error": "Invalid audit files"}, status=400)
-        for item in files:
-            if not isinstance(item, (list, tuple)) or len(item) < 2:
-                return JsonResponse({"error": "Invalid audit files"}, status=400)
-            try:
-                size = int(item[1])
-            except (TypeError, ValueError):
-                return JsonResponse({"error": "Invalid audit files"}, status=400)
-            if size < 0 or size > settings.RECORD_UPLOAD_MAX_FILE_BYTES:
-                return JsonResponse({"error": "Invalid audit files"}, status=400)
-            total_size += size
-    path = _bounded_audit_text(postdata.get("path", ""), 500)
-    user_ip = _audit_ip(info_obj.get("ip", ""))
-    remote_id = _audit_rid(postdata.get("peer_id", ""))
-    direction = _audit_enum(postdata.get("type", 0), (0, 1))
-    if path is None or user_ip is None or remote_id is None or direction is None:
+    if not _file_audit_version_is_current(postdata.get("version")):
+        return _audit_upgrade_required(FILE_AUDIT_PROTOCOL_VERSION)
+    if not _audit_evidence_receipt_version_is_current(postdata.get("receipt_version")):
+        return _audit_evidence_upgrade_required(FILE_AUDIT_PROTOCOL_VERSION)
+    audit_session_id = _audit_uuid4(postdata.get("audit_session_id"))
+    event_id = _audit_uuid4(postdata.get("event_id"))
+    reporter_sequence = _audit_reporter_sequence(postdata.get("reporter_sequence"))
+    transfer_id = _audit_uuid4(postdata.get("transfer_id"))
+    transfer_revision = _audit_revision(postdata.get("transfer_revision"))
+    conn_id = _audit_connection_id(postdata.get("conn_id"))
+    if (
+        audit_session_id is None
+        or event_id is None
+        or reporter_sequence is None
+        or transfer_id is None
+        or transfer_revision is None
+        or conn_id is None
+    ):
+        return JsonResponse({"error": "Invalid connection identity"}, status=400)
+    if not isinstance(postdata.get("is_file"), bool):
         return JsonResponse({"error": "Invalid file audit"}, status=400)
-    FileLog.objects.create(
-        file=path,
-        user_id=remote_id,
-        user_ip=user_ip,
-        remote_id=token.device.rid,
-        filesize=total_size,
-        direction=direction,
-        logged_at=timezone.now(),
-        details=info_obj,
-        reporter=user,
-        reporter_device_uuid=token.device.uuid,
-    )
+
+    state = postdata.get("state")
+    if state not in dict(FileLog.STATES):
+        return JsonResponse({"error": "Invalid file transfer state"}, status=400)
+    path = _bounded_audit_text(postdata.get("path", ""), 500)
+    remote_id = _audit_rid(postdata.get("peer_id", ""))
+    direction = _audit_enum(postdata.get("direction"), (0, 1))
+    planned_file_count = _audit_nonnegative_integer(postdata.get("planned_file_count"))
+    planned_bytes = _audit_nonnegative_integer(postdata.get("planned_bytes"))
+    transferred_bytes = _audit_nonnegative_integer(postdata.get("transferred_bytes"))
+    source_kind = postdata.get("source_kind")
+    terminal_reason = _bounded_audit_text(postdata.get("terminal_reason", ""), 256)
+    if (
+        path is None
+        or remote_id is None
+        or direction is None
+        or planned_file_count is None
+        or planned_bytes is None
+        or transferred_bytes is None
+        or source_kind not in dict(FileLog.SOURCE_KINDS)
+        or terminal_reason is None
+    ):
+        return JsonResponse({"error": "Invalid file audit"}, status=400)
+    if transferred_bytes > planned_bytes:
+        return JsonResponse({"error": "Invalid transferred bytes"}, status=400)
+    if state in (FileLog.STATE_STARTED, FileLog.STATE_PROGRESS, FileLog.STATE_COMPLETED):
+        if terminal_reason:
+            return JsonResponse({"error": "Invalid terminal reason"}, status=400)
+    elif not terminal_reason:
+        return JsonResponse({"error": "Terminal reason is required"}, status=400)
+
+    sample_files = postdata.get("sample_files")
+    if not isinstance(sample_files, list) or len(sample_files) > MAX_AUDIT_FILES:
+        return JsonResponse({"error": "Invalid audit files"}, status=400)
+    normalized_samples = []
+    sample_bytes = 0
+    for item in sample_files:
+        if not isinstance(item, dict) or set(item) != {"path", "size"}:
+            return JsonResponse({"error": "Invalid audit files"}, status=400)
+        sample_path = _bounded_audit_text(item.get("path"), 500)
+        sample_size = _audit_nonnegative_integer(item.get("size"))
+        if sample_path is None or sample_size is None:
+            return JsonResponse({"error": "Invalid audit files"}, status=400)
+        if sample_bytes > MAX_AUDIT_INTEGER - sample_size:
+            return JsonResponse({"error": "Invalid audit files"}, status=400)
+        sample_bytes += sample_size
+        normalized_samples.append({"path": sample_path, "size": sample_size})
+    if len(normalized_samples) > planned_file_count or sample_bytes > planned_bytes:
+        return JsonResponse({"error": "Invalid file plan"}, status=400)
+
+    details = {
+        "transfer_id": str(transfer_id),
+        "transfer_revision": transfer_revision,
+        "state": state,
+        "conn_id": conn_id,
+        "path": path,
+        "peer_id": remote_id,
+        "direction": direction,
+        "is_file": postdata["is_file"],
+        "planned_file_count": planned_file_count,
+        "planned_bytes": planned_bytes,
+        "transferred_bytes": transferred_bytes,
+        "sample_files": normalized_samples,
+        "source_kind": source_kind,
+        "terminal_reason": terminal_reason,
+    }
+    try:
+        with transaction.atomic():
+            device, connection_log, authority_error = _locked_host_audit_session(
+                token,
+                user,
+                audit_session_id,
+                active=False,
+                require_controller=True,
+            )
+            if authority_error:
+                return authority_error
+            if connection_log.conn_id != conn_id:
+                return json_error("audit_connection_not_found", "Connection not found", status=404)
+            if not connection_log.from_id or connection_log.from_id != remote_id:
+                return JsonResponse({"error": "Invalid file audit participant"}, status=403)
+            try:
+                payload_digest = _audit_evidence_digest(
+                    event_id=event_id,
+                    connection_log=connection_log,
+                    kind=ConnectionAuditEvent.KIND_FILE,
+                    actor=user,
+                    reporter_device=device,
+                    reporter_sequence=reporter_sequence,
+                    details=details,
+                )
+            except (TypeError, ValueError):
+                return JsonResponse({"error": "Invalid file audit"}, status=400)
+            existing = _existing_audit_event(event_id)
+            if existing:
+                if not _matching_evidence_event(
+                    existing,
+                    connection_log,
+                    ConnectionAuditEvent.KIND_FILE,
+                    user,
+                    device,
+                    reporter_sequence,
+                    payload_digest,
+                ):
+                    return _audit_event_conflict(request, kind=ConnectionAuditEvent.KIND_FILE)
+                transfer_event = (
+                    FileTransferAuditEvent.objects.select_related("transfer", "connection_event")
+                    .filter(
+                        connection_event=existing,
+                        transfer__connection=connection_log,
+                        transfer__transfer_id=transfer_id,
+                        revision=transfer_revision,
+                    )
+                    .first()
+                )
+                if transfer_event is None:
+                    raise IntegrityError("File transfer audit receipt is missing")
+                return _file_audit_success(connection_log, transfer_event)
+
+            if ConnectionAuditEvent.objects.filter(
+                connection=connection_log,
+                reporter_sequence=reporter_sequence,
+            ).exists():
+                return _reporter_sequence_conflict(reporter_sequence)
+
+            observed_at = audit_lifecycle.database_now()
+            audit_lifecycle.expire_locked_connection(connection_log, observed_at, source="file_event")
+            if connection_log.state != ConnLog.STATE_ACTIVE:
+                return _audit_terminal_conflict(connection_log)
+
+            transfer = FileLog.objects.select_for_update().filter(transfer_id=transfer_id).first()
+            if transfer is None:
+                if transfer_revision != 1 or state != FileLog.STATE_STARTED or transferred_bytes != 0:
+                    return JsonResponse({"error": "File transfer must start at revision one"}, status=409)
+            else:
+                immutable_plan = (
+                    transfer.audit_version == FILE_AUDIT_PROTOCOL_VERSION
+                    and transfer.connection_id == connection_log.id
+                    and transfer.file == path
+                    and transfer.remote_id == device.rid
+                    and transfer.user_id == remote_id
+                    and str(transfer.user_ip) == connection_log.from_ip
+                    and transfer.direction == direction
+                    and transfer.is_file == postdata["is_file"]
+                    and transfer.planned_file_count == planned_file_count
+                    and transfer.planned_bytes == planned_bytes
+                    and transfer.sample_files == normalized_samples
+                    and transfer.source_kind == source_kind
+                    and transfer.reporter_id == user.id
+                    and transfer.reporter_device_uuid == device.uuid
+                )
+                if not immutable_plan:
+                    return JsonResponse({"error": "File transfer plan is immutable"}, status=409)
+                if transfer.state in FileLog.TERMINAL_STATES:
+                    return JsonResponse({"error": "File transfer is terminal"}, status=409)
+                if transfer_revision != transfer.transfer_revision + 1:
+                    return JsonResponse({"error": "File transfer revision is out of order"}, status=409)
+                if state not in (
+                    FileLog.STATE_PROGRESS,
+                    FileLog.STATE_COMPLETED,
+                    FileLog.STATE_FAILED,
+                    FileLog.STATE_CANCELLED,
+                    FileLog.STATE_UNKNOWN,
+                ):
+                    return JsonResponse({"error": "Invalid file transfer transition"}, status=409)
+                if transferred_bytes < transfer.transferred_bytes:
+                    return JsonResponse({"error": "Transferred bytes cannot decrease"}, status=409)
+
+            audit_lifecycle.refresh_host_lease(connection_log, observed_at)
+            connection_log.save(update_fields=("last_seen_at", "lease_expires_at"))
+            event, _created = _append_audit_event(
+                connection_log,
+                event_id,
+                ConnectionAuditEvent.KIND_FILE,
+                user,
+                device.uuid,
+                details,
+                reporter_device=device,
+                reporter_sequence=reporter_sequence,
+                payload_digest=payload_digest,
+            )
+            terminal_at = observed_at if state in FileLog.TERMINAL_STATES else None
+            if transfer is None:
+                transfer = FileLog.objects.create(
+                    audit_version=FILE_AUDIT_PROTOCOL_VERSION,
+                    connection=connection_log,
+                    event=event,
+                    transfer_id=transfer_id,
+                    transfer_revision=transfer_revision,
+                    state=state,
+                    file=path,
+                    user_id=remote_id,
+                    user_ip=connection_log.from_ip,
+                    remote_id=device.rid,
+                    filesize=planned_bytes,
+                    direction=direction,
+                    is_file=postdata["is_file"],
+                    planned_file_count=planned_file_count,
+                    planned_bytes=planned_bytes,
+                    transferred_bytes=transferred_bytes,
+                    sample_files=normalized_samples,
+                    source_kind=source_kind,
+                    started_at=observed_at,
+                    terminal_at=terminal_at,
+                    terminal_reason=terminal_reason,
+                    logged_at=observed_at,
+                    details={"sample_files": normalized_samples},
+                    reporter=user,
+                    reporter_device_uuid=device.uuid,
+                )
+            else:
+                transfer.transfer_revision = transfer_revision
+                transfer.state = state
+                transfer.transferred_bytes = transferred_bytes
+                transfer.terminal_at = terminal_at
+                transfer.terminal_reason = terminal_reason
+                transfer.save(
+                    update_fields=(
+                        "transfer_revision",
+                        "state",
+                        "transferred_bytes",
+                        "terminal_at",
+                        "terminal_reason",
+                    )
+                )
+            transfer_event = FileTransferAuditEvent.objects.create(
+                transfer=transfer,
+                connection_event=event,
+                revision=transfer_revision,
+                state=state,
+                transferred_bytes=transferred_bytes,
+                terminal_reason=terminal_reason,
+                source_kind=source_kind,
+                created_at=observed_at,
+            )
+            acknowledgement = {
+                "response_schema_version": RESPONSE_SCHEMA_VERSION,
+                "version": FILE_AUDIT_PROTOCOL_VERSION,
+                "receipt_version": AUDIT_EVIDENCE_RECEIPT_VERSION,
+                "audit_session_id": str(connection_log.guid),
+                "acknowledged_event_id": str(event.event_id),
+                "reporter_sequence": reporter_sequence,
+                "payload_digest": payload_digest,
+                "transfer_id": str(transfer.transfer_id),
+                "transfer_revision": transfer_event.revision,
+                "transfer_state": transfer_event.state,
+                "transferred_bytes": transfer_event.transferred_bytes,
+            }
+            _store_evidence_acknowledgement(event, acknowledgement)
+    except IntegrityError:
+        return _audit_event_conflict(request, kind=ConnectionAuditEvent.KIND_FILE)
     _log_event(
         request,
         "api_audit_file",
         level="info",
         username=user.username,
         peer_id=remote_id,
-        remote_id=token.device.rid,
+        remote_id=connection_log.rid,
         direction=direction,
-        filesize=total_size,
+        transfer_id=transfer_id,
+        transfer_revision=transfer_revision,
+        state=state,
+        planned_bytes=planned_bytes,
+        transferred_bytes=transferred_bytes,
     )
-    return JsonResponse({"code": 1, "data": "ok"})
+    return _file_audit_success(connection_log, transfer_event)
 
 
 def _audit_alarm(request):
-    postdata = _load_json_object(request)
+    postdata = _load_json_object(request, max_bytes=settings.JSON_AUDIT_MAX_BODY_BYTES)
     token, user, error = _audit_device_context(request, postdata)
     if error:
         return error
+    if not _audit_version_is_current(postdata.get("version")):
+        return _audit_upgrade_required()
+    if not _audit_evidence_receipt_version_is_current(postdata.get("receipt_version")):
+        return _audit_evidence_upgrade_required(AUDIT_PROTOCOL_VERSION)
+    audit_session_id = _audit_uuid4(postdata.get("audit_session_id"))
+    event_id = _audit_uuid4(postdata.get("event_id"))
+    reporter_sequence = _audit_reporter_sequence(postdata.get("reporter_sequence"))
+    conn_id = _audit_connection_id(postdata.get("conn_id"))
+    if audit_session_id is None or event_id is None or reporter_sequence is None or conn_id is None:
+        return JsonResponse({"error": "Invalid connection identity"}, status=400)
     typ = _audit_enum(postdata.get("typ", 0), AlarmLog.TYPES)
     if typ is None:
         return JsonResponse({"error": "Invalid alarm type"}, status=400)
@@ -3372,79 +5528,268 @@ def _audit_alarm(request):
         return JsonResponse({"error": "Invalid alarm information"}, status=400)
     if isinstance(raw_info, str) and len(raw_info.encode()) > MAX_AUDIT_INFO_BYTES:
         return JsonResponse({"error": "Alarm information is too large"}, status=413)
-    try:
-        info = json.loads(raw_info) if isinstance(raw_info, str) else raw_info
-    except (TypeError, ValueError, json.JSONDecodeError):
-        return JsonResponse({"error": "Invalid alarm information"}, status=400)
+    info = load_json_text(raw_info, max_bytes=MAX_AUDIT_INFO_BYTES) if isinstance(raw_info, str) else raw_info
     if not isinstance(info, dict):
         return JsonResponse({"error": "Invalid alarm information"}, status=400)
-    conn_id_value = postdata.get("conn_id")
-    conn_id = None if conn_id_value is None else _audit_connection_id(conn_id_value)
-    if conn_id_value is not None and conn_id is None:
-        return JsonResponse({"error": "Invalid connection identity"}, status=400)
     audit_ref = _bounded_audit_text(postdata.get("conn_audit_ref", ""), 256)
     if audit_ref is None:
         return JsonResponse({"error": "Invalid audit reference"}, status=400)
-    AlarmLog.objects.create(
-        typ=typ,
-        info=info,
-        reporter=user,
-        reporter_device_id=token.device.rid,
-        reporter_device_uuid=token.device.uuid,
-        conn_id=conn_id,
-        audit_ref=audit_ref,
-    )
+    details = {
+        "conn_id": conn_id,
+        "typ": typ,
+        "info": info,
+        "audit_ref": audit_ref,
+    }
+    try:
+        with transaction.atomic():
+            device, connection_log, authority_error = _locked_host_audit_session(
+                token,
+                user,
+                audit_session_id,
+                active=False,
+                require_controller=True,
+            )
+            if authority_error:
+                return authority_error
+            if connection_log.conn_id != conn_id:
+                return json_error("audit_connection_not_found", "Connection not found", status=404)
+            if audit_ref and audit_ref != connection_log.audit_ref:
+                return JsonResponse({"error": "Invalid audit reference"}, status=409)
+            try:
+                payload_digest = _audit_evidence_digest(
+                    event_id=event_id,
+                    connection_log=connection_log,
+                    kind=ConnectionAuditEvent.KIND_ALARM,
+                    actor=user,
+                    reporter_device=device,
+                    reporter_sequence=reporter_sequence,
+                    details=details,
+                )
+            except (TypeError, ValueError):
+                return JsonResponse({"error": "Invalid alarm information"}, status=400)
+            existing = _existing_audit_event(event_id)
+            if existing:
+                if not _matching_evidence_event(
+                    existing,
+                    connection_log,
+                    ConnectionAuditEvent.KIND_ALARM,
+                    user,
+                    device,
+                    reporter_sequence,
+                    payload_digest,
+                ):
+                    return _audit_event_conflict(request, kind=ConnectionAuditEvent.KIND_ALARM)
+                if not AlarmLog.objects.filter(event=existing, connection=connection_log).exists():
+                    raise IntegrityError("Alarm audit receipt is missing")
+                return JsonResponse(existing.acknowledgement)
+            if ConnectionAuditEvent.objects.filter(
+                connection=connection_log,
+                reporter_sequence=reporter_sequence,
+            ).exists():
+                return _reporter_sequence_conflict(reporter_sequence)
+            observed_at = audit_lifecycle.database_now()
+            audit_lifecycle.expire_locked_connection(connection_log, observed_at, source="alarm_event")
+            if connection_log.state != ConnLog.STATE_ACTIVE:
+                return _audit_terminal_conflict(connection_log)
+            audit_lifecycle.refresh_host_lease(connection_log, observed_at)
+            connection_log.save(update_fields=("last_seen_at", "lease_expires_at"))
+            event, created = _append_audit_event(
+                connection_log,
+                event_id,
+                ConnectionAuditEvent.KIND_ALARM,
+                user,
+                device.uuid,
+                details,
+                reporter_device=device,
+                reporter_sequence=reporter_sequence,
+                payload_digest=payload_digest,
+            )
+            if created:
+                AlarmLog.objects.create(
+                    audit_version=AUDIT_PROTOCOL_VERSION,
+                    connection=connection_log,
+                    event=event,
+                    typ=typ,
+                    info=info,
+                    reporter=user,
+                    reporter_device_id=device.rid,
+                    reporter_device_uuid=device.uuid,
+                    conn_id=conn_id,
+                    audit_ref=connection_log.audit_ref,
+                )
+                acknowledgement = _audit_success_payload(connection_log, event_id)
+                acknowledgement.update(
+                    {
+                        "receipt_version": AUDIT_EVIDENCE_RECEIPT_VERSION,
+                        "reporter_sequence": reporter_sequence,
+                        "payload_digest": payload_digest,
+                    }
+                )
+                _store_evidence_acknowledgement(event, acknowledgement)
+            elif not AlarmLog.objects.filter(event=event, connection=connection_log).exists():
+                raise IntegrityError("Alarm audit receipt is missing")
+    except IntegrityError:
+        return _audit_event_conflict(request, kind=ConnectionAuditEvent.KIND_ALARM)
     _log_event(request, "api_audit_alarm", level="warning", username=user.username, typ=typ)
-    return JsonResponse({"code": 1, "data": "ok"})
+    return JsonResponse(acknowledgement)
 
 
 def audit(request):
     return _audit_conn(request)
 
 
-def _pagination(request, default=100):
-    try:
-        current = max(1, int(request.GET.get("current", 1)))
-        page_size = max(1, min(500, int(request.GET.get("pageSize", default))))
-    except (TypeError, ValueError):
-        current = 1
-        page_size = default
+def _strict_pagination_integer(request, field, *, default, maximum):
+    values = request.GET.getlist(field)
+    if not values:
+        return default
+    value = values[0]
+    if (
+        len(values) != 1
+        or not isinstance(value, str)
+        or len(value) > len(str(maximum))
+        or not re.fullmatch(r"[1-9][0-9]*", value, flags=re.ASCII)
+    ):
+        raise _InvalidPagination(field)
+    parsed = int(value)
+    if parsed > maximum:
+        raise _InvalidPagination(field)
+    return parsed
+
+
+def _pagination(request, default=100, *, enforce_offset_budget=True):
+    if not isinstance(default, int) or isinstance(default, bool) or not 1 <= default <= MAX_API_PAGE_SIZE:
+        raise ValueError("default page size is outside the pagination contract")
+    current = _strict_pagination_integer(
+        request,
+        "current",
+        default=1,
+        maximum=MAX_API_PAGE_OFFSET + 1,
+    )
+    page_size = _strict_pagination_integer(
+        request,
+        "pageSize",
+        default=default,
+        maximum=MAX_API_PAGE_SIZE,
+    )
     start = (current - 1) * page_size
-    return current, page_size, start, start + page_size
+    if enforce_offset_budget and start > MAX_API_PAGE_OFFSET:
+        raise _InvalidPagination("current")
+    return _Pagination(
+        current=current,
+        page_size=page_size,
+        start=start,
+        end=start + page_size,
+    )
 
 
-def _paged_response(request, qs, serializer, default_page_size=100):
-    current, page_size, start, end = _pagination(request, default_page_size)
-    total = qs.count() if isinstance(qs, QuerySet) else len(qs)
-    rows = qs[start:end]
+def _pagination_error_response(request, error):
+    _log_event(
+        request,
+        "api_pagination_rejected",
+        level="warning",
+        field=error.field,
+        reason="invalid_pagination",
+    )
+    return JsonResponse(
+        {
+            "error": "Invalid pagination",
+            "code": "invalid_pagination",
+            "pagination_contract_version": PAGINATION_CONTRACT_VERSION,
+            "field": error.field,
+            "limits": {
+                "max_page_size": MAX_API_PAGE_SIZE,
+                "max_offset": MAX_API_PAGE_OFFSET,
+            },
+        },
+        status=400,
+    )
+
+
+def _pagination_or_error(request, default=100, *, enforce_offset_budget=True):
+    try:
+        return _pagination(
+            request,
+            default,
+            enforce_offset_budget=enforce_offset_budget,
+        ), None
+    except _InvalidPagination as error:
+        return None, _pagination_error_response(request, error)
+
+
+def _pagination_response_fields(pagination):
+    return {
+        "pagination_contract_version": PAGINATION_CONTRACT_VERSION,
+        "current": pagination.current,
+        "pageSize": pagination.page_size,
+    }
+
+
+def _paged_response(request, qs, serializer, default_page_size=100, *, pagination=None, total=None):
+    if pagination is None:
+        pagination, error_response = _pagination_or_error(request, default_page_size)
+        if error_response:
+            return error_response
+    if total is None:
+        total = qs.count() if isinstance(qs, QuerySet) else len(qs)
+    rows = qs[pagination.start : pagination.end]
     return JsonResponse(
         {
             "total": total,
-            "current": current,
-            "pageSize": page_size,
+            **_pagination_response_fields(pagination),
             "data": [serializer(item) for item in rows],
         }
     )
 
 
-def _filter_text(qs, field, value):
-    value = str(value or "").strip()
-    if not value:
-        return qs
-    if "%" in value:
-        return qs.filter(**{f"{field}__icontains": value.replace("%", "")})
-    return qs.filter(**{field: value})
+def _filter_text(qs, field, value, *, parameter=None, allowed_modes=None):
+    return apply_control_filter(qs, field, value, parameter=parameter, allowed_modes=allowed_modes)
+
+
+def _request_filter_text(request, qs, field, parameter, *, allowed_modes=None):
+    values = request.GET.getlist(parameter)
+    if len(values) > 1:
+        raise ControlFilterError(parameter, "duplicate")
+    return _filter_text(
+        qs,
+        field,
+        values[0] if values else None,
+        parameter=parameter,
+        allowed_modes=allowed_modes,
+    )
+
+
+def _control_filter_error_response(request, error):
+    _log_event(
+        request,
+        "api_control_filter_rejected",
+        level="warning",
+        field=error.field,
+        reason=error.reason,
+    )
+    return json_error(
+        "invalid_control_filter",
+        "Invalid control-list filter",
+        status=400,
+        control_filter_contract_version=CONTROL_FILTER_CONTRACT_VERSION,
+        field=error.field,
+        reason=error.reason,
+    )
+
+
+def _require_admin_context(request, event):
+    token, user = _get_token_user(request)
+    if not user:
+        _log_event(request, f"{event}_unauthorized", level="warning")
+        return None, None, JsonResponse({"error": "Invalid token"}, status=401)
+    if not user.is_admin:
+        _log_event(request, f"{event}_denied", level="warning", username=user.username)
+        return token, user, JsonResponse({"error": "Admin required"}, status=403)
+    return token, user, None
 
 
 def _require_admin(request, event):
-    _token, user = _get_token_user(request)
-    if not user:
-        _log_event(request, f"{event}_unauthorized", level="warning")
-        return None, JsonResponse({"error": "Invalid token"}, status=401)
-    if not user.is_admin:
-        _log_event(request, f"{event}_denied", level="warning", username=user.username)
-        return user, JsonResponse({"error": "Admin required"}, status=403)
-    return user, None
+    _token, user, error = _require_admin_context(request, event)
+    return user, error
 
 
 def _device_guid(device):
@@ -3479,6 +5824,7 @@ def _serialize_user(u):
         "group_name": group_names[0] if group_names else "",
         "group_names": group_names,
         "strategy_name": u.strategy.name if u.strategy_id else "",
+        "mutation_generation": u.mutation_generation,
     }
 
 
@@ -3507,6 +5853,8 @@ def _serialize_device(device):
         "note": device.note or "",
         "is_deployed": deployed,
         "deployment_status": ("disabled" if not device.is_active else ("verified" if deployed else "pending")),
+        "policy_generation": device.policy_generation,
+        "mutation_generation": device.mutation_generation,
     }
 
 
@@ -3517,17 +5865,26 @@ def _serialize_device_group(group):
         "note": group.note or "",
         "allowed_incomings": (group.allowed_incomings if isinstance(group.allowed_incomings, list) else []),
         "strategy_name": group.strategy.name if group.strategy_id else "",
+        "mutation_generation": group.mutation_generation,
     }
 
 
 def _serialize_strategy(strategy):
-    options = _strategy_options_value(strategy.config_options)
+    try:
+        options = normalize_policy_options(strategy.config_options)
+    except InvalidManagedPolicy:
+        logger.error(
+            "event=invalid_strategy_options strategy_id=%s",
+            strategy.pk,
+        )
+        raise
     return {
         "guid": str(strategy.guid),
         "name": strategy.name,
         "enabled": bool(strategy.enabled),
         "status": 1 if strategy.enabled else 0,
-        "config_options": options if options is not None else {},
+        "config_options": options,
+        "mutation_generation": strategy.mutation_generation,
         "updated_at": strategy.updated_at.isoformat() if strategy.updated_at else "",
     }
 
@@ -3536,18 +5893,67 @@ def _is_online(updated_at):
     return (timezone.now() - updated_at).total_seconds() <= 120 if updated_at else False
 
 
+def _username_conflict_response(request, admin_user, *, phase):
+    _log_event(
+        request,
+        "api_users_create_conflict",
+        level="warning",
+        username=admin_user.username,
+        reason="username_conflict",
+        phase=phase,
+    )
+    return JsonResponse(
+        {
+            "error": "User already exists",
+            "code": "username_conflict",
+        },
+        status=409,
+    )
+
+
+def _locked_user_group(group_name):
+    def find_group():
+        return Group.objects.select_for_update().filter(name__iexact=group_name).order_by("pk").first()
+
+    group = find_group()
+    if group:
+        return group
+    for attempt in range(3):
+        try:
+            with transaction.atomic():
+                return Group.objects.create(name=group_name)
+        except IntegrityError:
+            group = find_group()
+            if group:
+                return group
+            if attempt == 2:
+                raise
+
+
 def users(request):
     if request.method == "POST":
         admin_user, error = _require_admin(request, "api_users_create")
         if error:
             return error
         data = _load_json_object(request)
-        username = _model_text_value(
-            data.get("name") or data.get("username"),
+        field_error = _mutation_fields_error(
+            data,
+            allowed={"name", "username", "password", "email", "note", "group_name"},
+            required={"password"},
+            exactly_one=({"name", "username"},),
+        )
+        if field_error:
+            return field_error
+        username_value = _model_text_value(
+            data["name"] if "name" in data else data["username"],
             UserProfile,
             "username",
             allow_empty=False,
         )
+        try:
+            username = normalize_username(username_value)
+        except ValueError:
+            username = None
         password = data.get("password")
         email = _email_value(data.get("email", ""))
         note = _model_text_value(
@@ -3573,8 +5979,6 @@ def users(request):
             or group_name is None
         ):
             return JsonResponse({"error": "Invalid user payload"}, status=400)
-        if UserProfile.objects.filter(username__iexact=username).exists():
-            return JsonResponse({"error": "User already exists"}, status=409)
         candidate = UserProfile(
             username=username,
             email=email,
@@ -3582,106 +5986,422 @@ def users(request):
         )
         try:
             candidate.set_password(password)
-            candidate.full_clean()
+            candidate.full_clean(validate_unique=False)
+        except (ValueError, ValidationError):
+            return JsonResponse({"error": "Invalid user payload"}, status=400)
+        try:
             password_validation.validate_password(password, user=candidate)
         except ValidationError:
             return JsonResponse({"error": "Password does not meet security requirements"}, status=400)
-        try:
-            with transaction.atomic():
-                user = UserProfile.objects.create_user(
-                    username=username,
-                    password=password,
-                    email=email,
-                    note=note,
+        operation_id, operation_error = _state040_operation_id(request)
+        if operation_error:
+            return operation_error
+
+        def mutate():
+            if UserProfile.objects.by_username(username).exists():
+                return ManagementMutation(
+                    status_code=409,
+                    body={"error": "User already exists", "code": "username_conflict"},
+                    applied={"users": 0},
+                    result_state={"error": "username_conflict"},
                 )
-                if group_name:
-                    group = Group.objects.filter(
-                        name__iexact=group_name,
-                    ).first()
-                    if not group:
-                        group = Group.objects.create(name=group_name)
-                    user.groups.add(group)
-        except IntegrityError:
-            return JsonResponse({"error": "User already exists"}, status=409)
-        _log_event(request, "api_users_created", username=admin_user.username, target=username)
-        return JsonResponse(_serialize_user(user))
+            try:
+                with transaction.atomic():
+                    user = UserProfile.objects.create_user(
+                        username=username,
+                        password=password,
+                        email=email,
+                        note=note,
+                    )
+            except (IntegrityError, ValidationError):
+                if UserProfile.objects.by_username(username).exists():
+                    return ManagementMutation(
+                        status_code=409,
+                        body={"error": "User already exists", "code": "username_conflict"},
+                        applied={"users": 0},
+                        result_state={"error": "username_conflict"},
+                    )
+                raise
+            if group_name:
+                group = _locked_user_group(group_name)
+                user.groups.add(group)
+            body = _serialize_user(user)
+            return ManagementMutation(
+                status_code=200,
+                body=body,
+                applied={"users": 1},
+                result_state=body,
+            )
+
+        response = _execute_management_batch(
+            actor=admin_user,
+            operation_id=operation_id,
+            operation="user_create",
+            request_document={
+                "operation": "user_create",
+                "username": data["name"] if "name" in data else data["username"],
+                "password_digest": document_digest(password),
+                "email": data.get("email", ""),
+                "note": data.get("note", ""),
+                "group_name": data.get("group_name", ""),
+            },
+            requested={"users": 1},
+            mutation=mutate,
+        )
+        _log_event(
+            request,
+            "api_users_created" if response.status_code == 200 else "api_users_create_failed",
+            level="info" if response.status_code == 200 else "warning",
+            username=admin_user.username,
+            target=username,
+            changed_fields=sorted(data),
+            operation_id=str(operation_id),
+        )
+        return response
     _token, user = _get_token_user(request)
     if not user:
         _log_event(request, "api_users_unauthorized", level="warning")
         return JsonResponse({"error": "Invalid token"}, status=401)
+    pagination, error_response = _pagination_or_error(request)
+    if error_response:
+        return error_response
     qs = UserProfile.objects.select_related("strategy").prefetch_related("groups").order_by("id")
     if not user.is_admin:
         qs = qs.filter(Q(id=user.id))
-    qs = _filter_text(qs, "username", request.GET.get("name"))
-    qs = _filter_text(qs, "groups__name", request.GET.get("group_name"))
+    guid_filter = request.GET.get("guid")
+    if guid_filter is not None:
+        user_pk = _numeric_pk(guid_filter, UserProfile)
+        if user_pk is None:
+            return JsonResponse({"error": "Invalid user identifier"}, status=400)
+        qs = qs.filter(pk=user_pk)
+    try:
+        qs = _request_filter_text(request, qs, "username", "name")
+        qs = _request_filter_text(request, qs, "groups__name", "group_name")
+    except ControlFilterError as error:
+        return _control_filter_error_response(request, error)
     status = request.GET.get("status", "")
     if status == "1":
         qs = qs.filter(Q(is_active=True))
     elif status == "0":
         qs = qs.filter(Q(is_active=False))
-    _log_event(request, "api_users", level="debug", username=user.username, total=qs.count())
-    return _paged_response(request, qs.distinct(), _serialize_user)
-
-
-def _user_by_guid(guid):
-    pk = _numeric_pk(guid)
-    return UserProfile.objects.filter(pk=pk).first() if pk is not None else None
+    qs = qs.distinct()
+    total = qs.count()
+    _log_event(request, "api_users", level="debug", username=user.username, total=total)
+    return _paged_response(request, qs, _serialize_user, pagination=pagination, total=total)
 
 
 def user_status(request, guid, action):
     admin_user, error = _require_admin(request, f"api_user_{action}")
     if error:
         return error
-    target = _user_by_guid(guid)
-    if not target:
-        return JsonResponse({"error": "User not found"}, status=404)
-    if target.id == admin_user.id and action == "disable":
-        return JsonResponse({"error": "Cannot disable current user"}, status=400)
-    target.is_active = action == "enable"
-    target.save(update_fields=["is_active"])
-    if not target.is_active:
-        RemoteToken.objects.filter(device__owner=target).delete()
-    _log_event(request, f"api_user_{action}", username=admin_user.username, target=target.username)
-    return JsonResponse(_serialize_user(target))
+    target_pk = _numeric_pk(guid, UserProfile)
+    if target_pk is None:
+        return JsonResponse({"error": "Invalid user identifier"}, status=400)
+    field_error = _optional_empty_mutation_body_error(request)
+    if field_error:
+        return field_error
+    operation_id, operation_error = _operation_id_or_error(request)
+    if operation_error:
+        return operation_error
+    expected_generation = _expected_mutation_generation(request)
+    if expected_generation is False:
+        return JsonResponse({"error": "Invalid If-Match"}, status=400)
+    operation = f"user_status_{action}"
+
+    def mutate():
+        target = UserProfile.objects.select_for_update().filter(pk=target_pk).first()
+        if not target:
+            return ManagementMutation(
+                status_code=404,
+                body={"error": "User not found"},
+                applied={"users": 0},
+                result_state={"missing": {"users": [str(target_pk)]}},
+            )
+        if expected_generation is not None and target.mutation_generation != expected_generation:
+            return _generation_conflict(target.mutation_generation, "users")
+        if target.id == admin_user.id and action == "disable":
+            return ManagementMutation(
+                status_code=400,
+                body={"error": "Cannot disable current user"},
+                applied={"users": 0},
+                result_state={"error": "current_user"},
+            )
+        try:
+            with transaction.atomic():
+                target.is_active = action == "enable"
+                target.save(update_fields=["is_active"])
+                revoked_tokens = 0
+                if not target.is_active:
+                    revoked_tokens = revoke_user_credentials((target.pk,)).deleted_tokens
+        except CredentialGenerationExhausted:
+            return ManagementMutation(
+                status_code=409,
+                body={"error": "Credential revocation failed"},
+                applied={"users": 0},
+                result_state={"error": "credential_generation_exhausted"},
+            )
+        target.refresh_from_db(fields=("is_active", "credential_generation"))
+        _advance_mutation_generation(target)
+        return ManagementMutation(
+            status_code=200,
+            body={
+                "result": "OK",
+                "guid": str(target.pk),
+                "status": 1 if target.is_active else 0,
+                "revoked_tokens": revoked_tokens,
+                "mutation_generation": target.mutation_generation,
+            },
+            applied={"users": 1},
+            result_state={
+                "user": {
+                    "id": target.pk,
+                    "is_active": target.is_active,
+                    "credential_generation": target.credential_generation,
+                    "mutation_generation": target.mutation_generation,
+                },
+                "revoked_tokens": revoked_tokens,
+            },
+        )
+
+    response = _execute_management_batch(
+        actor=admin_user,
+        operation_id=operation_id,
+        operation=operation,
+        request_document={
+            "operation": operation,
+            "user": str(target_pk),
+            **(
+                {"expected_generation": expected_generation}
+                if expected_generation is not None
+                else {}
+            ),
+        },
+        requested={"users": 1},
+        mutation=mutate,
+    )
+    body = json.loads(response.content)
+    if response.status_code != 200:
+        _log_event(
+            request,
+            f"api_user_{action}_failed",
+            level="warning",
+            username=admin_user.username,
+            target=guid,
+            operation_id=str(operation_id),
+        )
+        return response
+    _log_event(
+        request,
+        f"api_user_{action}",
+        username=admin_user.username,
+        target=body["guid"],
+        operation_id=str(operation_id),
+        operation_generation=body["operation_generation"],
+    )
+    return response
 
 
 def user_delete(request, guid):
     admin_user, error = _require_admin(request, "api_user_delete")
     if error:
         return error
-    with transaction.atomic():
-        target_pk = _numeric_pk(guid)
-        target = UserProfile.objects.select_for_update().filter(pk=target_pk).first() if target_pk is not None else None
+    target_pk = _numeric_pk(guid, UserProfile)
+    if target_pk is None:
+        return JsonResponse({"error": "Invalid user identifier"}, status=400)
+    field_error = _optional_empty_mutation_body_error(request)
+    if field_error:
+        return field_error
+    operation_id, operation_error = _state040_operation_id(request)
+    if operation_error:
+        return operation_error
+    expected_generation = _expected_mutation_generation(request)
+    if expected_generation is False:
+        return JsonResponse({"error": "Invalid If-Match"}, status=400)
+
+    def mutate():
+        target = UserProfile.objects.select_for_update().filter(pk=target_pk).first()
         if not target:
-            return JsonResponse({"error": "User not found"}, status=404)
+            return ManagementMutation(
+                status_code=404,
+                body={"error": "User not found"},
+                applied={"users": 0},
+                result_state={"error": "user_not_found"},
+            )
+        if expected_generation is not None and target.mutation_generation != expected_generation:
+            return _generation_conflict(target.mutation_generation, "users")
         if target.id == admin_user.id:
-            return JsonResponse({"error": "Cannot delete current user"}, status=400)
+            return ManagementMutation(
+                status_code=400,
+                body={"error": "Cannot delete current user"},
+                applied={"users": 0},
+                result_state={"error": "current_user"},
+            )
         username = target.username
+        # Keep the user -> device -> credential lock order used by session
+        # issuance. Heartbeat locks the device before conditionally renewing
+        # its credential, so deleting credentials before locking devices could
+        # deadlock with a concurrent heartbeat.
+        device_ids = list(
+            RemoteDevice.objects.select_for_update().filter(owner=target).order_by("pk").values_list("pk", flat=True)
+        )
+        DeviceProofChallenge.objects.filter(device_id__in=device_ids).delete()
+        DeviceRecoveryApproval.objects.filter(device_id__in=device_ids).delete()
         RemoteToken.objects.filter(device__owner=target).delete()
-        RemoteDevice.objects.filter(owner=target).update(
+        RemoteDevice.objects.filter(pk__in=device_ids).update(
             owner=None,
             public_key_hash=None,
             is_active=False,
             update_time=timezone.now(),
         )
         target.delete()
-    _log_event(request, "api_user_deleted", username=admin_user.username, target=username)
-    return JsonResponse({"result": "OK"})
+        _advance_mutation_generations(RemoteDevice, device_ids)
+        device_state = list(
+            RemoteDevice.objects.filter(pk__in=device_ids)
+            .order_by("pk")
+            .values("pk", "owner_id", "is_active", "mutation_generation")
+        )
+        return ManagementMutation(
+            status_code=200,
+            body={"result": "OK", "deleted_user": {"guid": str(target_pk), "username": username}},
+            applied={"users": 1},
+            result_state={
+                "deleted_user": {"id": target_pk, "username": username},
+                "devices": device_state,
+            },
+        )
+
+    response = _execute_management_batch(
+        actor=admin_user,
+        operation_id=operation_id,
+        operation="user_delete",
+        request_document={
+            "operation": "user_delete",
+            "user": str(target_pk),
+            **(
+                {"expected_generation": expected_generation}
+                if expected_generation is not None
+                else {}
+            ),
+        },
+        requested={"users": 1},
+        mutation=mutate,
+    )
+    body = json.loads(response.content)
+    _log_event(
+        request,
+        "api_user_deleted" if response.status_code == 200 else "api_user_delete_failed",
+        level="info" if response.status_code == 200 else "warning",
+        username=admin_user.username,
+        target=body.get("deleted_user", {}).get("username", guid),
+        operation_id=str(operation_id),
+        operation_generation=body.get("operation_generation"),
+    )
+    return response
 
 
 def users_force_logout(request):
     admin_user, error = _require_admin(request, "api_users_force_logout")
     if error:
         return error
-    data = _load_json_object(request)
-    guids = _identifier_list(data.get("user_guids"), numeric=True)
-    if guids is None:
+    data = _load_json_object(
+        request,
+        max_bytes=settings.JSON_MANAGEMENT_BATCH_MAX_BODY_BYTES,
+    )
+    field_error = _mutation_fields_error(
+        data,
+        allowed={"user_guids"},
+        required={"user_guids"},
+    )
+    if field_error:
+        return field_error
+    try:
+        guids = parse_model_pk_list(
+            data.get("user_guids"),
+            UserProfile,
+            max_items=MAX_MANAGEMENT_BATCH_ITEMS,
+        )
+    except InvalidIdentifier:
         return JsonResponse({"error": "Invalid user list"}, status=400)
-    deleted = RemoteToken.objects.filter(
-        device__owner_id__in=guids,
-    ).delete()[0]
-    _log_event(request, "api_users_force_logout", username=admin_user.username, deleted=deleted)
-    return JsonResponse({"result": "OK", "deleted": deleted})
+    if not guids:
+        return JsonResponse({"error": "User list required"}, status=400)
+    if admin_user.pk in guids:
+        return JsonResponse({"error": "Cannot force logout current user"}, status=400)
+    operation_id, operation_error = _operation_id_or_error(request)
+    if operation_error:
+        return operation_error
+    requested = {"users": len(guids)}
+    request_document = {
+        "operation": "users_force_logout",
+        "users": [str(user_id) for user_id in guids],
+    }
+
+    def mutate():
+        users = list(
+            UserProfile.objects.select_for_update()
+            .filter(pk__in=guids)
+            .order_by("pk")
+            .only("pk", "credential_generation")
+        )
+        found = {user.pk for user in users}
+        missing = [str(user_id) for user_id in guids if user_id not in found]
+        if missing:
+            return ManagementMutation(
+                status_code=409,
+                body={"error": "Batch targets changed", "missing": {"users": missing}},
+                applied={"users": 0},
+                result_state={"missing": {"users": missing}},
+            )
+        try:
+            revocation = revoke_user_credentials(guids)
+        except CredentialGenerationExhausted:
+            return ManagementMutation(
+                status_code=409,
+                body={"error": "Credential revocation failed"},
+                applied={"users": 0},
+                result_state={"error": "credential_generation_exhausted"},
+            )
+        if revocation.revoked_users != len(guids):
+            raise RuntimeError("Credential revocation did not apply the complete target set")
+        state = list(UserProfile.objects.filter(pk__in=guids).order_by("pk").values("pk", "credential_generation"))
+        return ManagementMutation(
+            status_code=200,
+            body={
+                "result": "OK",
+                "deleted": revocation.deleted_tokens,
+                "revoked_users": revocation.revoked_users,
+            },
+            applied={"users": revocation.revoked_users},
+            result_state={"users": state},
+        )
+
+    response = _execute_management_batch(
+        actor=admin_user,
+        operation_id=operation_id,
+        operation="users_force_logout",
+        request_document=request_document,
+        requested=requested,
+        mutation=mutate,
+    )
+    body = json.loads(response.content)
+    if response.status_code != 200:
+        _log_event(
+            request,
+            "api_users_force_logout_failed",
+            level="warning",
+            username=admin_user.username,
+            operation_id=str(operation_id),
+        )
+        return response
+    _log_event(
+        request,
+        "api_users_force_logout",
+        username=admin_user.username,
+        operation_id=str(operation_id),
+        operation_generation=body["operation_generation"],
+        deleted=body["deleted"],
+        revoked_users=body["revoked_users"],
+    )
+    return response
 
 
 def devices(request):
@@ -3689,6 +6409,9 @@ def devices(request):
     if not user:
         _log_event(request, "api_devices_unauthorized", level="warning")
         return JsonResponse({"error": "Invalid token"}, status=401)
+    pagination, error_response = _pagination_or_error(request)
+    if error_response:
+        return error_response
     qs = (
         RemoteDevice.objects.select_related(
             "owner__strategy",
@@ -3700,111 +6423,487 @@ def devices(request):
     )
     if not user.is_admin:
         qs = qs.filter(Q(owner=user))
-    qs = _filter_text(qs, "rid", request.GET.get("id"))
-    qs = _filter_text(qs, "hostname", request.GET.get("device_name"))
-    qs = _filter_text(qs, "username", request.GET.get("device_username"))
-    qs = _filter_text(
-        qs,
-        "device_group__name",
-        request.GET.get("device_group_name"),
-    )
-    user_name = request.GET.get("user_name")
-    if user_name:
-        qs = _filter_text(qs, "owner__username", user_name)
-    group_name = request.GET.get("group_name")
-    if group_name:
-        lookup = "owner__groups__name__icontains" if "%" in group_name else "owner__groups__name"
-        qs = qs.filter(**{lookup: group_name.replace("%", "")}).distinct()
-    return _paged_response(request, qs, _serialize_device)
-
-
-def _device_by_guid(guid):
-    pk = _numeric_pk(guid)
-    return (
-        RemoteDevice.objects.select_related(
-            "owner__strategy",
-            "device_group__strategy",
-            "strategy",
+    guid_filter = request.GET.get("guid")
+    if guid_filter is not None:
+        device_pk = _numeric_pk(guid_filter, RemoteDevice)
+        if device_pk is None:
+            return JsonResponse({"error": "Invalid device identifier"}, status=400)
+        qs = qs.filter(pk=device_pk)
+    try:
+        qs = _request_filter_text(request, qs, "rid", "id", allowed_modes=frozenset(("exact",)))
+        qs = _request_filter_text(request, qs, "hostname", "device_name")
+        qs = _request_filter_text(request, qs, "username", "device_username")
+        qs = _request_filter_text(
+            request,
+            qs,
+            "device_group__name",
+            "device_group_name",
         )
-        .filter(pk=pk)
-        .first()
-        if pk is not None
-        else None
-    )
+        qs = _request_filter_text(request, qs, "owner__username", "user_name")
+        group_name = request.GET.get("group_name")
+        qs = _request_filter_text(request, qs, "owner__groups__name", "group_name")
+    except ControlFilterError as error:
+        return _control_filter_error_response(request, error)
+    if group_name and str(group_name).strip():
+        qs = qs.distinct()
+    return _paged_response(request, qs, _serialize_device, pagination=pagination)
 
 
 def device_status(request, guid, action):
-    admin_user, error = _require_admin(request, f"api_device_{action}")
+    admin_token, admin_user, error = _require_admin_context(request, f"api_device_{action}")
     if error:
         return error
-    device = _device_by_guid(guid)
-    if not device:
-        return JsonResponse({"error": "Device not found"}, status=404)
-    device.is_active = action == "enable"
-    device.save(update_fields=["is_active", "update_time"])
-    if not device.is_active:
-        _revoke_device_tokens(device)
-    _log_event(request, f"api_device_{action}", username=admin_user.username, rid=device.rid)
-    return JsonResponse(_serialize_device(device))
+    device_pk = _numeric_pk(guid, RemoteDevice)
+    if device_pk is None:
+        return JsonResponse({"error": "Invalid device identifier"}, status=400)
+    field_error = _optional_empty_mutation_body_error(request)
+    if field_error:
+        return field_error
+    operation_id, operation_error = _operation_id_or_error(request)
+    if operation_error:
+        return operation_error
+    expected_generation = _expected_mutation_generation(request)
+    if expected_generation is False:
+        return JsonResponse({"error": "Invalid If-Match"}, status=400)
+    operation = f"device_status_{action}"
+
+    def mutate():
+        device = RemoteDevice.objects.select_for_update().filter(pk=device_pk).first()
+        if not device:
+            return ManagementMutation(
+                status_code=404,
+                body={"error": "Device not found"},
+                applied={"devices": 0},
+                result_state={"missing": {"devices": [str(device_pk)]}},
+            )
+        if expected_generation is not None and device.mutation_generation != expected_generation:
+            return _generation_conflict(device.mutation_generation, "devices")
+        if device.pk == admin_token.device_id and action == "disable":
+            return ManagementMutation(
+                status_code=400,
+                body={"error": "Cannot disable current device"},
+                applied={"devices": 0},
+                result_state={"error": "current_device"},
+            )
+        if action == "disable" and device.deployment_generation >= MAX_DEPLOYMENT_GENERATION:
+            return ManagementMutation(
+                status_code=409,
+                body={"error": "Device authority revocation failed"},
+                applied={"devices": 0},
+                result_state={"error": "deployment_generation_exhausted"},
+            )
+        device.is_active = action == "enable"
+        update_fields = ["is_active", "update_time"]
+        if not device.is_active:
+            device.deployment_generation += 1
+            update_fields.append("deployment_generation")
+        device.save(update_fields=update_fields)
+        revoked_tokens = 0
+        if not device.is_active:
+            revoked_tokens = _revoke_device_tokens(device)
+        _advance_mutation_generation(device)
+        return ManagementMutation(
+            status_code=200,
+            body={
+                "result": "OK",
+                "guid": str(device.pk),
+                "status": 1 if device.is_active else 0,
+                "revoked_tokens": revoked_tokens,
+                "mutation_generation": device.mutation_generation,
+            },
+            applied={"devices": 1},
+            result_state={
+                "device": {
+                    "id": device.pk,
+                    "rid": device.rid,
+                    "is_active": device.is_active,
+                    "deployment_generation": device.deployment_generation,
+                    "mutation_generation": device.mutation_generation,
+                },
+                "revoked_tokens": revoked_tokens,
+            },
+        )
+
+    response = _execute_management_batch(
+        actor=admin_user,
+        operation_id=operation_id,
+        operation=operation,
+        request_document={
+            "operation": operation,
+            "device": str(device_pk),
+            **(
+                {"expected_generation": expected_generation}
+                if expected_generation is not None
+                else {}
+            ),
+        },
+        requested={"devices": 1},
+        mutation=mutate,
+    )
+    body = json.loads(response.content)
+    if response.status_code != 200:
+        _log_event(
+            request,
+            f"api_device_{action}_failed",
+            level="warning",
+            username=admin_user.username,
+            target=guid,
+            operation_id=str(operation_id),
+        )
+        return response
+    _log_event(
+        request,
+        f"api_device_{action}",
+        username=admin_user.username,
+        target=body["guid"],
+        operation_id=str(operation_id),
+        operation_generation=body["operation_generation"],
+    )
+    return response
+
+
+def device_approve_recovery(request, guid):
+    admin_user, error = _require_admin(request, "api_device_approve_recovery")
+    if error:
+        return error
+    device_pk = _numeric_pk(guid, RemoteDevice)
+    if device_pk is None:
+        return JsonResponse({"error": "Invalid device identifier"}, status=400)
+    data = _load_json_object(request)
+    field_error = _mutation_fields_error(
+        data,
+        allowed={"pk"},
+        required={"pk"},
+    )
+    if field_error:
+        return field_error
+    public_key = str(data["pk"]).strip()
+    operation_id, operation_error = _state040_operation_id(request)
+    if operation_error:
+        return operation_error
+    expected_generation = _expected_mutation_generation(request)
+    if expected_generation is False:
+        return JsonResponse({"error": "Invalid If-Match"}, status=400)
+
+    def mutate():
+        device = RemoteDevice.objects.select_for_update().filter(pk=device_pk).first()
+        if not device:
+            return ManagementMutation(
+                status_code=404,
+                body={"error": "Device not found"},
+                applied={"devices": 0},
+                result_state={"error": "device_not_found"},
+            )
+        if expected_generation is not None and device.mutation_generation != expected_generation:
+            return _generation_conflict(device.mutation_generation, "devices")
+        if not device.is_active or not device.owner_id or not device.public_key_hash:
+            return ManagementMutation(
+                status_code=409,
+                body={"error": "Device is not eligible for recovery"},
+                applied={"devices": 0},
+                result_state={"error": "device_not_eligible"},
+            )
+        try:
+            approval = create_recovery_approval(
+                device=device,
+                public_key_text=public_key,
+                admin_user=admin_user,
+            )
+        except DeviceProofError:
+            return ManagementMutation(
+                status_code=400,
+                body={"error": "Invalid public key"},
+                applied={"devices": 0},
+                result_state={"error": "invalid_public_key"},
+            )
+        body = {
+            "result": "OK",
+            "expires_at": int(approval.expires_at.timestamp()),
+            "device": str(device_pk),
+        }
+        body["mutation_generation"] = _advance_mutation_generation(device)
+        return ManagementMutation(
+            status_code=200,
+            body=body,
+            applied={"devices": 1},
+            result_state=body,
+        )
+
+    response = _execute_management_batch(
+        actor=admin_user,
+        operation_id=operation_id,
+        operation="device_approve_recovery",
+        request_document={
+            "operation": "device_approve_recovery",
+            "device": str(device_pk),
+            "public_key_digest": document_digest(public_key),
+            "expected_generation": expected_generation,
+        },
+        requested={"devices": 1},
+        mutation=mutate,
+    )
+    body = json.loads(response.content)
+    _log_event(
+        request,
+        "api_device_recovery_approved" if response.status_code == 200 else "api_device_recovery_approval_failed",
+        level="info" if response.status_code == 200 else "warning",
+        username=admin_user.username,
+        target=guid,
+        operation_id=str(operation_id),
+        operation_generation=body.get("operation_generation"),
+    )
+    return response
 
 
 def device_delete(request, guid):
-    admin_user, error = _require_admin(request, "api_device_delete")
+    admin_token, admin_user, error = _require_admin_context(request, "api_device_delete")
     if error:
         return error
-    device = _device_by_guid(guid)
-    if not device:
-        return JsonResponse({"error": "Device not found"}, status=404)
-    rid = device.rid
-    _revoke_device_tokens(device)
-    device.delete()
-    _log_event(request, "api_device_deleted", username=admin_user.username, rid=rid)
-    return JsonResponse({"result": "OK"})
+    device_pk = _numeric_pk(guid, RemoteDevice)
+    if device_pk is None:
+        return JsonResponse({"error": "Invalid device identifier"}, status=400)
+    field_error = _optional_empty_mutation_body_error(request)
+    if field_error:
+        return field_error
+    operation_id, operation_error = _operation_id_or_error(request)
+    if operation_error:
+        return operation_error
+    expected_generation = _expected_mutation_generation(request)
+    if expected_generation is False:
+        return JsonResponse({"error": "Invalid If-Match"}, status=400)
+
+    def mutate():
+        observed_group_id = (
+            RemoteDevice.objects.filter(pk=device_pk).values_list("device_group_id", flat=True).first()
+        )
+        if observed_group_id is not None:
+            list(DeviceGroup.objects.select_for_update().filter(pk=observed_group_id))
+        device = RemoteDevice.objects.select_for_update().filter(pk=device_pk).first()
+        if not device:
+            return ManagementMutation(
+                status_code=404,
+                body={"error": "Device not found"},
+                applied={"devices": 0},
+                result_state={"missing": {"devices": [str(device_pk)]}},
+            )
+        if expected_generation is not None and device.mutation_generation != expected_generation:
+            return _generation_conflict(device.mutation_generation, "devices")
+        if device.device_group_id != observed_group_id:
+            return ManagementMutation(
+                status_code=409,
+                body={"error": "Device group changed"},
+                applied={"devices": 0},
+                result_state={"error": "device_group_changed"},
+            )
+        if device.pk == admin_token.device_id:
+            return ManagementMutation(
+                status_code=400,
+                body={"error": "Cannot delete current device"},
+                applied={"devices": 0},
+                result_state={"error": "current_device"},
+            )
+        rid = device.rid
+        revoked_tokens = _revoke_device_tokens(device)
+        device.delete()
+        _advance_mutation_generations(DeviceGroup, [observed_group_id] if observed_group_id is not None else [])
+        return ManagementMutation(
+            status_code=200,
+            body={
+                "result": "OK",
+                "deleted_device": {"guid": str(device_pk)},
+                "revoked_tokens": revoked_tokens,
+            },
+            applied={"devices": 1},
+            result_state={
+                "deleted_device": {"id": device_pk, "rid": rid},
+                "revoked_tokens": revoked_tokens,
+            },
+        )
+
+    response = _execute_management_batch(
+        actor=admin_user,
+        operation_id=operation_id,
+        operation="device_delete",
+        request_document={
+            "operation": "device_delete",
+            "device": str(device_pk),
+            **(
+                {"expected_generation": expected_generation}
+                if expected_generation is not None
+                else {}
+            ),
+        },
+        requested={"devices": 1},
+        mutation=mutate,
+    )
+    body = json.loads(response.content)
+    if response.status_code != 200:
+        _log_event(
+            request,
+            "api_device_delete_failed",
+            level="warning",
+            username=admin_user.username,
+            target=guid,
+            operation_id=str(operation_id),
+        )
+        return response
+    _log_event(
+        request,
+        "api_device_deleted",
+        username=admin_user.username,
+        target=body["deleted_device"]["guid"],
+        operation_id=str(operation_id),
+        operation_generation=body["operation_generation"],
+    )
+    return response
 
 
 def device_assign(request, guid):
     admin_user, error = _require_admin(request, "api_device_assign")
     if error:
         return error
+    device_pk = _numeric_pk(guid, RemoteDevice)
+    if device_pk is None:
+        return JsonResponse({"error": "Invalid device identifier"}, status=400)
     data = _load_json_object(request)
+    field_error = _mutation_fields_error(
+        data,
+        allowed={"type", "value"},
+        required={"type", "value"},
+    )
+    if field_error:
+        return field_error
     typ = str(data.get("type") or "")
     value = data.get("value")
-    owner_changed = False
-    device_pk = _numeric_pk(guid)
-    with transaction.atomic():
-        device = (
-            RemoteDevice.objects.select_for_update(of=("self",)).select_related("owner").filter(pk=device_pk).first()
-            if device_pk is not None
+    if typ == "ab" and isinstance(value, dict):
+        nested_field_error = _mutation_fields_error(
+            value,
+            allowed=DEVICE_ADDRESS_BOOK_FIELDS,
+            require_any=True,
+            prefix="value.",
+        )
+        if nested_field_error:
+            return nested_field_error
+    operation_id, operation_error = _state040_operation_id(request)
+    if operation_error:
+        return operation_error
+    expected_generation = _expected_mutation_generation(request)
+    if expected_generation is False:
+        return JsonResponse({"error": "Invalid If-Match"}, status=400)
+    receipt_value = value
+    if typ == "ab" and isinstance(value, dict):
+        receipt_value = {
+            key: nested_value
+            for key, nested_value in value.items()
+            if key != "address_book_password"
+        }
+        receipt_value["has_address_book_password"] = "address_book_password" in value
+        receipt_value["address_book_password_digest"] = (
+            document_digest(value["address_book_password"])
+            if "address_book_password" in value
             else None
         )
-        if not device:
-            return JsonResponse({"error": "Device not found"}, status=404)
+
+    def failed(status_code, message, code):
+        return ManagementMutation(
+            status_code=status_code,
+            body={"error": message},
+            applied={"devices": 0},
+            result_state={"error": code},
+        )
+
+    def mutate():
+        owner_changed = False
+        changed_fields = []
+        changed_group_ids = []
+        owner = None
+        group = None
+        strategy = None
+        observed_group_id = None
         if typ == "user_name":
-            owner = _user_by_identifier(value, active_only=True)
+            candidate = _user_by_identifier(value, active_only=True)
+            if not candidate:
+                return failed(404, "Active user not found", "active_user_not_found")
+            owner = UserProfile.objects.select_for_update().filter(pk=candidate.pk, is_active=True).first()
             if not owner:
-                return JsonResponse({"error": "Active user not found"}, status=404)
-            owner_changed = device.owner_id != owner.id
-            device.owner = owner
+                return failed(404, "Active user not found", "active_user_not_found")
         elif typ == "device_group_name":
             group_name = _bounded_text_value(value, 480)
             if group_name is not None:
                 group_name = group_name.strip()
             if group_name is None:
-                return JsonResponse({"error": "Invalid device group"}, status=400)
-            group = DeviceGroup.objects.filter(name=group_name).first() if group_name else None
-            if group_name and not group:
-                return JsonResponse({"error": "Device group not found"}, status=404)
-            device.device_group = group
+                return failed(400, "Invalid device group", "invalid_device_group")
+            observed = (
+                RemoteDevice.objects.filter(pk=device_pk)
+                .values("device_group_id")
+                .first()
+            )
+            if observed is None:
+                return failed(404, "Device not found", "device_not_found")
+            observed_group_id = observed["device_group_id"]
+            candidate_group_id = None
+            if group_name:
+                candidate_group_id = (
+                    DeviceGroup.objects.filter(name=group_name)
+                    .values_list("pk", flat=True)
+                    .first()
+                )
+                if candidate_group_id is None:
+                    return failed(404, "Device group not found", "device_group_not_found")
+            group_ids = sorted(
+                {
+                    group_id
+                    for group_id in (observed_group_id, candidate_group_id)
+                    if group_id is not None
+                }
+            )
+            locked_groups = list(
+                DeviceGroup.objects.select_for_update()
+                .filter(pk__in=group_ids)
+                .order_by("pk")
+            )
+            groups_by_id = {locked_group.pk: locked_group for locked_group in locked_groups}
+            if len(groups_by_id) != len(group_ids):
+                return failed(409, "Device group changed", "device_group_changed")
+            if candidate_group_id is not None:
+                group = groups_by_id[candidate_group_id]
+                if group.name != group_name:
+                    return failed(409, "Device group changed", "device_group_changed")
         elif typ == "strategy_name":
             strategy_name = _bounded_text_value(value, 240)
             if strategy_name is not None:
                 strategy_name = strategy_name.strip()
             if strategy_name is None:
-                return JsonResponse({"error": "Invalid strategy"}, status=400)
-            strategy = StrategyProfile.objects.filter(name=strategy_name).first() if strategy_name else None
-            if strategy_name and not strategy:
-                return JsonResponse({"error": "Strategy not found"}, status=404)
+                return failed(400, "Invalid strategy", "invalid_strategy")
+            if strategy_name:
+                strategy = StrategyProfile.objects.select_for_update().filter(name=strategy_name).first()
+                if not strategy:
+                    return failed(404, "Strategy not found", "strategy_not_found")
+        device = (
+            RemoteDevice.objects.select_for_update(of=("self",)).select_related("owner").filter(pk=device_pk).first()
+        )
+        if not device:
+            return failed(404, "Device not found", "device_not_found")
+        if expected_generation is not None and device.mutation_generation != expected_generation:
+            return _generation_conflict(device.mutation_generation, "devices")
+        if typ == "user_name":
+            owner_changed = device.owner_id != owner.id
+            device.owner = owner
+            changed_fields.append("owner")
+        elif typ == "device_group_name":
+            if device.device_group_id != observed_group_id:
+                return failed(409, "Device group changed", "device_group_changed")
+            if device.device_group_id != (group.pk if group else None):
+                changed_group_ids = [
+                    group_id
+                    for group_id in (device.device_group_id, group.pk if group else None)
+                    if group_id is not None
+                ]
+            device.device_group = group
+            changed_fields.append("device_group")
+        elif typ == "strategy_name":
             device.strategy = strategy
+            changed_fields.append("strategy")
         elif typ in ("note", "device_username", "device_name"):
             field_name = {
                 "note": "note",
@@ -3819,13 +6918,15 @@ def device_assign(request, guid):
                 max_bytes=4096 if field_name == "note" else None,
             )
             if text_value is None:
-                return JsonResponse({"error": "Invalid assignment value"}, status=400)
+                return failed(400, "Invalid assignment value", "invalid_assignment_value")
             setattr(device, field_name, text_value)
+            changed_fields.append(field_name)
         elif typ == "ab":
             if not isinstance(value, dict):
-                return JsonResponse(
-                    {"error": "Address-book assignment must be an object"},
-                    status=400,
+                return failed(
+                    400,
+                    "Address-book assignment must be an object",
+                    "invalid_address_book_assignment",
                 )
             ab_updates = _validated_device_update_fields(
                 value,
@@ -3839,19 +6940,63 @@ def device_assign(request, guid):
                 "address_book_note",
             }
             if ab_updates is None or not ab_updates or any(field not in allowed_fields for field in ab_updates):
-                return JsonResponse(
-                    {"error": "Invalid address-book assignment"},
-                    status=400,
-                )
+                return failed(400, "Invalid address-book assignment", "invalid_address_book_assignment")
             for field, field_value in ab_updates.items():
                 setattr(device, field, field_value)
+            changed_fields.extend(ab_updates)
         else:
-            return JsonResponse({"error": "Invalid assign type"}, status=400)
-        device.save()
-    if owner_changed:
-        _revoke_device_tokens(device)
-    _log_event(request, "api_device_assigned", username=admin_user.username, rid=device.rid, typ=typ)
-    return JsonResponse(_serialize_device(device))
+            return failed(400, "Invalid assign type", "invalid_assign_type")
+        device.save(update_fields=(*changed_fields, "update_time"))
+        if owner_changed:
+            _revoke_device_tokens(device)
+        device.refresh_from_db()
+        _advance_mutation_generation(device)
+        _advance_mutation_generations(DeviceGroup, changed_group_ids)
+        body = _serialize_device(device)
+        group_generations = {
+            str(group_guid): generation
+            for group_guid, generation in DeviceGroup.objects.filter(
+                pk__in=changed_group_ids
+            )
+            .order_by("pk")
+            .values_list("guid", "mutation_generation")
+        }
+        return ManagementMutation(
+            status_code=200,
+            body=body,
+            applied={"devices": 1},
+            result_state={
+                "device": body,
+                "group_generations": group_generations,
+            },
+        )
+
+    response = _execute_management_batch(
+        actor=admin_user,
+        operation_id=operation_id,
+        operation="device_assign",
+        request_document={
+            "operation": "device_assign",
+            "device": str(device_pk),
+            "type": typ,
+            "value": receipt_value,
+            "expected_generation": expected_generation,
+        },
+        requested={"devices": 1},
+        mutation=mutate,
+    )
+    body = json.loads(response.content)
+    _log_event(
+        request,
+        "api_device_assigned" if response.status_code == 200 else "api_device_assign_failed",
+        level="info" if response.status_code == 200 else "warning",
+        username=admin_user.username,
+        target=guid,
+        typ=typ,
+        operation_id=str(operation_id),
+        operation_generation=body.get("operation_generation"),
+    )
+    return response
 
 
 def peers(request):
@@ -3859,80 +7004,58 @@ def peers(request):
     if not user:
         _log_event(request, "api_peers_unauthorized", level="warning")
         return JsonResponse({"error": "Invalid token"}, status=401)
-    current, page_size, _start, _end = _pagination(request)
-    if user.is_admin:
-        device_qs = RemoteDevice.objects.select_related(
-            "owner__strategy",
-            "device_group__strategy",
-            "strategy",
-        ).order_by("rid")
-        peer_qs = RemotePeer.objects.filter(
-            profile__guid__startswith="personal-",
-        ).select_related("profile__owner")
-    else:
-        peer_qs = RemotePeer.objects.filter(
-            profile__owner=user,
-            profile__guid=_personal_guid(user),
-        ).select_related("profile__owner")
-        device_qs = RemoteDevice.objects.filter(
-            owner=user,
-        ).select_related(
-            "owner__strategy",
-            "device_group__strategy",
-            "strategy",
-        )
-        device_qs = device_qs.order_by("rid")
-    devices = {x.rid: x for x in device_qs}
-    if user.is_admin:
-        peers_by_owner_and_rid = {(peer.profile.owner_id, peer.rid): peer for peer in peer_qs}
-        peers_by_rid = {rid: peers_by_owner_and_rid.get((device.owner_id, rid)) for rid, device in devices.items()}
-        device_ids = sorted(devices)
-    else:
-        peers_by_rid = {peer.rid: peer for peer in peer_qs}
-        device_ids = sorted(set(devices) | set(peers_by_rid))
     status_filter = request.GET.get("status", "")
-    if status_filter in ("0", "1"):
-        target = 1 if status_filter == "1" else 0
-        device_ids = [
-            rid for rid in device_ids if (devices[rid].is_active if rid in devices else True) == (target == 1)
-        ]
-    total = len(device_ids)
-    start = (current - 1) * page_size
-    end = start + page_size
-    data = []
-    for rid in device_ids[start:end]:
-        device = devices.get(rid)
-        peer = peers_by_rid.get(rid)
-        username = device.username if device and device.username else (peer.username if peer else "")
-        owner = ""
-        if device and device.owner:
-            owner = device.owner.username
-        elif peer:
-            owner = peer.profile.owner.username
-        status = 1 if not device or device.is_active else 0
-        data.append(
-            {
-                "id": rid,
-                "info": {
-                    "username": username,
-                    "os": (device.os if device else (peer.platform if peer else "")),
-                    "device_name": (device.hostname if device else (peer.hostname if peer else "")),
-                },
-                "status": status,
-                "user": owner,
-                "user_name": owner,
-                "device_group_name": (
-                    device.device_group.name
-                    if device and device.device_group_id
-                    else (peer.device_group_name if peer else "")
-                ),
-                "note": device.note if device else (peer.note if peer else ""),
-            }
-        )
-    _log_event(
-        request, "api_peers", level="debug", username=user.username, total=total, page=current, page_size=page_size
+    if status_filter not in ("0", "1"):
+        status_filter = ""
+    cursor_value = str(request.GET.get("cursor", "") or "").strip()
+    pagination, error_response = _pagination_or_error(
+        request,
+        enforce_offset_budget=not bool(cursor_value),
     )
-    return JsonResponse({"total": total, "data": data})
+    if error_response:
+        return error_response
+    inventory = DeviceInventory(user)
+    rid_after = ""
+    if cursor_value:
+        try:
+            rid_after = load_inventory_cursor(cursor_value, user, status_filter)
+        except InvalidInventoryCursor:
+            return JsonResponse({"error": "Invalid inventory cursor"}, status=400)
+        offset = 0
+    else:
+        offset = pagination.start
+
+    total = inventory.count(status_filter=status_filter)
+    rows = inventory.rows(
+        offset=offset,
+        limit=pagination.page_size + 1 if cursor_value else pagination.page_size,
+        status_filter=status_filter,
+        rid_after=rid_after,
+    )
+    next_cursor = ""
+    has_more = len(rows) > pagination.page_size if cursor_value else bool(rows) and pagination.start + len(rows) < total
+    if cursor_value and has_more:
+        rows = rows[: pagination.page_size]
+    if has_more:
+        next_cursor = dump_inventory_cursor(rows[-1], user, status_filter)
+    data = [row.as_api_dict() for row in rows]
+    _log_event(
+        request,
+        "api_peers",
+        level="debug",
+        username=user.username,
+        total=total,
+        page=pagination.current,
+        page_size=pagination.page_size,
+    )
+    return JsonResponse(
+        {
+            "total": total,
+            **_pagination_response_fields(pagination),
+            "data": data,
+            "nextCursor": next_cursor,
+        }
+    )
 
 
 def device_group_accessible(request):
@@ -3964,6 +7087,13 @@ def device_groups(request):
         if error:
             return error
         data = _load_json_object(request)
+        field_error = _mutation_fields_error(
+            data,
+            allowed={"name", "note", "allowed_incomings", "strategy_name"},
+            required={"name"},
+        )
+        if field_error:
+            return field_error
         name = _model_text_value(
             data.get("name"),
             DeviceGroup,
@@ -3989,134 +7119,487 @@ def device_groups(request):
         strategy = StrategyProfile.objects.filter(name=strategy_name).first() if strategy_name else None
         if strategy_name and not strategy:
             return JsonResponse({"error": "Strategy not found"}, status=404)
-        try:
-            group = DeviceGroup.objects.create(
-                name=name,
-                note=note,
-                allowed_incomings=allowed_incomings,
-                strategy=strategy,
-            )
-        except IntegrityError:
-            return JsonResponse(
-                {"error": "Device group already exists"},
-                status=409,
-            )
-        _log_event(request, "api_device_groups_created", username=admin_user.username, target=name)
-        return JsonResponse(_serialize_device_group(group))
+        operation_id, operation_error = _state040_operation_id(request)
+        if operation_error:
+            return operation_error
+
+        def mutate():
+            try:
+                group = DeviceGroup.objects.create(
+                    name=name,
+                    note=note,
+                    allowed_incomings=allowed_incomings,
+                    strategy=strategy,
+                )
+            except IntegrityError:
+                return ManagementMutation(
+                    status_code=409,
+                    body={"error": "Device group already exists"},
+                    applied={"groups": 0},
+                    result_state={"error": "group_exists", "name": name},
+                )
+            body = _serialize_device_group(group)
+            return ManagementMutation(status_code=200, body=body, applied={"groups": 1}, result_state=body)
+
+        response = _execute_management_batch(
+            actor=admin_user,
+            operation_id=operation_id,
+            operation="device_group_create",
+            request_document={
+                "operation": "device_group_create",
+                "name": name,
+                "note": note,
+                "allowed_incomings": allowed_incomings,
+                "strategy_name": strategy_name,
+            },
+            requested={"groups": 1},
+            mutation=mutate,
+        )
+        _log_event(
+            request,
+            "api_device_groups_created",
+            username=admin_user.username,
+            target=name,
+            changed_fields=sorted(data),
+            operation_id=str(operation_id),
+        )
+        return response
     admin_user, error = _require_admin(request, "api_device_groups")
     if error:
         return error
+    pagination, error_response = _pagination_or_error(request)
+    if error_response:
+        return error_response
     qs = DeviceGroup.objects.select_related("strategy").order_by("name")
-    qs = _filter_text(qs, "name", request.GET.get("name"))
-    return _paged_response(request, qs, _serialize_device_group)
-
-
-def _device_group_by_guid(guid):
-    return DeviceGroup.objects.filter(guid=guid).first()
+    guid_filter = request.GET.get("guid")
+    if guid_filter is not None:
+        try:
+            group_guid = parse_uuid(guid_filter)
+        except InvalidIdentifier:
+            return JsonResponse({"error": "Invalid device group identifier"}, status=400)
+        qs = qs.filter(guid=group_guid)
+    try:
+        qs = _request_filter_text(request, qs, "name", "name")
+    except ControlFilterError as error:
+        return _control_filter_error_response(request, error)
+    return _paged_response(request, qs, _serialize_device_group, pagination=pagination)
 
 
 def device_group_detail(request, guid):
     admin_user, error = _require_admin(request, "api_device_group_detail")
     if error:
         return error
+    try:
+        group_guid = parse_uuid(guid)
+    except InvalidIdentifier:
+        return JsonResponse({"error": "Invalid device group identifier"}, status=400)
     if request.method == "PATCH":
         data = _load_json_object(request)
-        if not data:
-            return JsonResponse({"error": "Invalid device group"}, status=400)
-        with transaction.atomic():
-            group = DeviceGroup.objects.select_for_update().filter(guid=guid).first()
-            if not group:
-                return JsonResponse({"error": "Device group not found"}, status=404)
-            if "name" in data:
-                new_name = _model_text_value(
-                    data.get("name"),
-                    DeviceGroup,
-                    "name",
-                    allow_empty=False,
-                )
-                if new_name is None:
-                    return JsonResponse({"error": "Invalid name"}, status=400)
-                group.name = new_name
-            if "note" in data:
-                note = _model_text_value(
-                    data.get("note"),
-                    DeviceGroup,
-                    "note",
-                    strip=False,
-                    max_bytes=4096,
-                )
-                if note is None:
-                    return JsonResponse({"error": "Invalid note"}, status=400)
-                group.note = note
-            if "allowed_incomings" in data:
-                allowed_incomings = _allowed_incomings_value(data.get("allowed_incomings"))
-                if allowed_incomings is None:
-                    return JsonResponse(
-                        {"error": "Invalid allowed_incomings"},
-                        status=400,
-                    )
-                group.allowed_incomings = allowed_incomings
-            if "strategy_name" in data:
-                strategy_name = _bounded_text_value(
-                    data.get("strategy_name"),
-                    240,
-                )
-                if strategy_name is not None:
-                    strategy_name = strategy_name.strip()
-                if strategy_name is None:
-                    return JsonResponse({"error": "Invalid strategy"}, status=400)
-                strategy = StrategyProfile.objects.filter(name=strategy_name).first() if strategy_name else None
-                if strategy_name and not strategy:
-                    return JsonResponse({"error": "Strategy not found"}, status=404)
-                group.strategy = strategy
-            try:
-                group.save()
-            except IntegrityError:
-                return JsonResponse({"error": "Device group already exists"}, status=409)
-        return JsonResponse(_serialize_device_group(group))
-    elif request.method == "POST":
-        ids = _load_json(request)
-        ids = _identifier_list(ids)
-        if ids is None or any(not re.fullmatch(r"[A-Za-z0-9_-]{6,16}", item) for item in ids):
-            return JsonResponse({"error": "Device id list required"}, status=400)
-        group = _device_group_by_guid(guid)
-        if not group:
-            return JsonResponse({"error": "Device group not found"}, status=404)
-        updated = RemoteDevice.objects.filter(rid__in=[str(x) for x in ids]).update(device_group=group)
-        _log_event(
-            request, "api_device_group_add_devices", username=admin_user.username, target=group.name, updated=updated
+        field_error = _mutation_fields_error(
+            data,
+            allowed={"name", "note", "allowed_incomings", "strategy_name"},
+            require_any=True,
         )
-        return JsonResponse({"result": "OK", "updated": updated})
-    else:
-        with transaction.atomic():
-            group = DeviceGroup.objects.select_for_update().filter(guid=guid).first()
+        if field_error:
+            return field_error
+        parsed_name = None
+        if "name" in data:
+            parsed_name = _model_text_value(data.get("name"), DeviceGroup, "name", allow_empty=False)
+            if parsed_name is None:
+                return JsonResponse({"error": "Invalid name"}, status=400)
+        parsed_note = None
+        if "note" in data:
+            parsed_note = _model_text_value(
+                data.get("note"),
+                DeviceGroup,
+                "note",
+                strip=False,
+                max_bytes=4096,
+            )
+            if parsed_note is None:
+                return JsonResponse({"error": "Invalid note"}, status=400)
+        parsed_allowed_incomings = None
+        if "allowed_incomings" in data:
+            parsed_allowed_incomings = _allowed_incomings_value(data.get("allowed_incomings"))
+            if parsed_allowed_incomings is None:
+                return JsonResponse({"error": "Invalid allowed_incomings"}, status=400)
+        parsed_strategy_name = None
+        if "strategy_name" in data:
+            parsed_strategy_name = _bounded_text_value(data.get("strategy_name"), 240)
+            if parsed_strategy_name is not None:
+                parsed_strategy_name = parsed_strategy_name.strip()
+            if parsed_strategy_name is None:
+                return JsonResponse({"error": "Invalid strategy"}, status=400)
+        operation_id, operation_error = _state040_operation_id(request)
+        if operation_error:
+            return operation_error
+        expected_generation = _expected_mutation_generation(request)
+        if expected_generation is False:
+            return JsonResponse({"error": "Invalid If-Match"}, status=400)
+
+        def mutate():
+            with transaction.atomic():
+                group = DeviceGroup.objects.select_for_update().filter(guid=group_guid).first()
+                if not group:
+                    return ManagementMutation(
+                        status_code=404,
+                        body={"error": "Device group not found"},
+                        applied={"groups": 0},
+                        result_state={"error": "group_not_found"},
+                    )
+                if expected_generation is not None and group.mutation_generation != expected_generation:
+                    return _generation_conflict(group.mutation_generation, "groups")
+                changed_model_fields = []
+                if "name" in data:
+                    group.name = parsed_name
+                    changed_model_fields.append("name")
+                if "note" in data:
+                    group.note = parsed_note
+                    changed_model_fields.append("note")
+                if "allowed_incomings" in data:
+                    group.allowed_incomings = parsed_allowed_incomings
+                    changed_model_fields.append("allowed_incomings")
+                if "strategy_name" in data:
+                    strategy = (
+                        StrategyProfile.objects.filter(name=parsed_strategy_name).first()
+                        if parsed_strategy_name
+                        else None
+                    )
+                    if parsed_strategy_name and not strategy:
+                        return ManagementMutation(
+                            status_code=404,
+                            body={"error": "Strategy not found"},
+                            applied={"groups": 0},
+                            result_state={"error": "strategy_not_found"},
+                        )
+                    group.strategy = strategy
+                    changed_model_fields.append("strategy")
+                try:
+                    group.save(update_fields=(*changed_model_fields, "updated_at"))
+                except IntegrityError:
+                    return ManagementMutation(
+                        status_code=409,
+                        body={"error": "Device group already exists"},
+                        applied={"groups": 0},
+                        result_state={"error": "group_exists"},
+                    )
+                _advance_mutation_generation(group)
+                body = _serialize_device_group(group)
+                return ManagementMutation(
+                    status_code=200,
+                    body=body,
+                    applied={"groups": 1},
+                    result_state=body,
+                )
+
+        response = _execute_management_batch(
+            actor=admin_user,
+            operation_id=operation_id,
+            operation="device_group_update",
+            request_document={
+                "operation": "device_group_update",
+                "group": str(group_guid),
+                "data": data,
+                "expected_generation": expected_generation,
+            },
+            requested={"groups": 1},
+            mutation=mutate,
+        )
+        body = json.loads(response.content)
+        _log_event(
+            request,
+            "api_device_group_updated" if response.status_code == 200 else "api_device_group_update_failed",
+            level="info" if response.status_code == 200 else "warning",
+            username=admin_user.username,
+            target=str(group_guid),
+            changed_fields=sorted(data),
+            operation_id=str(operation_id),
+            operation_generation=body.get("operation_generation"),
+        )
+        return response
+    elif request.method == "POST":
+        ids = _load_json(
+            request,
+            max_bytes=settings.JSON_MANAGEMENT_BATCH_MAX_BODY_BYTES,
+        )
+        ids = _rid_list(ids)
+        if not ids or any(not re.fullmatch(r"[A-Za-z0-9_-]{6,16}", item) for item in ids):
+            return JsonResponse({"error": "Device id list required"}, status=400)
+        operation_id, operation_error = _operation_id_or_error(request)
+        if operation_error:
+            return operation_error
+        expected_generation = _expected_mutation_generation(request)
+        if expected_generation is False:
+            return JsonResponse({"error": "Invalid If-Match"}, status=400)
+        requested = {"devices": len(ids)}
+        request_document = {
+            "operation": "device_group_add_devices",
+            "group": str(group_guid),
+            "devices": ids,
+            "expected_generation": expected_generation,
+        }
+
+        def mutate():
+            observed_groups = dict(
+                RemoteDevice.objects.filter(rid__in=ids).values_list("pk", "device_group_id")
+            )
+            old_group_ids = {group_id for group_id in observed_groups.values() if group_id is not None}
+            locked_groups = list(
+                DeviceGroup.objects.select_for_update()
+                .filter(Q(guid=group_guid) | Q(pk__in=old_group_ids))
+                .order_by("pk")
+            )
+            group = next((item for item in locked_groups if item.guid == group_guid), None)
             if not group:
-                return JsonResponse({"error": "Device group not found"}, status=404)
-            name = group.name
-            group.delete()
-        _log_event(request, "api_device_group_deleted", username=admin_user.username, target=name)
-        return JsonResponse({"result": "OK"})
+                return ManagementMutation(
+                    status_code=404,
+                    body={"error": "Device group not found"},
+                    applied={"devices": 0},
+                    result_state={"error": "group_not_found"},
+                )
+            if group.mutation_generation != expected_generation:
+                return _generation_conflict(group.mutation_generation, "devices")
+            devices = list(
+                RemoteDevice.objects.select_for_update()
+                .filter(rid__in=ids).order_by("pk").only("pk", "rid", "device_group_id")
+            )
+            found = {device.rid for device in devices}
+            missing = [rid for rid in ids if rid not in found]
+            if missing:
+                return ManagementMutation(
+                    status_code=409,
+                    body={"error": "Batch targets changed", "missing": {"devices": missing}},
+                    applied={"devices": 0},
+                    result_state={"missing": {"devices": missing}},
+                )
+            if any(device.device_group_id != observed_groups.get(device.pk) for device in devices):
+                return ManagementMutation(
+                    status_code=409,
+                    body={"error": "Device group changed"},
+                    applied={"devices": 0},
+                    result_state={"error": "device_group_changed"},
+                )
+            device_ids = [device.pk for device in devices]
+            updated = RemoteDevice.objects.filter(pk__in=device_ids).update(device_group=group)
+            if updated != len(ids):
+                raise RuntimeError("Device group assignment did not apply the complete target set")
+            _advance_mutation_generations(RemoteDevice, device_ids)
+            _advance_mutation_generations(DeviceGroup, old_group_ids - {group.pk})
+            _advance_mutation_generation(group)
+            state = list(
+                RemoteDevice.objects.filter(pk__in=device_ids)
+                .order_by("pk")
+                .values("rid", "device_group_id", "policy_generation", "mutation_generation")
+            )
+            return ManagementMutation(
+                status_code=200,
+                body={
+                    "result": "OK",
+                    "updated": updated,
+                    "mutation_generation": group.mutation_generation,
+                },
+                applied={"devices": updated},
+                result_state={"devices": state},
+            )
+
+        response = _execute_management_batch(
+            actor=admin_user,
+            operation_id=operation_id,
+            operation="device_group_add_devices",
+            request_document=request_document,
+            requested=requested,
+            mutation=mutate,
+        )
+        body = json.loads(response.content)
+        _log_event(
+            request,
+            "api_device_group_add_devices" if response.status_code == 200 else "api_device_group_add_devices_failed",
+            level="info" if response.status_code == 200 else "warning",
+            username=admin_user.username,
+            target=str(group_guid),
+            operation_id=str(operation_id),
+            operation_generation=body.get("operation_generation"),
+            updated=body.get("updated", 0),
+        )
+        return response
+    else:
+        field_error = _optional_empty_mutation_body_error(request)
+        if field_error:
+            return field_error
+        operation_id, operation_error = _state040_operation_id(request)
+        if operation_error:
+            return operation_error
+        expected_generation = _expected_mutation_generation(request)
+        if expected_generation is False:
+            return JsonResponse({"error": "Invalid If-Match"}, status=400)
+
+        def mutate():
+            with transaction.atomic():
+                group = DeviceGroup.objects.select_for_update().filter(guid=group_guid).first()
+                if not group:
+                    return ManagementMutation(
+                        status_code=404,
+                        body={"error": "Device group not found"},
+                        applied={"groups": 0},
+                        result_state={"error": "group_not_found"},
+                    )
+                if expected_generation is not None and group.mutation_generation != expected_generation:
+                    return _generation_conflict(group.mutation_generation, "groups")
+                name = group.name
+                device_ids = list(
+                    RemoteDevice.objects.select_for_update()
+                    .filter(device_group=group)
+                    .order_by("pk")
+                    .values_list("pk", flat=True)
+                )
+                group.delete()
+                _advance_mutation_generations(RemoteDevice, device_ids)
+                device_state = list(
+                    RemoteDevice.objects.filter(pk__in=device_ids)
+                    .order_by("pk")
+                    .values("pk", "device_group_id", "mutation_generation")
+                )
+                return ManagementMutation(
+                    status_code=200,
+                    body={"result": "OK", "deleted": str(group_guid), "name": name},
+                    applied={"groups": 1},
+                    result_state={
+                        "deleted": str(group_guid),
+                        "name": name,
+                        "devices": device_state,
+                    },
+                )
+
+        response = _execute_management_batch(
+            actor=admin_user,
+            operation_id=operation_id,
+            operation="device_group_delete",
+            request_document={
+                "operation": "device_group_delete",
+                "group": str(group_guid),
+                "expected_generation": expected_generation,
+            },
+            requested={"groups": 1},
+            mutation=mutate,
+        )
+        body = json.loads(response.content)
+        _log_event(
+            request,
+            "api_device_group_deleted" if response.status_code == 200 else "api_device_group_delete_failed",
+            level="info" if response.status_code == 200 else "warning",
+            username=admin_user.username,
+            target=str(group_guid),
+            operation_id=str(operation_id),
+            operation_generation=body.get("operation_generation"),
+        )
+        return response
 
 
 def device_group_remove_devices(request, guid):
     admin_user, error = _require_admin(request, "api_device_group_remove_devices")
     if error:
         return error
-    group = _device_group_by_guid(guid)
-    if not group:
-        return JsonResponse({"error": "Device group not found"}, status=404)
-    ids = _load_json(request)
-    ids = _identifier_list(ids)
-    if ids is None or any(not re.fullmatch(r"[A-Za-z0-9_-]{6,16}", item) for item in ids):
-        return JsonResponse({"error": "Device id list required"}, status=400)
-    updated = RemoteDevice.objects.filter(
-        rid__in=[str(x) for x in ids],
-        device_group=group,
-    ).update(device_group=None)
-    _log_event(
-        request, "api_device_group_remove_devices", username=admin_user.username, target=group.name, updated=updated
+    try:
+        group_guid = parse_uuid(guid)
+    except InvalidIdentifier:
+        return JsonResponse({"error": "Invalid device group identifier"}, status=400)
+    ids = _load_json(
+        request,
+        max_bytes=settings.JSON_MANAGEMENT_BATCH_MAX_BODY_BYTES,
     )
-    return JsonResponse({"result": "OK", "updated": updated})
+    ids = _rid_list(ids)
+    if not ids or any(not re.fullmatch(r"[A-Za-z0-9_-]{6,16}", item) for item in ids):
+        return JsonResponse({"error": "Device id list required"}, status=400)
+    operation_id, operation_error = _operation_id_or_error(request)
+    if operation_error:
+        return operation_error
+    expected_generation = _expected_mutation_generation(request)
+    if expected_generation is False:
+        return JsonResponse({"error": "Invalid If-Match"}, status=400)
+    requested = {"devices": len(ids)}
+    request_document = {
+        "operation": "device_group_remove_devices",
+        "group": str(group_guid),
+        "devices": ids,
+        "expected_generation": expected_generation,
+    }
+
+    def mutate():
+        group = DeviceGroup.objects.select_for_update().filter(guid=group_guid).first()
+        if not group:
+            return ManagementMutation(
+                status_code=404,
+                body={"error": "Device group not found"},
+                applied={"devices": 0},
+                result_state={"error": "group_not_found"},
+            )
+        if group.mutation_generation != expected_generation:
+            return _generation_conflict(group.mutation_generation, "devices")
+        devices = list(
+            RemoteDevice.objects.select_for_update()
+            .filter(rid__in=ids)
+            .order_by("pk")
+            .only("pk", "rid", "device_group_id")
+        )
+        found = {device.rid for device in devices}
+        missing = [rid for rid in ids if rid not in found]
+        wrong_group = [device.rid for device in devices if device.device_group_id != group.pk]
+        if missing or wrong_group:
+            return ManagementMutation(
+                status_code=409,
+                body={
+                    "error": "Batch targets changed",
+                    "missing": {"devices": missing},
+                    "rejected": {"not_in_group": wrong_group},
+                },
+                applied={"devices": 0},
+                result_state={
+                    "missing": {"devices": missing},
+                    "rejected": {"not_in_group": wrong_group},
+                },
+            )
+        device_ids = [device.pk for device in devices]
+        updated = RemoteDevice.objects.filter(pk__in=device_ids, device_group=group).update(device_group=None)
+        if updated != len(ids):
+            raise RuntimeError("Device group removal did not apply the complete target set")
+        _advance_mutation_generations(RemoteDevice, device_ids)
+        _advance_mutation_generation(group)
+        state = list(
+            RemoteDevice.objects.filter(pk__in=device_ids)
+            .order_by("pk")
+            .values("rid", "device_group_id", "policy_generation", "mutation_generation")
+        )
+        return ManagementMutation(
+            status_code=200,
+            body={
+                "result": "OK",
+                "updated": updated,
+                "mutation_generation": group.mutation_generation,
+            },
+            applied={"devices": updated},
+            result_state={"devices": state},
+        )
+
+    response = _execute_management_batch(
+        actor=admin_user,
+        operation_id=operation_id,
+        operation="device_group_remove_devices",
+        request_document=request_document,
+        requested=requested,
+        mutation=mutate,
+    )
+    body = json.loads(response.content)
+    _log_event(
+        request,
+        "api_device_group_remove_devices" if response.status_code == 200 else "api_device_group_remove_devices_failed",
+        level="info" if response.status_code == 200 else "warning",
+        username=admin_user.username,
+        target=str(group_guid),
+        operation_id=str(operation_id),
+        operation_generation=body.get("operation_generation"),
+        updated=body.get("updated", 0),
+    )
+    return response
 
 
 def strategies(request):
@@ -4125,6 +7608,13 @@ def strategies(request):
         return error
     if request.method == "POST":
         data = _load_json_object(request)
+        field_error = _mutation_fields_error(
+            data,
+            allowed={"name", "config_options", "enabled"},
+            required={"name"},
+        )
+        if field_error:
+            return field_error
         name = _model_text_value(
             data.get("name"),
             StrategyProfile,
@@ -4137,148 +7627,587 @@ def strategies(request):
         enabled = _strict_bool(data.get("enabled", True))
         if name is None or options is None or enabled is None:
             return JsonResponse({"error": "Invalid strategy"}, status=400)
-        try:
-            strategy = StrategyProfile.objects.create(
-                name=name,
-                config_options=options,
-                enabled=enabled,
+        operation_id, operation_error = _state040_operation_id(request)
+        if operation_error:
+            return operation_error
+
+        def mutate():
+            try:
+                strategy = StrategyProfile.objects.create(
+                    name=name,
+                    config_options=options,
+                    enabled=enabled,
+                )
+            except IntegrityError:
+                return ManagementMutation(
+                    status_code=409,
+                    body={"error": "Strategy already exists"},
+                    applied={"strategies": 0},
+                    result_state={"error": "strategy_exists", "name": name},
+                )
+            return ManagementMutation(
+                status_code=200,
+                body=_serialize_strategy(strategy),
+                applied={"strategies": 1},
+                result_state=_serialize_strategy(strategy),
             )
-        except IntegrityError:
-            return JsonResponse({"error": "Strategy already exists"}, status=409)
+
+        response = _execute_management_batch(
+            actor=admin_user,
+            operation_id=operation_id,
+            operation="strategy_create",
+            request_document={
+                "operation": "strategy_create",
+                "name": name,
+                "config_options": options,
+                "enabled": enabled,
+            },
+            requested={"strategies": 1},
+            mutation=mutate,
+        )
         _log_event(
             request,
             "api_strategy_created",
             username=admin_user.username,
             target=name,
+            changed_fields=sorted(data),
+            operation_id=str(operation_id),
         )
-        return JsonResponse(_serialize_strategy(strategy))
+        return response
     qs = StrategyProfile.objects.all().order_by("name")
-    return JsonResponse([_serialize_strategy(strategy) for strategy in qs], safe=False)
+    try:
+        data = [_serialize_strategy(strategy) for strategy in qs]
+    except InvalidManagedPolicy:
+        return json_error(
+            "invalid_strategy_configuration",
+            "Invalid strategy configuration",
+            status=503,
+        )
+    return JsonResponse(data, safe=False)
 
 
 def strategy_detail(request, guid):
     admin_user, error = _require_admin(request, "api_strategy_detail")
     if error:
         return error
+    try:
+        strategy_guid = parse_uuid(guid)
+    except InvalidIdentifier:
+        return JsonResponse({"error": "Invalid strategy identifier"}, status=400)
     if request.method == "GET":
-        strategy = StrategyProfile.objects.filter(guid=guid).first()
+        strategy = StrategyProfile.objects.filter(guid=strategy_guid).first()
         if not strategy:
             return JsonResponse({"error": "Strategy not found"}, status=404)
-        return JsonResponse(_serialize_strategy(strategy))
+        try:
+            data = _serialize_strategy(strategy)
+        except InvalidManagedPolicy:
+            return json_error(
+                "invalid_strategy_configuration",
+                "Invalid strategy configuration",
+                status=503,
+            )
+        return JsonResponse(data)
     elif request.method == "PATCH":
         data = _load_json_object(request)
-        if not data:
-            return JsonResponse({"error": "Invalid strategy"}, status=400)
-        with transaction.atomic():
-            strategy = StrategyProfile.objects.select_for_update().filter(guid=guid).first()
-            if not strategy:
-                return JsonResponse({"error": "Strategy not found"}, status=404)
-            if "name" in data:
-                name = _model_text_value(
-                    data.get("name"),
-                    StrategyProfile,
-                    "name",
-                    allow_empty=False,
-                )
-                if name is None:
-                    return JsonResponse({"error": "Invalid strategy name"}, status=400)
-                strategy.name = name
-            if "config_options" in data:
-                options = _strategy_options_value(
-                    data.get("config_options"),
-                )
-                if options is None:
-                    return JsonResponse(
-                        {"error": "Invalid strategy options"},
-                        status=400,
+        field_error = _mutation_fields_error(
+            data,
+            allowed={"name", "config_options", "enabled"},
+            require_any=True,
+        )
+        if field_error:
+            return field_error
+        operation_id, operation_error = _state040_operation_id(request)
+        if operation_error:
+            return operation_error
+        expected_generation = _expected_mutation_generation(request)
+        if expected_generation is False:
+            return JsonResponse({"error": "Invalid If-Match"}, status=400)
+
+        def mutate():
+            with transaction.atomic():
+                strategy = StrategyProfile.objects.select_for_update().filter(guid=strategy_guid).first()
+                if not strategy:
+                    return ManagementMutation(
+                        status_code=404,
+                        body={"error": "Strategy not found"},
+                        applied={"strategies": 0},
+                        result_state={"error": "strategy_not_found"},
                     )
-                strategy.config_options = options
-            if "enabled" in data:
-                enabled = _strict_bool(data.get("enabled"))
-                if enabled is None:
-                    return JsonResponse(
-                        {"error": "Invalid enabled value"},
-                        status=400,
+                if expected_generation is not None and strategy.mutation_generation != expected_generation:
+                    return _generation_conflict(strategy.mutation_generation, "strategies")
+                changed_model_fields = []
+                if "name" in data:
+                    name = _model_text_value(data.get("name"), StrategyProfile, "name", allow_empty=False)
+                    if name is None:
+                        return ManagementMutation(
+                            status_code=400,
+                            body={"error": "Invalid strategy name"},
+                            applied={"strategies": 0},
+                            result_state={"error": "invalid_name"},
+                        )
+                    strategy.name = name
+                    changed_model_fields.append("name")
+                if "config_options" in data:
+                    options = _strategy_options_value(data.get("config_options"))
+                    if options is None:
+                        return ManagementMutation(
+                            status_code=400,
+                            body={"error": "Invalid strategy options"},
+                            applied={"strategies": 0},
+                            result_state={"error": "invalid_options"},
+                        )
+                    strategy.config_options = options
+                    changed_model_fields.append("config_options")
+                if "enabled" in data:
+                    enabled = _strict_bool(data.get("enabled"))
+                    if enabled is None:
+                        return ManagementMutation(
+                            status_code=400,
+                            body={"error": "Invalid enabled value"},
+                            applied={"strategies": 0},
+                            result_state={"error": "invalid_enabled"},
+                        )
+                    strategy.enabled = enabled
+                    changed_model_fields.append("enabled")
+                try:
+                    strategy.save(update_fields=(*changed_model_fields, "updated_at"))
+                except IntegrityError:
+                    return ManagementMutation(
+                        status_code=409,
+                        body={"error": "Strategy already exists"},
+                        applied={"strategies": 0},
+                        result_state={"error": "strategy_exists"},
                     )
-                strategy.enabled = enabled
-            try:
-                strategy.save()
-            except IntegrityError:
-                return JsonResponse({"error": "Strategy already exists"}, status=409)
+                _advance_mutation_generation(strategy)
+                body = _serialize_strategy(strategy)
+                return ManagementMutation(
+                    status_code=200,
+                    body=body,
+                    applied={"strategies": 1},
+                    result_state=body,
+                )
+
+        response = _execute_management_batch(
+            actor=admin_user,
+            operation_id=operation_id,
+            operation="strategy_update",
+            request_document={
+                "operation": "strategy_update",
+                "strategy": str(strategy_guid),
+                "data": data,
+                "expected_generation": expected_generation,
+            },
+            requested={"strategies": 1},
+            mutation=mutate,
+        )
+        body = json.loads(response.content)
         _log_event(
             request,
-            "api_strategy_updated",
+            "api_strategy_updated" if response.status_code == 200 else "api_strategy_update_failed",
+            level="info" if response.status_code == 200 else "warning",
             username=admin_user.username,
-            target=strategy.name,
+            target=str(strategy_guid),
+            changed_fields=sorted(data),
+            operation_id=str(operation_id),
+            operation_generation=body.get("operation_generation"),
         )
-        return JsonResponse(_serialize_strategy(strategy))
+        return response
     else:
-        with transaction.atomic():
-            strategy = StrategyProfile.objects.select_for_update().filter(guid=guid).first()
-            if not strategy:
-                return JsonResponse({"error": "Strategy not found"}, status=404)
-            name = strategy.name
-            strategy.delete()
+        field_error = _optional_empty_mutation_body_error(request)
+        if field_error:
+            return field_error
+        operation_id, operation_error = _state040_operation_id(request)
+        if operation_error:
+            return operation_error
+        expected_generation = _expected_mutation_generation(request)
+        if expected_generation is False:
+            return JsonResponse({"error": "Invalid If-Match"}, status=400)
+
+        def mutate():
+            with transaction.atomic():
+                strategy = StrategyProfile.objects.select_for_update().filter(guid=strategy_guid).first()
+                if not strategy:
+                    return ManagementMutation(
+                        status_code=404,
+                        body={"error": "Strategy not found"},
+                        applied={"strategies": 0},
+                        result_state={"error": "strategy_not_found"},
+                    )
+                if expected_generation is not None and strategy.mutation_generation != expected_generation:
+                    return _generation_conflict(strategy.mutation_generation, "strategies")
+                name = strategy.name
+                groups = list(
+                    DeviceGroup.objects.select_for_update()
+                    .filter(strategy=strategy)
+                    .order_by("pk")
+                    .only("pk")
+                )
+                users = list(
+                    UserProfile.objects.select_for_update()
+                    .filter(strategy=strategy)
+                    .order_by("pk")
+                    .only("pk")
+                )
+                devices = list(
+                    RemoteDevice.objects.select_for_update()
+                    .filter(strategy=strategy)
+                    .order_by("pk")
+                    .only("pk")
+                )
+                group_ids = [group.pk for group in groups]
+                user_ids = [user.pk for user in users]
+                device_ids = [device.pk for device in devices]
+                strategy.delete()
+                _advance_mutation_generations(DeviceGroup, group_ids)
+                _advance_mutation_generations(UserProfile, user_ids)
+                _advance_mutation_generations(RemoteDevice, device_ids)
+                detached = {
+                    "groups": list(
+                        DeviceGroup.objects.filter(pk__in=group_ids)
+                        .order_by("pk")
+                        .values("pk", "strategy_id", "mutation_generation")
+                    ),
+                    "users": list(
+                        UserProfile.objects.filter(pk__in=user_ids)
+                        .order_by("pk")
+                        .values("pk", "strategy_id", "mutation_generation")
+                    ),
+                    "devices": list(
+                        RemoteDevice.objects.filter(pk__in=device_ids)
+                        .order_by("pk")
+                        .values("pk", "strategy_id", "mutation_generation")
+                    ),
+                }
+                return ManagementMutation(
+                    status_code=200,
+                    body={"result": "OK", "deleted": str(strategy_guid), "name": name},
+                    applied={"strategies": 1},
+                    result_state={
+                        "deleted": str(strategy_guid),
+                        "name": name,
+                        "detached": detached,
+                    },
+                )
+
+        response = _execute_management_batch(
+            actor=admin_user,
+            operation_id=operation_id,
+            operation="strategy_delete",
+            request_document={
+                "operation": "strategy_delete",
+                "strategy": str(strategy_guid),
+                "expected_generation": expected_generation,
+            },
+            requested={"strategies": 1},
+            mutation=mutate,
+        )
         _log_event(
             request,
-            "api_strategy_deleted",
+            "api_strategy_deleted" if response.status_code == 200 else "api_strategy_delete_failed",
+            level="info" if response.status_code == 200 else "warning",
             username=admin_user.username,
-            target=name,
+            target=str(strategy_guid),
+            operation_id=str(operation_id),
         )
-        return JsonResponse({"result": "OK"})
+        return response
 
 
 def strategy_status(request, guid):
     admin_user, error = _require_admin(request, "api_strategy_status")
     if error:
         return error
-    strategy = StrategyProfile.objects.filter(guid=guid).first()
-    if not strategy:
-        return JsonResponse({"error": "Strategy not found"}, status=404)
+    try:
+        strategy_guid = parse_uuid(guid)
+    except InvalidIdentifier:
+        return JsonResponse({"error": "Invalid strategy identifier"}, status=400)
     data = _load_json(request)
-    enabled = _strict_bool(data if isinstance(data, bool) else data.get("enabled") if isinstance(data, dict) else None)
+    if isinstance(data, dict):
+        field_error = _mutation_fields_error(
+            data,
+            allowed={"enabled"},
+            required={"enabled"},
+        )
+        if field_error:
+            return field_error
+        enabled = _strict_bool(data["enabled"])
+    else:
+        enabled = _strict_bool(data)
     if enabled is None:
         return JsonResponse({"error": "Boolean enabled value required"}, status=400)
-    strategy.enabled = enabled
-    strategy.save(update_fields=["enabled", "updated_at"])
-    _log_event(
-        request, "api_strategy_status", username=admin_user.username, target=strategy.name, enabled=strategy.enabled
+    operation_id, operation_error = _state040_operation_id(request)
+    if operation_error:
+        return operation_error
+    expected_generation = _expected_mutation_generation(request)
+    if expected_generation is False:
+        return JsonResponse({"error": "Invalid If-Match"}, status=400)
+
+    def mutate():
+        strategy = StrategyProfile.objects.select_for_update().filter(guid=strategy_guid).first()
+        if not strategy:
+            return ManagementMutation(
+                status_code=404,
+                body={"error": "Strategy not found"},
+                applied={"strategies": 0},
+                result_state={"error": "strategy_not_found"},
+            )
+        if expected_generation is not None and strategy.mutation_generation != expected_generation:
+            return _generation_conflict(strategy.mutation_generation, "strategies")
+        strategy.enabled = enabled
+        strategy.save(update_fields=["enabled", "updated_at"])
+        _advance_mutation_generation(strategy)
+        body = _serialize_strategy(strategy)
+        return ManagementMutation(
+            status_code=200,
+            body=body,
+            applied={"strategies": 1},
+            result_state=body,
+        )
+
+    response = _execute_management_batch(
+        actor=admin_user,
+        operation_id=operation_id,
+        operation="strategy_status",
+        request_document={
+            "operation": "strategy_status",
+            "strategy": str(strategy_guid),
+            "enabled": enabled,
+            "expected_generation": expected_generation,
+        },
+        requested={"strategies": 1},
+        mutation=mutate,
     )
-    return JsonResponse(_serialize_strategy(strategy))
+    body = json.loads(response.content)
+    _log_event(
+        request,
+        "api_strategy_status" if response.status_code == 200 else "api_strategy_status_failed",
+        level="info" if response.status_code == 200 else "warning",
+        username=admin_user.username,
+        target=str(strategy_guid),
+        enabled=enabled,
+        operation_id=str(operation_id),
+        operation_generation=body.get("operation_generation"),
+    )
+    return response
 
 
 def strategy_assign(request):
     admin_user, error = _require_admin(request, "api_strategy_assign")
     if error:
         return error
-    data = _load_json_object(request)
-    strategy = None
+    data = _load_json_object(
+        request,
+        max_bytes=settings.JSON_MANAGEMENT_BATCH_MAX_BODY_BYTES,
+    )
+    field_error = _mutation_fields_error(
+        data,
+        allowed={"strategy", "peers", "users", "groups", "expected_generations"},
+        required={"expected_generations"},
+    )
+    if field_error:
+        return field_error
     strategy_guid = data.get("strategy")
-    if strategy_guid:
-        if not isinstance(strategy_guid, str) or len(strategy_guid) > 64:
+    if strategy_guid not in (None, ""):
+        try:
+            strategy_guid = parse_uuid(strategy_guid)
+        except InvalidIdentifier:
             return JsonResponse({"error": "Invalid strategy"}, status=400)
-        strategy = StrategyProfile.objects.filter(guid=strategy_guid).first()
-        if not strategy:
-            return JsonResponse({"error": "Strategy not found"}, status=404)
-    peer_guids = _identifier_list(data.get("peers", []), numeric=True)
-    user_guids = _identifier_list(data.get("users", []), numeric=True)
-    group_guids = _identifier_list(data.get("groups", []))
-    if peer_guids is None or user_guids is None or group_guids is None:
+    else:
+        strategy_guid = None
+    try:
+        peer_guids = parse_model_pk_list(
+            data.get("peers", []),
+            RemoteDevice,
+            max_items=MAX_MANAGEMENT_BATCH_ITEMS,
+        )
+        user_guids = parse_model_pk_list(
+            data.get("users", []),
+            UserProfile,
+            max_items=MAX_MANAGEMENT_BATCH_ITEMS,
+        )
+        group_guids = parse_uuid_list(
+            data.get("groups", []),
+            max_items=MAX_MANAGEMENT_BATCH_ITEMS,
+        )
+    except InvalidIdentifier:
         return JsonResponse({"error": "Invalid assignment targets"}, status=400)
     if not peer_guids and not user_guids and not group_guids:
         return JsonResponse({"error": "No assignment targets"}, status=400)
-    with transaction.atomic():
-        devices_updated = RemoteDevice.objects.filter(pk__in=peer_guids).update(strategy=strategy)
-        users_updated = UserProfile.objects.filter(pk__in=user_guids).update(strategy=strategy)
-        groups = DeviceGroup.objects.filter(guid__in=group_guids)
-        groups_updated = groups.update(strategy=strategy)
+    target_ids = {
+        "devices": [str(peer_id) for peer_id in peer_guids],
+        "users": [str(user_id) for user_id in user_guids],
+        "groups": [str(group_id) for group_id in group_guids],
+    }
+    expected_generations = _expected_mutation_generation_map(
+        data.get("expected_generations"),
+        target_ids,
+    )
+    if expected_generations is None:
+        return JsonResponse({"error": "Invalid expected_generations"}, status=400)
+    operation_id, operation_error = _operation_id_or_error(request)
+    if operation_error:
+        return operation_error
+    requested = {
+        "devices": len(peer_guids),
+        "users": len(user_guids),
+        "groups": len(group_guids),
+    }
+    request_document = {
+        "operation": "strategy_assign",
+        "strategy": str(strategy_guid) if strategy_guid else None,
+        "peers": [str(peer_id) for peer_id in peer_guids],
+        "users": [str(user_id) for user_id in user_guids],
+        "groups": [str(group_id) for group_id in group_guids],
+        "expected_generations": expected_generations,
+    }
+
+    def mutate():
+        strategy = None
+        if strategy_guid:
+            strategy = StrategyProfile.objects.select_for_update().filter(guid=strategy_guid).first()
+            if not strategy:
+                return ManagementMutation(
+                    status_code=404,
+                    body={"error": "Strategy not found"},
+                    applied=dict.fromkeys(requested, 0),
+                    result_state={"error": "strategy_not_found"},
+                )
+        groups = list(
+            DeviceGroup.objects.select_for_update()
+            .filter(guid__in=group_guids)
+            .order_by("pk")
+            .only("pk", "guid", "mutation_generation")
+        )
+        users = list(
+            UserProfile.objects.select_for_update()
+            .filter(pk__in=user_guids)
+            .order_by("pk")
+            .only("pk", "mutation_generation")
+        )
+        group_ids = [group.pk for group in groups]
+        user_ids = [user.pk for user in users]
+        affected_device_ids = set(peer_guids)
+        affected_device_ids.update(device_ids_affected_by_groups(group_ids))
+        affected_device_ids.update(device_ids_affected_by_users(user_ids))
+        locked_devices = list(
+            RemoteDevice.objects.select_for_update()
+            .filter(pk__in=affected_device_ids)
+            .order_by("pk")
+            .only("pk", "mutation_generation")
+        )
+        found_devices = {device.pk for device in locked_devices}
+        found_users = {user.pk for user in users}
+        found_groups = {group.guid for group in groups}
+        missing = {
+            "devices": [str(peer_id) for peer_id in peer_guids if peer_id not in found_devices],
+            "users": [str(user_id) for user_id in user_guids if user_id not in found_users],
+            "groups": [str(group_id) for group_id in group_guids if group_id not in found_groups],
+        }
+        if any(missing.values()):
+            return ManagementMutation(
+                status_code=409,
+                body={"error": "Batch targets changed", "missing": missing},
+                applied=dict.fromkeys(requested, 0),
+                result_state={"missing": missing},
+            )
+        current_generations = {
+            "devices": {
+                str(device.pk): device.mutation_generation
+                for device in locked_devices
+                if device.pk in peer_guids
+            },
+            "users": {str(user.pk): user.mutation_generation for user in users},
+            "groups": {str(group.guid): group.mutation_generation for group in groups},
+        }
+        stale = _mutation_generation_conflicts(
+            expected_generations,
+            current_generations,
+        )
+        if stale:
+            return ManagementMutation(
+                status_code=409,
+                body={
+                    "error": "Resource changed",
+                    "code": "resource_generation_conflict",
+                    "stale": stale,
+                },
+                applied=dict.fromkeys(requested, 0),
+                result_state={"stale": stale},
+            )
+        device_ids = list(peer_guids)
+        groups_updated = DeviceGroup.objects.filter(pk__in=group_ids).update(strategy=strategy)
+        users_updated = UserProfile.objects.filter(pk__in=user_ids).update(strategy=strategy)
+        devices_updated = RemoteDevice.objects.filter(pk__in=device_ids).update(strategy=strategy)
+        applied = {
+            "devices": devices_updated,
+            "users": users_updated,
+            "groups": groups_updated,
+        }
+        if applied != requested:
+            raise RuntimeError("Strategy assignment did not apply the complete target set")
+        _advance_mutation_generations(RemoteDevice, device_ids)
+        _advance_mutation_generations(UserProfile, user_ids)
+        _advance_mutation_generations(DeviceGroup, group_ids)
+        state = {
+            "strategy": str(strategy.guid) if strategy else None,
+            "devices": list(
+                RemoteDevice.objects.filter(pk__in=device_ids)
+                .order_by("pk")
+                .values("pk", "strategy_id", "policy_generation", "mutation_generation")
+            ),
+            "users": list(
+                UserProfile.objects.filter(pk__in=user_ids)
+                .order_by("pk")
+                .values("pk", "strategy_id", "mutation_generation")
+            ),
+            "groups": [
+                {
+                    "guid": str(group.guid),
+                    "strategy_id": group.strategy_id,
+                    "mutation_generation": group.mutation_generation,
+                }
+                for group in DeviceGroup.objects.filter(pk__in=group_ids).order_by("pk")
+            ],
+        }
+        next_generations = {
+            "devices": {
+                str(row["pk"]): row["mutation_generation"]
+                for row in state["devices"]
+            },
+            "users": {
+                str(row["pk"]): row["mutation_generation"]
+                for row in state["users"]
+            },
+            "groups": {
+                row["guid"]: row["mutation_generation"]
+                for row in state["groups"]
+            },
+        }
+        return ManagementMutation(
+            status_code=200,
+            body={"result": "OK", **applied, "mutation_generations": next_generations},
+            applied=applied,
+            result_state=state,
+        )
+
+    response = _execute_management_batch(
+        actor=admin_user,
+        operation_id=operation_id,
+        operation="strategy_assign",
+        request_document=request_document,
+        requested=requested,
+        mutation=mutate,
+    )
+    body = json.loads(response.content)
     _log_event(
         request,
-        "api_strategy_assign",
+        "api_strategy_assign" if response.status_code == 200 else "api_strategy_assign_failed",
+        level="info" if response.status_code == 200 else "warning",
         username=admin_user.username,
-        strategy=strategy.name if strategy else "",
-        devices=devices_updated,
-        users=users_updated,
-        groups=groups_updated,
+        strategy=str(strategy_guid or ""),
+        operation_id=str(operation_id),
+        operation_generation=body.get("operation_generation"),
+        devices=body.get("devices", 0),
+        users=body.get("users", 0),
+        groups=body.get("groups", 0),
     )
-    return JsonResponse({"result": "OK", "devices": devices_updated, "users": users_updated, "groups": groups_updated})
+    return response

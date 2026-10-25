@@ -4,43 +4,61 @@ import hashlib
 import json
 import os
 import tempfile
-from io import StringIO
+import uuid
+from io import BytesIO, StringIO
 from pathlib import Path
 from unittest.mock import patch
 
 from django.contrib.auth.models import Group
 from django.core.exceptions import ImproperlyConfigured, ValidationError
 from django.core.management import call_command
-from django.db import connection, transaction
+from django.core.management.base import CommandError
+from django.db import IntegrityError, connection, transaction
 from django.test import SimpleTestCase, TestCase, override_settings
+from django.test.utils import CaptureQueriesContext
 from django.utils import timezone
+from nacl.secret import SecretBox
 from nacl.signing import SigningKey
+from openpyxl import load_workbook
 
+from api import ingestion_governance, recording_crypto
+from api.encrypted_fields import FIELD_PREFIX, encrypt_text, key_canary, key_fingerprint
 from api.formatting import format_bytes
 from api.models import (
     AddressBookProfile,
     AddressBookRule,
     AlarmLog,
     ConnLog,
+    DataEncryptionKeyState,
     DeviceGroup,
     FileLog,
+    LoginAdmissionLock,
     LoginAttempt,
     OidcPendingAuth,
+    RecordingUpload,
     RemoteDevice,
     RemotePeer,
     RemoteTag,
     RemoteToken,
+    RequestRateBucket,
+    RequestRateLease,
     ShareLink,
     StrategyProfile,
     UserProfile,
 )
+from api.policy_generation import InvalidManagedPolicy
 from api.tag_colors import normalize_tag_color, tag_color_css
+from api.test_support import reset_data_encryption_key_inventory
+from api.views_api import _audit_enum, _audit_uuid4, _json_value, _valid_ab_rule
+from api.views_front import _parse_rule
 from api.xlsx import spreadsheet_safe_value
 from camellia_remote_management import settings as project_settings
 from camellia_remote_management.settings import (
     _database_host,
     _database_text,
     _database_tls_options,
+    data_encryption_key_id,
+    data_encryption_legacy_keys,
     env_bool,
     env_choice,
     env_int,
@@ -79,8 +97,35 @@ class UtilityContractTests(SimpleTestCase):
         self.assertEqual(spreadsheet_safe_value("ordinary text"), "ordinary text")
         self.assertEqual(spreadsheet_safe_value(42), 42)
 
+    def test_json_enum_uuid_and_rule_parsers_reject_unrepresentable_values(self):
+        self.assertIsNone(_json_value(float("nan"), expected_type=float, max_bytes=32))
+        self.assertIsNone(_valid_ab_rule(object()))
+        self.assertIsNone(_audit_enum(object(), {1, 2, 3}))
+        self.assertIsNone(_audit_uuid4("not-a-uuid"))
+        self.assertEqual(_parse_rule(object()), 1)
+
 
 class SettingsParserTests(SimpleTestCase):
+    def test_data_encryption_key_ids_and_legacy_keyring_are_strict(self):
+        first_key = base64.b64encode(b"a" * 32).decode()
+        second_key = base64.b64encode(b"b" * 32).decode()
+        self.assertEqual(data_encryption_key_id("key-2026.08", "TEST_KEY_ID"), "key-2026.08")
+        self.assertEqual(
+            data_encryption_legacy_keys(f"old-a:{first_key},old-b:{second_key}"),
+            {"old-a": b"a" * 32, "old-b": b"b" * 32},
+        )
+        for value in ("", "UPPERCASE", "-leading", "x" * 33, "contains space"):
+            with self.subTest(value=value), self.assertRaises(ImproperlyConfigured):
+                data_encryption_key_id(value, "TEST_KEY_ID")
+        for value in (
+            "missing-separator",
+            "duplicate:" + first_key + ",duplicate:" + second_key,
+            "first:" + first_key + ",alias:" + first_key,
+            "invalid:not-base64",
+        ):
+            with self.subTest(value=value), self.assertRaises(ImproperlyConfigured):
+                data_encryption_legacy_keys(value)
+
     def test_boolean_values_are_explicit_and_case_insensitive(self):
         with patch.dict(os.environ, {"TEST_BOOLEAN": "YeS"}):
             self.assertTrue(env_bool("TEST_BOOLEAN"))
@@ -189,9 +234,13 @@ class ApiTestMixin:
             password="alice-pass",
             email="alice@example.test",
         )
+        self.device_signing_keys = {}
 
-    def _post_json(self, path, payload, token=None):
+    def _post_json(self, path, payload, token=None, expected_generation=None):
         headers = self._auth_headers(token)
+        headers["HTTP_IDEMPOTENCY_KEY"] = str(uuid.uuid4())
+        if expected_generation is not None:
+            headers["HTTP_IF_MATCH"] = f'"{expected_generation}"'
         return self.client.post(
             path,
             data=json.dumps(payload),
@@ -199,8 +248,11 @@ class ApiTestMixin:
             **headers,
         )
 
-    def _put_json(self, path, payload, token=None):
+    def _put_json(self, path, payload, token=None, expected_generation=None):
         headers = self._auth_headers(token)
+        headers["HTTP_IDEMPOTENCY_KEY"] = str(uuid.uuid4())
+        if expected_generation is not None:
+            headers["HTTP_IF_MATCH"] = f'"{expected_generation}"'
         return self.client.put(
             path,
             data=json.dumps(payload),
@@ -208,8 +260,11 @@ class ApiTestMixin:
             **headers,
         )
 
-    def _delete_json(self, path, payload=None, token=None):
+    def _delete_json(self, path, payload=None, token=None, expected_generation=None):
         headers = self._auth_headers(token)
+        headers["HTTP_IDEMPOTENCY_KEY"] = str(uuid.uuid4())
+        if expected_generation is not None:
+            headers["HTTP_IF_MATCH"] = f'"{expected_generation}"'
         return self.client.delete(
             path,
             data=json.dumps(payload if payload is not None else {}),
@@ -222,27 +277,48 @@ class ApiTestMixin:
         return {"HTTP_AUTHORIZATION": f"Bearer {token}"} if token else {}
 
     def _login(self, username, password, rid="123456789", uuid=DEFAULT_DEVICE_UUID):
+        payload = {
+            "username": username,
+            "password": password,
+            "id": rid,
+            "uuid": uuid,
+            "type": "client",
+            "deviceInfo": {
+                "os": "linux",
+                "type": "client",
+                "name": "desktop",
+            },
+        }
+        signing_key = self.device_signing_keys.get((rid, uuid))
+        if signing_key is not None:
+            payload["device_proof"] = self._device_proof("login", signing_key, rid, uuid)
         response = self._post_json(
             "/api/login",
-            {
-                "username": username,
-                "password": password,
-                "id": rid,
-                "uuid": uuid,
-                "type": "client",
-                "deviceInfo": {
-                    "os": "linux",
-                    "type": "client",
-                    "name": "desktop",
-                },
-            },
+            payload,
         )
         self.assertEqual(response.status_code, 200, response.content)
         body = response.json()
         self.assertIn("access_token", body)
         return body["access_token"]
 
+    def _device_proof(self, purpose, signing_key, rid, uuid, token=None):
+        public_key = base64.b64encode(bytes(signing_key.verify_key)).decode("ascii")
+        challenge = self._post_json(
+            "/api/devices/proof-challenge",
+            {"purpose": purpose, "id": rid, "uuid": uuid, "pk": public_key},
+            token=token,
+        )
+        self.assertEqual(challenge.status_code, 200, challenge.content)
+        challenge_body = challenge.json()
+        signature = signing_key.sign(challenge_body["message"].encode("utf-8")).signature
+        return {
+            "challenge": challenge_body["challenge"],
+            "public_key": public_key,
+            "signature": base64.b64encode(signature).decode("ascii"),
+        }
+
     def _device(self, owner=None, rid="123456789", uuid=DEFAULT_DEVICE_UUID, **overrides):
+        signing_key = SigningKey.generate()
         data = {
             "rid": rid,
             "cpu": "-",
@@ -252,11 +328,14 @@ class ApiTestMixin:
             "uuid": uuid,
             "username": "desktop-user",
             "version": "2.0.0",
-            "public_key_hash": hashlib.sha256(uuid.encode()).hexdigest(),
+            "public_key_hash": hashlib.sha256(bytes(signing_key.verify_key)).hexdigest(),
             "owner": owner,
         }
         data.update(overrides)
-        return RemoteDevice.objects.create(**data)
+        device = RemoteDevice.objects.create(**data)
+        if "public_key_hash" not in overrides:
+            self.device_signing_keys[(rid, uuid)] = signing_key
+        return device
 
     @staticmethod
     def _personal_profile(user):
@@ -282,7 +361,12 @@ class ApiContractTests(ApiTestMixin, TestCase):
                 )
 
                 self.assertEqual(response.status_code, 400, response.content)
-                self.assertEqual(response.json(), {"error": "Invalid JSON payload"})
+                body = response.json()
+                self.assertEqual(body["code"], "invalid_json_payload")
+                self.assertEqual(body["message"], "Invalid JSON payload")
+                self.assertEqual(body["response_schema_version"], 1)
+                self.assertFalse(body["retryable"])
+                self.assertNotIn("error", body)
 
     def test_routes_reject_unsupported_methods_with_allow_contracts(self):
         for path, method, allowed in (
@@ -319,7 +403,10 @@ class ApiContractTests(ApiTestMixin, TestCase):
             {"username": "alice", "password": "wrong", "id": "123456789", "uuid": DEFAULT_DEVICE_UUID},
         )
         self.assertEqual(response.status_code, 401)
-        self.assertIn("error", response.json())
+        self.assertEqual(response.json()["code"], "http_401_api_login")
+        self.assertTrue(response.json()["message"])
+        self.assertFalse(response.json()["retryable"])
+        self.assertNotIn("error", response.json())
         self.assertEqual(LoginAttempt.objects.filter(ip="127.0.0.1").count(), 1)
 
     def test_login_rejects_noncanonical_device_identity(self):
@@ -353,7 +440,9 @@ class ApiContractTests(ApiTestMixin, TestCase):
             {"username": "alice", "password": "alice-pass", "id": "123456789", "uuid": DEFAULT_DEVICE_UUID},
         )
         self.assertEqual(locked.status_code, 429)
-        self.assertIn("error", locked.json())
+        self.assertEqual(locked.json()["code"], "http_429_api_login")
+        self.assertTrue(locked.json()["retryable"])
+        self.assertNotIn("error", locked.json())
 
     def test_successful_login_clears_failures_and_stores_hashed_token(self):
         self._post_json(
@@ -367,10 +456,10 @@ class ApiContractTests(ApiTestMixin, TestCase):
         self.assertNotEqual(stored.access_token, token)
         self.assertEqual(stored.access_token, hashlib.sha256(token.encode()).hexdigest())
 
-        # currentUser echoes the presented raw token, never the stored hash.
+        # currentUser validates the bearer without making another response-body copy.
         response = self._post_json("/api/currentUser", {}, token=token)
         self.assertEqual(response.status_code, 200, response.content)
-        self.assertEqual(response.json()["access_token"], token)
+        self.assertNotIn("access_token", response.json())
 
     def test_relogin_rotates_the_stored_token(self):
         first = self._login("alice", "alice-pass")
@@ -405,18 +494,55 @@ class ApiContractTests(ApiTestMixin, TestCase):
                 ["test-state"],
             )
             stored_nonce, stored_verifier = cursor.fetchone()
-        self.assertTrue(stored_nonce.startswith("secretbox:v1:"))
-        self.assertTrue(stored_verifier.startswith("secretbox:v1:"))
+        envelope_prefix = f"{FIELD_PREFIX}{project_settings.DATA_ENCRYPTION_PRIMARY_KEY_ID}:"
+        self.assertTrue(stored_nonce.startswith(envelope_prefix))
+        self.assertTrue(stored_verifier.startswith(envelope_prefix))
         self.assertNotIn("test-nonce", stored_nonce)
         self.assertNotIn("test-code-verifier", stored_verifier)
 
-        state_is_not_a_poll_secret = self.client.get("/api/oidc/auth-query?code=test-state")
+        state_is_not_a_poll_secret = self._post_json(
+            "/api/oidc/auth-query",
+            {"code": "test-state", "id": "123456789", "uuid": DEFAULT_DEVICE_UUID},
+        )
         self.assertNotIn("access_token", state_is_not_a_poll_secret.json())
-        response = self.client.get(f"/api/oidc/auth-query?code={poll_code}")
+        response = self._post_json(
+            "/api/oidc/auth-query",
+            {"code": poll_code, "id": "123456789", "uuid": DEFAULT_DEVICE_UUID},
+        )
         self.assertEqual(response.status_code, 200, response.content)
         self.assertIn("access_token", response.json())
         self.assertNotEqual(response.json()["access_token"], poll_code)
         self.assertFalse(OidcPendingAuth.objects.filter(state="test-state").exists())
+
+    def test_oidc_auth_query_consumes_terminal_device_claim_failures(self):
+        failures = (
+            (IntegrityError("sensitive identity constraint"), 409, "oidc_authorization_conflict"),
+            (PermissionError("sensitive device proof"), 403, "oidc_authorization_failed"),
+        )
+        for index, (failure, status, code) in enumerate(failures):
+            with self.subTest(status=status):
+                poll_code = f"terminal-poll-code-{index}"
+                session = OidcPendingAuth.objects.create(
+                    state=f"terminal-state-{index}",
+                    poll_code_hash=hashlib.sha256(poll_code.encode()).hexdigest(),
+                    provider="example",
+                    rid="123456789",
+                    device_uuid=DEFAULT_DEVICE_UUID,
+                    nonce="test-nonce",
+                    code_verifier="test-code-verifier",
+                    status=OidcPendingAuth.STATUS_DONE,
+                    authenticated_user=self.user,
+                )
+                with patch("api.views_api._claim_session_device", side_effect=failure):
+                    response = self._post_json(
+                        "/api/oidc/auth-query",
+                        {"code": poll_code, "id": "123456789", "uuid": DEFAULT_DEVICE_UUID},
+                    )
+
+                self.assertEqual(response.status_code, status, response.content)
+                self.assertEqual(response.json()["code"], code)
+                self.assertNotIn(b"sensitive", response.content)
+                self.assertFalse(OidcPendingAuth.objects.filter(pk=session.pk).exists())
 
     def test_telemetry_requires_the_token_bound_to_that_device(self):
         response = self._post_json(
@@ -453,6 +579,41 @@ class ApiContractTests(ApiTestMixin, TestCase):
             token=token,
         )
         self.assertEqual(heartbeat.status_code, 200, heartbeat.content)
+
+    def test_device_mutations_classify_identity_conflicts(self):
+        device = self._device(owner=self.user)
+        token = self._login("alice", "alice-pass")
+        requests = (
+            ("/api/sysinfo", {"id": device.rid, "uuid": device.uuid, "hostname": "new-host"}),
+            ("/api/devices/cli", {"id": device.rid, "uuid": device.uuid, "user_name": self.user.username}),
+        )
+        for path, payload in requests:
+            with (
+                self.subTest(path=path),
+                patch(
+                    "api.views_api._device_by_identity",
+                    side_effect=IntegrityError("sensitive identity constraint"),
+                ),
+            ):
+                response = self._post_json(path, payload, token=token)
+
+            self.assertEqual(response.status_code, 409, response.content)
+            self.assertNotIn(b"sensitive identity constraint", response.content)
+
+        device.refresh_from_db()
+        self.assertEqual(device.hostname, "desktop")
+
+    def test_address_book_tags_tolerate_an_unparseable_stored_color(self):
+        token = self._login("alice", "alice-pass")
+        profile = self._personal_profile(self.user)
+        tag = RemoteTag.objects.create(profile=profile, tag_name="invalid-color")
+        RemoteTag.objects.filter(pk=tag.pk).update(tag_color="not-an-integer")
+
+        response = self._post_json(f"/api/ab/tags/{profile.guid}", {}, token=token)
+
+        self.assertEqual(response.status_code, 200, response.content)
+        self.assertEqual(response.json()["data"], [{"name": "invalid-color", "color": 0}])
+        self.assertEqual(response.json()["authorization_generation"], profile.authorization_generation)
 
     def test_address_book_peers_match_flutter_client_contract(self):
         token = self._login("alice", "alice-pass")
@@ -526,9 +687,11 @@ class ApiContractTests(ApiTestMixin, TestCase):
             f"/api/ab/tag/rename/{profile.guid}",
             {"old": "old", "new": "target"},
             token=token,
+            expected_generation=0,
         )
 
         self.assertEqual(renamed.status_code, 200, renamed.content)
+        self.assertEqual(renamed.json()["operation"], "address_book_tag_rename")
         self.assertFalse(RemoteTag.objects.filter(profile=profile, tag_name="old").exists())
         self.assertEqual(
             list(peer.tags.values_list("tag_name", flat=True)),
@@ -553,8 +716,11 @@ class ApiContractTests(ApiTestMixin, TestCase):
             f"/api/ab/tag/{profile.guid}",
             ["target"],
             token=token,
+            expected_generation=1,
         )
         self.assertEqual(deleted.status_code, 200, deleted.content)
+        self.assertEqual(deleted.json()["operation"], "address_book_tag_delete")
+        self.assertEqual(deleted.json()["applied"], {"mutations": 1})
         self.assertFalse(peer.tags.exists())
         self.assertFalse(RemoteTag.objects.filter(pk=target_tag.pk).exists())
 
@@ -582,8 +748,9 @@ class ApiContractTests(ApiTestMixin, TestCase):
                 [second.pk],
             )
             second_raw_rhash = cursor.fetchone()[0]
-        self.assertTrue(raw_rhash.startswith("secretbox:v1:"))
-        self.assertTrue(raw_password.startswith("secretbox:v1:"))
+        envelope_prefix = f"{FIELD_PREFIX}{project_settings.DATA_ENCRYPTION_PRIMARY_KEY_ID}:"
+        self.assertTrue(raw_rhash.startswith(envelope_prefix))
+        self.assertTrue(raw_password.startswith(envelope_prefix))
         self.assertNotIn("same-sensitive-value", raw_rhash)
         self.assertNotEqual(raw_rhash, raw_password)
         self.assertNotEqual(raw_rhash, second_raw_rhash)
@@ -595,7 +762,7 @@ class ApiContractTests(ApiTestMixin, TestCase):
         with connection.cursor() as cursor:
             cursor.execute(
                 "UPDATE api_remotepeer SET rhash = %s WHERE id = %s",
-                ["secretbox:v1:AAAA", first.pk],
+                [f"{envelope_prefix}AAAA", first.pk],
             )
         with self.assertRaises(ValidationError):
             first.refresh_from_db()
@@ -645,18 +812,127 @@ class ApiContractTests(ApiTestMixin, TestCase):
         self.assertEqual(exported.status_code, 200, exported.content)
         self.assertNotIn(peer_secret.encode(), exported.content)
 
+    def test_device_inventory_export_uses_a_safe_versioned_allowlist(self):
+        credential_canary = "DEVICE-EXPORT-CREDENTIAL-CANARY"
+        uuid_canary = device_uuid("device-export-uuid-canary")
+        public_key_hash_canary = hashlib.sha256(b"device-export-public-key-canary").hexdigest()
+        device = self._device(
+            owner=self.user,
+            rid="765432188",
+            uuid=uuid_canary,
+            public_key_hash=public_key_hash_canary,
+            address_book_password=credential_canary,
+            version="DEVICE-EXPORT-VERSION-CANARY",
+            os="DEVICE-EXPORT-OS-CANARY",
+        )
+
+        self.client.force_login(self.user)
+        denied = self.client.get("/api/down_peers")
+        self.assertEqual(denied.status_code, 302)
+        self.assertEqual(denied.headers["Location"], "/api/work")
+
+        self.client.force_login(self.admin)
+        with (
+            CaptureQueriesContext(connection) as export_queries,
+            self.assertLogs("api.views_front", level="INFO") as export_logs,
+        ):
+            response = self.client.get("/api/down_peers")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.streaming)
+        response_body = b"".join(response.streaming_content)
+        for closer in response._resource_closers:
+            closer()
+        response._resource_closers.clear()
+        workbook = load_workbook(BytesIO(response_body), read_only=True, data_only=False)
+        try:
+            worksheet = workbook.active
+            exported_rows = list(worksheet.iter_rows(values_only=True))
+        finally:
+            workbook.close()
+        self.assertEqual(len(exported_rows), 2)
+        headers = tuple(exported_rows[0])
+        values = tuple(exported_rows[1])
+        for forbidden_header in (
+            "id",
+            "uuid",
+            "public_key_hash",
+            "deployment_generation",
+            "policy_generation",
+            "address_book_password",
+        ):
+            with self.subTest(header=forbidden_header):
+                self.assertNotIn(forbidden_header, headers)
+        for canary in (credential_canary, uuid_canary, public_key_hash_canary):
+            with self.subTest(canary=canary):
+                self.assertNotIn(canary, values)
+        export_sql = "\n".join(query["sql"] for query in export_queries.captured_queries)
+        for forbidden_column in ("address_book_password", "uuid", "public_key_hash"):
+            with self.subTest(sql_column=forbidden_column):
+                self.assertNotIn(f'"api_remotedevice"."{forbidden_column}"', export_sql)
+
+        expected_headers = (
+            "rid",
+            "owner_name",
+            "device_group_name",
+            "strategy_name",
+            "version",
+            "os",
+            "enabled",
+            "status",
+            "update_time",
+        )
+        self.assertEqual(headers, expected_headers)
+        exported = dict(zip(headers, values, strict=True))
+        self.assertEqual(exported["rid"], device.rid)
+        self.assertEqual(exported["owner_name"], self.user.username)
+        self.assertEqual(exported["version"], "DEVICE-EXPORT-VERSION-CANARY")
+        self.assertEqual(exported["os"], "DEVICE-EXPORT-OS-CANARY")
+        self.assertIs(exported["enabled"], True)
+        self.assertEqual(response.headers.get("Cache-Control"), "no-store, private")
+        self.assertEqual(response.headers.get("Pragma"), "no-cache")
+        self.assertEqual(response.headers.get("X-Camellia-Export-Schema"), "device-inventory-v1")
+        self.assertEqual(response.headers.get("Content-Disposition"), 'attachment; filename="DeviceInfo-v1.xlsx"')
+
+        log_output = "\n".join(export_logs.output)
+        export_payload = next(
+            payload
+            for payload in (json.loads(record.getMessage()) for record in export_logs.records)
+            if payload.get("event") == "front_export_xlsx"
+        )
+        self.assertEqual(export_payload["attributes"]["schema"], "device-inventory-v1")
+        self.assertEqual(export_payload["attributes"]["count"], 1)
+        for canary in (credential_canary, uuid_canary, public_key_hash_canary):
+            with self.subTest(log_canary=canary):
+                self.assertNotIn(canary, log_output)
+
     def test_expired_authentication_state_cleanup_is_dry_run_safe_and_idempotent(self):
+        recording_root = self.enterContext(tempfile.TemporaryDirectory())
+        self.enterContext(
+            override_settings(
+                RECORD_UPLOAD_ROOT=Path(recording_root),
+                RECORD_UPLOAD_REQUIRE_MOUNT=False,
+                RECORD_UPLOAD_VOLUME_RESERVE_BYTES=0,
+                RECORD_UPLOAD_VOLUME_RESERVE_INODES=0,
+                RECORD_UPLOAD_CAPABILITY_CACHE_SECONDS=0,
+            )
+        )
         now = timezone.now()
         old = now - datetime.timedelta(days=60)
         device = self._device(owner=self.user)
         token = RemoteToken.objects.create(
             device=device,
+            subject_user=self.user,
             access_token="a" * 64,
             expires_at=now - datetime.timedelta(minutes=1),
         )
         attempt = LoginAttempt.objects.create(ip="192.0.2.1", username="alice")
         LoginAttempt.objects.filter(pk=attempt.pk).update(
             created_at=now - datetime.timedelta(hours=1),
+        )
+        admission_lock = LoginAdmissionLock.objects.create(ip="192.0.2.1")
+        LoginAdmissionLock.objects.filter(pk=admission_lock.pk).update(
+            updated_at=now - datetime.timedelta(hours=1),
         )
         oidc = OidcPendingAuth.objects.create(
             state="expired-state",
@@ -683,23 +959,44 @@ class ApiContractTests(ApiTestMixin, TestCase):
             used_by=self.user,
         )
         ShareLink.objects.filter(pk=retained_share.pk).update(create_time=old)
+        rate_bucket = RequestRateBucket.objects.create(
+            key_hash="e" * 64,
+            scope="source",
+            group="read",
+            window_seconds=60,
+            used=1,
+            expires_at=now - datetime.timedelta(seconds=1),
+        )
+        rate_lease = RequestRateLease.objects.create(
+            request_id="f" * 32,
+            key_hash="f" * 64,
+            scope="source",
+            group="read",
+            expires_at=now - datetime.timedelta(seconds=1),
+        )
 
         output = StringIO()
         call_command("purge_expired_state", "--dry-run", stdout=output)
         self.assertTrue(RemoteToken.objects.filter(pk=token.pk).exists())
         self.assertTrue(LoginAttempt.objects.filter(pk=attempt.pk).exists())
+        self.assertTrue(LoginAdmissionLock.objects.filter(pk=admission_lock.pk).exists())
         self.assertTrue(OidcPendingAuth.objects.filter(pk=oidc.pk).exists())
         self.assertFalse(ShareLink.objects.get(pk=recent_expired_share.pk).is_expired)
         self.assertTrue(ShareLink.objects.filter(pk=retained_share.pk).exists())
+        self.assertTrue(RequestRateBucket.objects.filter(pk=rate_bucket.pk).exists())
+        self.assertTrue(RequestRateLease.objects.filter(pk=rate_lease.pk).exists())
         self.assertTrue(json.loads(output.getvalue())["dry_run"])
 
         call_command("purge_expired_state", stdout=StringIO())
         self.assertFalse(RemoteToken.objects.filter(pk=token.pk).exists())
         self.assertFalse(LoginAttempt.objects.filter(pk=attempt.pk).exists())
+        self.assertFalse(LoginAdmissionLock.objects.filter(pk=admission_lock.pk).exists())
         self.assertFalse(OidcPendingAuth.objects.filter(pk=oidc.pk).exists())
         recent_expired_share.refresh_from_db()
         self.assertTrue(recent_expired_share.is_expired)
         self.assertFalse(ShareLink.objects.filter(pk=retained_share.pk).exists())
+        self.assertFalse(RequestRateBucket.objects.filter(pk=rate_bucket.pk).exists())
+        self.assertFalse(RequestRateLease.objects.filter(pk=rate_lease.pk).exists())
 
         second = StringIO()
         call_command("purge_expired_state", stdout=second)
@@ -708,10 +1005,27 @@ class ApiContractTests(ApiTestMixin, TestCase):
             {key: value for key, value in result.items() if key != "dry_run"},
             {
                 "expired_access_tokens": 0,
+                "expired_device_proof_challenges": 0,
+                "expired_device_recovery_approvals": 0,
                 "expired_oidc_sessions": 0,
                 "expired_share_links_marked": 0,
                 "login_attempts": 0,
+                "login_admission_locks": 0,
                 "retained_share_links": 0,
+                "request_rate_buckets": 0,
+                "request_rate_leases": 0,
+                "expired_management_batch_operations": 0,
+                "management_batch_operations_purged": 0,
+                "management_batch_operations_remaining": 0,
+                "recording_active_expired": 0,
+                "recording_finalized_purged": 0,
+                "recording_aborted_purged": 0,
+                "recording_orphans_quarantined": 0,
+                "recording_quarantine_purged": 0,
+                "audit_connections_purged": 0,
+                "audit_connections_expired": 0,
+                "legacy_file_audits_purged": 0,
+                "legacy_alarm_audits_purged": 0,
             },
         )
 
@@ -753,7 +1067,12 @@ class ApiContractTests(ApiTestMixin, TestCase):
             ["ops"],
         )
 
-        disabled = self._post_json(f"/api/users/{user_guid}/disable", {}, token=admin_token)
+        disabled = self._post_json(
+            f"/api/users/{user_guid}/disable",
+            {},
+            token=admin_token,
+            expected_generation=0,
+        )
         self.assertEqual(disabled.status_code, 200, disabled.content)
         denied = self._post_json(
             "/api/login",
@@ -768,7 +1087,12 @@ class ApiContractTests(ApiTestMixin, TestCase):
         # the login endpoint does not become an account-status oracle.
         self.assertEqual(denied.status_code, 401)
 
-        enabled = self._post_json(f"/api/users/{user_guid}/enable", {}, token=admin_token)
+        enabled = self._post_json(
+            f"/api/users/{user_guid}/enable",
+            {},
+            token=admin_token,
+            expected_generation=1,
+        )
         self.assertEqual(enabled.status_code, 200, enabled.content)
         self.assertTrue(enabled.json()["status"])
 
@@ -921,6 +1245,7 @@ class ApiContractTests(ApiTestMixin, TestCase):
             f"/api/device-groups/{group_guid}",
             ["123456789"],
             token=admin_token,
+            expected_generation=0,
         )
         self.assertEqual(assigned_devices.status_code, 200, assigned_devices.content)
         self.assertEqual(assigned_devices.json()["updated"], 1)
@@ -931,7 +1256,15 @@ class ApiContractTests(ApiTestMixin, TestCase):
         )
         assigned_strategy = self._post_json(
             "/api/strategies/assign",
-            {"strategy": str(strategy.guid), "groups": [group_guid]},
+            {
+                "strategy": str(strategy.guid),
+                "groups": [group_guid],
+                "expected_generations": {
+                    "devices": {},
+                    "users": {},
+                    "groups": {group_guid: 1},
+                },
+            },
             token=admin_token,
         )
         self.assertEqual(assigned_strategy.status_code, 200, assigned_strategy.content)
@@ -943,12 +1276,26 @@ class ApiContractTests(ApiTestMixin, TestCase):
             token=device_token,
         )
         self.assertEqual(heartbeat.status_code, 200, heartbeat.content)
-        self.assertEqual(heartbeat.json()["strategy"]["config_options"]["quality"], "best")
+        initial_policy = heartbeat.json()["managed_policy"]
+        self.assertEqual(initial_policy["version"], 1)
+        self.assertEqual(initial_policy["id"], "123456789")
+        self.assertEqual(initial_policy["uuid"], DEFAULT_DEVICE_UUID)
+        self.assertEqual(initial_policy["config_options"]["quality"], "best")
+        canonical = json.dumps(
+            initial_policy["config_options"],
+            sort_keys=True,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode()
+        self.assertEqual(initial_policy["digest"], hashlib.sha256(canonical).hexdigest())
+        self.assertNotIn("strategy", heartbeat.json())
+        self.assertNotIn("modified_at", heartbeat.json())
 
         disabled = self._put_json(
             f"/api/strategies/{strategy.guid}/status",
             {"enabled": False},
             token=admin_token,
+            expected_generation=0,
         )
         self.assertEqual(disabled.status_code, 200, disabled.content)
         self.assertFalse(disabled.json()["enabled"])
@@ -959,7 +1306,9 @@ class ApiContractTests(ApiTestMixin, TestCase):
             token=device_token,
         )
         self.assertEqual(heartbeat.status_code, 200, heartbeat.content)
-        self.assertNotIn("strategy", heartbeat.json())
+        tombstone = heartbeat.json()["managed_policy"]
+        self.assertGreater(tombstone["generation"], initial_policy["generation"])
+        self.assertEqual(tombstone["config_options"], {})
 
     def test_strategy_precedence_and_device_policy_is_admin_only(self):
         admin_token = self._login(
@@ -1002,7 +1351,7 @@ class ApiContractTests(ApiTestMixin, TestCase):
             token=device_token,
         )
         self.assertEqual(
-            heartbeat.json()["strategy"]["config_options"]["source"],
+            heartbeat.json()["managed_policy"]["config_options"]["source"],
             "device",
         )
 
@@ -1010,6 +1359,7 @@ class ApiContractTests(ApiTestMixin, TestCase):
             f"/api/devices/{device.pk}/assign",
             {"type": "strategy_name", "value": ""},
             token=admin_token,
+            expected_generation=0,
         )
         self.assertEqual(cleared.status_code, 200, cleared.content)
         heartbeat = self._post_json(
@@ -1022,7 +1372,7 @@ class ApiContractTests(ApiTestMixin, TestCase):
             token=device_token,
         )
         self.assertEqual(
-            heartbeat.json()["strategy"]["config_options"]["source"],
+            heartbeat.json()["managed_policy"]["config_options"]["source"],
             "group",
         )
 
@@ -1038,7 +1388,7 @@ class ApiContractTests(ApiTestMixin, TestCase):
             token=device_token,
         )
         self.assertEqual(
-            heartbeat.json()["strategy"]["config_options"]["source"],
+            heartbeat.json()["managed_policy"]["config_options"]["source"],
             "user",
         )
 
@@ -1057,7 +1407,7 @@ class ApiContractTests(ApiTestMixin, TestCase):
         self.assertIsNone(device.strategy_id)
         self.assertEqual(device.device_group_id, group.id)
 
-    def test_heartbeat_fails_closed_for_corrupt_strategy_data(self):
+    def test_heartbeat_rejects_corrupt_strategy_writes_and_fails_closed_on_read_errors(self):
         device = self._device(owner=self.user)
         device_token = self._login("alice", "alice-pass")
         strategy = StrategyProfile.objects.create(
@@ -1066,18 +1416,33 @@ class ApiContractTests(ApiTestMixin, TestCase):
         )
         device.strategy = strategy
         device.save(update_fields=["strategy"])
-        StrategyProfile.objects.filter(pk=strategy.pk).update(
-            config_options={"unexpected": ["non-string-value"]},
-        )
+        with self.assertRaises(ValidationError):
+            StrategyProfile.objects.filter(pk=strategy.pk).update(
+                config_options={"unexpected": ["non-string-value"]},
+            )
+        strategy.refresh_from_db()
+        self.assertEqual(strategy.config_options, {"source": "valid"})
 
-        heartbeat = self._post_json(
-            "/api/heartbeat",
-            {"id": device.rid, "uuid": device.uuid, "modified_at": 0},
-            token=device_token,
-        )
+        with patch(
+            "api.policy_generation.normalize_policy_options",
+            side_effect=InvalidManagedPolicy("injected read failure"),
+        ):
+            heartbeat = self._post_json(
+                "/api/heartbeat",
+                {"id": device.rid, "uuid": device.uuid, "modified_at": 0},
+                token=device_token,
+            )
 
         self.assertEqual(heartbeat.status_code, 503, heartbeat.content)
-        self.assertEqual(heartbeat.json(), {"error": "Invalid strategy configuration"})
+        self.assertEqual(
+            heartbeat.json(),
+            {
+                "response_schema_version": 1,
+                "code": "invalid_strategy_configuration",
+                "message": "Invalid strategy configuration",
+                "retryable": True,
+            },
+        )
 
     def test_disabled_devices_are_blocked_by_login_and_heartbeat(self):
         device = self._device(owner=self.user)
@@ -1101,27 +1466,37 @@ class ApiContractTests(ApiTestMixin, TestCase):
             {"id": "123456789", "uuid": DEFAULT_DEVICE_UUID},
             token=token,
         )
-        self.assertEqual(heartbeat.status_code, 403)
+        # Disabling the device invalidates its bearer before endpoint-specific
+        # authorization and does not disclose device state to the old token.
+        self.assertEqual(heartbeat.status_code, 401)
 
     @override_settings(DEVICE_VERIFICATION_TOKEN="v" * 48)
     def test_device_deployment_is_bound_to_uuid_key_and_active_owner(self):
         managed_uuid = base64.b64encode(b"managed-device").decode()
         token = self._login("alice", "alice-pass", uuid=managed_uuid)
-        public_key = base64.b64encode(bytes(range(32))).decode()
+        signing_key = SigningKey.generate()
+        public_key = base64.b64encode(bytes(signing_key.verify_key)).decode()
+        proof = self._device_proof("deploy", signing_key, "123456789", managed_uuid, token=token)
         deployed = self._post_json(
             "/api/devices/deploy",
-            {"id": "123456789", "uuid": managed_uuid, "pk": public_key},
+            {
+                "id": "123456789",
+                "uuid": managed_uuid,
+                "pk": public_key,
+                "device_proof": proof,
+            },
             token=token,
         )
         self.assertEqual(deployed.status_code, 200, deployed.content)
         device = RemoteDevice.objects.get(rid="123456789")
         self.assertEqual(device.uuid, managed_uuid)
-        self.assertEqual(device.public_key_hash, hashlib.sha256(bytes(range(32))).hexdigest())
+        self.assertEqual(device.public_key_hash, hashlib.sha256(bytes(signing_key.verify_key)).hexdigest())
 
         payload = {
             "id": device.rid,
             "uuid": device.uuid,
             "public_key_hash": device.public_key_hash,
+            "request_nonce": base64.b64encode(b"v" * 32).decode("ascii"),
         }
         self.assertEqual(self._post_json("/api/devices/verify-deployment", payload).status_code, 401)
         verified = self._post_json(
@@ -1129,7 +1504,8 @@ class ApiContractTests(ApiTestMixin, TestCase):
             payload,
             token="v" * 48,
         )
-        self.assertEqual(verified.status_code, 204, verified.content)
+        self.assertEqual(verified.status_code, 200, verified.content)
+        self.assertEqual(verified.json()["deployment_generation"], 1)
 
         payload["public_key_hash"] = "0" * 64
         denied = self._post_json(
@@ -1145,7 +1521,12 @@ class ApiContractTests(ApiTestMixin, TestCase):
             rid="900000001",
             uuid=device_uuid("admin-device"),
         )
-        disabled = self._post_json(f"/api/devices/{device.pk}/disable", {}, token=admin_token)
+        disabled = self._post_json(
+            f"/api/devices/{device.pk}/disable",
+            {},
+            token=admin_token,
+            expected_generation=0,
+        )
         self.assertEqual(disabled.status_code, 200, disabled.content)
         payload["public_key_hash"] = device.public_key_hash
         revoked = self._post_json(
@@ -1160,7 +1541,8 @@ class ApiContractTests(ApiTestMixin, TestCase):
     def test_device_deployment_rejects_noncanonical_identity_and_id_takeover(self):
         first_uuid = base64.b64encode(b"first-device").decode()
         token = self._login("alice", "alice-pass", uuid=first_uuid)
-        public_key = base64.b64encode(bytes(range(32))).decode()
+        signing_key = SigningKey.generate()
+        public_key = base64.b64encode(bytes(signing_key.verify_key)).decode()
         malformed = self._post_json(
             "/api/devices/deploy",
             {"id": "123456789", "uuid": "not-base64", "pk": public_key},
@@ -1170,7 +1552,18 @@ class ApiContractTests(ApiTestMixin, TestCase):
 
         first = self._post_json(
             "/api/devices/deploy",
-            {"id": "123456789", "uuid": first_uuid, "pk": public_key},
+            {
+                "id": "123456789",
+                "uuid": first_uuid,
+                "pk": public_key,
+                "device_proof": self._device_proof(
+                    "deploy",
+                    signing_key,
+                    "123456789",
+                    first_uuid,
+                    token=token,
+                ),
+            },
             token=token,
         )
         self.assertEqual(first.status_code, 200, first.content)
@@ -1229,20 +1622,6 @@ class ApiContractTests(ApiTestMixin, TestCase):
         self.assertEqual(response.status_code, 401, response.content)
         self.assertFalse(RemoteToken.objects.filter(device__owner=self.user).exists())
 
-    def test_plugin_sign_requires_configured_signing_key(self):
-        admin_token = self._login(
-            "admin",
-            "admin-pass",
-            rid="900000001",
-            uuid=device_uuid("admin-device"),
-        )
-        response = self._post_json(
-            "/lic/web/api/plugin-sign",
-            {"msg": [1, 2, 3], "plugin_id": "sample", "version": "1.0.0"},
-            token=admin_token,
-        )
-        self.assertEqual(response.status_code, 503)
-
     @override_settings(ALLOW_REGISTRATION=True)
     def test_first_public_registration_never_bootstraps_an_administrator(self):
         UserProfile.objects.all().delete()
@@ -1269,28 +1648,34 @@ class ApiContractTests(ApiTestMixin, TestCase):
             },
         )
         self.assertEqual(mismatch.status_code, 400, mismatch.content)
-        self.assertEqual(mismatch.json()["code"], 0)
+        self.assertEqual(mismatch.json()["code"], "http_400_api_user_action")
+        self.assertFalse(mismatch.json()["retryable"])
+        self.assertNotIn("error", mismatch.json())
         self.assertFalse(UserProfile.objects.filter(username="second-user").exists())
 
-    @override_settings(PLUGIN_SIGNING_KEY=SigningKey.generate().encode().hex())
-    def test_plugin_sign_is_an_admin_only_operation(self):
-        user_token = self._login("alice", "alice-pass")
+    @override_settings(PLUGIN_SIGNING_KEY="00" * 32)
+    def test_plugin_raw_signing_oracle_is_not_routed(self):
         admin_token = self._login(
             "admin",
             "admin-pass",
             rid="900000001",
             uuid=device_uuid("admin-device"),
         )
-        payload = {"msg": [1, 2, 3], "plugin_id": "sample", "version": "1.0.0"}
-
-        self.assertEqual(self._post_json("/lic/web/api/plugin-sign", payload).status_code, 401)
-        self.assertEqual(
-            self._post_json("/lic/web/api/plugin-sign", payload, token=user_token).status_code,
-            403,
+        payloads = (
+            {"msg": []},
+            {"msg": [True, False, 255]},
+            {"msg": [9, 8, 7], "plugin_id": "alpha", "version": "1.0.0"},
+            {"msg": [9, 8, 7], "plugin_id": "beta", "version": "2.0.0"},
         )
-        signed = self._post_json("/lic/web/api/plugin-sign", payload, token=admin_token)
-        self.assertEqual(signed.status_code, 200, signed.content)
-        self.assertEqual(len(signed.json()["signed_msg"]), 67)
+
+        for payload in payloads:
+            with self.subTest(payload=payload):
+                response = self._post_json(
+                    "/lic/web/api/plugin-sign",
+                    payload,
+                    token=admin_token,
+                )
+                self.assertEqual(response.status_code, 404, response.content)
 
     def test_device_group_delete_detaches_devices(self):
         admin_token = self._login(
@@ -1302,7 +1687,11 @@ class ApiContractTests(ApiTestMixin, TestCase):
         group = DeviceGroup.objects.create(name="ops")
         device = self._device(owner=self.user, device_group=group)
 
-        response = self._delete_json(f"/api/device-groups/{group.guid}", token=admin_token)
+        response = self._delete_json(
+            f"/api/device-groups/{group.guid}",
+            token=admin_token,
+            expected_generation=0,
+        )
         self.assertEqual(response.status_code, 200, response.content)
         device.refresh_from_db()
         self.assertIsNone(device.device_group_id)
@@ -1387,6 +1776,125 @@ class ApiContractTests(ApiTestMixin, TestCase):
             "staticfiles": {"BACKEND": "django.contrib.staticfiles.storage.StaticFilesStorage"},
         }
     )
+    def test_front_device_pages_do_not_expose_another_owners_inventory_by_rid(self):
+        self._device(
+            owner=self.user,
+            rid="765432100",
+            uuid=device_uuid("alice-owned-device"),
+            cpu="ALICE-CPU-CANARY",
+            hostname="ALICE-HOST-CANARY",
+            memory="ALICE-MEMORY-CANARY",
+            version="ALICE-VERSION-CANARY",
+            ip_address="192.0.2.10",
+        )
+        bob = UserProfile.objects.create_user(username="bob-inventory-owner", password="bob-pass")
+        bob_device = self._device(
+            owner=bob,
+            rid="765432199",
+            uuid=device_uuid("bob-owned-device"),
+            cpu="BOB-CPU-INVENTORY-CANARY",
+            hostname="BOB-HOST-INVENTORY-CANARY",
+            memory="BOB-MEMORY-INVENTORY-CANARY",
+            os="BOB-OS-INVENTORY-CANARY",
+            username="BOB-USER-INVENTORY-CANARY",
+            version="BOB-VERSION-INVENTORY-CANARY",
+            ip_address="203.0.113.77",
+        )
+        bob_update_time = datetime.datetime(2037, 2, 3, 4, 5, tzinfo=datetime.UTC)
+        RemoteDevice.objects.filter(pk=bob_device.pk).update(update_time=bob_update_time)
+        bob_device.refresh_from_db()
+
+        personal_profile = self._personal_profile(self.user)
+        RemotePeer.objects.create(
+            profile=personal_profile,
+            rid=bob_device.rid,
+            username="ALICE-SAVED-USER",
+            hostname="ALICE-SAVED-HOST",
+            alias="Alice saved Bob",
+            note="Alice private note",
+            platform="ALICE-SAVED-PLATFORM",
+        )
+
+        self.client.force_login(self.user)
+        with self.assertLogs("api.views_front", level="INFO") as alice_logs:
+            alice_work = self.client.get("/api/work")
+            alice_home = self.client.get("/api/home")
+        self.client.force_login(bob)
+        bob_work = self.client.get("/api/work")
+        self.client.force_login(self.admin)
+        admin_work = self.client.get("/api/work?show_type=admin")
+
+        for response in (alice_work, alice_home, bob_work, admin_work):
+            self.assertEqual(response.status_code, 200, response.content)
+
+        bob_owned_item = {item["rid"]: item for item in bob_work.context["page_obj"]}[bob_device.rid]
+        self.assertEqual(bob_owned_item["cpu"], "BOB-CPU-INVENTORY-CANARY")
+        self.assertEqual(bob_owned_item["hostname"], "BOB-HOST-INVENTORY-CANARY")
+        admin_item = {item["rid"]: item for item in admin_work.context["page_obj"]}[bob_device.rid]
+        self.assertEqual(admin_item["cpu"], "BOB-CPU-INVENTORY-CANARY")
+        self.assertEqual(admin_item["ip_address"], "203.0.113.77")
+
+        alice_items = {item["rid"]: item for item in alice_work.context["page_obj"]}
+        self.assertEqual(set(alice_items), {"765432100", bob_device.rid})
+        self.assertEqual(alice_items["765432100"]["cpu"], "ALICE-CPU-CANARY")
+        address_book_item = alice_items[bob_device.rid]
+        self.assertEqual(address_book_item["alias"], "Alice saved Bob")
+        self.assertEqual(address_book_item["note"], "Alice private note")
+        self.assertEqual(address_book_item["platform"], "ALICE-SAVED-PLATFORM")
+        self.assertEqual(address_book_item["username"], "ALICE-SAVED-USER")
+        self.assertEqual(address_book_item["hostname"], "ALICE-SAVED-HOST")
+        self.assertEqual(address_book_item["status"], "未知状态")
+        for field in ("version", "os", "cpu", "memory", "ip_address", "create_time", "update_time"):
+            with self.subTest(field=field):
+                self.assertEqual(address_book_item[field], "")
+
+        inventory_canaries = (
+            "BOB-CPU-INVENTORY-CANARY",
+            "BOB-HOST-INVENTORY-CANARY",
+            "BOB-MEMORY-INVENTORY-CANARY",
+            "BOB-OS-INVENTORY-CANARY",
+            "BOB-USER-INVENTORY-CANARY",
+            "BOB-VERSION-INVENTORY-CANARY",
+            "203.0.113.77",
+            "2037-02-03 04:05",
+        )
+        for response in (alice_work, alice_home):
+            for canary in inventory_canaries:
+                with self.subTest(path=response.request["PATH_INFO"], canary=canary):
+                    self.assertNotContains(response, canary)
+        alice_log_output = "\n".join(alice_logs.output)
+        for canary in inventory_canaries:
+            with self.subTest(channel="log", canary=canary):
+                self.assertNotIn(canary, alice_log_output)
+        self.assertContains(alice_work, "Alice saved Bob")
+        self.assertContains(alice_work, "Alice private note")
+        self.assertContains(alice_work, "ALICE-SAVED-PLATFORM")
+        self.assertContains(alice_work, "未知状态")
+        self.assertContains(bob_work, "BOB-CPU-INVENTORY-CANARY")
+        self.assertContains(admin_work, "BOB-CPU-INVENTORY-CANARY")
+
+        bob_device.owner = self.user
+        bob_device.save(update_fields=("owner",))
+        self.client.force_login(self.user)
+        transferred_work = self.client.get("/api/work")
+        self.assertContains(transferred_work, "BOB-CPU-INVENTORY-CANARY")
+        transferred_item = {item["rid"]: item for item in transferred_work.context["page_obj"]}[bob_device.rid]
+        self.assertEqual(transferred_item["status"], "在线")
+
+        bob_device.owner = bob
+        bob_device.save(update_fields=("owner",))
+        revoked_work = self.client.get("/api/work")
+        self.assertNotContains(revoked_work, "BOB-CPU-INVENTORY-CANARY")
+        revoked_item = {item["rid"]: item for item in revoked_work.context["page_obj"]}[bob_device.rid]
+        self.assertEqual(revoked_item["cpu"], "")
+        self.assertEqual(revoked_item["status"], "未知状态")
+
+    @override_settings(
+        STORAGES={
+            "default": {"BACKEND": "django.core.files.storage.FileSystemStorage"},
+            "staticfiles": {"BACKEND": "django.contrib.staticfiles.storage.StaticFilesStorage"},
+        }
+    )
     def test_share_link_is_hashed_preview_only_and_single_use(self):
         profile = self._personal_profile(self.user)
         peer = RemotePeer.objects.create(
@@ -1404,6 +1912,7 @@ class ApiContractTests(ApiTestMixin, TestCase):
         created = self.client.post(
             "/api/share",
             {"data": json.dumps([{"value": str(peer.pk), "title": "ignored"}])},
+            HTTP_IDEMPOTENCY_KEY=str(uuid.uuid4()),
         )
         self.assertEqual(created.status_code, 200, created.content)
         raw_token = created.json()["token"]
@@ -1428,7 +1937,10 @@ class ApiContractTests(ApiTestMixin, TestCase):
             ).exists()
         )
 
-        accepted = self.client.post(f"/api/share/{raw_token}")
+        accepted = self.client.post(
+            f"/api/share/{raw_token}",
+            {"idempotency_key": str(uuid.uuid4())},
+        )
         self.assertEqual(accepted.status_code, 200, accepted.content)
         link.refresh_from_db()
         self.assertTrue(link.is_used)
@@ -1442,7 +1954,10 @@ class ApiContractTests(ApiTestMixin, TestCase):
         self.assertEqual(imported_tag.tag_name, "studio")
         self.assertEqual(imported_tag.profile.owner, recipient)
 
-        replay = self.client.post(f"/api/share/{raw_token}")
+        replay = self.client.post(
+            f"/api/share/{raw_token}",
+            {"idempotency_key": str(uuid.uuid4())},
+        )
         self.assertEqual(replay.status_code, 404)
 
 
@@ -1547,15 +2062,23 @@ class SessionIntegrityTests(ApiTestMixin, TestCase):
         )
         self.assertEqual(locked.status_code, 429)
 
-    def test_out_of_range_pagination_is_clamped(self):
+    def test_nonpositive_pagination_is_rejected(self):
         token = self._login("alice", "alice-pass")
-        for query in ("current=0", "current=-5", "pageSize=-1", "current=0&pageSize=0"):
+        cases = (
+            ("current=0", "current"),
+            ("current=-5", "current"),
+            ("pageSize=-1", "pageSize"),
+            ("current=0&pageSize=0", "current"),
+        )
+        for query, field in cases:
             response = self._post_json(
                 f"/api/ab/peers?{query}",
                 {},
                 token=token,
             )
-            self.assertEqual(response.status_code, 200, f"{query}: {response.content}")
+            self.assertEqual(response.status_code, 400, f"{query}: {response.content}")
+            self.assertEqual(response.json()["code"], "invalid_pagination")
+            self.assertEqual(response.json()["field"], field)
 
 
 class SensitiveIngestionTests(ApiTestMixin, TestCase):
@@ -1564,55 +2087,81 @@ class SensitiveIngestionTests(ApiTestMixin, TestCase):
             f"/api/record?{query}",
             data=body,
             content_type="application/octet-stream",
+            CONTENT_LENGTH=str(len(body)),
             **self._auth_headers(token),
         )
 
     def test_record_upload_is_authenticated_sequential_and_device_isolated(self):
         self._device(owner=self.user)
         token = self._login("alice", "alice-pass")
+        create_id = "11111111-1111-4111-8111-111111111111"
         with tempfile.TemporaryDirectory() as upload_root:
             with self.settings(
                 RECORD_UPLOAD_ROOT=Path(upload_root),
                 RECORD_UPLOAD_MAX_CHUNK_BYTES=1024,
                 RECORD_UPLOAD_MAX_FILE_BYTES=2048,
                 DATA_UPLOAD_MAX_MEMORY_SIZE=1024,
+                RECORD_UPLOAD_VOLUME_RESERVE_BYTES=0,
+                RECORD_UPLOAD_VOLUME_RESERVE_INODES=0,
             ):
                 self.assertEqual(
-                    self._raw_record("type=new&file=session.webm", b"").status_code,
+                    self._raw_record(
+                        f"version=2&type=new&file=session.webm&create_id={create_id}",
+                        b"",
+                    ).status_code,
                     401,
                 )
-                created = self._raw_record("type=new&file=session.webm", b"", token)
-                self.assertEqual(created.status_code, 200, created.content)
-                traversal = self._raw_record("type=new&file=../session.webm", b"", token)
+                created = self._raw_record(
+                    f"version=2&type=new&file=session.webm&create_id={create_id}",
+                    b"",
+                    token,
+                )
+                self.assertEqual(created.status_code, 201, created.content)
+                state = created.json()
+                traversal = self._raw_record(
+                    "version=2&type=new&file=../session.webm&create_id=22222222-2222-4222-8222-222222222222",
+                    b"",
+                    token,
+                )
                 self.assertEqual(traversal.status_code, 400)
 
                 from api.views_api import _record_file_lock
 
-                recording = next(Path(upload_root).glob("*/session.webm"))
-                with _record_file_lock(recording.parent, "session.webm"):
+                staging = next(Path(upload_root).glob("*/.uploads/*.part"))
+                base_dir = staging.parent.parent
+                with _record_file_lock(base_dir):
                     busy = self._raw_record(
-                        "type=part&file=session.webm&offset=0&length=4",
+                        "version=2&type=part"
+                        f"&upload_id={state['upload_id']}&offset=0&revision=0&length=4"
+                        f"&digest={hashlib.sha256(b'data').hexdigest()}"
+                        "&chunk_id=33333333-3333-4333-8333-333333333333",
                         b"data",
                         token,
                     )
                 self.assertEqual(busy.status_code, 423)
 
                 first = self._raw_record(
-                    "type=part&file=session.webm&offset=0&length=4",
+                    "version=2&type=part"
+                    f"&upload_id={state['upload_id']}&offset=0&revision=0&length=4"
+                    f"&digest={hashlib.sha256(b'data').hexdigest()}"
+                    "&chunk_id=33333333-3333-4333-8333-333333333333",
                     b"data",
                     token,
                 )
                 self.assertEqual(first.status_code, 200, first.content)
                 conflict = self._raw_record(
-                    "type=part&file=session.webm&offset=0&length=4",
+                    "version=2&type=part"
+                    f"&upload_id={state['upload_id']}&offset=0&revision=0&length=4"
+                    f"&digest={hashlib.sha256(b'evil').hexdigest()}"
+                    "&chunk_id=33333333-3333-4333-8333-333333333333",
                     b"evil",
                     token,
                 )
                 self.assertEqual(conflict.status_code, 409)
 
-                files = list(Path(upload_root).glob("*/session.webm"))
-                self.assertEqual(len(files), 1)
-                self.assertEqual(files[0].read_bytes(), b"data")
+                self.assertNotIn(b"data", staging.read_bytes())
+                self.assertGreater(staging.stat().st_size, len(b"data"))
+                self.assertEqual(list(Path(upload_root).glob("*/session.webm")), [])
 
     def test_audit_ingestion_and_notes_are_scoped_to_authenticated_participants(self):
         host_uuid = device_uuid("host-device")
@@ -1643,6 +2192,8 @@ class SensitiveIngestionTests(ApiTestMixin, TestCase):
             uuid=outsider_uuid,
         )
         new_event = {
+            "version": 3,
+            "event_id": str(uuid.uuid4()),
             "action": "new",
             "id": "111111111",
             "uuid": host_uuid,
@@ -1654,13 +2205,17 @@ class SensitiveIngestionTests(ApiTestMixin, TestCase):
 
         self.assertEqual(self._post_json("/api/audit/conn", new_event).status_code, 401)
         created = self._post_json("/api/audit/conn", new_event, token=host_token)
-        self.assertEqual(created.status_code, 200, created.content)
+        self.assertEqual(created.status_code, 201, created.content)
+        audit_session_id = created.json()["audit_session_id"]
         replayed = self._post_json("/api/audit/conn", new_event, token=host_token)
         self.assertEqual(replayed.status_code, 200, replayed.content)
         self.assertEqual(ConnLog.objects.count(), 1)
         updated = self._post_json(
             "/api/audit/conn",
             {
+                "version": 3,
+                "event_id": str(uuid.uuid4()),
+                "audit_session_id": audit_session_id,
                 "id": "111111111",
                 "uuid": host_uuid,
                 "conn_id": 7,
@@ -1679,11 +2234,11 @@ class SensitiveIngestionTests(ApiTestMixin, TestCase):
         self.assertEqual(connection_log.two_factor, 1)
 
         active = self.client.get(
-            "/api/audit/conn/active?id=111111111&session_id=99&conn_type=0",
+            f"/api/audit/conn/active?version=3&event_id={uuid.uuid4()}&id=111111111&session_id=99&conn_type=0",
             **self._auth_headers(controller_token),
         )
         self.assertEqual(active.status_code, 200, active.content)
-        guid = active.json()
+        guid = active.json()["audit_session_id"]
         self.assertTrue(guid)
         connection_log.refresh_from_db()
         self.assertEqual(str(connection_log.guid), guid)
@@ -1691,19 +2246,34 @@ class SensitiveIngestionTests(ApiTestMixin, TestCase):
 
         direct_note = self._post_json(
             "/api/audit/conn",
-            {"id": "111111111", "session_id": 99, "note": "during session"},
+            {
+                "version": 3,
+                "event_id": str(uuid.uuid4()),
+                "audit_session_id": audit_session_id,
+                "note": "during session",
+            },
             token=controller_token,
         )
         self.assertEqual(direct_note.status_code, 200, direct_note.content)
         denied = self._put_json(
             "/api/audit",
-            {"guid": guid, "note": "tampered"},
+            {
+                "version": 3,
+                "event_id": str(uuid.uuid4()),
+                "audit_session_id": audit_session_id,
+                "note": "tampered",
+            },
             token=outsider_token,
         )
         self.assertEqual(denied.status_code, 404)
         allowed = self._put_json(
             "/api/audit",
-            {"guid": guid, "note": "approved"},
+            {
+                "version": 3,
+                "event_id": str(uuid.uuid4()),
+                "audit_session_id": audit_session_id,
+                "note": "approved",
+            },
             token=controller_token,
         )
         self.assertEqual(allowed.status_code, 200, allowed.content)
@@ -1711,6 +2281,9 @@ class SensitiveIngestionTests(ApiTestMixin, TestCase):
         self.assertEqual(connection_log.note, "approved")
 
         close_event = {
+            "version": 3,
+            "event_id": str(uuid.uuid4()),
+            "audit_session_id": audit_session_id,
             "action": "close",
             "id": "111111111",
             "uuid": host_uuid,
@@ -1728,33 +2301,65 @@ class SensitiveIngestionTests(ApiTestMixin, TestCase):
 
         restarted_process_event = {
             **new_event,
+            "event_id": str(uuid.uuid4()),
             "session_id": 100,
         }
-        self.assertEqual(
-            self._post_json(
-                "/api/audit/conn",
-                restarted_process_event,
-                token=host_token,
-            ).status_code,
-            200,
+        restarted = self._post_json(
+            "/api/audit/conn",
+            restarted_process_event,
+            token=host_token,
         )
+        self.assertEqual(restarted.status_code, 201, restarted.content)
+        restarted_audit_session_id = restarted.json()["audit_session_id"]
+        restarted_update = self._post_json(
+            "/api/audit/conn",
+            {
+                "version": 3,
+                "event_id": str(uuid.uuid4()),
+                "audit_session_id": restarted_audit_session_id,
+                "action": "update",
+                "id": "111111111",
+                "uuid": host_uuid,
+                "conn_id": 7,
+                "session_id": 100,
+                "peer": ["222222222", "bob"],
+                "type": 0,
+                "primary_auth": 3,
+                "two_factor": 1,
+            },
+            token=host_token,
+        )
+        self.assertEqual(restarted_update.status_code, 200, restarted_update.content)
+        restarted_active = self.client.get(
+            f"/api/audit/conn/active?version=3&event_id={uuid.uuid4()}&id=111111111&session_id=100&conn_type=0",
+            **self._auth_headers(controller_token),
+        )
+        self.assertEqual(restarted_active.status_code, 200, restarted_active.content)
+        self.assertEqual(restarted_active.json()["audit_session_id"], restarted_audit_session_id)
         self.assertEqual(ConnLog.objects.count(), 2)
 
         file_event = {
+            "version": 4,
+            "receipt_version": 1,
+            "event_id": str(uuid.uuid4()),
+            "reporter_sequence": ConnLog.objects.get(guid=restarted_audit_session_id).event_revision + 1,
+            "audit_session_id": restarted_audit_session_id,
+            "transfer_id": str(uuid.uuid4()),
+            "transfer_revision": 1,
+            "state": "started",
             "id": "111111111",
             "uuid": host_uuid,
             "peer_id": "222222222",
             "conn_id": 7,
-            "type": 0,
+            "direction": 0,
             "path": "/documents",
             "is_file": False,
-            "info": json.dumps(
-                {
-                    "ip": "192.0.2.10",
-                    "name": "bob",
-                    "files": [["report.pdf", 4096]],
-                }
-            ),
+            "planned_file_count": 1,
+            "planned_bytes": 4096,
+            "transferred_bytes": 0,
+            "sample_files": [{"path": "report.pdf", "size": 4096}],
+            "source_kind": "file_transfer",
+            "terminal_reason": "",
         }
         self.assertEqual(
             self._post_json("/api/audit/file", file_event, token=host_token).status_code,
@@ -1762,9 +2367,15 @@ class SensitiveIngestionTests(ApiTestMixin, TestCase):
         )
         file_log = FileLog.objects.get()
         self.assertEqual(file_log.filesize, 4096)
-        self.assertEqual(file_log.details["files"], [["report.pdf", 4096]])
+        self.assertEqual(file_log.planned_bytes, 4096)
+        self.assertEqual(file_log.sample_files, [{"path": "report.pdf", "size": 4096}])
 
         alarm_event = {
+            "version": 3,
+            "receipt_version": 1,
+            "event_id": str(uuid.uuid4()),
+            "reporter_sequence": ConnLog.objects.get(guid=restarted_audit_session_id).event_revision + 1,
+            "audit_session_id": restarted_audit_session_id,
             "id": "111111111",
             "uuid": host_uuid,
             "typ": AlarmLog.TYPE_SESSION_SCOPE_VIOLATION,
@@ -1781,6 +2392,65 @@ class SensitiveIngestionTests(ApiTestMixin, TestCase):
 
 
 class OperationalEndpointTests(TestCase):
+    def setUp(self):
+        reset_data_encryption_key_inventory()
+        self.recording_root = tempfile.TemporaryDirectory()
+        self.recording_settings = override_settings(
+            RECORD_UPLOAD_ROOT=Path(self.recording_root.name),
+            RECORD_UPLOAD_REQUIRE_MOUNT=False,
+            RECORD_UPLOAD_VOLUME_RESERVE_BYTES=0,
+            RECORD_UPLOAD_VOLUME_RESERVE_INODES=0,
+            RECORD_UPLOAD_CAPABILITY_CACHE_SECONDS=0,
+        )
+        self.recording_settings.enable()
+
+    def tearDown(self):
+        self.recording_settings.disable()
+        self.recording_root.cleanup()
+
+    @override_settings(
+        DEVICE_VERIFICATION_TOKEN="v" * 48,
+        SECURE_SSL_REDIRECT=False,
+        RECORD_UPLOAD_REQUIRE_MOUNT=False,
+    )
+    def test_readiness_rejects_a_missing_runtime_recording_volume(self):
+        with tempfile.TemporaryDirectory() as parent:
+            missing_root = Path(parent) / "removed-recording-volume"
+            with override_settings(RECORD_UPLOAD_ROOT=missing_root):
+                response = self.client.get("/health/ready")
+
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.json()["status"], "not_ready")
+        self.assertEqual(response.json()["code"], "http_503_health_ready")
+
+    @override_settings(
+        DEVICE_VERIFICATION_TOKEN="v" * 48,
+        SECURE_SSL_REDIRECT=False,
+    )
+    def test_readiness_rejects_a_wrong_but_well_formed_data_key(self):
+        pending = OidcPendingAuth.objects.create(
+            state="readiness-key-check",
+            poll_code_hash=hashlib.sha256(b"readiness-poll-code").hexdigest(),
+            provider="example",
+            nonce="readiness-nonce",
+            code_verifier="readiness-code-verifier",
+        )
+        wrong_key = b"w" * 32
+
+        with override_settings(
+            DATA_ENCRYPTION_KEY_BYTES=wrong_key,
+            DATA_ENCRYPTION_PRIMARY_KEY_ID="wrong-key",
+            DATA_ENCRYPTION_KEYS={"wrong-key": wrong_key},
+            DATA_ENCRYPTION_V1_KEY_ID="wrong-key",
+        ):
+            with self.assertRaises(ValidationError):
+                pending.refresh_from_db()
+            response = self.client.get("/health/ready")
+
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.json()["status"], "not_ready")
+        self.assertEqual(response.json()["code"], "http_503_health_ready")
+
     @override_settings(
         DEVICE_VERIFICATION_TOKEN="v" * 48,
         SECURE_PROXY_SSL_HEADER=("HTTP_X_FORWARDED_PROTO", "https"),
@@ -1796,7 +2466,8 @@ class OperationalEndpointTests(TestCase):
             HTTP_X_FORWARDED_PROTO="https",
         )
         self.assertEqual(secure.status_code, 200)
-        self.assertEqual(secure.json(), {"status": "ready"})
+        self.assertEqual(secure.json()["status"], "ready")
+        self.assertEqual(secure.json()["response_schema_version"], 1)
 
     @override_settings(
         DEVICE_VERIFICATION_TOKEN="",
@@ -1806,11 +2477,286 @@ class OperationalEndpointTests(TestCase):
         response = self.client.get("/health/ready")
 
         self.assertEqual(response.status_code, 503)
-        self.assertEqual(response.json(), {"status": "not_ready"})
+        self.assertEqual(response.json()["status"], "not_ready")
+        self.assertEqual(response.json()["code"], "http_503_health_ready")
 
     @override_settings(SECURE_SSL_REDIRECT=False)
     def test_liveness_does_not_depend_on_database_readiness(self):
         response = self.client.get("/health/live")
 
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.json(), {"status": "live"})
+        self.assertEqual(response.json(), {"status": "live", "response_schema_version": 1})
+
+
+class DataEncryptionRotationTests(TestCase):
+    def setUp(self):
+        reset_data_encryption_key_inventory()
+
+    def test_rotation_rewraps_recording_data_keys_before_retiring_the_old_kek(self):
+        encoded_data_key = recording_crypto.encode_data_key(b"d" * recording_crypto.DATA_KEY_BYTES)
+        storage_object_id = uuid.uuid4()
+        old_key_id = project_settings.DATA_ENCRYPTION_PRIMARY_KEY_ID
+        upload = RecordingUpload.objects.create(
+            create_id=uuid.uuid4(),
+            device_id=None,
+            device_id_at_create=1,
+            owner_id_at_create=1,
+            deployment_generation=0,
+            device_rid_at_create="rotation-device",
+            device_uuid_at_create="rotation-device-uuid",
+            storage_object_id=storage_object_id,
+            storage_namespace=ingestion_governance.recording_namespace(storage_object_id),
+            filename="rotation-recording.webm",
+            encryption_version=recording_crypto.FORMAT_VERSION,
+            data_key_kek_id=old_key_id,
+            encrypted_data_key=encoded_data_key,
+            storage_offset=recording_crypto.HEADER_SIZE,
+        )
+        database_upload_id = RecordingUpload._meta.pk.get_db_prep_value(upload.pk, connection)
+        old_key = project_settings.DATA_ENCRYPTION_KEYS[old_key_id]
+        new_key_id = "recording-rotation"
+        new_key = b"n" * 32
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT encrypted_data_key FROM api_recordingupload WHERE upload_id = %s",
+                [database_upload_id],
+            )
+            old_envelope = cursor.fetchone()[0]
+        self.assertTrue(old_envelope.startswith(f"{FIELD_PREFIX}{old_key_id}:"))
+        self.assertNotIn(encoded_data_key, old_envelope)
+
+        with override_settings(
+            DATA_ENCRYPTION_KEY_BYTES=new_key,
+            DATA_ENCRYPTION_KEYS={old_key_id: old_key, new_key_id: new_key},
+            DATA_ENCRYPTION_PRIMARY_KEY_ID=new_key_id,
+            DATA_ENCRYPTION_V1_KEY_ID=old_key_id,
+        ):
+            output = StringIO()
+            call_command("rotate_data_encryption", stdout=output)
+            self.assertEqual(json.loads(output.getvalue())["rewritten"], 1)
+            upload.refresh_from_db()
+            self.assertEqual(upload.encrypted_data_key, encoded_data_key)
+            self.assertEqual(upload.data_key_kek_id, new_key_id)
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    "SELECT encrypted_data_key FROM api_recordingupload WHERE upload_id = %s",
+                    [database_upload_id],
+                )
+                new_envelope = cursor.fetchone()[0]
+            self.assertTrue(new_envelope.startswith(f"{FIELD_PREFIX}{new_key_id}:"))
+            self.assertNotIn(encoded_data_key, new_envelope)
+            call_command(
+                "rotate_data_encryption",
+                retire_key_id=old_key_id,
+                stdout=StringIO(),
+            )
+            self.assertFalse(DataEncryptionKeyState.objects.filter(key_id=old_key_id).exists())
+
+    def test_rotation_is_resumable_and_legacy_key_retirement_is_explicit(self):
+        recording_root = self.enterContext(tempfile.TemporaryDirectory())
+        old_key_id = project_settings.DATA_ENCRYPTION_PRIMARY_KEY_ID
+        old_key = project_settings.DATA_ENCRYPTION_KEYS[old_key_id]
+        pending = OidcPendingAuth.objects.create(
+            state="rotation-state",
+            poll_code_hash=hashlib.sha256(b"rotation-poll-code").hexdigest(),
+            provider="example",
+            nonce="legacy-v1-nonce",
+            code_verifier="old-v2-verifier",
+        )
+        legacy_ciphertext = SecretBox(old_key).encrypt(b"legacy-v1-nonce")
+        legacy_envelope = "secretbox:v1:" + base64.b64encode(bytes(legacy_ciphertext)).decode()
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "UPDATE api_oidcpendingauth SET nonce = %s WHERE state = %s",
+                [legacy_envelope, pending.pk],
+            )
+
+        new_key_id = "rotation-2026-08"
+        new_key = b"n" * 32
+        rotated_prefix = f"{FIELD_PREFIX}{new_key_id}:"
+        rotation_settings = {
+            "DATA_ENCRYPTION_KEY_BYTES": new_key,
+            "DATA_ENCRYPTION_KEYS": {old_key_id: old_key, new_key_id: new_key},
+            "DATA_ENCRYPTION_PRIMARY_KEY_ID": new_key_id,
+            "DATA_ENCRYPTION_V1_KEY_ID": old_key_id,
+            "DEVICE_VERIFICATION_TOKEN": "v" * 48,
+            "SECURE_SSL_REDIRECT": False,
+            "RECORD_UPLOAD_ROOT": Path(recording_root),
+            "RECORD_UPLOAD_REQUIRE_MOUNT": False,
+            "RECORD_UPLOAD_VOLUME_RESERVE_BYTES": 0,
+            "RECORD_UPLOAD_VOLUME_RESERVE_INODES": 0,
+            "RECORD_UPLOAD_CAPABILITY_CACHE_SECONDS": 0,
+        }
+        with override_settings(**rotation_settings):
+            first_output = StringIO()
+            call_command(
+                "rotate_data_encryption",
+                batch_size=1,
+                max_batches=1,
+                stdout=first_output,
+            )
+            first_result = json.loads(first_output.getvalue())
+            self.assertEqual(first_result["rewritten"], 1)
+            self.assertEqual(first_result["batches"], 1)
+
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    "SELECT nonce, code_verifier FROM api_oidcpendingauth WHERE state = %s",
+                    [pending.pk],
+                )
+                first_nonce, first_verifier = cursor.fetchone()
+            self.assertTrue(first_nonce.startswith(rotated_prefix))
+            self.assertFalse(first_verifier.startswith(rotated_prefix))
+
+            call_command("rotate_data_encryption", batch_size=1, stdout=StringIO())
+            pending.refresh_from_db()
+            self.assertEqual(pending.nonce, "legacy-v1-nonce")
+            self.assertEqual(pending.code_verifier, "old-v2-verifier")
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    "SELECT nonce, code_verifier FROM api_oidcpendingauth WHERE state = %s",
+                    [pending.pk],
+                )
+                rotated_nonce, rotated_verifier = cursor.fetchone()
+            self.assertTrue(rotated_nonce.startswith(rotated_prefix))
+            self.assertTrue(rotated_verifier.startswith(rotated_prefix))
+            self.assertEqual(
+                list(DataEncryptionKeyState.objects.filter(is_primary=True).values_list("key_id", flat=True)),
+                [new_key_id],
+            )
+            self.assertEqual(self.client.get("/health/ready").status_code, 200)
+
+            call_command(
+                "rotate_data_encryption",
+                retire_key_id=old_key_id,
+                stdout=StringIO(),
+            )
+            self.assertFalse(DataEncryptionKeyState.objects.filter(key_id=old_key_id).exists())
+
+    def test_rotation_does_not_retire_a_referenced_key(self):
+        old_key_id = project_settings.DATA_ENCRYPTION_PRIMARY_KEY_ID
+        old_key = project_settings.DATA_ENCRYPTION_KEYS[old_key_id]
+        OidcPendingAuth.objects.create(
+            state="referenced-key-state",
+            poll_code_hash=hashlib.sha256(b"referenced-key-poll-code").hexdigest(),
+            provider="example",
+            nonce="nonce",
+            code_verifier="verifier",
+        )
+        new_key_id = "retirement-candidate"
+        new_key = b"r" * 32
+        with (
+            override_settings(
+                DATA_ENCRYPTION_KEY_BYTES=new_key,
+                DATA_ENCRYPTION_KEYS={old_key_id: old_key, new_key_id: new_key},
+                DATA_ENCRYPTION_PRIMARY_KEY_ID=new_key_id,
+                DATA_ENCRYPTION_V1_KEY_ID=old_key_id,
+            ),
+            self.assertRaisesMessage(CommandError, "still referenced"),
+        ):
+            call_command(
+                "rotate_data_encryption",
+                max_batches=1,
+                retire_key_id=old_key_id,
+                stdout=StringIO(),
+            )
+
+    def test_bounded_rotation_makes_progress_across_repeated_invocations(self):
+        old_key_id = project_settings.DATA_ENCRYPTION_PRIMARY_KEY_ID
+        old_key = project_settings.DATA_ENCRYPTION_KEYS[old_key_id]
+        for index in range(2):
+            OidcPendingAuth.objects.create(
+                state=f"bounded-rotation-{index}",
+                poll_code_hash=hashlib.sha256(f"bounded-poll-{index}".encode()).hexdigest(),
+                provider="example",
+                nonce=f"nonce-{index}",
+                code_verifier=f"verifier-{index}",
+            )
+        new_key_id = "bounded-primary"
+        new_key = b"b" * 32
+        with override_settings(
+            DATA_ENCRYPTION_KEY_BYTES=new_key,
+            DATA_ENCRYPTION_KEYS={old_key_id: old_key, new_key_id: new_key},
+            DATA_ENCRYPTION_PRIMARY_KEY_ID=new_key_id,
+            DATA_ENCRYPTION_V1_KEY_ID=old_key_id,
+        ):
+            remaining = []
+            for _index in range(4):
+                output = StringIO()
+                call_command(
+                    "rotate_data_encryption",
+                    batch_size=1,
+                    max_batches=1,
+                    stdout=output,
+                )
+                result = json.loads(output.getvalue())
+                self.assertEqual(result["rewritten"], 1)
+                remaining.append(result["remaining"])
+
+        self.assertEqual(remaining, [3, 2, 1, 0])
+
+    def test_full_rotation_authenticates_existing_primary_envelopes(self):
+        pending = OidcPendingAuth.objects.create(
+            state="corrupt-primary-envelope",
+            poll_code_hash=hashlib.sha256(b"corrupt-primary-poll").hexdigest(),
+            provider="example",
+            nonce="nonce-to-corrupt",
+            code_verifier="valid-verifier",
+        )
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT nonce FROM api_oidcpendingauth WHERE state = %s",
+                [pending.pk],
+            )
+            envelope = cursor.fetchone()[0]
+            prefix, encoded = envelope.rsplit(":", 1)
+            ciphertext = bytearray(base64.b64decode(encoded))
+            ciphertext[-1] ^= 1
+            cursor.execute(
+                "UPDATE api_oidcpendingauth SET nonce = %s WHERE state = %s",
+                [f"{prefix}:{base64.b64encode(ciphertext).decode()}", pending.pk],
+            )
+
+        with self.assertRaisesMessage(CommandError, "authentication failed"):
+            call_command("rotate_data_encryption", stdout=StringIO())
+
+    def test_key_id_like_wildcards_do_not_hide_non_primary_values(self):
+        primary_key_id = "key_a"
+        confusing_key_id = "keyxa"
+        primary_key = b"p" * 32
+        confusing_key = b"x" * 32
+        default_key_id = project_settings.DATA_ENCRYPTION_PRIMARY_KEY_ID
+        default_key = project_settings.DATA_ENCRYPTION_KEYS[default_key_id]
+        keyring = {
+            default_key_id: default_key,
+            primary_key_id: primary_key,
+            confusing_key_id: confusing_key,
+        }
+        with override_settings(
+            DATA_ENCRYPTION_KEY_BYTES=primary_key,
+            DATA_ENCRYPTION_KEYS=keyring,
+            DATA_ENCRYPTION_PRIMARY_KEY_ID=primary_key_id,
+            DATA_ENCRYPTION_V1_KEY_ID=default_key_id,
+        ):
+            DataEncryptionKeyState.objects.create(
+                key_id=confusing_key_id,
+                key_fingerprint=key_fingerprint(confusing_key),
+                encrypted_canary=key_canary(confusing_key_id),
+                is_primary=False,
+            )
+            pending = OidcPendingAuth.objects.create(
+                state="wildcard-key-id",
+                poll_code_hash=hashlib.sha256(b"wildcard-key-poll").hexdigest(),
+                provider="example",
+                nonce="primary-value",
+                code_verifier="primary-verifier",
+            )
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    "UPDATE api_oidcpendingauth SET nonce = %s WHERE state = %s",
+                    [encrypt_text("confusing-value", key_id=confusing_key_id), pending.pk],
+                )
+            output = StringIO()
+            call_command("rotate_data_encryption", dry_run=True, stdout=output)
+
+        self.assertEqual(json.loads(output.getvalue())["remaining"], 1)
