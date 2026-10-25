@@ -72,6 +72,13 @@ runtime不含编译器或build backend。隔离构建的setuptools版本及wheel
 已安装包和已有构建wheel不重新核验，干净缓存门禁需实际触发源码构建。
 依赖更新器也必须支持该配置；旧更新器应升级，不能移除哈希门禁来接受更新。
 
+Management operation receipt v2的写请求使用`Idempotency-Key: v2:<uuidv4>`，
+保存、展示与receipt GET仍使用裸UUID。公开request digest只证明非秘密intent与秘密的
+keep/clear/set标记，不含密码hash或长度。完整intent以随机per-operation key作HMAC，
+key、原status和唯一结果body一同进入context-bound加密receipt；正常key rotation可重包而不破坏replay。
+迁移0035将旧弱摘要/回执退役为正常retention窗口内的ID墓碑，恢复返回410；必须先核对实际资源，
+不能换新ID盲目重试。反向迁移也清除新私有容器，且不会恢复旧结果；历史导出/备份不会被迁移安全擦除。
+
 ## 生产配置
 
 从 `.env.example` 生成权限为 `0600` 的配置。至少必须设置：
@@ -99,7 +106,7 @@ Gunicorn访问日志只输出method、固定路由模式、status、bytes、dura
 
 用户、设备、设备组和策略管理mutation按method使用精确字段allowlist；unknown、只读字段、缺失必填字段、同时提交`name`与`username`别名以及不含任何可变字段的PATCH会在数据库查询/保存前返回400。错误包含固定`field_contract_version=1`、机器码`invalid_request_fields`和排序后的字段名，但绝不回显字段值。合法PATCH和设备assign只保存显式字段，成功审计只记录有界`changed_fields`；状态和DELETE请求只允许空object或空body。策略status暂时同时接受JSON boolean和精确`{"enabled": BOOLEAN}`object，object中的任何额外字段都会拒绝。
 
-策略批量分配、设备组批量加入/移除、用户批量强制登出，以及单个用户/设备启停和设备删除都必须携带canonical UUID形式的`Idempotency-Key`。Management在同一PostgreSQL事务中持久化operation receipt，并以transaction-scoped advisory lock串行化这些低频控制mutation；批操作先锁定并核对完整目标集合，状态/删除操作则锁定权威row，把状态或删除与适用的token、proof challenge和recovery approval撤销作为同一commit。禁用用户会推进credential generation并删除其bearer；禁用设备会推进deployment generation并删除该设备的bearer、proof challenge和未消费recovery approval，因此后来重新启用设备也不能复活由旧generation授权的recording upload、audit session、proof challenge或recovery approval。重复、缺失、generation耗尽、错误成员关系、竞争删除或注入数据库故障只能保留完整旧状态或完整新状态。response receipt包含`management_operation_receipt_version`、operation ID/单调generation、canonical request/result digest以及精确`requested`/`applied`计数；单目标receipt只保留目标数据库标识、最终状态和撤销数量，不把profile note、email、host metadata或IP复制进receipt表。相同ID和相同请求在响应丢失后返回原receipt，即使设备row已经删除也可重放，ID被不同actor、操作或target复用则409。管理员不能禁用或删除当前bearer所在设备，因为这会销毁响应丢失后重放receipt所需的authority；此类操作必须从另一台active管理员设备执行。批处理CLI会在发送前打印ID并支持`--operation-id`；其他调用方同样必须在发送前持久化ID并核对receipt后才能报告成功。cleanup timer按`CAMELLIA_REMOTE_MANAGEMENT_OPERATION_RETENTION_DAYS`和有界batch删除过期receipt，超过该窗口不得把旧ID重放当成幂等恢复。
+策略批量分配、设备组批量加入/移除、用户批量强制登出，以及单个用户/设备启停和设备删除都必须携带`v2:<canonical UUIDv4>`格式的`Idempotency-Key`。Management在同一PostgreSQL事务中持久化operation receipt，并以transaction-scoped advisory lock串行化这些低频控制mutation；批操作先锁定并核对完整目标集合，状态/删除操作则锁定权威row，把状态或删除与适用的token、proof challenge和recovery approval撤销作为同一commit。禁用用户会推进credential generation并删除其bearer；禁用设备会推进deployment generation并删除该设备的bearer、proof challenge和未消费recovery approval，因此后来重新启用设备也不能复活由旧generation授权的recording upload、audit session、proof challenge或recovery approval。重复、缺失、generation耗尽、错误成员关系、竞争删除或注入数据库故障只能保留完整旧状态或完整新状态。response receipt包含`management_operation_receipt_version`、operation ID/单调generation、canonical request/result digest以及精确`requested`/`applied`计数；单目标receipt只保留目标数据库标识、最终状态和撤销数量，不把profile note、email、host metadata或IP复制进receipt表。相同ID和相同请求在响应丢失后返回原receipt，即使设备row已经删除也可重放，ID被不同actor、操作或target复用则409。管理员不能禁用或删除当前bearer所在设备，因为这会销毁响应丢失后重放receipt所需的authority；此类操作必须从另一台active管理员设备执行。批处理CLI会在发送前打印ID并支持`--operation-id`；其他调用方同样必须在发送前持久化ID并核对receipt后才能报告成功。cleanup timer按`CAMELLIA_REMOTE_MANAGEMENT_OPERATION_RETENTION_DAYS`和有界batch删除过期receipt，超过该窗口不得把旧ID重放当成幂等恢复。
 
 控制面create/update/assign、地址簿profile/content/rule和ShareLink create/accept同样要求随机UUIDv4 operation ID。已有资源mutation必须提交首次读取的`If-Match`，browser form使用等价generation字段；策略批量分配要求`expected_generations`精确包含全部直接device/user/group目标。锁内检查任一版本冲突会使全部目标零修改，成功推进目标版本；成员移动、解绑和删除也推进实际变化的设备组/设备版本。重放必须携带完整首次请求（包括首次generation），不能重新查询新版本后复用旧ID。进程或浏览器重启后，可通过`GET /api/management-operations/<uuidv4>`读取原actor的不可变receipt；Bearer和browser session均可认证，其他actor得到404。create/update receipt保留原响应中公开的资源字段；密码只进入request digest，ShareLink raw token所在receipt单独按operation ID、actor和operation上下文加密，并纳入key rotation与retention。该恢复接口始终使用`no-store, private`和`no-referrer`。浏览器仅持久化operation ID与提交时间，不保存表单、路径或token；收到恢复结果后显示操作状态并删除待恢复条目。
 

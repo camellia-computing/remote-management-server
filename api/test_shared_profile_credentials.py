@@ -51,7 +51,7 @@ class SharedProfileCredentialTests(TestCase):
     def post_json(self, path, payload, token):
         headers = {}
         if path == "/api/ab/shared/add":
-            headers["HTTP_IDEMPOTENCY_KEY"] = str(uuid.uuid4())
+            headers["HTTP_IDEMPOTENCY_KEY"] = "v2:" + str(uuid.uuid4())
         return self.client.post(
             path,
             data=json.dumps(payload),
@@ -67,7 +67,7 @@ class SharedProfileCredentialTests(TestCase):
             data=json.dumps(payload),
             content_type="application/json",
             HTTP_AUTHORIZATION=f"Bearer {token}",
-            HTTP_IDEMPOTENCY_KEY=str(uuid.uuid4()),
+            HTTP_IDEMPOTENCY_KEY="v2:" + str(uuid.uuid4()),
             HTTP_IF_MATCH=f'"{profile.authorization_generation}"',
         )
 

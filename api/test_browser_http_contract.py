@@ -29,7 +29,7 @@ class BrowserHttpContractTests(TestCase):
         return self.client.post(
             "/api/share",
             {"data": json.dumps([{"value": str(pk)} for pk in peer_ids])},
-            HTTP_IDEMPOTENCY_KEY=str(uuid.uuid4()),
+            HTTP_IDEMPOTENCY_KEY="v2:" + str(uuid.uuid4()),
         )
 
     def test_missing_share_owner_is_a_typed_client_error_and_never_creates_a_link(self):
@@ -81,7 +81,9 @@ class BrowserHttpContractTests(TestCase):
             ([{"value": str(self.peer.pk)}], "invalid", "invalid_operation_id"),
         ):
             with self.subTest(code=code):
-                response = self.client.post("/api/share", {"data": json.dumps(data)}, HTTP_IDEMPOTENCY_KEY=operation_id)
+                response = self.client.post(
+                    "/api/share", {"data": json.dumps(data)}, HTTP_IDEMPOTENCY_KEY="v2:" + str(operation_id)
+                )
                 self.assertEqual(response.status_code, 400, response.content)
                 self.assertEqual(response.json()["code"], code)
                 self.assertFalse(response.json()["retryable"])

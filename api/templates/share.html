@@ -262,7 +262,7 @@
       await window.camelliaMutationRecovery.remember(pendingOperationId);
       reserved = true;
       const { data, status, requestId } = await window.camelliaHttp.requestJson('/api/share', {
-        headers: { 'X-CSRFToken': getCookie('csrftoken'), 'Idempotency-Key': pendingOperationId },
+        headers: { 'X-CSRFToken': getCookie('csrftoken'), 'Idempotency-Key': `v2:${pendingOperationId}` },
         body: formData,
       });
       if (!await displayReceipt(data, status)) throw new window.camelliaHttp.HttpFailure('protocol', { status, requestId });

@@ -54,7 +54,7 @@ class AddressBookAuditRetentionTests(TestCase):
             data=json.dumps(payload),
             content_type="application/json",
             HTTP_AUTHORIZATION=f"Bearer {self.token}",
-            HTTP_IDEMPOTENCY_KEY=str(uuid.uuid4()),
+            HTTP_IDEMPOTENCY_KEY="v2:" + str(uuid.uuid4()),
             HTTP_IF_MATCH='"0"',
         )
 
@@ -64,7 +64,7 @@ class AddressBookAuditRetentionTests(TestCase):
             data=json.dumps(payload),
             content_type="application/json",
             HTTP_AUTHORIZATION=f"Bearer {self.token}",
-            HTTP_IDEMPOTENCY_KEY=str(uuid.uuid4()),
+            HTTP_IDEMPOTENCY_KEY="v2:" + str(uuid.uuid4()),
             HTTP_IF_MATCH='"0"',
         )
 
@@ -123,7 +123,7 @@ class AddressBookAuditRetentionTests(TestCase):
             {
                 "action": "delete_book",
                 "guid": self.profile.guid,
-                "idempotency_key": str(uuid.uuid4()),
+                "idempotency_key": "v2:" + str(uuid.uuid4()),
                 "expected_generation": "0",
             },
         )

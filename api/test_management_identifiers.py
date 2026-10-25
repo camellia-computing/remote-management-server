@@ -75,7 +75,7 @@ class ManagementIdentifierHttpTests(TestCase):
 
     def post_json(self, path, payload, *, expected_generation=None):
         headers = {
-            "HTTP_IDEMPOTENCY_KEY": str(uuid.uuid4()),
+            "HTTP_IDEMPOTENCY_KEY": "v2:" + str(uuid.uuid4()),
             **self.auth,
         }
         if expected_generation is not None:
@@ -145,7 +145,7 @@ class ManagementIdentifierHttpTests(TestCase):
                 f"/api/users/{AUTO_FIELD_MAX}/enable",
                 data=json.dumps({}),
                 content_type="application/json",
-                HTTP_IDEMPOTENCY_KEY=str(uuid.uuid4()),
+                HTTP_IDEMPOTENCY_KEY="v2:" + str(uuid.uuid4()),
                 HTTP_IF_MATCH='"0"',
                 **self.auth,
             ),
@@ -156,7 +156,7 @@ class ManagementIdentifierHttpTests(TestCase):
                 f"/api/devices/{AUTO_FIELD_MAX}/disable",
                 data=json.dumps({}),
                 content_type="application/json",
-                HTTP_IDEMPOTENCY_KEY=str(uuid.uuid4()),
+                HTTP_IDEMPOTENCY_KEY="v2:" + str(uuid.uuid4()),
                 HTTP_IF_MATCH='"0"',
                 **self.auth,
             ),

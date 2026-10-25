@@ -42,11 +42,13 @@ class TokenSubjectIntegrityTests(TestCase):
         self.bob = UserProfile.objects.create_user("subject-bob", "bob-pass")
 
     @staticmethod
-    def post_json(path, payload, token=None):
+    def post_json(path, payload, token=None, expected_generation=None):
         headers = {
-            "HTTP_IDEMPOTENCY_KEY": str(uuid.uuid4()),
+            "HTTP_IDEMPOTENCY_KEY": "v2:" + str(uuid.uuid4()),
             **({"HTTP_AUTHORIZATION": f"Bearer {token}"} if token else {}),
         }
+        if expected_generation is not None:
+            headers["HTTP_IF_MATCH"] = f'"{expected_generation}"'
         return Client().post(
             path,
             data=json.dumps(payload),
@@ -80,6 +82,7 @@ class TokenSubjectIntegrityTests(TestCase):
                 f"/api/devices/{device.pk}/assign",
                 {"type": "user_name", "value": self.bob.username},
                 token=admin_token,
+                expected_generation=device.mutation_generation,
             )
 
         self.assertEqual(assigned.status_code, 200, assigned.content)
@@ -94,7 +97,12 @@ class TokenSubjectIntegrityTests(TestCase):
         device = RemoteDevice.objects.get(rid="800000012")
 
         with patch("api.views_api._revoke_device_tokens", return_value=0):
-            disabled = self.post_json(f"/api/devices/{device.pk}/disable", {}, token=admin_token)
+            disabled = self.post_json(
+                f"/api/devices/{device.pk}/disable",
+                {},
+                token=admin_token,
+                expected_generation=device.mutation_generation,
+            )
 
         self.assertEqual(disabled.status_code, 200, disabled.content)
         self.assertEqual(self.post_json("/api/currentUser", {}, token=alice_token).status_code, 401)
@@ -109,6 +117,7 @@ class TokenSubjectIntegrityTests(TestCase):
                 f"/api/devices/{device.pk}/assign",
                 {"type": "user_name", "value": self.bob.username},
                 token=admin_token,
+                expected_generation=device.mutation_generation,
             )
         self.assertEqual(failed.status_code, 500, failed.content)
         self.assertEqual(failed.json()["code"], "internal_server_error")
@@ -128,7 +137,12 @@ class TokenSubjectIntegrityTests(TestCase):
         device = RemoteDevice.objects.get(rid="800000014")
 
         with patch("api.views_api._revoke_device_tokens", side_effect=RuntimeError("injected cleanup failure")):
-            failed = self.post_json(f"/api/devices/{device.pk}/disable", {}, token=admin_token)
+            failed = self.post_json(
+                f"/api/devices/{device.pk}/disable",
+                {},
+                token=admin_token,
+                expected_generation=device.mutation_generation,
+            )
         self.assertEqual(failed.status_code, 500, failed.content)
         self.assertEqual(failed.json()["code"], "internal_server_error")
         self.assertTrue(failed.json()["retryable"])
@@ -178,8 +192,8 @@ class TokenSubjectIntegrityTests(TestCase):
 @override_settings(STORAGES=TEST_STORAGES)
 class PostgreSQLTokenSubjectIntegrityTests(TransactionTestCase):
     @staticmethod
-    def post_json(path, payload, token=None):
-        return TokenSubjectIntegrityTests.post_json(path, payload, token)
+    def post_json(path, payload, token=None, expected_generation=None):
+        return TokenSubjectIntegrityTests.post_json(path, payload, token, expected_generation)
 
     @staticmethod
     def login_token(user, password, rid, label):
@@ -229,6 +243,7 @@ class PostgreSQLTokenSubjectIntegrityTests(TransactionTestCase):
                     f"/api/devices/{device.pk}/assign",
                     {"type": "user_name", "value": bob.username},
                     token=admin_token,
+                    expected_generation=device.mutation_generation,
                 )
             finally:
                 connections.close_all()

@@ -15,7 +15,7 @@ const response = (body, status = 200, headers = {}) => new Response(JSON.stringi
 const rejected = (status, code = "invalid_input") => response({ code, message: "Safe validation message", retryable: false }, status);
 const client = (fetch, options = {}) => createHttpClient({ fetch, baseUrl: BASE, ...options });
 const receipt = (id) => ({
-  management_operation_receipt_version: 1, operation_id: id, operation: "share_link_create", operation_generation: 1,
+  management_operation_receipt_version: 2, operation_id: id, operation: "share_link_create", operation_generation: 1,
   request_digest: "a".repeat(64), result_digest: "b".repeat(64), requested: { share_links: 1 },
   applied: { share_links: 1 }, result: "OK", code: 1, token: "A".repeat(43),
 });
@@ -205,7 +205,8 @@ test("Share unknown outcome freezes key/selection and recovers only by GET", asy
   const fixture = templateFixture("share.html", async (url, options) => {
     calls.push([url, options.method]);
     if (options.method === "POST") {
-      operation = options.headers.get("Idempotency-Key");
+      assert.ok(options.headers.get("Idempotency-Key").startsWith("v2:"));
+      operation = options.headers.get("Idempotency-Key").slice(3);
       throw new TypeError("connection lost after possible commit");
     }
     assert.ok(url.endsWith(operation));
@@ -253,6 +254,8 @@ test("receipt validation rejects unbound, partial-shape and boolean counts", () 
   const http = client(async () => response({}));
   assert.equal(http.receiptMatches(receipt(OPERATION_ID), OPERATION_ID), true);
   for (const malformed of [{ ...receipt(OPERATION_ID), operation_id: "other" },
+    { ...receipt(OPERATION_ID), management_operation_receipt_version: 1 },
+    { ...receipt(OPERATION_ID), management_operation_receipt_version: true },
     { ...receipt(OPERATION_ID), applied: { share_links: true } },
     { ...receipt(OPERATION_ID), operation_generation: 0 },
     { ...receipt(OPERATION_ID), request_digest: "invalid" }]) {
@@ -290,13 +293,13 @@ function recoveryFixture(fetcher) {
 }
 
 test("restart recovery retains missing receipts and stops serial waits on shared failures", async () => {
-  for (const mode of ["missing", "authentication", "network", "server"]) {
+  for (const mode of ["missing", "retired", "authentication", "network", "server"]) {
     let calls = 0;
     const fixture = recoveryFixture(async (_url, options) => {
       calls++;
       assert.equal(options.method, "GET");
       if (mode === "network") throw new TypeError("lost");
-      return rejected(mode === "missing" ? 404 : mode === "authentication" ? 401 : 500);
+      return rejected(mode === "missing" ? 404 : mode === "retired" ? 410 : mode === "authentication" ? 401 : 500);
     });
     await fixture.window.camelliaMutationRecovery.recover();
     assert.equal(fixture.remaining().length, 2);
@@ -354,7 +357,7 @@ test("login/register success navigates once and HTTP error matrix clears both pa
 test("Share typed rejections allow correction but HTTP500/HTML/invalid JSON remain locked", async () => {
   for (const [make, locked] of [
     [() => rejected(400), false], [() => rejected(403, "csrf_failed"), false],
-    [() => rejected(429), false], [() => rejected(409), true], [() => rejected(500), true],
+    [() => rejected(429), false], [() => rejected(409), true], [() => rejected(410, "operation_receipt_retired"), true], [() => rejected(500), true],
     [() => new Response("<html>private-canary</html>"), true],
     [() => new Response("broken", { headers: { "Content-Type": "application/json" } }), true],
   ]) {
@@ -385,7 +388,7 @@ test("Share never posts while recovery is blocked or durable reservation fails",
 
 test("a confirmed Share token stays visible when clearing local recovery storage fails", async () => {
   const fixture = templateFixture("share.html", async (_url, options) =>
-    response(receipt(options.headers.get("Idempotency-Key"))));
+    response(receipt(options.headers.get("Idempotency-Key").slice(3))));
   fixture.window.camelliaMutationRecovery.forget = async () => { throw { kind: "storage" }; };
   const checkbox = fixture.elements.get("peer-list").querySelectorAll("input")[0];
   checkbox.checked = true; checkbox.handlers.change();

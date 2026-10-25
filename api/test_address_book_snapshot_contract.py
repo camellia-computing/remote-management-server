@@ -1,6 +1,5 @@
 """Read snapshots required by the mandatory Native/CLI mutation protocol."""
 
-import hashlib
 import json
 import uuid
 from pathlib import Path
@@ -10,18 +9,18 @@ from django.db import transaction
 from django.test import SimpleTestCase, TestCase
 
 from api.address_book_authorization import bump_locked_authorization_generation
-from api.management_operations import document_digest
 from api.models import AddressBookProfile, ManagementBatchOperation, RemoteDevice, RemotePeer, RemoteTag, UserProfile
+from api.operation_intents import public_intent_digest as document_digest
 from api.views_api import _issue_access_token
 
 
 class AddressBookMutationDigestCorpusTests(SimpleTestCase):
     def test_shared_native_digest_corpus_matches_provider_canonical_document(self):
         corpus = json.loads(
-            (Path(__file__).parent / "fixtures" / "address_book_mutations_v1.json").read_text(encoding="utf-8")
+            (Path(__file__).parent / "fixtures" / "address_book_mutations_v2.json").read_text(encoding="utf-8")
         )
-        self.assertEqual(corpus["version"], 1)
-        self.assertEqual(len(corpus["vectors"]), 7)
+        self.assertEqual(corpus["version"], 2)
+        self.assertEqual(len(corpus["vectors"]), 10)
         for vector in corpus["vectors"]:
             with self.subTest(name=vector["name"]):
                 document = {
@@ -29,7 +28,8 @@ class AddressBookMutationDigestCorpusTests(SimpleTestCase):
                     "method": vector["method"],
                     "path": vector["path"],
                     "args": {},
-                    "body_sha256": hashlib.sha256(vector["body"].encode("utf-8")).hexdigest(),
+                    "body": json.loads(vector["body"]) if vector["body"] else None,
+                    "has_body": bool(vector["body"]),
                     "expected_generation": vector["expected_generation"],
                 }
                 self.assertEqual(document_digest(document), vector["request_digest"])
@@ -201,7 +201,7 @@ class AddressBookSnapshotContractTests(TestCase):
                 operation_id = str(uuid.uuid4())
                 headers = {
                     "HTTP_AUTHORIZATION": f"Bearer {self.token}",
-                    "HTTP_IDEMPOTENCY_KEY": operation_id,
+                    "HTTP_IDEMPOTENCY_KEY": "v2:" + str(operation_id),
                     "HTTP_IF_MATCH": f'"{observed}"',
                 }
                 write = getattr(self.client, method)
@@ -213,7 +213,8 @@ class AddressBookSnapshotContractTests(TestCase):
                     "method": method.upper(),
                     "path": path,
                     "args": {},
-                    "body_sha256": hashlib.sha256(body.encode("utf-8")).hexdigest(),
+                    "body": json.loads(body) if body else None,
+                    "has_body": bool(body),
                     "expected_generation": observed,
                 }
                 self.assertEqual(receipt["request_digest"], document_digest(expected_document))
@@ -231,7 +232,7 @@ class AddressBookSnapshotContractTests(TestCase):
                     path,
                     data=body,
                     content_type="application/json",
-                    **{**headers, "HTTP_IDEMPOTENCY_KEY": str(uuid.uuid4())},
+                    **{**headers, "HTTP_IDEMPOTENCY_KEY": "v2:" + str(uuid.uuid4())},
                 )
                 self.assertEqual(stale.status_code, 409)
                 self.assertEqual(stale.json()["applied"], {"mutations": 0})

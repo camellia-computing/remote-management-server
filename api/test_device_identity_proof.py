@@ -67,11 +67,13 @@ class DeviceIdentityProofTests(TestCase):
             version="-",
         )
 
-    def post_json(self, path, payload, token=None):
+    def post_json(self, path, payload, token=None, expected_generation=None):
         headers = {
-            "HTTP_IDEMPOTENCY_KEY": str(uuid.uuid4()),
+            "HTTP_IDEMPOTENCY_KEY": "v2:" + str(uuid.uuid4()),
             **({"HTTP_AUTHORIZATION": f"Bearer {token}"} if token else {}),
         }
+        if expected_generation is not None:
+            headers["HTTP_IF_MATCH"] = f'"{expected_generation}"'
         return self.client.post(
             path,
             data=json.dumps(payload),
@@ -79,11 +81,13 @@ class DeviceIdentityProofTests(TestCase):
             **headers,
         )
 
-    def delete_json(self, path, payload, token=None):
+    def delete_json(self, path, payload, token=None, expected_generation=None):
         headers = {
-            "HTTP_IDEMPOTENCY_KEY": str(uuid.uuid4()),
+            "HTTP_IDEMPOTENCY_KEY": "v2:" + str(uuid.uuid4()),
             **({"HTTP_AUTHORIZATION": f"Bearer {token}"} if token else {}),
         }
+        if expected_generation is not None:
+            headers["HTTP_IF_MATCH"] = f'"{expected_generation}"'
         return self.client.delete(
             path,
             data=json.dumps(payload),
@@ -331,6 +335,7 @@ class DeviceIdentityProofTests(TestCase):
             f"/api/devices/{self.device.pk}/disable",
             {},
             token=self.admin_bearer(),
+            expected_generation=self.device.mutation_generation,
         )
         self.assertEqual(disabled.status_code, 200, disabled.content)
 
@@ -343,6 +348,7 @@ class DeviceIdentityProofTests(TestCase):
             f"/api/devices/{self.device.pk}",
             {},
             token=self.admin_bearer(),
+            expected_generation=self.device.mutation_generation,
         )
         self.assertEqual(deleted.status_code, 200, deleted.content)
 
@@ -354,6 +360,7 @@ class DeviceIdentityProofTests(TestCase):
             f"/api/users/{self.user.pk}/disable",
             {},
             token=self.admin_bearer(),
+            expected_generation=self.user.mutation_generation,
         )
         self.assertEqual(disabled.status_code, 200, disabled.content)
 
@@ -366,6 +373,7 @@ class DeviceIdentityProofTests(TestCase):
             f"/api/users/{self.user.pk}",
             {},
             token=self.admin_bearer(),
+            expected_generation=self.user.mutation_generation,
         )
         self.assertEqual(deleted.status_code, 200, deleted.content)
 
@@ -711,6 +719,7 @@ class DeviceIdentityProofTests(TestCase):
             f"/api/devices/{self.device.pk}/approve-recovery",
             {"pk": recovery_proof["public_key"]},
             token=admin_bearer,
+            expected_generation=self.device.mutation_generation,
         )
         self.assertEqual(approved.status_code, 200, approved.content)
 
@@ -815,7 +824,7 @@ class PostgreSQLDeviceIdentityProofTests(TransactionTestCase):
     @staticmethod
     def post_json(client, path, payload, token=None):
         headers = {
-            "HTTP_IDEMPOTENCY_KEY": str(uuid.uuid4()),
+            "HTTP_IDEMPOTENCY_KEY": "v2:" + str(uuid.uuid4()),
             **({"HTTP_AUTHORIZATION": f"Bearer {token}"} if token else {}),
         }
         return client.post(

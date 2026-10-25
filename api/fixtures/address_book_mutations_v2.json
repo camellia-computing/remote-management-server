@@ -1,5 +1,5 @@
 {
-  "version": 1,
+  "version": 2,
   "vectors": [
     {
       "name": "peer_add_zero",
@@ -8,7 +8,7 @@
       "path": "/api/ab/peer/add/personal-7",
       "body": "{\"id\":\"123\",\"alias\":\"原生😀\"}",
       "expected_generation": 0,
-      "request_digest": "b5c4f45b332b9b968b3779acbedb5289712e2d47c17f878d77f947fb861481de"
+      "request_digest": "8d9314edd39169d81cf65970782c59bf78ab46e3805e2d39d41c93bf3ca486e2"
     },
     {
       "name": "peer_update_controls",
@@ -17,7 +17,7 @@
       "path": "/remote/api/ab/peer/update/03440000-0000-4000-8000-000000000001",
       "body": "{\"id\":\"123\",\"note\":\"quote\\\" slash\\\\ newline\\n tab\\t   \"}",
       "expected_generation": 2,
-      "request_digest": "c6281b849d45a41b4bc72ed98bc57a72492eba2b4d42ee8205bfc73e90015e51"
+      "request_digest": "0fd8c3804c9651df443f9450a092170f715be4f2ae5bd8ad157132f21e6b81c8"
     },
     {
       "name": "peer_delete_many",
@@ -26,7 +26,7 @@
       "path": "/api/ab/peer/personal-7",
       "body": "[\"123\",\"456\"]",
       "expected_generation": 9,
-      "request_digest": "fd6129e90bfcc2ce64a0879ae0056940b9b84f1fd8335dc0d07236d5153759ac"
+      "request_digest": "36ae794c20fb7d3e9814243cd40f4ea2758094f82c13c468796fcde34be73050"
     },
     {
       "name": "tag_add_color",
@@ -35,7 +35,7 @@
       "path": "/api/ab/tag/add/personal-7",
       "body": "{\"name\":\"团队\",\"color\":4294967295}",
       "expected_generation": 3,
-      "request_digest": "86029fc4aa71edbf2750a0697d1e2f052bfcc1fa7eaaa411f9c204cf36de78db"
+      "request_digest": "c7e4ccb4858cd1837c8f45eb5221265ada7997c11b81f9e70cf0b6b78bc67ac4"
     },
     {
       "name": "tag_rename_unicode_prefix",
@@ -44,7 +44,7 @@
       "path": "/路径 /api/ab/tag/rename/personal-7",
       "body": "{\"old\":\"a\",\"new\":\"b\"}",
       "expected_generation": 44,
-      "request_digest": "d01bed5482aa4077b685541a1bd15c8c65c6bba6f785eee05fef58ee8360a403"
+      "request_digest": "d7616593b73f71aefa2a3bd7b967b36e6e7eb098d97b93219e2b71a1268069d0"
     },
     {
       "name": "tag_update_large_safe_generation",
@@ -53,7 +53,7 @@
       "path": "/api/ab/tag/update/personal-7",
       "body": "{\"name\":\"x\",\"color\":0}",
       "expected_generation": 9007199254740990,
-      "request_digest": "3b65e2d98dc22ec1f117e2b87cdab88bf8f36c0d18106e31026ed9d20fa3ad8c"
+      "request_digest": "676d8a3a37d3acc6bf1a5ed9e38086154fc9668a6bc45399a0753604d2204460"
     },
     {
       "name": "tag_delete_empty",
@@ -62,7 +62,34 @@
       "path": "/api/ab/tag/personal-7",
       "body": "[]",
       "expected_generation": 0,
-      "request_digest": "9c5279cebeb2f6d4103e928b5a1668ed657670bf1f415218467d0204f383ceec"
+      "request_digest": "e4370a86ad0588e4de15f408f9bc1ecd7851a3c86abb15c861906d70d9b301e4"
+    },
+    {
+      "name": "peer_add_secret",
+      "operation": "address_book_peer_add",
+      "method": "POST",
+      "path": "/api/ab/peer/add/personal-7",
+      "body": "{\"id\":\"123\",\"password\":\"SYNTHETIC-SECRET-A\",\"hash\":\"SYNTHETIC-HASH-A\"}",
+      "expected_generation": 0,
+      "request_digest": "d8cd1048e88bd3516d8122328ffc3635bce5419213ef1c1975e37992cedb02ca"
+    },
+    {
+      "name": "peer_add_other_secret",
+      "operation": "address_book_peer_add",
+      "method": "POST",
+      "path": "/api/ab/peer/add/personal-7",
+      "body": "{\"id\":\"123\",\"password\":\"SYNTHETIC-OTHER-SECRET-B\",\"hash\":\"SYNTHETIC-OTHER-HASH-B\"}",
+      "expected_generation": 0,
+      "request_digest": "d8cd1048e88bd3516d8122328ffc3635bce5419213ef1c1975e37992cedb02ca"
+    },
+    {
+      "name": "peer_update_secret_clear",
+      "operation": "address_book_peer_update",
+      "method": "PUT",
+      "path": "/api/ab/peer/update/personal-7",
+      "body": "{\"id\":\"123\",\"password\":\"\"}",
+      "expected_generation": 1,
+      "request_digest": "45270f98e7257fd893107c9c87ba34227491599e7c19f96d1f3e6fbec141d90e"
     }
   ]
 }

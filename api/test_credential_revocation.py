@@ -33,11 +33,13 @@ class CredentialRevocationTests(TestCase):
         self.target = UserProfile.objects.create_superuser("target-admin", "target-pass")
 
     @staticmethod
-    def post_json(client, path, payload, token=None):
+    def post_json(client, path, payload, token=None, expected_generation=None):
         headers = {
-            "HTTP_IDEMPOTENCY_KEY": str(uuid.uuid4()),
+            "HTTP_IDEMPOTENCY_KEY": "v2:" + str(uuid.uuid4()),
             **({"HTTP_AUTHORIZATION": f"Bearer {token}"} if token else {}),
         }
+        if expected_generation is not None:
+            headers["HTTP_IF_MATCH"] = f'"{expected_generation}"'
         return client.post(
             path,
             data=json.dumps(payload),
@@ -138,6 +140,7 @@ class CredentialRevocationTests(TestCase):
             f"/api/users/{self.target.pk}/disable",
             {},
             token=operator_token,
+            expected_generation=self.target.mutation_generation,
         )
 
         self.assertEqual(disabled.status_code, 200, disabled.content)

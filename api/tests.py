@@ -238,7 +238,7 @@ class ApiTestMixin:
 
     def _post_json(self, path, payload, token=None, expected_generation=None):
         headers = self._auth_headers(token)
-        headers["HTTP_IDEMPOTENCY_KEY"] = str(uuid.uuid4())
+        headers["HTTP_IDEMPOTENCY_KEY"] = "v2:" + str(uuid.uuid4())
         if expected_generation is not None:
             headers["HTTP_IF_MATCH"] = f'"{expected_generation}"'
         return self.client.post(
@@ -250,7 +250,7 @@ class ApiTestMixin:
 
     def _put_json(self, path, payload, token=None, expected_generation=None):
         headers = self._auth_headers(token)
-        headers["HTTP_IDEMPOTENCY_KEY"] = str(uuid.uuid4())
+        headers["HTTP_IDEMPOTENCY_KEY"] = "v2:" + str(uuid.uuid4())
         if expected_generation is not None:
             headers["HTTP_IF_MATCH"] = f'"{expected_generation}"'
         return self.client.put(
@@ -262,7 +262,7 @@ class ApiTestMixin:
 
     def _delete_json(self, path, payload=None, token=None, expected_generation=None):
         headers = self._auth_headers(token)
-        headers["HTTP_IDEMPOTENCY_KEY"] = str(uuid.uuid4())
+        headers["HTTP_IDEMPOTENCY_KEY"] = "v2:" + str(uuid.uuid4())
         if expected_generation is not None:
             headers["HTTP_IF_MATCH"] = f'"{expected_generation}"'
         return self.client.delete(
@@ -1142,6 +1142,8 @@ class ApiContractTests(ApiTestMixin, TestCase):
             profiles.json()["data"],
             [
                 {
+                    "address_book_snapshot_version": 1,
+                    "authorization_generation": profile.authorization_generation,
                     "guid": "team-design",
                     "name": "Design team",
                     "owner": "alice",
@@ -1912,7 +1914,7 @@ class ApiContractTests(ApiTestMixin, TestCase):
         created = self.client.post(
             "/api/share",
             {"data": json.dumps([{"value": str(peer.pk), "title": "ignored"}])},
-            HTTP_IDEMPOTENCY_KEY=str(uuid.uuid4()),
+            HTTP_IDEMPOTENCY_KEY="v2:" + str(uuid.uuid4()),
         )
         self.assertEqual(created.status_code, 200, created.content)
         raw_token = created.json()["token"]
@@ -1939,7 +1941,7 @@ class ApiContractTests(ApiTestMixin, TestCase):
 
         accepted = self.client.post(
             f"/api/share/{raw_token}",
-            {"idempotency_key": str(uuid.uuid4())},
+            {"idempotency_key": "v2:" + str(uuid.uuid4())},
         )
         self.assertEqual(accepted.status_code, 200, accepted.content)
         link.refresh_from_db()
@@ -1956,7 +1958,7 @@ class ApiContractTests(ApiTestMixin, TestCase):
 
         replay = self.client.post(
             f"/api/share/{raw_token}",
-            {"idempotency_key": str(uuid.uuid4())},
+            {"idempotency_key": "v2:" + str(uuid.uuid4())},
         )
         self.assertEqual(replay.status_code, 404)
 
