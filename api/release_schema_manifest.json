@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "schema_generation": "management-schema-0033-v1",
+  "schema_generation": "management-schema-0034-v1",
   "migrations": [
     ["admin", "0001_initial"],
     ["admin", "0002_logentry_remove_auto_add"],
@@ -38,6 +38,7 @@
     ["api", "0031_control_filter_indexes"],
     ["api", "0032_context_bound_encrypted_fields"],
     ["api", "0033_mutation_generations"],
+    ["api", "0034_frozen_username_identity"],
     ["auth", "0001_initial"],
     ["auth", "0002_alter_permission_name_max_length"],
     ["auth", "0003_alter_user_email_max_length"],
@@ -56,7 +57,7 @@
   ],
   "leaf_migrations": [
     ["admin", "0003_logentry_add_action_flag_choices"],
-    ["api", "0033_mutation_generations"],
+    ["api", "0034_frozen_username_identity"],
     ["auth", "0012_alter_user_first_name_max_length"],
     ["contenttypes", "0002_remove_content_type_name"],
     ["sessions", "0001_initial"]

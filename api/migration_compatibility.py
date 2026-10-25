@@ -160,11 +160,13 @@ def check_migration_compatibility(migrations_path=None):
         if item["kind"] == "callable" and not callable(value):
             raise MigrationCompatibilityError(f"migration compatibility callable is invalid: {item['path']}")
         deconstruct_path = item["deconstruct_path"]
-        if deconstruct_path and item["kind"] in {"field", "manager", "expression"}:
+        if deconstruct_path and item["kind"] in {"field", "manager", "expression", "validator"}:
             if item["kind"] == "field":
                 observed_path = value(max_length=1).deconstruct()[1]
             elif item["kind"] == "manager":
                 observed_path = value().deconstruct()[1]
+            elif item["kind"] == "validator":
+                observed_path = value().deconstruct()[0]
             else:
                 observed_path = value("compatibility_probe").deconstruct()[0]
             if observed_path != deconstruct_path:

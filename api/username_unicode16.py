@@ -117,3 +117,21 @@ def canonical_username_key(value):
     if len(key) > MAX_CANONICAL_BYTES:
         raise ValueError("username canonical form is too large")
     return key
+
+
+def username_candidate(value):
+    """Project a bounded optional IdP label; it never selects an existing user."""
+    require_unicode_version()
+    if not isinstance(value, str) or len(value) > MAX_INPUT_LENGTH:
+        return ""
+    value = _DATA.normalize("NFKC", value.strip(STRIP_CHARACTERS))
+    result = []
+    replacing = False
+    for character in value:
+        if valid_character(character):
+            result.append(character)
+            replacing = False
+        elif not replacing:
+            result.append("-")
+            replacing = True
+    return "".join(result).strip("-")[:MAX_LENGTH]

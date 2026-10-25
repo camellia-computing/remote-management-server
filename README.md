@@ -191,7 +191,9 @@ Stack 的长期健康所有者是 `deploy/supervise-management-stack.sh`，不�
 
 Compose还为Management、一次性migration、PostgreSQL和每个数据库client分别设置有限的CPU、memory reservation/max、PID、nofile/nproc、IO weight与OOM优先级；默认容量包络为稳定态PostgreSQL+Management约3 CPU/3 GiB，migration只在controller停止Management后使用独立2 CPU/1 GiB profile，backup使用既有1 CPU/512 MiB profile。PostgreSQL的`max_connections=128`、`shared_buffers=512MB`、`work_mem=4MB`和`maintenance_work_mem=128MB`必须与cgroup和Gunicorn/限流并行度一起按真实设备/记录/导出负载校准，不能把默认值当作1/100/10k规模的测量结论。生产Management/migrate容器启动前要求cgroup v2的`memory.max`、`pids.max`和`cpu.max`为有限值且不低于安全底线；触顶时应由edge准入和受监督controller摘流/退避，不能依赖宿主OOM随机选择进程。修改任何预算必须保留同一容量证据、PSI/cgroup事件、p95/p99和恢复时间，不能只增大limit掩盖过载。
 
-Username identity v1先对去除首尾空白的输入执行NFKC，再执行Unicode full casefold和第二次NFKC；显示用户名保存第一次NFKC结果，登录、OIDC分配、账号查找及登录限流桶只使用对应UTF-8 binary canonical key。PostgreSQL的`lower/iexact`和locale不再参与账号身份。新Compose cluster固定为UTF8、builtin locale provider、`C.UTF-8`和collation version 1；已有volume、外部数据库及恢复目标必须满足相同契约。迁移0026发现历史collision时只输出有界user ID与canonical digest并停止，不自动合并、改名或转移账号；管理员必须在离线审计后显式解决冲突再重跑迁移。
+Username identity v1先按固定29字符集合去除首尾空白，执行Unicode 16 NFKC、默认full casefold和第二次NFKC；不使用随Python版本变化的`str.casefold()`或`\w`。显示用户名保存第一次NFKC结果，登录、Admin表单、OIDC候选分配、账号查找及登录限流桶共享冻结规则和UTF-8 binary canonical key。CaseFolding数据和完整Unicode许可随`api/data/unicode16/`发布，加载时核对大小、SHA-256及映射数量；NFKC与字符分类只接受精确16.0.0数据。PostgreSQL的`lower/iexact`和locale不参与账号身份。新Compose cluster固定为UTF8、builtin locale provider、`C.UTF-8`和collation version 1；已有volume、外部数据库及恢复目标必须满足相同契约。
+
+迁移0026历史不改写；追加0034在单一独占事务内先分批验证全部显示名和最终key，发现collision或非规范显示名时只输出有界user ID与canonical digest并停止，不自动合并、改名或转移账号。管理员必须离线审计、显式解决冲突后重跑。预检成功才原子替换需要修复的derived key（包括旧key互换），不改变用户ID、密码、权限、凭证或mutation generation。readiness要求0034已应用；回退迁移只保留正确key，不恢复解释器相关算法。应用回滚必须使用同一冻结身份规则和受支持数据版本，不能单边退回旧Python身份实现。
 
 `POST /api/users`只有在username canonical预检命中，或user insert的独立savepoint失败后再次读到同一canonical账号时，才返回`409`与机器码`username_conflict`。指定的新Group发生并发创建时，服务会在savepoint回滚后锁定并复用已提交Group，保证不同新用户可加入同一目标；Group无法读回、M2M或其他未知完整性错误保持5xx并回滚整笔user创建，不会冒充用户名已存在。
 

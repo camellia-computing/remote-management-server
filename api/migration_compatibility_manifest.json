@@ -59,6 +59,27 @@
       "path": "api.models_work.share_link_expiry",
       "kind": "callable",
       "consumers": ["0001_initial.py"]
+    },
+    {
+      "path": "api.username_unicode16.canonical_username_key",
+      "kind": "callable",
+      "consumers": ["0034_frozen_username_identity.py"]
+    },
+    {
+      "path": "api.username_unicode16.normalize_username",
+      "kind": "callable",
+      "consumers": ["0034_frozen_username_identity.py"]
+    },
+    {
+      "path": "api.username_unicode16.require_unicode_version",
+      "kind": "callable",
+      "consumers": ["0034_frozen_username_identity.py"]
+    },
+    {
+      "path": "api.username_validators.Unicode16UsernameValidator",
+      "kind": "validator",
+      "deconstruct_path": "api.username_validators.Unicode16UsernameValidator",
+      "consumers": ["0034_frozen_username_identity.py"]
     }
   ]
 }

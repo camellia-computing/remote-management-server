@@ -39,8 +39,8 @@ class ReleaseSchemaContractTests(TestCase):
         self.assertEqual(
             check_release_schema(),
             {
-                "migration_count": 51,
-                "schema_generation": "management-schema-0033-v1",
+                "migration_count": 52,
+                "schema_generation": "management-schema-0034-v1",
                 "schema_manifest_version": 1,
             },
         )
@@ -114,7 +114,7 @@ class ReleaseSchemaContractTests(TestCase):
     def test_management_command_reports_manifest_generation(self):
         output = StringIO()
         call_command("check_release_schema", stdout=output)
-        self.assertIn('"schema_generation": "management-schema-0033-v1"', output.getvalue())
+        self.assertIn('"schema_generation": "management-schema-0034-v1"', output.getvalue())
 
 
 class ReleaseSchemaManifestValidationTests(TestCase):

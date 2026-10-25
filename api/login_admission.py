@@ -35,8 +35,10 @@ def _bounded_scope_text(value):
     try:
         return canonical_username(value)[:_MAX_SCOPE_TEXT]
     except ValueError:
-        value = value if isinstance(value, str) else str(value)
-        return value.casefold()[:_MAX_SCOPE_TEXT]
+        # Invalid input cannot identify a principal. A separate stable sentinel
+        # also avoids surrogate/NUL database failures and version-dependent
+        # casefold buckets for rejected identifiers.
+        return "<invalid-username>"
 
 
 def scope_hash(scope, username):

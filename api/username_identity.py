@@ -1,26 +1,23 @@
 import hashlib
-import unicodedata as _stdlib_unicode_data
-
-try:
-    import unicodedata2 as _backport_unicode_data
-except ImportError:
-    _backport_unicode_data = None
 
 from django.db import connections
 
-USERNAME_CANONICAL_VERSION = 1
-USERNAME_CANONICAL_ALGORITHM = "unicode-16.0.0-nfkc-casefold-nfkc-strip-v1"
-USERNAME_UNICODE_DATA_VERSION = "16.0.0"
-USERNAME_MAX_LENGTH = 50
-USERNAME_MAX_INPUT_LENGTH = 200
-USERNAME_CANONICAL_MAX_BYTES = 1024
-USERNAME_MIGRATION = "0026_username_canonical_identity"
+from api import username_unicode16 as identity_v1
 
-_UNICODE_DATA = (
-    _stdlib_unicode_data
-    if _stdlib_unicode_data.unidata_version == USERNAME_UNICODE_DATA_VERSION
-    else _backport_unicode_data or _stdlib_unicode_data
-)
+# Runtime and migration consumers share a frozen Unicode contract, not the
+# interpreter's evolving casefold/word-character tables.
+USERNAME_CANONICAL_VERSION = 1
+USERNAME_CANONICAL_ALGORITHM = identity_v1.ALGORITHM
+USERNAME_UNICODE_DATA_VERSION = identity_v1.UNICODE_VERSION
+USERNAME_MAX_LENGTH = identity_v1.MAX_LENGTH
+USERNAME_MAX_INPUT_LENGTH = identity_v1.MAX_INPUT_LENGTH
+USERNAME_CANONICAL_MAX_BYTES = identity_v1.MAX_CANONICAL_BYTES
+USERNAME_MIGRATION = "0034_frozen_username_identity"
+UsernameIdentityError = identity_v1.Unicode16IdentityError
+require_username_unicode_version = identity_v1.require_unicode_version
+normalize_username = identity_v1.normalize_username
+canonical_username = identity_v1.canonical_username
+canonical_username_key = identity_v1.canonical_username_key
 
 POSTGRES_ENCODING = "UTF8"
 POSTGRES_LOCALE_PROVIDER = "b"
@@ -28,43 +25,6 @@ POSTGRES_LOCALE = "C.UTF-8"
 POSTGRES_COLLATION_VERSION = "1"
 
 MAX_IDENTITY_ERRORS = 20
-
-
-class UsernameIdentityError(RuntimeError):
-    pass
-
-
-def require_username_unicode_version():
-    if _UNICODE_DATA.unidata_version != USERNAME_UNICODE_DATA_VERSION:
-        raise UsernameIdentityError(
-            "username canonicalization requires Unicode data "
-            f"{USERNAME_UNICODE_DATA_VERSION}, found {_UNICODE_DATA.unidata_version}"
-        )
-
-
-def normalize_username(value):
-    require_username_unicode_version()
-    if not isinstance(value, str) or len(value) > USERNAME_MAX_INPUT_LENGTH:
-        raise ValueError("username is not a bounded string")
-    normalized = _UNICODE_DATA.normalize("NFKC", value.strip())
-    if not normalized or len(normalized) > USERNAME_MAX_LENGTH:
-        raise ValueError("username has an invalid normalized length")
-    return normalized
-
-
-def canonical_username(value):
-    normalized = normalize_username(value)
-    canonical = _UNICODE_DATA.normalize("NFKC", normalized.casefold())
-    if not canonical:
-        raise ValueError("username has an empty canonical form")
-    return canonical
-
-
-def canonical_username_key(value):
-    key = canonical_username(value).encode("utf-8")
-    if len(key) > USERNAME_CANONICAL_MAX_BYTES:
-        raise ValueError("username canonical form is too large")
-    return key
 
 
 def canonical_username_digest(key):

@@ -4,20 +4,45 @@ import subprocess
 import sys
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from types import SimpleNamespace
 from unittest.mock import patch
 
+from django.core.exceptions import ValidationError
 from django.test import SimpleTestCase
 
 from api import username_unicode16 as identity
+from api.username_identity import canonical_username_key
+from api.username_validators import Unicode16UsernameField, Unicode16UsernameValidator
 
 
 class FrozenUnicode16Tests(SimpleTestCase):
+    def test_runtime_field_and_validator_share_the_frozen_authority(self):
+        self.assertEqual(canonical_username_key("\u1c89"), "\u1c8a".encode())
+        self.assertEqual(Unicode16UsernameField().clean(" \u1c89 "), "\u1c89")
+        Unicode16UsernameValidator()("\u1c89")
+        for value in ["name!", "name\x00", "name\ud800", "x" * 51]:
+            with self.assertRaises(ValidationError):
+                Unicode16UsernameValidator()(value)
+        self.assertEqual(identity.username_candidate("Full   Name😀"), "Full-Name")
+        self.assertEqual(identity.username_candidate({"name": "ignored"}), "")
+
     def test_full_casefold_is_the_frozen_default_not_interpreter_or_turkic_mapping(self):
         self.assertEqual(identity.full_casefold("\u1c89\u1c8a"), "\u1c8a\u1c8a")
         self.assertEqual(identity.full_casefold("StraßeΣςİI"), "strasseσσi\u0307i")
         self.assertEqual(identity.canonical_username_key(" \u1c89 "), "\u1c8a".encode())
         self.assertEqual(identity.normalize_username("\x1cＡlice\u3000"), "Alice")
         self.assertEqual(len(identity.STRIP_CHARACTERS), 29)
+
+    def test_wrong_normalization_data_version_fails_closed_at_each_identity_entrypoint(self):
+        with patch.object(identity, "_DATA", SimpleNamespace(unidata_version="17.0.0")):
+            for operation, value in [
+                (identity.normalize_username, "Alice"),
+                (identity.canonical_username_key, "Alice"),
+                (identity.username_candidate, "Alice"),
+                (identity.valid_character, "A"),
+            ]:
+                with self.assertRaisesMessage(identity.Unicode16IdentityError, "requires Unicode data 16.0.0"):
+                    operation(value)
 
     def test_character_validation_uses_unicode16_even_when_python_does_not_know_a_letter(self):
         self.assertTrue(identity.valid_character("\u1c89"))
@@ -46,7 +71,10 @@ class FrozenUnicode16Tests(SimpleTestCase):
         code = (
             "import hashlib, json; from api import username_unicode16 as u; "
             "text = ''.join(chr(n) for n in range(0x110000)); "
+            "u.require_unicode_version(); "
             "print(json.dumps([hashlib.sha256(u.full_casefold(text).encode('utf-8', 'surrogatepass')).hexdigest(), "
+            "hashlib.sha256(u._DATA.normalize('NFKC', text).encode('utf-8', 'surrogatepass')).hexdigest(), "
+            "hashlib.sha256(bytes(u.valid_character(c) for c in text)).hexdigest(), "
             "[ord(c) for c in u.STRIP_CHARACTERS]]))"
         )
         expected = None

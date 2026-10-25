@@ -2,6 +2,7 @@ import base64
 import concurrent.futures
 import json
 import threading
+import uuid
 from unittest.mock import patch
 
 from django.contrib.auth.models import Group
@@ -54,6 +55,7 @@ class UserCreateIntegrityClassificationTests(TestCase):
             ),
             content_type="application/json",
             HTTP_AUTHORIZATION=f"Bearer {self.bearer}",
+            HTTP_IDEMPOTENCY_KEY=str(uuid.uuid4()),
         )
 
     def test_canonical_username_collision_has_a_stable_machine_code(self):
@@ -165,6 +167,7 @@ class PostgreSQLUserCreateConcurrencyTests(TransactionTestCase):
                 ),
                 content_type="application/json",
                 HTTP_AUTHORIZATION=f"Bearer {self.bearer}",
+                HTTP_IDEMPOTENCY_KEY=str(uuid.uuid4()),
             )
         finally:
             connections.close_all()

@@ -136,6 +136,7 @@ from api.request_utils import (
 from api.response_contract import RESPONSE_SCHEMA_VERSION, empty_success, json_error, json_pending
 from api.tag_colors import normalize_tag_color
 from api.username_identity import canonical_username_key, check_username_identity, normalize_username
+from api.username_unicode16 import username_candidate
 from camellia_remote_management.observability import log_structured_event
 
 logger = logging.getLogger(__name__)
@@ -927,21 +928,17 @@ def _validate_oidc_id_token(token, metadata, provider, nonce):
 
 
 def _oidc_local_username(claims, issuer, subject, attempt=0):
+    email = claims.get("email")
     raw_candidates = (
         claims.get("preferred_username"),
         claims.get("name"),
-        str(claims.get("email") or "").split("@", 1)[0],
+        email.split("@", 1)[0] if isinstance(email, str) else None,
         subject,
     )
     max_length = UserProfile._meta.get_field("username").max_length
     base = ""
     for value in raw_candidates:
-        value = str(value or "").strip()
-        value = re.sub(r"[^\w.@+-]+", "-", value, flags=re.UNICODE).strip("-")
-        try:
-            base = normalize_username(value[:max_length])
-        except ValueError:
-            continue
+        base = username_candidate(value)
         if base:
             break
     if not base:

@@ -1,6 +1,7 @@
 import base64
 import hashlib
 import json
+import uuid
 from unittest.mock import patch
 
 from django.contrib import auth
@@ -10,9 +11,9 @@ from django.db import IntegrityError, connection, transaction
 from django.db.migrations.executor import MigrationExecutor
 from django.test import TestCase, TransactionTestCase, override_settings, skipUnlessDBFeature
 
-from api.login_admission import scope_hash
+from api.login_admission import reserve_login_attempt, scope_hash
 from api.migration_test_support import restore_latest_migration_state
-from api.models import RemoteDevice, UserProfile
+from api.models import LoginAttempt, RemoteDevice, UserProfile
 from api.username_identity import (
     POSTGRES_COLLATION_VERSION,
     POSTGRES_ENCODING,
@@ -136,6 +137,7 @@ class UsernameIdentityTests(TestCase):
             data=json.dumps({"username": "ＳtraßeNew", "password": self.password}),
             content_type="application/json",
             HTTP_AUTHORIZATION=f"Bearer {token}",
+            HTTP_IDEMPOTENCY_KEY=str(uuid.uuid4()),
         )
         self.assertEqual(created.status_code, 200, created.content)
         collision = admin_api.post(
@@ -143,6 +145,7 @@ class UsernameIdentityTests(TestCase):
             data=json.dumps({"username": "STRASSENEW", "password": self.password}),
             content_type="application/json",
             HTTP_AUTHORIZATION=f"Bearer {token}",
+            HTTP_IDEMPOTENCY_KEY=str(uuid.uuid4()),
         )
         self.assertEqual(collision.status_code, 409, collision.content)
         normalization_overflow = admin_api.post(
@@ -150,6 +153,7 @@ class UsernameIdentityTests(TestCase):
             data=json.dumps({"username": "ﬃ" * 20, "password": self.password}),
             content_type="application/json",
             HTTP_AUTHORIZATION=f"Bearer {token}",
+            HTTP_IDEMPOTENCY_KEY=str(uuid.uuid4()),
         )
         self.assertEqual(normalization_overflow.status_code, 400, normalization_overflow.content)
 
@@ -201,6 +205,44 @@ class UsernameIdentityTests(TestCase):
         allocated = _oidc_local_username(claims, "https://issuer.example", "subject-a")
         self.assertNotEqual(canonical_username_key(allocated), bytes(self.user.username_canonical))
         self.assertRegex(allocated, r"^äSTER-[0-9a-f]{10}$")
+
+    def test_new_unicode16_letter_uses_one_authority_for_model_admin_oidc_and_admission(self):
+        from api.admin_site import AdmissionAdminAuthenticationForm
+        from api.admin_user import UserChangeForm, UserCreationForm
+        from api.username_validators import Unicode16UsernameField
+
+        for form in (AdmissionAdminAuthenticationForm, UserCreationForm, UserChangeForm):
+            self.assertIsInstance(form.base_fields["username"], Unicode16UsernameField)
+            self.assertEqual(form.base_fields["username"].clean(" \u1c89 "), "\u1c89")
+        admin = UserProfile.objects.create_superuser("\u1c89", self.password)
+        admin.full_clean()
+        self.assertEqual(bytes(admin.username_canonical), "\u1c8a".encode())
+        response = self.client.post(
+            "/admin/login/", {"username": "\u1c8a", "password": self.password, "next": "/admin/"}
+        )
+        self.assertEqual(response.status_code, 302, response.content)
+        self.assertEqual(auth.authenticate(username="\u1c8a", password=self.password), admin)
+        self.assertEqual(scope_hash("login", "\u1c89"), scope_hash("login", "\u1c8a"))
+        allocated = _oidc_local_username({"name": "\u1c89"}, "https://issuer.example", "other-subject")
+        self.assertRegex(allocated, "^\u1c89-[0-9a-f]{10}$")
+        self.assertNotEqual(canonical_username_key(allocated), bytes(admin.username_canonical))
+
+    def test_oidc_optional_name_claims_are_bounded_strings_not_coerced_objects(self):
+        allocated = _oidc_local_username(
+            {"preferred_username": {"private": "bad"}, "name": "x" * 201, "email": ["bad"]},
+            "https://issuer.example",
+            "subject-valid",
+        )
+        self.assertEqual(allocated, "subject-valid")
+
+    def test_invalid_identifiers_use_a_stable_separate_admission_bucket_without_database_encoding_errors(self):
+        for value in ["name\x00", "name\ud800", "x" * 201, {"private": "bad"}, None]:
+            self.assertEqual(scope_hash("login", value), scope_hash("login", "!"))
+            self.assertNotEqual(scope_hash("login", value), scope_hash("login", self.user.username))
+            admission = reserve_login_attempt("127.0.0.1", value)
+            self.assertIsNotNone(admission)
+            attempt = LoginAttempt.objects.get(pk=admission.attempt_id)
+            self.assertEqual(attempt.username, "<invalid-username>")
 
     def test_queryset_and_bulk_paths_cannot_split_display_and_authority(self):
         UserProfile.objects.filter(pk=self.user.pk).update(username="Ｓtraße")
@@ -260,6 +302,7 @@ class UsernameIdentityTests(TestCase):
                 [self.user.pk],
             )
 
+    @override_settings(DEVICE_VERIFICATION_TOKEN="v" * 48)
     def test_readiness_fails_closed_when_identity_contract_fails(self):
         from api import views_api
 

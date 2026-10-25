@@ -5,14 +5,15 @@ from django.contrib.auth.models import (
     BaseUserManager,
     PermissionsMixin,
 )
-from django.contrib.auth.validators import UnicodeUsernameValidator
 from django.contrib.postgres.indexes import GinIndex, OpClass
+from django.core.exceptions import ValidationError
 from django.db import models, router, transaction
 from django.db.models.functions import Cast, Upper
 from django.utils.crypto import salted_hmac
 from django.utils.translation import gettext_lazy as _
 
 from api.username_identity import canonical_username_key, normalize_username
+from api.username_validators import Unicode16UsernameValidator
 
 _USERNAME_BULK_UPDATE = ContextVar("username_bulk_update", default=False)
 
@@ -134,7 +135,7 @@ class UserProfile(AbstractBaseUser, PermissionsMixin):
         _("用户名"),
         unique=True,
         max_length=50,
-        validators=[UnicodeUsernameValidator()],
+        validators=[Unicode16UsernameValidator()],
     )
     username_canonical = models.BinaryField(
         max_length=1024,
@@ -191,9 +192,16 @@ class UserProfile(AbstractBaseUser, PermissionsMixin):
         self.username = normalize_username(self.username)
         self.username_canonical = canonical_username_key(self.username)
 
+    @classmethod
+    def normalize_username(cls, username):
+        return normalize_username(username)
+
     def clean(self):
-        super().clean()
-        self._sync_username_identity()
+        try:
+            super().clean()
+            self._sync_username_identity()
+        except ValueError:
+            raise ValidationError({"username": Unicode16UsernameValidator.message}) from None
 
     def save(self, *args, **kwargs):
         """Never let a stale model instance move credential generation backward."""

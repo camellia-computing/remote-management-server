@@ -21,6 +21,7 @@ from api.audit_queries import (
 )
 from api.credential_sessions import revoke_device_credentials, revoke_user_credentials
 from api.username_identity import canonical_username_key, normalize_username
+from api.username_validators import Unicode16UsernameField
 
 AUDIT_ADMIN_BROWSE_LIMIT = 10_000
 
@@ -97,6 +98,7 @@ class UserCreationForm(forms.ModelForm):
 
     class Meta:
         model = models.UserProfile
+        field_classes = {"username": Unicode16UsernameField}
         fields = (
             "username",
             "email",
@@ -156,6 +158,7 @@ class UserChangeForm(forms.ModelForm):
 
     class Meta:
         model = models.UserProfile
+        field_classes = {"username": Unicode16UsernameField}
         fields = (
             "username",
             "email",

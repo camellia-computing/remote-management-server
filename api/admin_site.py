@@ -1,5 +1,6 @@
 import logging
 
+from django import forms
 from django.contrib.admin import AdminSite
 from django.contrib.admin.forms import AdminAuthenticationForm
 from django.contrib.auth.decorators import login_not_required
@@ -10,6 +11,7 @@ from django.views.decorators.cache import never_cache
 
 from api.login_admission import complete_login_success, reserve_login_attempt
 from api.request_utils import client_ip
+from api.username_validators import Unicode16UsernameField
 from camellia_remote_management.access_logging import normalized_route, safe_request_id
 
 logger = logging.getLogger(__name__)
@@ -18,6 +20,9 @@ _LOCKED_ATTRIBUTE = "_camellia_admin_login_locked"
 
 
 class AdmissionAdminAuthenticationForm(AdminAuthenticationForm):
+    username = Unicode16UsernameField(
+        widget=forms.TextInput(attrs={"autofocus": True, "autocomplete": "username", "autocapitalize": "none"})
+    )
     error_messages = {
         **AdminAuthenticationForm.error_messages,
         "locked": _("尝试次数过多，请稍后再试。"),
