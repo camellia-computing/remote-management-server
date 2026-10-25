@@ -1,9 +1,9 @@
 """Idempotency and generation boundary for Address Book JSON mutations."""
 
-import hashlib
 import json
 import re
 
+from django.conf import settings
 from django.db import transaction
 from django.http import JsonResponse
 from django.views.decorators.csrf import csrf_exempt
@@ -14,10 +14,12 @@ from api.identifiers import InvalidIdentifier
 from api.management_operations import (
     ManagementMutation,
     ManagementOperationConflict,
+    ManagementOperationRetired,
     execute_management_operation,
     operation_id_from_request,
 )
 from api.models import AddressBookProfile, AddressBookRule, AddressBookShare
+from api.request_utils import InvalidJsonPayload, JsonPayloadTooLarge, UnsupportedJsonMediaType, load_json_body
 from api.response_contract import RESPONSE_MODE_JSON, RESPONSE_MODE_MARKER
 
 
@@ -41,17 +43,9 @@ def _expected_generation(request):
     return generation if generation <= MAX_AUTHORIZATION_GENERATION else False
 
 
-def _json_body(request):
-    try:
-        return json.loads(request.body)
-    except (TypeError, ValueError):
-        return None
-
-
-def _profile_references(operation, request, route_kwargs):
+def _profile_references(operation, request, route_kwargs, body):
     """Return explicit profile GUIDs and profile PKs referenced by a request."""
 
-    body = _json_body(request)
     profile_guids = set()
     profile_pks = set()
     if operation.startswith(("address_book_peer_", "address_book_tag_")):
@@ -67,17 +61,15 @@ def _profile_references(operation, request, route_kwargs):
             share_profile = AddressBookShare.objects.filter(guid=reference).values_list("profile_id", flat=True).first()
             rule_profile = None
             if share_profile is None:
-                rule_profile = AddressBookRule.objects.filter(guid=reference).values_list("profile_id", flat=True).first()
+                rule_profile = (
+                    AddressBookRule.objects.filter(guid=reference).values_list("profile_id", flat=True).first()
+                )
             if share_profile is not None or rule_profile is not None:
                 profile_pks.add(share_profile if share_profile is not None else rule_profile)
     elif operation == "address_book_rule_delete" and isinstance(body, list):
         references = [str(value) for value in body]
-        profile_pks.update(
-            AddressBookShare.objects.filter(guid__in=references).values_list("profile_id", flat=True)
-        )
-        profile_pks.update(
-            AddressBookRule.objects.filter(guid__in=references).values_list("profile_id", flat=True)
-        )
+        profile_pks.update(AddressBookShare.objects.filter(guid__in=references).values_list("profile_id", flat=True))
+        profile_pks.update(AddressBookRule.objects.filter(guid__in=references).values_list("profile_id", flat=True))
     return profile_guids, profile_pks
 
 
@@ -173,21 +165,32 @@ def replayable_stateless_api(view, operation, *methods):
         expected_generation = _expected_generation(request)
         if expected_generation is False:
             return JsonResponse({"error": "Invalid If-Match"}, status=400)
-        profile_guids, profile_pks = _profile_references(operation, request, kwargs)
+        maximum = {
+            "address_book_peer_delete": settings.JSON_ADDRESS_BOOK_BULK_MAX_BODY_BYTES,
+            "address_book_tag_delete": settings.JSON_MANAGEMENT_BATCH_MAX_BODY_BYTES,
+        }.get(operation, settings.JSON_CONTROL_MAX_BODY_BYTES)
+        try:
+            body = load_json_body(request, max_bytes=maximum) if request.body else None
+        except UnsupportedJsonMediaType:
+            return JsonResponse({"error": "A JSON content type is required"}, status=415)
+        except JsonPayloadTooLarge:
+            return JsonResponse({"error": "JSON body exceeds its budget"}, status=413)
+        except InvalidJsonPayload:
+            return JsonResponse({"error": "Invalid JSON body"}, status=400)
+        profile_guids, profile_pks = _profile_references(operation, request, kwargs, body)
         request_document = {
             "operation": operation,
             "method": request.method,
             "path": request.path,
             "args": {key: sorted(request.GET.getlist(key)) for key in sorted(request.GET)},
-            "body_sha256": hashlib.sha256(request.body).hexdigest(),
+            "body": body,
+            "has_body": bool(request.body),
             "expected_generation": expected_generation,
         }
 
         def mutate():
             profiles = _lock_profiles(profile_guids, profile_pks)
-            generations_before = {
-                profile.pk: profile.authorization_generation for profile in profiles.values()
-            }
+            generations_before = {profile.pk: profile.authorization_generation for profile in profiles.values()}
             if expected_generation is not None and any(
                 profile.authorization_generation != expected_generation for profile in profiles.values()
             ):
@@ -213,9 +216,7 @@ def replayable_stateless_api(view, operation, *methods):
                     bump_locked_authorization_generation(profile)
                 elif profile.authorization_generation < previous:
                     raise RuntimeError("Address Book generation moved backwards")
-            generations = {
-                str(profile.guid): profile.authorization_generation for profile in profiles.values()
-            }
+            generations = {str(profile.guid): profile.authorization_generation for profile in profiles.values()}
             if generations:
                 body["mutation_generations"] = generations
             if len(generations) == 1:
@@ -239,6 +240,14 @@ def replayable_stateless_api(view, operation, *methods):
                 request_document=request_document,
                 requested={"mutations": 1},
                 mutation=mutate,
+            )
+        except ManagementOperationRetired:
+            return JsonResponse(
+                {
+                    "error": "Operation receipt retired; operation must not be repeated",
+                    "code": "operation_receipt_retired",
+                },
+                status=410,
             )
         except ManagementOperationConflict:
             return JsonResponse({"error": "Operation identifier conflict"}, status=409)

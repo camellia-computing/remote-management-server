@@ -62,7 +62,7 @@ class ControlMutationTransactionTests(TestCase):
             "HTTP_IF_MATCH": f'"{expected_generation}"',
         }
         if operation_id is not None:
-            headers["HTTP_IDEMPOTENCY_KEY"] = operation_id
+            headers["HTTP_IDEMPOTENCY_KEY"] = "v2:" + str(operation_id)
         return getattr(self.client, method)(
             path,
             data=json.dumps({}),
@@ -73,7 +73,7 @@ class ControlMutationTransactionTests(TestCase):
     def _assert_receipt(self, response, operation, operation_id, target_kind):
         self.assertEqual(response.status_code, 200, response.content)
         body = response.json()
-        self.assertEqual(body["management_operation_receipt_version"], 1)
+        self.assertEqual(body["management_operation_receipt_version"], 2)
         self.assertEqual(body["operation_id"], operation_id)
         self.assertEqual(body["operation"], operation)
         self.assertIsInstance(body["operation_generation"], int)
@@ -269,7 +269,7 @@ class ControlMutationTransactionTests(TestCase):
         self.assertEqual(self.target.credential_generation, MAX_CREDENTIAL_GENERATION)
         receipt = ManagementBatchOperation.objects.get(operation_id=operation_id)
         self.assertEqual(receipt.status_code, 409)
-        self.assertEqual(receipt.response, first_body)
+        self.assertEqual(json.loads(receipt.secret_response)["body"], first_body)
 
         device_operation_id = str(uuid.uuid4())
         RemoteDevice.objects.filter(pk=self.target_device.pk).update(
@@ -450,7 +450,7 @@ class ControlMutationConcurrencyTests(TransactionTestCase):
                 data=json.dumps({}),
                 content_type="application/json",
                 HTTP_AUTHORIZATION=f"Bearer {self.bearer}",
-                HTTP_IDEMPOTENCY_KEY=operation_id,
+                HTTP_IDEMPOTENCY_KEY="v2:" + str(operation_id),
                 HTTP_IF_MATCH='"0"',
             )
         finally:
@@ -465,7 +465,7 @@ class ControlMutationConcurrencyTests(TransactionTestCase):
                 data=json.dumps({}),
                 content_type="application/json",
                 HTTP_AUTHORIZATION=f"Bearer {actor_bearer}",
-                HTTP_IDEMPOTENCY_KEY=operation_id,
+                HTTP_IDEMPOTENCY_KEY="v2:" + str(operation_id),
                 HTTP_IF_MATCH='"0"',
             )
         finally:

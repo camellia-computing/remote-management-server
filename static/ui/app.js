@@ -347,6 +347,8 @@ document.addEventListener("submit", async (event) => {
   form.dataset.mutationSubmitting = "preparing";
   operationId = form.elements.namedItem("idempotency_key");
   if (!(operationId instanceof HTMLInputElement)) return;
+  const operationNonce = operationId.value.startsWith("v2:") ? operationId.value.slice(3) : operationId.value;
+  operationId.value = `v2:${operationNonce}`;
   const pageGeneration = mutationPageGeneration;
   let fingerprint;
   try { fingerprint = formFingerprint(form, event.submitter); } catch (_error) {
@@ -357,7 +359,7 @@ document.addEventListener("submit", async (event) => {
   let reserved = false;
   let mayHaveSubmitted = false;
   try {
-    await rememberPendingMutation(operationId.value);
+    await rememberPendingMutation(operationNonce);
     reserved = true;
     if (pageGeneration !== mutationPageGeneration || !form.isConnected ||
         fingerprint !== formFingerprint(form, event.submitter)) {
@@ -377,7 +379,7 @@ document.addEventListener("submit", async (event) => {
     if (!mayHaveSubmitted) {
       delete form.dataset.mutationSubmitting;
       if (reserved) {
-        try { await forgetPendingMutation(operationId.value); } catch (_error) { /* Retain if cleanup cannot persist. */ }
+        try { await forgetPendingMutation(operationNonce); } catch (_error) { /* Retain if cleanup cannot persist. */ }
       }
     }
   }

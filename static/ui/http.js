@@ -133,7 +133,7 @@
             status === 401 ? "authentication" : status === 403 ? "permission" :
             status === 409 ? "conflict" : status === 429 ? "rate_limit" :
             status >= 500 ? "server" : "validation";
-          throw failure(kind, { data, outcomeKnown: status < 500 && status !== 409 && data.result !== "unknown" });
+          throw failure(kind, { data, outcomeKnown: status < 500 && status !== 409 && status !== 410 && data.result !== "unknown" });
         }
         if (status < 200 || status >= 300 || data.code === 0) throw failure("protocol", { data });
         return { data, status, requestId };
@@ -177,7 +177,7 @@
     }
 
     function receiptMatches(data, id, operation) {
-      if (!data || data.management_operation_receipt_version !== 1 || data.operation_id !== id ||
+      if (!data || data.management_operation_receipt_version !== 2 || data.operation_id !== id ||
           typeof data.operation !== "string" || !MACHINE_CODE.test(data.operation) ||
           (operation !== undefined && data.operation !== operation) ||
           !Number.isSafeInteger(data.operation_generation) || data.operation_generation < 1 ||

@@ -79,6 +79,7 @@ from api.login_admission import complete_login_success, reserve_login_attempt
 from api.management_operations import (
     ManagementMutation,
     ManagementOperationConflict,
+    ManagementOperationRetired,
     document_digest,
     execute_management_operation,
     find_management_operation,
@@ -284,10 +285,14 @@ def management_operation_receipt(request, operation_id):
         parsed_operation_id = parse_operation_id(operation_id)
     except InvalidIdentifier:
         return JsonResponse({"error": "Invalid operation identifier"}, status=400)
-    result = find_management_operation(
-        actor=actor,
-        operation_id=parsed_operation_id,
-    )
+    try:
+        result = find_management_operation(actor=actor, operation_id=parsed_operation_id)
+    except ManagementOperationRetired:
+        return json_error(
+            "operation_receipt_retired",
+            "Operation receipt retired; inspect the resource before any new operation",
+            status=410,
+        )
     if result is None:
         return JsonResponse({"error": "Operation receipt not found"}, status=404)
     return JsonResponse(
@@ -1426,8 +1431,8 @@ def _generation_conflict(current, kind="resources"):
 def _advance_mutation_generation(instance):
     if instance.mutation_generation >= MAX_MUTATION_GENERATION:
         raise RuntimeError("Resource mutation generation exhausted")
-    updated = type(instance)._base_manager.filter(pk=instance.pk).update(
-        mutation_generation=F("mutation_generation") + 1
+    updated = (
+        type(instance)._base_manager.filter(pk=instance.pk).update(mutation_generation=F("mutation_generation") + 1)
     )
     if updated != 1:
         raise RuntimeError("Resource disappeared while advancing mutation generation")
@@ -1465,11 +1470,7 @@ def _expected_mutation_generation_map(value, target_ids):
         normalized[kind] = {}
         for target_id in expected_ids:
             generation = generations.get(target_id)
-            if (
-                type(generation) is not int
-                or generation < 0
-                or generation > MAX_MUTATION_GENERATION
-            ):
+            if type(generation) is not int or generation < 0 or generation > MAX_MUTATION_GENERATION:
                 return None
             normalized[kind][target_id] = generation
     return normalized
@@ -1551,6 +1552,10 @@ def _optional_empty_mutation_body_error(request):
 def _execute_management_batch(**kwargs):
     try:
         result = execute_management_operation(**kwargs)
+    except ManagementOperationRetired:
+        return json_error(
+            "operation_receipt_retired", "Operation receipt retired; operation must not be repeated", status=410
+        )
     except ManagementOperationConflict:
         return JsonResponse({"error": "Operation identifier conflict"}, status=409)
     response = JsonResponse(result.body, status=result.status_code)
@@ -3157,11 +3162,7 @@ def ab_shared_add(request):
             "note": note,
             "info": parsed_info,
             "has_default_password": "default_password" in postdata,
-            "default_password_digest": (
-                document_digest(default_password)
-                if "default_password" in postdata
-                else None
-            ),
+            "default_password": default_password if "default_password" in postdata else None,
         },
         requested={"profiles": 1},
         mutation=mutate,
@@ -3239,6 +3240,7 @@ def ab_shared_update_profile(request):
             return JsonResponse({"error": "Owner not found"}, status=404)
         if AddressBookProfile.objects.filter(owner=new_owner, name=profile.name).exclude(pk=profile.pk).exists():
             return JsonResponse({"error": "Owner already has an address book with this name"}, status=409)
+
     def mutate():
         with transaction.atomic():
             locked_profile = _lock_profile_for_management(user, profile)
@@ -3255,10 +3257,14 @@ def ab_shared_update_profile(request):
             current_name = locked_profile.name
             if "name" in postdata:
                 current_name = str(postdata.get("name") or "").strip()
-            if AddressBookProfile.objects.filter(
-                owner=target_owner,
-                name=current_name,
-            ).exclude(pk=locked_profile.pk).exists():
+            if (
+                AddressBookProfile.objects.filter(
+                    owner=target_owner,
+                    name=current_name,
+                )
+                .exclude(pk=locked_profile.pk)
+                .exists()
+            ):
                 return ManagementMutation(
                     status_code=409,
                     body={"error": "Owner already has an address book with this name"},
@@ -3309,17 +3315,9 @@ def ab_shared_update_profile(request):
         request_document={
             "operation": "address_book_profile_update",
             "guid": str(guid),
-            "data": {
-                key: value
-                for key, value in postdata.items()
-                if key not in {"default_password"}
-            },
+            "data": {key: value for key, value in postdata.items() if key not in {"default_password"}},
             "has_default_password": "default_password" in postdata,
-            "default_password_digest": (
-                document_digest(default_password)
-                if "default_password" in postdata
-                else None
-            ),
+            "default_password": default_password if "default_password" in postdata else None,
             "owner": postdata.get("owner") if "owner" in postdata else None,
             "expected_generation": expected_generation,
         },
@@ -6040,7 +6038,7 @@ def users(request):
             request_document={
                 "operation": "user_create",
                 "username": data["name"] if "name" in data else data["username"],
-                "password_digest": document_digest(password),
+                "password": password,
                 "email": data.get("email", ""),
                 "note": data.get("note", ""),
                 "group_name": data.get("group_name", ""),
@@ -6170,11 +6168,7 @@ def user_status(request, guid, action):
         request_document={
             "operation": operation,
             "user": str(target_pk),
-            **(
-                {"expected_generation": expected_generation}
-                if expected_generation is not None
-                else {}
-            ),
+            **({"expected_generation": expected_generation} if expected_generation is not None else {}),
         },
         requested={"users": 1},
         mutation=mutate,
@@ -6277,11 +6271,7 @@ def user_delete(request, guid):
         request_document={
             "operation": "user_delete",
             "user": str(target_pk),
-            **(
-                {"expected_generation": expected_generation}
-                if expected_generation is not None
-                else {}
-            ),
+            **({"expected_generation": expected_generation} if expected_generation is not None else {}),
         },
         requested={"users": 1},
         mutation=mutate,
@@ -6531,11 +6521,7 @@ def device_status(request, guid, action):
         request_document={
             "operation": operation,
             "device": str(device_pk),
-            **(
-                {"expected_generation": expected_generation}
-                if expected_generation is not None
-                else {}
-            ),
+            **({"expected_generation": expected_generation} if expected_generation is not None else {}),
         },
         requested={"devices": 1},
         mutation=mutate,
@@ -6673,9 +6659,7 @@ def device_delete(request, guid):
         return JsonResponse({"error": "Invalid If-Match"}, status=400)
 
     def mutate():
-        observed_group_id = (
-            RemoteDevice.objects.filter(pk=device_pk).values_list("device_group_id", flat=True).first()
-        )
+        observed_group_id = RemoteDevice.objects.filter(pk=device_pk).values_list("device_group_id", flat=True).first()
         if observed_group_id is not None:
             list(DeviceGroup.objects.select_for_update().filter(pk=observed_group_id))
         device = RemoteDevice.objects.select_for_update().filter(pk=device_pk).first()
@@ -6727,11 +6711,7 @@ def device_delete(request, guid):
         request_document={
             "operation": "device_delete",
             "device": str(device_pk),
-            **(
-                {"expected_generation": expected_generation}
-                if expected_generation is not None
-                else {}
-            ),
+            **({"expected_generation": expected_generation} if expected_generation is not None else {}),
         },
         requested={"devices": 1},
         mutation=mutate,
@@ -6792,16 +6772,10 @@ def device_assign(request, guid):
         return JsonResponse({"error": "Invalid If-Match"}, status=400)
     receipt_value = value
     if typ == "ab" and isinstance(value, dict):
-        receipt_value = {
-            key: nested_value
-            for key, nested_value in value.items()
-            if key != "address_book_password"
-        }
+        receipt_value = {key: nested_value for key, nested_value in value.items() if key != "address_book_password"}
         receipt_value["has_address_book_password"] = "address_book_password" in value
-        receipt_value["address_book_password_digest"] = (
-            document_digest(value["address_book_password"])
-            if "address_book_password" in value
-            else None
+        receipt_value["address_book_password"] = (
+            value["address_book_password"] if "address_book_password" in value else None
         )
 
     def failed(status_code, message, code):
@@ -6833,35 +6807,19 @@ def device_assign(request, guid):
                 group_name = group_name.strip()
             if group_name is None:
                 return failed(400, "Invalid device group", "invalid_device_group")
-            observed = (
-                RemoteDevice.objects.filter(pk=device_pk)
-                .values("device_group_id")
-                .first()
-            )
+            observed = RemoteDevice.objects.filter(pk=device_pk).values("device_group_id").first()
             if observed is None:
                 return failed(404, "Device not found", "device_not_found")
             observed_group_id = observed["device_group_id"]
             candidate_group_id = None
             if group_name:
-                candidate_group_id = (
-                    DeviceGroup.objects.filter(name=group_name)
-                    .values_list("pk", flat=True)
-                    .first()
-                )
+                candidate_group_id = DeviceGroup.objects.filter(name=group_name).values_list("pk", flat=True).first()
                 if candidate_group_id is None:
                     return failed(404, "Device group not found", "device_group_not_found")
             group_ids = sorted(
-                {
-                    group_id
-                    for group_id in (observed_group_id, candidate_group_id)
-                    if group_id is not None
-                }
+                {group_id for group_id in (observed_group_id, candidate_group_id) if group_id is not None}
             )
-            locked_groups = list(
-                DeviceGroup.objects.select_for_update()
-                .filter(pk__in=group_ids)
-                .order_by("pk")
-            )
+            locked_groups = list(DeviceGroup.objects.select_for_update().filter(pk__in=group_ids).order_by("pk"))
             groups_by_id = {locked_group.pk: locked_group for locked_group in locked_groups}
             if len(groups_by_id) != len(group_ids):
                 return failed(409, "Device group changed", "device_group_changed")
@@ -6955,9 +6913,7 @@ def device_assign(request, guid):
         body = _serialize_device(device)
         group_generations = {
             str(group_guid): generation
-            for group_guid, generation in DeviceGroup.objects.filter(
-                pk__in=changed_group_ids
-            )
+            for group_guid, generation in DeviceGroup.objects.filter(pk__in=changed_group_ids)
             .order_by("pk")
             .values_list("guid", "mutation_generation")
         }
@@ -7340,9 +7296,7 @@ def device_group_detail(request, guid):
         }
 
         def mutate():
-            observed_groups = dict(
-                RemoteDevice.objects.filter(rid__in=ids).values_list("pk", "device_group_id")
-            )
+            observed_groups = dict(RemoteDevice.objects.filter(rid__in=ids).values_list("pk", "device_group_id"))
             old_group_ids = {group_id for group_id in observed_groups.values() if group_id is not None}
             locked_groups = list(
                 DeviceGroup.objects.select_for_update()
@@ -7361,7 +7315,9 @@ def device_group_detail(request, guid):
                 return _generation_conflict(group.mutation_generation, "devices")
             devices = list(
                 RemoteDevice.objects.select_for_update()
-                .filter(rid__in=ids).order_by("pk").only("pk", "rid", "device_group_id")
+                .filter(rid__in=ids)
+                .order_by("pk")
+                .only("pk", "rid", "device_group_id")
             )
             found = {device.rid for device in devices}
             missing = [rid for rid in ids if rid not in found]
@@ -7837,22 +7793,13 @@ def strategy_detail(request, guid):
                     return _generation_conflict(strategy.mutation_generation, "strategies")
                 name = strategy.name
                 groups = list(
-                    DeviceGroup.objects.select_for_update()
-                    .filter(strategy=strategy)
-                    .order_by("pk")
-                    .only("pk")
+                    DeviceGroup.objects.select_for_update().filter(strategy=strategy).order_by("pk").only("pk")
                 )
                 users = list(
-                    UserProfile.objects.select_for_update()
-                    .filter(strategy=strategy)
-                    .order_by("pk")
-                    .only("pk")
+                    UserProfile.objects.select_for_update().filter(strategy=strategy).order_by("pk").only("pk")
                 )
                 devices = list(
-                    RemoteDevice.objects.select_for_update()
-                    .filter(strategy=strategy)
-                    .order_by("pk")
-                    .only("pk")
+                    RemoteDevice.objects.select_for_update().filter(strategy=strategy).order_by("pk").only("pk")
                 )
                 group_ids = [group.pk for group in groups]
                 user_ids = [user.pk for user in users]
@@ -8111,9 +8058,7 @@ def strategy_assign(request):
             )
         current_generations = {
             "devices": {
-                str(device.pk): device.mutation_generation
-                for device in locked_devices
-                if device.pk in peer_guids
+                str(device.pk): device.mutation_generation for device in locked_devices if device.pk in peer_guids
             },
             "users": {str(user.pk): user.mutation_generation for user in users},
             "groups": {str(group.guid): group.mutation_generation for group in groups},
@@ -8169,18 +8114,9 @@ def strategy_assign(request):
             ],
         }
         next_generations = {
-            "devices": {
-                str(row["pk"]): row["mutation_generation"]
-                for row in state["devices"]
-            },
-            "users": {
-                str(row["pk"]): row["mutation_generation"]
-                for row in state["users"]
-            },
-            "groups": {
-                row["guid"]: row["mutation_generation"]
-                for row in state["groups"]
-            },
+            "devices": {str(row["pk"]): row["mutation_generation"] for row in state["devices"]},
+            "users": {str(row["pk"]): row["mutation_generation"] for row in state["users"]},
+            "groups": {row["guid"]: row["mutation_generation"] for row in state["groups"]},
         }
         return ManagementMutation(
             status_code=200,

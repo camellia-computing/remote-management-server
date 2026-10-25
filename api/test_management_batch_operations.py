@@ -138,7 +138,7 @@ class ManagementBatchOperationTests(TestCase):
         operation_id = operation_id or str(uuid.uuid4())
         headers = {
             "HTTP_AUTHORIZATION": f"Bearer {self.bearer}",
-            "HTTP_IDEMPOTENCY_KEY": operation_id,
+            "HTTP_IDEMPOTENCY_KEY": "v2:" + str(operation_id),
         }
         if expected_generation is not None:
             headers["HTTP_IF_MATCH"] = f'"{expected_generation}"'
@@ -175,14 +175,14 @@ class ManagementBatchOperationTests(TestCase):
         self.assertRegex(body["code"], r"^[a-z][a-z0-9_]{0,63}$")
         self.assertFalse(body["retryable"])
         self.assertEqual(body["applied"], dict.fromkeys(body["requested"], 0))
-        self.assertEqual(body["management_operation_receipt_version"], 1)
+        self.assertEqual(body["management_operation_receipt_version"], 2)
         self.assertRegex(body["request_digest"], r"^[0-9a-f]{64}$")
 
     def assert_success_receipt(self, response, operation, operation_id, requested):
         self.assertEqual(response.status_code, 200, response.content)
         body = response.json()
         self.assertEqual(body["result"], "OK")
-        self.assertEqual(body["management_operation_receipt_version"], 1)
+        self.assertEqual(body["management_operation_receipt_version"], 2)
         self.assertEqual(body["operation"], operation)
         self.assertEqual(body["operation_id"], operation_id)
         self.assertIsInstance(body["operation_generation"], int)
@@ -448,7 +448,7 @@ class ManagementBatchOperationTests(TestCase):
         )
         receipt = ManagementBatchOperation.objects.get(operation_id=operation_id)
         self.assertEqual(receipt.status_code, 409)
-        self.assertEqual(receipt.response, response.json())
+        self.assertEqual(json.loads(receipt.secret_response)["body"], response.json())
 
     def test_missing_or_invalid_operation_identifier_is_rejected(self):
         missing = self.client.post(
@@ -499,7 +499,7 @@ class ManagementBatchOperationTests(TestCase):
         self.assert_zero_application_conflict(rejected)
         receipt = ManagementBatchOperation.objects.get(operation_id=operation_id)
         self.assertEqual(receipt.status_code, 409)
-        self.assertEqual(receipt.response, first_body)
+        self.assertEqual(json.loads(receipt.secret_response)["body"], first_body)
 
         late_device = self._device("missing001", "batch-late-device", self.second_user)
         replayed = self._post(
@@ -569,7 +569,7 @@ class ManagementBatchOperationTests(TestCase):
             data=json.dumps(payload),
             content_type="application/json",
             HTTP_AUTHORIZATION=f"Bearer {other_bearer}",
-            HTTP_IDEMPOTENCY_KEY=operation_id,
+            HTTP_IDEMPOTENCY_KEY="v2:" + str(operation_id),
             HTTP_IF_MATCH='"0"',
         )
 
@@ -807,7 +807,6 @@ class ManagementBatchOperationTests(TestCase):
                 applied={"results": 1},
                 result_state={"created": True},
             ),
-            sensitive_response=True,
         )
         path = f"/api/management-operations/{operation_id}"
 
@@ -847,7 +846,6 @@ class ManagementBatchOperationTests(TestCase):
                 applied={"results": 1},
                 result_state={"created": True},
             ),
-            sensitive_response=True,
         )
         old_key_id = settings.DATA_ENCRYPTION_PRIMARY_KEY_ID
         old_key = settings.DATA_ENCRYPTION_KEYS[old_key_id]
@@ -882,9 +880,19 @@ class ManagementBatchOperationTests(TestCase):
             self.assertTrue(new_envelope.startswith(f"{FIELD_PREFIX}{new_key_id}:"))
             receipt = ManagementBatchOperation.objects.get(operation_id=operation_id)
             self.assertEqual(
-                json.loads(receipt.secret_response)["token"],
+                json.loads(receipt.secret_response)["body"]["token"],
                 "rotation-sensitive-value",
             )
+            with override_settings(DATA_ENCRYPTION_KEYS={new_key_id: new_key}, DATA_ENCRYPTION_V1_KEY_ID=new_key_id):
+                replay = execute_management_operation(
+                    actor=self.admin,
+                    operation_id=operation_id,
+                    operation="receipt_rotation_test",
+                    request_document={"operation": "receipt_rotation_test"},
+                    requested={"results": 1},
+                    mutation=lambda: self.fail("rotated receipt must replay without applying the mutation"),
+                )
+                self.assertEqual(replay.body["token"], "rotation-sensitive-value")
 
     @override_settings(MANAGEMENT_OPERATION_RETENTION_DAYS=30)
     def test_cleanup_purges_expired_receipts_in_bounded_batches(self):
@@ -953,7 +961,7 @@ class ManagementBatchOperationConcurrencyTests(TransactionTestCase):
         try:
             headers = {
                 "HTTP_AUTHORIZATION": f"Bearer {self.bearer}",
-                "HTTP_IDEMPOTENCY_KEY": operation_id,
+                "HTTP_IDEMPOTENCY_KEY": "v2:" + str(operation_id),
             }
             if expected_generation is not None:
                 headers["HTTP_IF_MATCH"] = f'"{expected_generation}"'

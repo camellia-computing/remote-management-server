@@ -182,7 +182,7 @@ class AddressBookRuleTargetConstraintTests(TestCase):
                 ),
                 content_type="application/json",
                 HTTP_AUTHORIZATION=f"Bearer {token}",
-                HTTP_IDEMPOTENCY_KEY=str(uuid.uuid4()),
+                HTTP_IDEMPOTENCY_KEY="v2:" + str(uuid.uuid4()),
                 HTTP_IF_MATCH=f'"{generation}"',
             )
             generation += 1
@@ -191,7 +191,7 @@ class AddressBookRuleTargetConstraintTests(TestCase):
                 data=json.dumps({"guid": self.profile.guid, "rule": rule}),
                 content_type="application/json",
                 HTTP_AUTHORIZATION=f"Bearer {token}",
-                HTTP_IDEMPOTENCY_KEY=str(uuid.uuid4()),
+                HTTP_IDEMPOTENCY_KEY="v2:" + str(uuid.uuid4()),
                 HTTP_IF_MATCH=f'"{generation}"',
             )
             generation += 1
@@ -222,7 +222,7 @@ class AddressBookRuleTargetConstraintTests(TestCase):
                     "profile_guid": web_profile.guid,
                     "group": self.group.name,
                     "rule": rule,
-                    "idempotency_key": str(uuid.uuid4()),
+                    "idempotency_key": "v2:" + str(uuid.uuid4()),
                     "expected_generation": str(generation),
                 },
             )
@@ -233,7 +233,7 @@ class AddressBookRuleTargetConstraintTests(TestCase):
                     "action": "add_everyone_rule",
                     "profile_guid": web_profile.guid,
                     "rule": rule,
-                    "idempotency_key": str(uuid.uuid4()),
+                    "idempotency_key": "v2:" + str(uuid.uuid4()),
                     "expected_generation": str(generation),
                 },
             )

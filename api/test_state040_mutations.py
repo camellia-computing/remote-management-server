@@ -7,7 +7,7 @@ from django.db import close_old_connections, connection, connections
 from django.http import JsonResponse
 from django.test import RequestFactory, TestCase, TransactionTestCase, override_settings, skipUnlessDBFeature
 
-from api.management_operations import document_digest
+from api.management_operations import ManagementMutation, execute_management_operation
 from api.models import (
     AddressBookProfile,
     AddressBookRule,
@@ -19,6 +19,7 @@ from api.models import (
     ShareLink,
     UserProfile,
 )
+from api.operation_intents import public_intent_digest as document_digest
 from api.replayable_mutations import replayable_stateless_api
 from api.views_api import _issue_access_token
 
@@ -52,7 +53,7 @@ class State040ControlMutationTests(TestCase):
     def _headers(self, operation_id, *, if_match=None):
         headers = {
             "HTTP_AUTHORIZATION": f"Bearer {self.bearer}",
-            "HTTP_IDEMPOTENCY_KEY": str(operation_id),
+            "HTTP_IDEMPOTENCY_KEY": "v2:" + str(operation_id),
         }
         if if_match is not None:
             headers["HTTP_IF_MATCH"] = if_match
@@ -94,7 +95,113 @@ class State040ControlMutationTests(TestCase):
         self.assertEqual(conflict.json()["code"], "http_409_api_device_groups")
         self.assertEqual(DeviceGroup.objects.filter(name=payload["name"]).count(), 1)
 
+    def test_receipt_does_not_publish_an_offline_password_verifier(self):
+        # Precomputed legacy SHA256 over the documented user_create intent,
+        # including the nested SHA256 of this isolated synthetic password.
+        # No database encryption key or password-KDF work is needed to guess it.
+        legacy_verifier = "25a7972bbdcd3c09541983ae117631de7648a32ae1ffd3b61dffe3fa7c99e771"
+        operation_id = uuid.uuid4()
+        response = self._json(
+            "post",
+            "/api/users",
+            {"username": "receipt-password-privacy", "password": "Synthetic-password-987!"},
+            operation_id=operation_id,
+        )
+        self.assertEqual(response.status_code, 200, response.content)
+        self.assertNotEqual(response.json()["request_digest"], legacy_verifier)
+        stored = ManagementBatchOperation.objects.get(operation_id=operation_id)
+        self.assertNotEqual(stored.request_digest, legacy_verifier)
+        replay = self._json(
+            "post",
+            "/api/users",
+            {"username": "receipt-password-privacy", "password": "Synthetic-password-987!"},
+            operation_id=operation_id,
+        )
+        self.assertEqual(replay.json(), response.json())
+        changed = self._json(
+            "post",
+            "/api/users",
+            {"username": "receipt-password-privacy", "password": "Changed-synthetic-password-123!"},
+            operation_id=operation_id,
+        )
+        self.assertEqual(changed.status_code, 409, changed.content)
+        self.assertTrue(
+            UserProfile.objects.by_username("receipt-password-privacy").get().check_password("Synthetic-password-987!")
+        )
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT request_digest, secret_response FROM api_managementbatchoperation WHERE generation = %s",
+                [stored.pk],
+            )
+            raw_digest, raw_envelope = cursor.fetchone()
+        self.assertEqual(raw_digest, response.json()["request_digest"])
+        self.assertTrue(raw_envelope.startswith("secretbox:v3:"))
+        self.assertNotIn("Synthetic-password-987!", raw_envelope)
+        self.assertNotIn(legacy_verifier, raw_envelope)
+
+    def test_personal_peer_hash_uses_a_public_marker_and_a_private_replay_binding(self):
+        profile = AddressBookProfile.objects.create(
+            guid=f"personal-{self.admin.pk}", owner=self.admin, name="Personal privacy test"
+        )
+        operation_id = uuid.uuid4()
+        path = f"/api/ab/peer/add/{profile.guid}"
+        payload = {"id": "personal-privacy-peer", "hash": "SYNTHETIC-PERSONAL-HASH-A"}
+        response = self._json("post", path, payload, operation_id=operation_id, if_match='"0"')
+        self.assertEqual(response.status_code, 200, response.content)
+        different_secret = {**payload, "hash": "SYNTHETIC-PERSONAL-HASH-B"}
+        self.assertEqual(
+            response.json()["request_digest"],
+            document_digest(
+                {
+                    "operation": "address_book_peer_add",
+                    "method": "POST",
+                    "path": path,
+                    "args": {},
+                    "body": different_secret,
+                    "has_body": True,
+                    "expected_generation": 0,
+                }
+            ),
+        )
+        replay = self._json("post", path, payload, operation_id=operation_id, if_match='"0"')
+        self.assertEqual(replay.json(), response.json())
+        changed = self._json("post", path, different_secret, operation_id=operation_id, if_match='"0"')
+        self.assertEqual(changed.status_code, 409, changed.content)
+        self.assertEqual(RemotePeer.objects.get(profile=profile, rid=payload["id"]).rhash, payload["hash"])
+
+    def test_result_proof_also_omits_secret_values(self):
+        digests = []
+        for credential in ["SYNTHETIC-RESULT-A", "SYNTHETIC-DIFFERENT-RESULT-B"]:
+            result = execute_management_operation(
+                actor=self.admin,
+                operation_id=uuid.uuid4(),
+                operation="result_privacy",
+                request_document={"operation": "result_privacy"},
+                requested={"results": 1},
+                mutation=lambda credential=credential: ManagementMutation(
+                    status_code=200,
+                    body={"result": "OK"},
+                    applied={"results": 1},
+                    result_state={"password": credential},
+                ),
+            )
+            digests.append(result.body["result_digest"])
+        self.assertEqual(digests[0], digests[1])
+
     def test_mutations_require_uuid4_operation_id_and_resource_generation(self):
+        nonce = str(uuid.uuid4())
+        for wire_key in [nonce, f"v1:{nonce}", f"v3:{nonce}"]:
+            with self.subTest(wire_version=wire_key[:3]):
+                rejected = self.client.post(
+                    "/api/device-groups",
+                    data=json.dumps({"name": "state040-unsupported-wire-key"}),
+                    content_type="application/json",
+                    headers={"Idempotency-Key": wire_key},
+                    HTTP_AUTHORIZATION=f"Bearer {self.bearer}",
+                )
+                self.assertEqual(rejected.status_code, 400, rejected.content)
+                self.assertFalse(DeviceGroup.objects.filter(name="state040-unsupported-wire-key").exists())
+                self.assertFalse(ManagementBatchOperation.objects.filter(operation_id=nonce).exists())
         missing_key = self.client.post(
             "/api/device-groups",
             data=json.dumps({"name": "state040-missing-operation"}),
@@ -109,7 +216,7 @@ class State040ControlMutationTests(TestCase):
             data=json.dumps({"name": "state040-non-random-operation"}),
             content_type="application/json",
             HTTP_AUTHORIZATION=f"Bearer {self.bearer}",
-            HTTP_IDEMPOTENCY_KEY=str(uuid.uuid1()),
+            HTTP_IDEMPOTENCY_KEY="v2:" + str(uuid.uuid1()),
         )
         self.assertEqual(non_random_key.status_code, 400, non_random_key.content)
         self.assertFalse(DeviceGroup.objects.filter(name="state040-non-random-operation").exists())
@@ -155,22 +262,16 @@ class State040ControlMutationTests(TestCase):
             "password": "R3mote!Zebra-Quartz-Password-47",
             "note": "created",
         }
-        created = self._json(
-            "post", "/api/users", create_payload, operation_id=create_id
-        )
+        created = self._json("post", "/api/users", create_payload, operation_id=create_id)
         self.assertEqual(created.status_code, 200, created.content)
         created_body = created.json()
         self.assertEqual(created_body["mutation_generation"], 0)
         target_id = created_body["guid"]
 
-        replay = self._json(
-            "post", "/api/users", create_payload, operation_id=create_id
-        )
+        replay = self._json("post", "/api/users", create_payload, operation_id=create_id)
         self.assertEqual(replay.status_code, 200, replay.content)
         self.assertEqual(replay.json(), created_body)
-        self.assertEqual(
-            UserProfile.objects.filter(username="state040-created-user").count(), 1
-        )
+        self.assertEqual(UserProfile.objects.filter(username="state040-created-user").count(), 1)
 
         password_conflict = self._json(
             "post",
@@ -229,7 +330,7 @@ class State040ControlMutationTests(TestCase):
         )
         self.assertEqual(address_book_assign.status_code, 200, address_book_assign.content)
         address_book_receipt = ManagementBatchOperation.objects.get(operation_id=address_book_id)
-        self.assertNotIn(address_book_password, json.dumps(address_book_receipt.response))
+        self.assertNotIn(address_book_password, json.dumps(json.loads(address_book_receipt.secret_response)["body"]))
         self.assertEqual(
             address_book_receipt.request_digest,
             document_digest(
@@ -243,7 +344,7 @@ class State040ControlMutationTests(TestCase):
                         "address_book_alias": "desk",
                         "address_book_note": "note",
                         "has_address_book_password": True,
-                        "address_book_password_digest": document_digest(address_book_password),
+                        "address_book_password": address_book_password,
                     },
                     "expected_generation": 1,
                 }
@@ -442,7 +543,7 @@ class State040ControlMutationTests(TestCase):
                     "note": "digest",
                     "info": None,
                     "has_default_password": True,
-                    "default_password_digest": document_digest(create_password),
+                    "default_password": create_password,
                 }
             ),
         )
@@ -499,7 +600,7 @@ class State040ControlMutationTests(TestCase):
             data=json.dumps({"id": "state040-transient-peer"}),
             content_type="application/json",
             HTTP_AUTHORIZATION=f"Bearer {self.bearer}",
-            HTTP_IDEMPOTENCY_KEY=str(operation_id),
+            HTTP_IDEMPOTENCY_KEY="v2:" + str(operation_id),
             HTTP_IF_MATCH='"0"',
         )
         response = wrapped(request, guid=profile.guid)
@@ -521,7 +622,7 @@ class State040ControlMutationTests(TestCase):
         first = self.client.post(
             "/api/share",
             {"data": create_payload},
-            HTTP_IDEMPOTENCY_KEY=str(create_id),
+            HTTP_IDEMPOTENCY_KEY="v2:" + str(create_id),
         )
         self.assertEqual(first.status_code, 200, first.content)
         first_body = first.json()
@@ -529,15 +630,15 @@ class State040ControlMutationTests(TestCase):
         replay = self.client.post(
             "/api/share",
             {"data": create_payload},
-            HTTP_IDEMPOTENCY_KEY=str(create_id),
+            HTTP_IDEMPOTENCY_KEY="v2:" + str(create_id),
         )
         self.assertEqual(replay.status_code, 200, replay.content)
         self.assertEqual(replay.json(), first_body)
         self.assertEqual(ShareLink.objects.count(), 1)
 
         receipt = ManagementBatchOperation.objects.get(operation_id=create_id)
-        self.assertEqual(receipt.response["sensitive_response"], True)
-        self.assertNotIn(raw_token, json.dumps(receipt.response))
+        self.assertEqual(receipt.receipt_version, 2)
+        self.assertEqual(json.loads(receipt.secret_response)["body"]["token"], raw_token)
         with connection.cursor() as cursor:
             cursor.execute(
                 "SELECT secret_response FROM api_managementbatchoperation WHERE operation_id = %s",
@@ -551,10 +652,10 @@ class State040ControlMutationTests(TestCase):
         self.client.force_login(recipient)
         accept_id = uuid.uuid4()
         path = f"/api/share/{raw_token}"
-        accepted = self.client.post(path, {"idempotency_key": str(accept_id)})
+        accepted = self.client.post(path, {"idempotency_key": "v2:" + str(accept_id)})
         self.assertEqual(accepted.status_code, 200, accepted.content)
         self.assertContains(accepted, "已获取 1 台设备")
-        accepted_replay = self.client.post(path, {"idempotency_key": str(accept_id)})
+        accepted_replay = self.client.post(path, {"idempotency_key": "v2:" + str(accept_id)})
         self.assertEqual(accepted_replay.status_code, 200, accepted_replay.content)
         self.assertContains(accepted_replay, "已获取 1 台设备")
         self.assertEqual(RemotePeer.objects.filter(profile__owner=recipient, rid=peer.rid).count(), 1)
@@ -564,8 +665,31 @@ class State040ControlMutationTests(TestCase):
         self.assertEqual(recipient_profile.authorization_generation, 1)
         self.assertEqual(ManagementBatchOperation.objects.filter(operation_id=accept_id).count(), 1)
 
-        different_operation = self.client.post(path, {"idempotency_key": str(uuid.uuid4())})
+        different_operation = self.client.post(path, {"idempotency_key": "v2:" + str(uuid.uuid4())})
         self.assertEqual(different_operation.status_code, 404, different_operation.content)
+
+        generations = list(
+            ManagementBatchOperation.objects.filter(operation_id__in=[create_id, accept_id])
+            .order_by("generation")
+            .values_list("generation", flat=True)
+        )
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "UPDATE api_managementbatchoperation "
+                "SET receipt_version = 0, request_digest = %s, secret_response = '', status_code = 410 "
+                "WHERE generation IN (%s, %s)",
+                ["0" * 64, *generations],
+            )
+        retired_accept = self.client.post(path, {"idempotency_key": "v2:" + str(accept_id)})
+        self.assertEqual(retired_accept.status_code, 410, retired_accept.content)
+        self.assertEqual(RemotePeer.objects.filter(profile__owner=recipient, rid=peer.rid).count(), 1)
+        self.client.force_login(self.admin)
+        retired_create = self.client.post(
+            "/api/share", {"data": create_payload}, HTTP_IDEMPOTENCY_KEY="v2:" + str(create_id)
+        )
+        self.assertEqual(retired_create.status_code, 410, retired_create.content)
+        self.assertEqual(retired_create.json()["code"], "operation_receipt_retired")
+        self.assertEqual(ShareLink.objects.count(), 1)
 
     def test_browser_profile_forms_replay_and_reject_stale_generation(self):
         self.client.force_login(self.admin)
@@ -578,19 +702,15 @@ class State040ControlMutationTests(TestCase):
             "action": "create_book",
             "name": "state040-browser-book",
             "note": "initial",
-            "idempotency_key": str(create_id),
+            "idempotency_key": "v2:" + str(create_id),
         }
         first = self.client.post("/api/ab_books", create_form)
         replay = self.client.post("/api/ab_books", create_form)
         self.assertEqual(first.status_code, 302, first.content)
         self.assertEqual(replay.status_code, 302, replay.content)
-        profile = AddressBookProfile.objects.get(
-            owner=self.admin, name="state040-browser-book"
-        )
+        profile = AddressBookProfile.objects.get(owner=self.admin, name="state040-browser-book")
         self.assertEqual(
-            AddressBookProfile.objects.filter(
-                owner=self.admin, name="state040-browser-book"
-            ).count(),
+            AddressBookProfile.objects.filter(owner=self.admin, name="state040-browser-book").count(),
             1,
         )
 
@@ -600,7 +720,7 @@ class State040ControlMutationTests(TestCase):
             "guid": profile.guid,
             "name": profile.name,
             "note": "updated",
-            "idempotency_key": str(update_id),
+            "idempotency_key": "v2:" + str(update_id),
             "expected_generation": "0",
         }
         updated = self.client.post("/api/ab_books", update_form)
@@ -620,7 +740,7 @@ class State040ControlMutationTests(TestCase):
             "action": "transfer_book",
             "guid": profile.guid,
             "owner": transfer_owner.username,
-            "idempotency_key": str(transfer_id),
+            "idempotency_key": "v2:" + str(transfer_id),
             "expected_generation": "1",
         }
         transferred = self.client.post("/api/ab_books", transfer_form)
@@ -635,7 +755,7 @@ class State040ControlMutationTests(TestCase):
             "/api/ab_books",
             {
                 **update_form,
-                "idempotency_key": str(uuid.uuid4()),
+                "idempotency_key": "v2:" + str(uuid.uuid4()),
                 "note": "stale",
             },
         )
@@ -648,7 +768,7 @@ class State040ControlMutationTests(TestCase):
         delete_form = {
             "action": "delete_book",
             "guid": profile.guid,
-            "idempotency_key": str(delete_id),
+            "idempotency_key": "v2:" + str(delete_id),
             "expected_generation": "2",
         }
         deleted = self.client.post("/api/ab_books", delete_form)
@@ -680,7 +800,7 @@ class State040ControlMutationTests(TestCase):
             "password": "State040-Browser-Secret-48",
             "tags": "production",
             "expected_generation": "0",
-            "idempotency_key": str(add_id),
+            "idempotency_key": "v2:" + str(add_id),
         }
         added = self.client.post("/api/ab_book", add_form)
         replay = self.client.post("/api/ab_book", add_form)
@@ -694,8 +814,8 @@ class State040ControlMutationTests(TestCase):
         self.assertEqual(profile.authorization_generation, 1)
         add_receipt = ManagementBatchOperation.objects.get(operation_id=add_id)
         self.assertEqual(add_receipt.operation, "browser_ab_book_add_peer")
-        self.assertEqual(add_receipt.response["applied"], {"mutations": 1})
-        self.assertNotIn("State040-Browser-Secret-48", json.dumps(add_receipt.response))
+        self.assertEqual(json.loads(add_receipt.secret_response)["body"]["applied"], {"mutations": 1})
+        self.assertNotIn("State040-Browser-Secret-48", json.dumps(json.loads(add_receipt.secret_response)["body"]))
 
         conflict = self.client.post(
             "/api/ab_book",
@@ -713,7 +833,7 @@ class State040ControlMutationTests(TestCase):
                 "action": "update_peer",
                 "alias": "stale-alias",
                 "password": "",
-                "idempotency_key": str(stale_id),
+                "idempotency_key": "v2:" + str(stale_id),
             },
         )
         self.assertEqual(stale.status_code, 302, stale.content)
@@ -723,7 +843,7 @@ class State040ControlMutationTests(TestCase):
         self.assertEqual(profile.authorization_generation, 1)
         stale_receipt = ManagementBatchOperation.objects.get(operation_id=stale_id)
         self.assertEqual(stale_receipt.status_code, 409)
-        self.assertEqual(stale_receipt.response["applied"], {"mutations": 0})
+        self.assertEqual(json.loads(stale_receipt.secret_response)["body"]["applied"], {"mutations": 0})
 
         delete_id = uuid.uuid4()
         delete_form = {
@@ -731,7 +851,7 @@ class State040ControlMutationTests(TestCase):
             "guid": profile.guid,
             "rid": peer.rid,
             "expected_generation": "1",
-            "idempotency_key": str(delete_id),
+            "idempotency_key": "v2:" + str(delete_id),
         }
         deleted = self.client.post("/api/ab_book", delete_form)
         deleted_replay = self.client.post("/api/ab_book", delete_form)
@@ -748,7 +868,7 @@ class State040ControlMutationTests(TestCase):
             "name": "operations",
             "color": "#397bff",
             "expected_generation": "2",
-            "idempotency_key": str(tag_id),
+            "idempotency_key": "v2:" + str(tag_id),
         }
         tagged = self.client.post("/api/tag_manage", tag_form)
         tagged_replay = self.client.post("/api/tag_manage", tag_form)
@@ -764,7 +884,7 @@ class State040ControlMutationTests(TestCase):
             "profile_guid": profile.guid,
             "rule": "1",
             "expected_generation": "3",
-            "idempotency_key": str(rule_id),
+            "idempotency_key": "v2:" + str(rule_id),
         }
         ruled = self.client.post("/api/ab_manage", rule_form)
         ruled_replay = self.client.post("/api/ab_manage", rule_form)
@@ -798,7 +918,7 @@ class State040ControlMutationTests(TestCase):
                         "state040-unselected-profile": 0,
                     }
                 ),
-                "idempotency_key": str(invalid_bulk_id),
+                "idempotency_key": "v2:" + str(invalid_bulk_id),
             },
         )
         self.assertEqual(invalid_bulk.status_code, 302, invalid_bulk.content)
@@ -808,7 +928,7 @@ class State040ControlMutationTests(TestCase):
         self.assertEqual(profile.authorization_generation, 4)
         invalid_receipt = ManagementBatchOperation.objects.get(operation_id=invalid_bulk_id)
         self.assertEqual(invalid_receipt.status_code, 400)
-        self.assertEqual(invalid_receipt.response["applied"], {"mutations": 0})
+        self.assertEqual(json.loads(invalid_receipt.secret_response)["body"]["applied"], {"mutations": 0})
 
         valid_bulk_id = uuid.uuid4()
         valid_bulk = self.client.post(
@@ -818,7 +938,7 @@ class State040ControlMutationTests(TestCase):
                 "selected": [str(everyone_rule.guid)],
                 "rule": "2",
                 "expected_generations": json.dumps({str(profile.guid): 4}),
-                "idempotency_key": str(valid_bulk_id),
+                "idempotency_key": "v2:" + str(valid_bulk_id),
             },
         )
         self.assertEqual(valid_bulk.status_code, 302, valid_bulk.content)
@@ -867,7 +987,7 @@ class State040ConcurrencyTests(TransactionTestCase):
                     data=payload,
                     content_type="application/json",
                     HTTP_AUTHORIZATION=f"Bearer {bearer}",
-                    HTTP_IDEMPOTENCY_KEY=operation_id,
+                    HTTP_IDEMPOTENCY_KEY="v2:" + str(operation_id),
                 )
             finally:
                 connections.close_all()

@@ -137,7 +137,7 @@ class UsernameIdentityTests(TestCase):
             data=json.dumps({"username": "ＳtraßeNew", "password": self.password}),
             content_type="application/json",
             HTTP_AUTHORIZATION=f"Bearer {token}",
-            HTTP_IDEMPOTENCY_KEY=str(uuid.uuid4()),
+            HTTP_IDEMPOTENCY_KEY="v2:" + str(uuid.uuid4()),
         )
         self.assertEqual(created.status_code, 200, created.content)
         collision = admin_api.post(
@@ -145,7 +145,7 @@ class UsernameIdentityTests(TestCase):
             data=json.dumps({"username": "STRASSENEW", "password": self.password}),
             content_type="application/json",
             HTTP_AUTHORIZATION=f"Bearer {token}",
-            HTTP_IDEMPOTENCY_KEY=str(uuid.uuid4()),
+            HTTP_IDEMPOTENCY_KEY="v2:" + str(uuid.uuid4()),
         )
         self.assertEqual(collision.status_code, 409, collision.content)
         normalization_overflow = admin_api.post(
@@ -153,7 +153,7 @@ class UsernameIdentityTests(TestCase):
             data=json.dumps({"username": "ﬃ" * 20, "password": self.password}),
             content_type="application/json",
             HTTP_AUTHORIZATION=f"Bearer {token}",
-            HTTP_IDEMPOTENCY_KEY=str(uuid.uuid4()),
+            HTTP_IDEMPOTENCY_KEY="v2:" + str(uuid.uuid4()),
         )
         self.assertEqual(normalization_overflow.status_code, 400, normalization_overflow.content)
 

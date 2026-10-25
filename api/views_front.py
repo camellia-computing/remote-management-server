@@ -37,8 +37,9 @@ from api.login_admission import REGISTER_SCOPE, complete_login_success, reserve_
 from api.management_operations import (
     ManagementMutation,
     ManagementOperationConflict,
+    ManagementOperationRetired,
     execute_management_operation,
-    parse_operation_id,
+    parse_operation_key,
 )
 from api.models import (
     AddressBookProfile,
@@ -97,7 +98,7 @@ def _state040_operation_id(request):
     value = request.META.get("HTTP_IDEMPOTENCY_KEY") or request.POST.get("idempotency_key")
     if not value or not str(value).strip():
         raise InvalidIdentifier("A canonical Idempotency-Key UUID is required")
-    return parse_operation_id(str(value))
+    return parse_operation_key(str(value))
 
 
 def _browser_expected_generation(request):
@@ -1158,10 +1159,7 @@ def _share_message(request, title, message, status=200):
 def _accept_share_link(request, token_hash):
     with transaction.atomic():
         link = (
-            ShareLink.objects.select_for_update(of=("self",))
-            .select_related("creator")
-            .filter(shash=token_hash)
-            .first()
+            ShareLink.objects.select_for_update(of=("self",)).select_related("creator").filter(shash=token_hash).first()
         )
         if not link or link.is_used or link.is_expired or link.expires_at <= timezone.now():
             if link and not link.is_used:
@@ -1235,7 +1233,11 @@ def _accept_share_link(request, token_hash):
         if recipient_peer_count + len(sources_to_import) > MAX_AB_PEERS:
             return ManagementMutation(
                 status_code=409,
-                body={"code": "share_recipient_peer_limit", "title": "错误", "message": "个人地址簿设备数量已达到上限。"},
+                body={
+                    "code": "share_recipient_peer_limit",
+                    "title": "错误",
+                    "message": "个人地址簿设备数量已达到上限。",
+                },
                 applied={"share_links": 0},
                 result_state={"error": "recipient_peer_limit"},
             )
@@ -1246,7 +1248,11 @@ def _accept_share_link(request, token_hash):
         if recipient_tags is None:
             return ManagementMutation(
                 status_code=409,
-                body={"code": "share_recipient_tag_limit", "title": "错误", "message": "个人地址簿标签数量已达到上限。"},
+                body={
+                    "code": "share_recipient_tag_limit",
+                    "title": "错误",
+                    "message": "个人地址簿标签数量已达到上限。",
+                },
                 applied={"share_links": 0},
                 result_state={"error": "recipient_tag_limit"},
             )
@@ -1349,6 +1355,8 @@ def share(request, share_token=None):
                 requested={"share_links": 1},
                 mutation=lambda: _accept_share_link(request, token_hash),
             )
+        except ManagementOperationRetired:
+            return _share_message(request, "错误", "操作回执已退役，请核对资源状态，勿重复提交。", status=410)
         except ManagementOperationConflict:
             return _share_message(request, "错误", "操作标识已用于其他请求。", status=409)
         body = result.body
@@ -1569,7 +1577,12 @@ def share(request, share_token=None):
                 request_document={"operation": "share_link_create", "peers": selected_peer_keys, "source": share_uid},
                 requested={"share_links": 1},
                 mutation=mutate,
-                sensitive_response=True,
+            )
+        except ManagementOperationRetired:
+            return json_error(
+                "operation_receipt_retired",
+                "Operation receipt retired; inspect the resource before any new operation",
+                status=410,
             )
         except ManagementOperationConflict:
             return json_error("operation_identifier_conflict", _("Operation identifier conflict"), status=409)
@@ -1949,9 +1962,7 @@ def ab_books(request):
                                     "current_generation": locked_profile.authorization_generation,
                                 },
                                 applied={"profiles": 0},
-                                result_state={
-                                    "current_generation": locked_profile.authorization_generation
-                                },
+                                result_state={"current_generation": locked_profile.authorization_generation},
                             )
                         if name != locked_profile.name:
                             if _is_reserved_ab_profile_name(name):
@@ -1962,9 +1973,7 @@ def ab_books(request):
                                     result_state={"error": "reserved_name"},
                                 )
                             if (
-                                AddressBookProfile.objects.filter(
-                                    Q(owner=locked_profile.owner) & Q(name=name)
-                                )
+                                AddressBookProfile.objects.filter(Q(owner=locked_profile.owner) & Q(name=name))
                                 .exclude(pk=locked_profile.pk)
                                 .exists()
                             ):
@@ -2074,9 +2083,7 @@ def ab_books(request):
                                 "current_generation": locked_profile.authorization_generation,
                             },
                             applied={"profiles": 0},
-                            result_state={
-                                "current_generation": locked_profile.authorization_generation
-                            },
+                            result_state={"current_generation": locked_profile.authorization_generation},
                         )
                     deleted = {
                         "guid": str(locked_profile.guid),
@@ -2169,9 +2176,7 @@ def ab_books(request):
                                     "current_generation": locked_profile.authorization_generation,
                                 },
                                 applied={"profiles": 0},
-                                result_state={
-                                    "current_generation": locked_profile.authorization_generation
-                                },
+                                result_state={"current_generation": locked_profile.authorization_generation},
                             )
                         if (
                             AddressBookProfile.objects.filter(
@@ -3113,10 +3118,7 @@ def ab_rules(request):
     try:
         rules = _collect_global_rules(filter_q)
         rule_generation_map = json.dumps(
-            {
-                str(rule["profile_guid"]): rule["authorization_generation"]
-                for rule in rules
-            },
+            {str(rule["profile_guid"]): rule["authorization_generation"] for rule in rules},
             sort_keys=True,
             separators=(",", ":"),
         )

@@ -208,8 +208,8 @@ class ManagementBatchOperation(models.Model):
     )
     operation = models.CharField(max_length=64, editable=False)
     request_digest = models.CharField(max_length=64, editable=False)
+    receipt_version = models.PositiveSmallIntegerField(default=2, editable=False)
     status_code = models.PositiveSmallIntegerField(editable=False)
-    response = models.JSONField(editable=False)
     secret_response = EncryptedTextField(
         blank=True,
         context_fields=("operation_id", "actor_id", "operation"),
@@ -230,7 +230,14 @@ class ManagementBatchOperation(models.Model):
             models.CheckConstraint(
                 condition=models.Q(status_code__gte=200, status_code__lt=500),
                 name="valid_mgmt_batch_status",
-            )
+            ),
+            models.CheckConstraint(
+                condition=(
+                    models.Q(receipt_version=0, request_digest="0" * 64, status_code=410, secret_response="")
+                    | (models.Q(receipt_version=2) & ~models.Q(secret_response=""))
+                ),
+                name="valid_mgmt_receipt_version",
+            ),
         ]
 
 

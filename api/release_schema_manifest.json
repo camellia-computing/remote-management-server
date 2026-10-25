@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "schema_generation": "management-schema-0034-v1",
+  "schema_generation": "management-schema-0035-v1",
   "migrations": [
     ["admin", "0001_initial"],
     ["admin", "0002_logentry_remove_auto_add"],
@@ -39,6 +39,7 @@
     ["api", "0032_context_bound_encrypted_fields"],
     ["api", "0033_mutation_generations"],
     ["api", "0034_frozen_username_identity"],
+    ["api", "0035_private_operation_receipts"],
     ["auth", "0001_initial"],
     ["auth", "0002_alter_permission_name_max_length"],
     ["auth", "0003_alter_user_email_max_length"],
@@ -57,7 +58,7 @@
   ],
   "leaf_migrations": [
     ["admin", "0003_logentry_add_action_flag_choices"],
-    ["api", "0034_frozen_username_identity"],
+    ["api", "0035_private_operation_receipts"],
     ["auth", "0012_alter_user_first_name_max_length"],
     ["contenttypes", "0002_remove_content_type_name"],
     ["sessions", "0001_initial"]
@@ -68,7 +69,7 @@
       "api_addressbookrule": ["group_id", "id", "is_everyone", "profile_id", "user_id"],
       "api_connectionauditevent": ["id", "payload_digest", "reporter_sequence"],
       "api_devicegroup": ["id", "mutation_generation", "name"],
-      "api_managementbatchoperation": ["actor_id", "generation", "operation", "operation_id", "secret_response"],
+      "api_managementbatchoperation": ["actor_id", "generation", "operation", "operation_id", "receipt_version", "secret_response"],
       "api_oidcpendingauth": ["secret_context", "state"],
       "api_recordingupload": ["secret_context", "upload_id"],
       "api_remotedevice": ["deployment_generation", "id", "mutation_generation", "owner_id", "policy_generation", "rid", "secret_context"],
@@ -85,7 +86,7 @@
       "column_types": {
         "api_addressbookprofile": {"secret_context": "uuid"},
         "api_devicegroup": {"mutation_generation": "bigint"},
-        "api_managementbatchoperation": {"secret_response": "text"},
+        "api_managementbatchoperation": {"receipt_version": "smallint", "secret_response": "text"},
         "api_oidcpendingauth": {"secret_context": "uuid"},
         "api_recordingupload": {"secret_context": "uuid"},
         "api_remotedevice": {"id": "bigint", "mutation_generation": "bigint", "secret_context": "uuid"},
@@ -98,6 +99,7 @@
       "constraints": {
         "api_addressbookprofile": ["unique_ab_profile_secret_context"],
         "api_connectionauditevent": ["positive_audit_reporter_sequence"],
+        "api_managementbatchoperation": ["valid_mgmt_receipt_version"],
         "api_oidcpendingauth": ["unique_oidc_secret_context"],
         "api_recordingupload": ["unique_recording_secret_context"],
         "api_remotedevice": ["unique_device_secret_context"],
@@ -119,7 +121,7 @@
       "not_null": {
         "api_addressbookprofile": ["secret_context"],
         "api_devicegroup": ["mutation_generation"],
-        "api_managementbatchoperation": ["secret_response"],
+        "api_managementbatchoperation": ["receipt_version", "secret_response"],
         "api_oidcpendingauth": ["secret_context"],
         "api_recordingupload": ["secret_context"],
         "api_remotedevice": ["mutation_generation", "secret_context"],

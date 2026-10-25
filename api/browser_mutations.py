@@ -13,9 +13,9 @@ from api.identifiers import InvalidIdentifier
 from api.management_operations import (
     ManagementMutation,
     ManagementOperationConflict,
-    document_digest,
+    ManagementOperationRetired,
     execute_management_operation,
-    parse_operation_id,
+    parse_operation_key,
 )
 from api.models import AddressBookProfile, AddressBookRule, AddressBookShare
 
@@ -51,7 +51,6 @@ _REDIRECTS = {
     "ab_rules": "/api/ab_rules",
 }
 _EXCLUDED_FORM_FIELDS = {"csrfmiddlewaretoken", "idempotency_key"}
-_SENSITIVE_FORM_FIELDS = {"password", "default_password"}
 
 
 class _UnrecordableBrowserMutation(RuntimeError):
@@ -64,7 +63,7 @@ def _operation_id(request):
     value = request.META.get("HTTP_IDEMPOTENCY_KEY") or request.POST.get("idempotency_key")
     if value is None or not str(value).strip():
         raise InvalidIdentifier("A canonical Idempotency-Key UUID is required")
-    return parse_operation_id(str(value))
+    return parse_operation_key(str(value))
 
 
 def _request_document(request, *, operation):
@@ -72,10 +71,7 @@ def _request_document(request, *, operation):
     for key, values in sorted(request.POST.lists()):
         if key in _EXCLUDED_FORM_FIELDS:
             continue
-        if key in _SENSITIVE_FORM_FIELDS:
-            fields[key] = [document_digest(value) for value in values]
-        else:
-            fields[key] = list(values)
+        fields[key] = list(values)
     return {
         "operation": operation,
         "method": request.method,
@@ -88,12 +84,8 @@ def _rule_profile_ids(references):
     references = [str(reference) for reference in references if str(reference).strip()]
     if not references:
         return set()
-    profile_ids = set(
-        AddressBookShare.objects.filter(guid__in=references).values_list("profile_id", flat=True)
-    )
-    profile_ids.update(
-        AddressBookRule.objects.filter(guid__in=references).values_list("profile_id", flat=True)
-    )
+    profile_ids = set(AddressBookShare.objects.filter(guid__in=references).values_list("profile_id", flat=True))
+    profile_ids.update(AddressBookRule.objects.filter(guid__in=references).values_list("profile_id", flat=True))
     return profile_ids
 
 
@@ -107,9 +99,7 @@ def _referenced_profile_ids(request, surface):
     if surface == "ab_manage":
         profile_guid = str(request.POST.get("profile_guid", "")).strip()
         if profile_guid:
-            return set(
-                AddressBookProfile.objects.filter(guid=profile_guid).values_list("pk", flat=True)
-            )
+            return set(AddressBookProfile.objects.filter(guid=profile_guid).values_list("pk", flat=True))
         return _rule_profile_ids([request.POST.get("rule_guid", "")])
     if surface == "ab_rules":
         references = request.POST.getlist("selected")
@@ -124,9 +114,7 @@ def _lock_profiles(profile_ids):
         raise RuntimeError("Browser Address Book mutation requires a transaction")
     return {
         profile.pk: profile
-        for profile in AddressBookProfile.objects.select_for_update()
-        .filter(pk__in=profile_ids)
-        .order_by("pk")
+        for profile in AddressBookProfile.objects.select_for_update().filter(pk__in=profile_ids).order_by("pk")
     }
 
 
@@ -252,9 +240,7 @@ def replayable_address_book_form(surface):
             def mutate():
                 profile_ids = _referenced_profile_ids(request, surface)
                 profiles = _lock_profiles(profile_ids)
-                before = {
-                    profile.pk: profile.authorization_generation for profile in profiles.values()
-                }
+                before = {profile.pk: profile.authorization_generation for profile in profiles.values()}
                 try:
                     expected = _expected_generations(request, profiles)
                 except ValueError:
@@ -277,8 +263,7 @@ def replayable_address_book_form(surface):
                 stale = {
                     str(profile.guid): profile.authorization_generation
                     for profile in profiles.values()
-                    if str(profile.guid) in expected
-                    and profile.authorization_generation != expected[str(profile.guid)]
+                    if str(profile.guid) in expected and profile.authorization_generation != expected[str(profile.guid)]
                 }
                 if stale:
                     return ManagementMutation(
@@ -337,6 +322,10 @@ def replayable_address_book_form(surface):
                     requested={"mutations": 1},
                     mutation=mutate,
                 )
+            except ManagementOperationRetired:
+                _restore_feedback(request, prior_feedback)
+                messages.error(request, "操作回执已退役，请核对资源状态，勿重复提交。")
+                return HttpResponseRedirect(redirect_fallback)
             except ManagementOperationConflict:
                 _restore_feedback(request, prior_feedback)
                 messages.error(request, "操作标识已被其他请求使用。")

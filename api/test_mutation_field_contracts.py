@@ -73,7 +73,7 @@ class MutationFieldContractTests(TestCase):
             data=json.dumps(payload),
             content_type="application/json",
             HTTP_AUTHORIZATION=f"Bearer {self.bearer}",
-            HTTP_IDEMPOTENCY_KEY=str(uuid.uuid4()),
+            HTTP_IDEMPOTENCY_KEY="v2:" + str(uuid.uuid4()),
             HTTP_IF_MATCH=f'"{expected_generation}"',
         )
 
@@ -326,7 +326,7 @@ class MutationFieldContractTests(TestCase):
             data="true",
             content_type="application/json",
             HTTP_AUTHORIZATION=f"Bearer {self.bearer}",
-            HTTP_IDEMPOTENCY_KEY=str(uuid.uuid4()),
+            HTTP_IDEMPOTENCY_KEY="v2:" + str(uuid.uuid4()),
             HTTP_IF_MATCH='"0"',
         )
         self.assertEqual(scalar.status_code, 200, scalar.content)

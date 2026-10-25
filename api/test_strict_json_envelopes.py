@@ -59,7 +59,7 @@ class StrictJsonEnvelopeHttpTests(TestCase):
         return f"/api/strategies/{self.strategy.guid}/status"
 
     def put_strategy(self, body, content_type="application/json", **extra):
-        extra.setdefault("HTTP_IDEMPOTENCY_KEY", str(uuid.uuid4()))
+        extra.setdefault("HTTP_IDEMPOTENCY_KEY", "v2:" + str(uuid.uuid4()))
         extra.setdefault("HTTP_IF_MATCH", '"0"')
         return self.client.generic(
             "PUT",
@@ -246,7 +246,7 @@ class StrictJsonEnvelopeHttpTests(TestCase):
             f"/api/ab/peer/{profile.guid}",
             data=json.dumps(values),
             content_type="application/json",
-            HTTP_IDEMPOTENCY_KEY=str(uuid.uuid4()),
+            HTTP_IDEMPOTENCY_KEY="v2:" + str(uuid.uuid4()),
             HTTP_IF_MATCH='"0"',
             **self.auth,
         )
@@ -519,7 +519,7 @@ class StrictShareEnvelopeHttpTests(TestCase):
                 "data": json.dumps([{"value": str(self.peer_one.pk)}]),
             },
             HTTP_X_CSRFTOKEN=token,
-            HTTP_IDEMPOTENCY_KEY=str(uuid.uuid4()),
+            HTTP_IDEMPOTENCY_KEY="v2:" + str(uuid.uuid4()),
         )
 
         self.assertEqual(response.status_code, 200, response.content[:1000])
@@ -530,7 +530,7 @@ class StrictShareEnvelopeHttpTests(TestCase):
         response = self.client.post(
             "/api/share",
             data={"data": first},
-            HTTP_IDEMPOTENCY_KEY=str(uuid.uuid4()),
+            HTTP_IDEMPOTENCY_KEY="v2:" + str(uuid.uuid4()),
         )
         self.assertEqual(response.status_code, 200, response.content[:1000])
 
@@ -540,7 +540,7 @@ class StrictShareEnvelopeHttpTests(TestCase):
             "/api/share",
             data=encoded,
             content_type="application/x-www-form-urlencoded",
-            HTTP_IDEMPOTENCY_KEY=str(uuid.uuid4()),
+            HTTP_IDEMPOTENCY_KEY="v2:" + str(uuid.uuid4()),
         )
         self.assertEqual(response.status_code, 200, response.content[:1000])
         self.assertEqual(ShareLink.objects.count(), 2)
