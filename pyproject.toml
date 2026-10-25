@@ -3,11 +3,11 @@ name = "camellia-remote-management-server"
 version = "1.0.0"
 description = "Production management API and web console for Camellia Remote"
 readme = "README.md"
-requires-python = ">=3.13,<3.15"
+requires-python = ">=3.13,<3.16"
 license = "AGPL-3.0-only"
 authors = [{ name = "Camellia Computing" }]
 dependencies = [
-  "django>=6.0.8,<6.1",
+  "django>=6.1.2,<6.2",
   "openpyxl>=3.1,<4",
   "gunicorn>=26,<27",
   "whitenoise>=6.12,<7",
@@ -15,13 +15,13 @@ dependencies = [
   "requests>=2.32,<3",
   "pynacl>=1.6,<2",
   "psycopg[binary]>=3.3,<4",
-  "unicodedata2==16.0.0; python_version < '3.14'",
+  "unicodedata2==16.0.0; python_version != '3.14'",
 ]
 
 [dependency-groups]
 dev = [
   "defusedxml>=0.7.1,<1",
-  "ruff>=0.16,<0.17",
+  "ruff>=0.17.2,<0.18",
   "pytest>=9,<10",
   "pytest-django>=4.12,<5",
   "coverage>=7.15,<8",
@@ -30,9 +30,12 @@ dev = [
 
 [tool.uv]
 package = false
-# GitHub's hosted Dependabot updater still uses uv 0.11.8 as of 2026-07-30.
-# CI remains pinned to 0.12.0; restore an exact constraint when it catches up.
-required-version = ">=0.11.8,<0.13"
+# Hash-verified build constraints require the same uv used by CI and Docker.
+required-version = ">=0.13.5,<0.14"
+require-build-hashes = true
+build-constraint-dependencies = [
+  { requirement = "setuptools==83.0.0", hashes = ["sha256:29b23c360f22f414dc7336bb39178cc7bcbf6021ed2733cde173f09dba19abb3", "sha256:025bccbbf0fa05b6192bc64ae1e7b16e001fd6d6d4d5de03c97b1c1ade523bef"] },
+]
 
 [tool.ruff]
 target-version = "py313"

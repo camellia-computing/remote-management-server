@@ -117,7 +117,10 @@ class DeploymentDependencyTests(unittest.TestCase):
             with self.subTest(relative=relative):
                 path = self.root / relative
                 original = path.read_text(encoding="utf-8")
-                path.write_text(original.replace("9a8afc", "0a8afc", 1), encoding="utf-8")
+                digest = self.policy["database"]["digest"]
+                self.assertIn(digest, original)
+                replacement = "sha256:" + ("f" if digest[-1] != "f" else "e") * 64
+                path.write_text(original.replace(digest, replacement, 1), encoding="utf-8")
                 with self.assertRaisesRegex(ValueError, "reference drifted"):
                     dependencies.load_policy(self.root)
                 path.write_text(original, encoding="utf-8")

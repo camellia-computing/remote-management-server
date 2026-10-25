@@ -11,7 +11,7 @@ Camellia Remote 的生产管理平面：提供账号与设备管理、地址簿�
 
 ## 本地开发
 
-主质量门禁使用 Python 3.14，支持下界为 Python 3.13，统一使用 uv 0.12.0 和 PostgreSQL 18。Username identity v1 固定使用 Unicode 16.0.0 数据：Python 3.14 使用标准库，Python 3.13 使用精确锁定的 `unicodedata2==16.0.0`；缺失或其他 Unicode 数据版本会在迁移或启动检查时 fail closed。仅快速开发时可使用 SQLite：
+生产和主质量门禁使用 Python 3.15.1，支持范围为 Python 3.13–3.15；下界门禁使用3.13，SQLite debug门禁保留3.14。统一使用 uv 0.13.5 和 PostgreSQL 18。Username identity v1 固定使用 Unicode 16.0.0 数据：Python 3.14 使用标准库，3.13及3.15使用精确锁定的 `unicodedata2==16.0.0`；缺失或其他 Unicode 数据版本会在迁移或启动检查时 fail closed。仅快速开发时可使用 SQLite：
 
 ```bash
 uv sync --locked --all-groups
@@ -64,10 +64,13 @@ Node窄测无npm依赖，CI使用当前Web工具链同版本Node24.18.0；本地
 保持 base-owned verifier、workflow 专属 CODEOWNER、至少两名独立审查人与
 ruleset 的 expected-source 配置，不能把候选 `CI / Required` 单独视为信任边界。
 
-`[tool.uv].required-version` 暂时允许 `>=0.11.8,<0.13`：截至
-2026-07-30，GitHub 托管的 Dependabot uv 更新器仍使用 0.11.8，精确要求
-0.12.0 会使自动依赖更新失败。CI 仍精确安装 0.12.0；托管更新器支持该版本后
-应恢复精确约束。
+`[tool.uv].required-version` 为 `>=0.13.5,<0.14`，CI和Docker固定0.13.5。
+Unicode16 backport在CPython3.15需要源码构建；Docker仅builder安装gcc/libc开发文件，
+runtime不含编译器或build backend。隔离构建的setuptools版本及wheel/sdist SHA-256由
+`build-constraint-dependencies`固定并强制`require-build-hashes`，不在应用运行依赖内安装。
+具体哈希边界遵循[uv build dependency hashes](https://docs.astral.sh/uv/concepts/projects/build/#project-build-dependency-hashes)：
+已安装包和已有构建wheel不重新核验，干净缓存门禁需实际触发源码构建。
+依赖更新器也必须支持该配置；旧更新器应升级，不能移除哈希门禁来接受更新。
 
 ## 生产配置
 

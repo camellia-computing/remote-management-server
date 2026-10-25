@@ -208,7 +208,7 @@ def validate_ci_workflow(text: str) -> None:
     quality = _block(text, "quality")
     for marker in (
         "fetch-depth: 0",
-        'python-version: "3.14"',
+        'python-version: "3.15.1"',
         "uv run coverage run --branch -m pytest --create-db",
         "uv run coverage report",
         'uv run coverage xml -o "$RUNNER_TEMP/coverage.xml"',

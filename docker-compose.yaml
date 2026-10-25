@@ -151,7 +151,7 @@ x-application: &application
     - backend
 
 x-database-client: &database-client
-  image: postgres:18-alpine@sha256:9a8afca54e7861fd90fab5fdf4c42477a6b1cb7d293595148e674e0a3181de15
+  image: postgres:18-alpine@sha256:898c60cb390d1085bc97bdd6a1ae968757421df394b071848b52b1c09c89d6a5
   pull_policy: always
   entrypoint: []
   user: "70:70"
@@ -178,7 +178,7 @@ x-database-client: &database-client
 
 services:
   postgres-data-bootstrap:
-    image: postgres:18-alpine@sha256:9a8afca54e7861fd90fab5fdf4c42477a6b1cb7d293595148e674e0a3181de15
+    image: postgres:18-alpine@sha256:898c60cb390d1085bc97bdd6a1ae968757421df394b071848b52b1c09c89d6a5
     pull_policy: always
     profiles:
       - database-operations
@@ -217,7 +217,7 @@ services:
         ( test "$(stat -c %a "$${PGDATA}")" = 700 || chmod 700 "$${PGDATA}" )
 
   postgres:
-    image: postgres:18-alpine@sha256:9a8afca54e7861fd90fab5fdf4c42477a6b1cb7d293595148e674e0a3181de15
+    image: postgres:18-alpine@sha256:898c60cb390d1085bc97bdd6a1ae968757421df394b071848b52b1c09c89d6a5
     pull_policy: always
     user: "70:70"
     read_only: true

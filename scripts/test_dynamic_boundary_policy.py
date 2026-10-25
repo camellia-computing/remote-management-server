@@ -35,7 +35,7 @@ missing = [marker for marker in required_test if marker not in test]
 if missing:
     raise SystemExit(f"Management generated-input contract is incomplete: {missing}")
 documentation = DOCUMENTATION.read_text(encoding="utf-8")
-for marker in ("normal Required pytest suite", "Python 3.14", "60-second", "reads no", "It uploads no"):
+for marker in ("normal Required pytest suite", "Python 3.15.1", "60-second", "reads no", "It uploads no"):
     if marker not in documentation:
         raise SystemExit(f"Management dynamic boundary documentation is incomplete: {marker}")
 print("Management dynamic boundary policy passed")

@@ -6,7 +6,7 @@ The normal Required pytest suite discovers
 nesting, numeric precision, and execution time are bounded.
 
 The scheduled `Dynamic Boundaries` workflow repeats that contract on
-Ubuntu 24.04 with Python 3.14, `uv 0.12.0`, and the committed dependency lock.
+Ubuntu 24.04 with Python 3.15.1, `uv 0.13.5`, and the committed dependency lock.
 The ten-minute job budget covers environment setup; the mutation test has its
 own 60-second limit and each Hypothesis example has a 500 ms deadline.
 
